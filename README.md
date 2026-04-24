@@ -1,292 +1,252 @@
 # unified-cli
 
-Claude Code / OpenAI Codex / Google Gemini 세 CLI를 **하나의 Python API** 로 통합.
+**One Python + CLI interface for Claude Code, OpenAI Codex, and Google Gemini.**
 
-- 구독 OAuth (Pro/Max, ChatGPT Plus/Pro, Google) 로 로그인되어 있으면 **구독 크레딧으로** 실행
-- API 키 환경변수만 있으면 **자동 폴백**
-- 히스토리 · 스트리밍 · 도구 사용 · **웹서치 기본 ON** · OpenAI 호환 HTTP 서버
-- 명시적 에러 분류 (auth_expired / rate_limit / model_not_allowed / not_found / network / config / internal)
+🇰🇷 [한국어 README](README.ko.md) · 📖 [Detailed usage (KR)](USAGE.md)
 
-## 설치
+Use all three AI coding CLIs — each signed in with your personal subscription
+(Claude Pro/Max, ChatGPT Plus/Pro, Google AI Pro) — from a single unified
+interface, both as a **terminal CLI** and as a **Python library you can
+`import` in your own code**.
 
 ```bash
-git clone <repo-url> cli-wrapper-unified   # 또는 로컬 경로로 이동
-cd cli-wrapper-unified
+# CLI
+$ unified-cli chat "hi" -m haiku
+# or: unified-cli repl  →  interactive mode with slash commands
+```
+
+```python
+# Python
+from unified_cli import create, UnifiedConversation
+resp = create("claude").chat("hi")
+conv = UnifiedConversation()
+conv.send("Hello", provider="claude")
+conv.send("Continue", provider="gemini")   # context auto-injected
+```
+
+## Why this exists
+
+Each of the three CLIs (`claude`, `codex`, `gemini`) ships great subscription
+auth but lives in its own world. Want to route "quick query" to the fastest
+model regardless of provider? Want a single OpenAI-compatible `/v1/chat/completions`
+endpoint backed by whatever CLI is cheapest/freshest? Want your Python app to
+switch providers mid-conversation with automatic context handoff? That's what
+this wrapper does — **as a CLI you can shell into, and as a Python package you
+can import**.
+
+## Features
+
+- **Dual mode**: full-featured CLI (`unified-cli chat`, `repl`, `status`, ...)
+  AND clean Python API (`from unified_cli import ...`) — same code, same state
+- **Subscription-aware**: uses your existing `claude login` / `codex login` /
+  `gemini` OAuth. Falls back automatically to `ANTHROPIC_API_KEY` /
+  `OPENAI_API_KEY` / `GEMINI_API_KEY` if OAuth expires
+- **Multi-turn history**: CLI via `--continue` / `--resume`, Python via
+  `session_id=` or `UnifiedConversation`
+- **Cross-provider conversation**: one `UnifiedConversation` can switch providers
+  mid-chat; the last 8 turns auto-inject as context into the new provider's prompt
+- **Unified streaming events**: `kind="text" | "tool_use" | "tool_result" |
+  "reasoning" | "usage" | "session" | "done" | "error"` — normalized across
+  the three native JSONL schemas
+- **Web search by default**: Claude `WebSearch`, Codex `web_search`, Gemini
+  `google_web_search` — all ON unless you pass `web_search=False`
+- **Structured errors**: every failure → `UnifiedError(kind=...)` from one of
+  seven categories (`auth_expired` / `rate_limit` / `model_not_allowed` /
+  `not_found` / `network` / `config` / `internal`) with Korean recovery hints
+- **OpenAI-compatible server**: drop-in `/v1/chat/completions` + auto-updating
+  dashboard at `/dashboard`
+- **Rich terminal UI**: `doctor` health table, `status --watch` live dashboard,
+  `setup` interactive wizard, streaming spinner
+
+## Default models (lightweight, subscription-friendly)
+
+| Provider | Default | Why |
+|---|---|---|
+| Claude | `claude-haiku-4-5` | Fastest tier of Claude 4.x |
+| Codex | `gpt-5.4-mini` | Fastest model allowed on ChatGPT subscription |
+| Gemini | `gemini-3.1-flash-lite-preview` | Fastest Gemini 3.x variant |
+
+Override via `-m <name>`. Use `-m gpt-5.3-codex-spark` for the absolute fastest
+(tends to respond in ~2.5s vs Claude's 5-6s).
+
+## Install
+
+```bash
+git clone https://github.com/MinwooKim1990/unified_cli.git
+cd unified_cli
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[server,dev]'
 
-unified-cli setup      # 최초 1회: 대화형 온보딩 (CLI 설치 + 로그인 + 검증)
-unified-cli doctor     # 언제든지 환경 상태 점검
-unified-cli status     # 사용량/최근 호출 스냅샷
+unified-cli setup     # first-time onboarding (installs + logs into 3 CLIs)
 ```
 
-### CLI 세션 관리
+Requires Python 3.9+ and at least one of `claude`, `codex`, `gemini` already
+installed (or the setup wizard will install the missing ones for you).
 
-`unified-cli chat` 은 매 호출마다 session_id 를 `~/.unified-cli/state.json` 에 저장.
-다음 호출에서 `--continue` 로 이어쓰기 가능:
+## Usage at a glance
+
+### CLI
 
 ```bash
-unified-cli chat "내 이름은 민우"              # 새 대화 → state 저장
-unified-cli chat "내 이름?" --continue         # 직전 세션 이어쓰기 → "민우" 답변
-unified-cli chat "..." --resume <session_id>   # 특정 세션 이어쓰기
-unified-cli chat "..." --new                    # state 리셋 + 새 대화
+# Single turn
+unified-cli chat "explain python list reversal in one line"
+
+# Continue the last conversation
+unified-cli chat "what about in-place?" --continue
+
+# Resume a specific session
+unified-cli chat "continue from earlier" --resume <session_id>
+
+# Interactive REPL with slash commands (/provider, /model, /history, /save, ...)
+unified-cli repl
+
+# Stream + web-search (both defaults)
+unified-cli chat "latest Python release?" --stream
+
+# Cheapest fast query
+unified-cli chat "quick q" -m gpt-5.3-codex-spark
+
+# Status & dashboard
+unified-cli doctor          # one-time health check
+unified-cli status --watch  # live terminal dashboard (5s refresh)
+uvicorn unified_cli.server:app --port 8000  # + http://localhost:8000/dashboard
 ```
 
-### 대화형 REPL (`unified-cli repl`)
-
-한 프로세스에서 multi-turn + provider 교체:
-
-```bash
-unified-cli repl                          # 기본 Claude 로 시작
-unified-cli repl --provider codex -m gpt-5.4-mini
-```
-
-슬래시 명령:
-
-| 명령 | 동작 |
-|---|---|
-| `/help` | 명령 목록 |
-| `/model <name>` | 같은 provider 에서 모델 변경 |
-| `/provider <name>` | provider 전환 (이전 8턴 컨텍스트 자동 주입) |
-| `/new` | 대화 초기화 |
-| `/save` | 현재 session_id + 이어쓰기 명령 표시 |
-| `/history [N]` | 최근 N 턴 표시 |
-| `/tokens` | 누적 사용량 |
-| `/doctor` | provider 헬스 한 줄 |
-| `/exit` or Ctrl+D | 종료 (마지막 session_id 자동 저장) |
-
-REPL 종료 후 `unified-cli chat "..." --continue` 로도 대화가 이어집니다.
-
-`unified-cli setup` 은 3개 CLI(`claude`/`codex`/`gemini`) 중 빠진 것을 감지해서:
-1. 패키지 매니저(brew/npm) 로 설치 명령 제안 → Y/n 동의 후 실행
-2. 로그인 안 된 provider 는 `login` 명령 spawn → 브라우저 OAuth 로 유도
-3. 각 provider 에 "say hi" 테스트 호출로 최종 검증
-
-중간에 거부하면 수동으로 실행할 명령만 출력하고 넘어갑니다.
-
-### 웹 대시보드
-
-서버 기동 후 브라우저에서 **`http://localhost:8000/dashboard`** 접속하면:
-- 3 provider 헬스 상태
-- 누적 사용량 (provider/모델별 호출수, 토큰, 평균 지연)
-- 최근 30개 호출 로그
-- 활성 대화 목록
-
-5초마다 자동 갱신. 외부 의존성 없는 단일 HTML + inline JS.
-
-의존성: Python 3.9+, 각 provider의 CLI (자동 탐색).
-
-## 실행 가능한 예제
-
-`examples/` 디렉토리에 8개의 실행 가능한 스크립트가 있습니다. 바로 `python examples/XX.py` 로 실행.
-
-| 파일 | 내용 |
-|---|---|
-| `examples/01_hello.py` | 3 provider 인사 — 가장 단순한 단일 호출 |
-| `examples/02_history.py` | 한 provider 안에서 대화 이어쓰기 |
-| `examples/03_multi_provider.py` | provider 자유 전환 + 컨텍스트 자동 주입 |
-| `examples/04_streaming.py` | 스트리밍 이벤트 종류별 처리 |
-| `examples/05_web_search.py` | 3 provider 전부 웹서치 호출 |
-| `examples/06_error_handling.py` | `UnifiedError` 분류 시연 |
-| `examples/07_openai_sdk.py` | OpenAI Python SDK 로 로컬 서버 호출 |
-| `examples/08_async.py` | `achat` / `astream` / `asyncio.gather` |
-
-더 상세한 사용 가이드 / 트러블슈팅: [USAGE.md](USAGE.md)
-
-## 빠른 시작
+### Python
 
 ```python
-from unified_cli import create
+from unified_cli import create, UnifiedConversation, UnifiedError, load_last_session
 
-# 기본 provider = Claude, 기본 모델 = claude-haiku-4-5
-cli = create("claude")
-resp = cli.chat("안녕")
-print(resp.text, resp.session_id, resp.usage.input_tokens)
+# Pattern 1 — single call
+resp = create("claude").chat("hi")
+
+# Pattern 2 — external code manages history (typical for chatbots)
+cli = create("codex")
+sessions = {}
+def reply(user_id: str, prompt: str) -> str:
+    r = cli.chat(prompt, session_id=sessions.get(user_id))
+    sessions[user_id] = r.session_id
+    return r.text
+
+# Pattern 3 — wrapper manages history + cross-provider
+conv = UnifiedConversation()
+conv.send("My name is Minwoo.", provider="claude")
+conv.send("What's my name?", provider="gemini")   # knows "Minwoo"
+
+# Pattern 4 — resume from CLI session
+state = load_last_session()   # reads ~/.unified-cli/state.json
+if state:
+    resp = create(state.provider, model=state.model).chat(
+        "follow-up from REPL", session_id=state.session_id,
+    )
+
+# Pattern 5 — error-aware fallback
+for p in ("claude", "codex", "gemini"):
+    try:
+        return create(p).chat("...")
+    except UnifiedError as e:
+        if e.kind in ("auth_expired", "rate_limit"):
+            continue
+        raise
 ```
 
-Provider별 기본 모델:
-| Provider | 기본 모델 |
-|---|---|
-| claude | `claude-haiku-4-5` |
-| codex | `gpt-5.4-mini` |
-| gemini | `gemini-3.1-flash-lite-preview` |
+See [USAGE.md](USAGE.md) for the full cookbook (7 patterns: sync, async,
+streaming, tool events, error fallback, CLI↔Python state sharing, advanced
+provider options).
 
-모델명만 알면 provider 자동 라우팅:
+## Known limitations
 
-```python
-from unified_cli import route
-route("haiku")                    # ('claude', 'haiku')
-route("gpt-5.4-mini")             # ('codex', 'gpt-5.4-mini')
-route("gemini-3.1-flash-lite-preview")  # ('gemini', '...')
-route("claude/sonnet")            # 명시 prefix도 지원
-```
+**Speed**: every call spawns a fresh subprocess (`claude -p` / `codex exec` /
+`gemini -p`) — these CLIs don't support a long-lived daemon. Measured latency:
 
-## 통합 대화 (provider 자유 전환)
+| Stage | Claude | Codex | Gemini |
+|---|---|---|---|
+| Subprocess spawn | ~50 ms | ~60 ms | ~460 ms (Node bundle) |
+| API round-trip (API round-trip) | 3–6 s | 2–3 s | 3–4 s |
+| **Full chat turn** | **5–6 s** | **2.7–3 s** | **3–4 s** |
 
-```python
-from unified_cli import UnifiedConversation
+For the absolute fastest interactive feel, use `-m gpt-5.3-codex-spark`. Even
+then, expect 2–3 seconds per turn. This is a **structural limit of the
+subprocess architecture** — not something the wrapper can fix without either
+(a) losing subscription auth by calling provider APIs directly, or (b) using
+experimental daemon modes (`codex app-server`, `gemini --acp`) that aren't
+fully stable yet.
 
-conv = UnifiedConversation()   # sticky=False 가 기본
-conv.send("내 이름은 민우야", provider="claude")
-conv.send("내 이름 뭐였지?", provider="codex")     # ← 자동으로 Claude 대화의 직전 8턴을
-                                                      #   Codex 프롬프트 앞에 컨텍스트로 주입
-conv.send("내 이름 한 번 더 말해", provider="gemini")
-```
+**Subscription ToS**: each provider's terms forbid reselling/exposing your
+personal subscription as a third-party service. This wrapper is designed for
+**personal local automation**, not as a SaaS gateway. Don't ship a web service
+backed by your personal OAuth.
 
-같은 provider 로 연속 호출하면 native session (`--resume`) 으로 처리되어 효율적.
-`sticky=True` 로 생성하면 첫 provider 에 고정되고 전환 시 에러.
+**macOS-first**: Claude's Desktop app bundle is auto-discovered on macOS. On
+Linux/Windows the `claude` binary needs to be on `$PATH`. REPL's arrow-key
+history needs `readline` (stdlib on macOS/Linux; Windows users may need
+`pyreadline3`).
 
-## 스트리밍 + 도구 + 웹서치
+**Gemini session resume** is index-based (CLI limitation). The wrapper does a
+`--list-sessions` lookup each turn to translate UUID → index (~500 ms
+overhead). Works, just slower than the other two.
 
-```python
-cli = create("claude")  # web_search=True 기본
-for msg in cli.stream("오늘 최신 Python 버전은?"):
-    if msg.kind == "text":
-        print(msg.text, end="", flush=True)
-    elif msg.kind == "tool_use":
-        print(f"\n[tool: {msg.tool['name']}]", flush=True)
-```
+**No persistent usage tracking**: `UsageTracker` keeps per-provider aggregates
+and recent-call history in process memory only. Restart = counters reset. For
+long-term usage analytics you'd need to log separately.
 
-웹서치 비활성화:
-```python
-cli = create("claude", web_search=False)
-```
+## Comparison with similar projects
 
-> Gemini CLI는 `google_web_search`가 구조적으로 항상 ON이라 `web_search=False` 설정 시 `--approval-mode plan` 으로 근사 차단.
+| Project | Language | CLI + Python import | 3-CLI subprocess | OpenAI server | Dashboard | REPL |
+|---|---|---|---|---|---|---|
+| **unified-cli** (this) | Python | ✅ | ✅ (direct) | ✅ | ✅ | ✅ |
+| [oauth-cli-coder](https://github.com/codeninja/oauth-cli-coder) | Python | ✅ | ✅ (via tmux) | ❌ | ❌ | — |
+| [coding-cli-runtime](https://pypi.org/project/coding-cli-runtime/) | Python | library only | ✅ | ❌ | ❌ | ❌ |
+| [router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) | Go | ❌ (server only) | ✅ | ✅ | ✅ | ❌ |
+| [codeking-ai/cligate](https://github.com/codeking-ai/cligate) | TypeScript | ❌ (server only) | ✅ | ✅ | — | ❌ |
+| [PleasePrompto/ductor](https://github.com/PleasePrompto/ductor) | Python | ❌ (bot only) | ✅ | ❌ | ❌ | ❌ |
+| [simonw/llm + llm-claude-code](https://github.com/simonw/llm) | Python | ✅ | Claude only | ❌ | ❌ | ❌ |
+| [litellm](https://github.com/BerriAI/litellm) | Python | ❌ | direct API | ✅ | ❌ | ❌ |
 
-## 에러 분류 + 자동 복구
+**Closest neighbour**: `oauth-cli-coder` — same dual-mode idea, but uses `tmux`
+sessions as the integration primitive (requires tmux on user's machine). This
+project uses direct `subprocess.Popen` for a simpler deployment story
+(stdlib-only core, no external process manager), adds the OpenAI-compatible
+server + live dashboard + rich REPL + state-file sharing between CLI and
+Python code.
 
-```python
-from unified_cli import UnifiedError
+**Closest library-only alternative**: `coding-cli-runtime` on PyPI — pure
+Python library covering 4 CLIs (adds GitHub Copilot), but no CLI entry point,
+no server, no REPL.
 
-try:
-    cli.chat("...")
-except UnifiedError as e:
-    print(e.kind)      # auth_expired / rate_limit / model_not_allowed / ...
-    print(e.provider)  # "claude"
-    print(e.message)   # 사용자용 한국어 메시지
-    print(e.hint)      # 복구 힌트 ("claude /login 재실행...")
-```
+If your use case is *just* "spawn a CLI and get text back" — `coding-cli-runtime`
+is smaller. If you want dual-mode + richer infrastructure (state, server,
+dashboard, REPL), this is the one.
 
-동작:
-- **auth_expired**: `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` 환경변수가 있으면 **자동으로 1회 재시도**. 없으면 hint 포함한 에러 raise
-- **network**: exponential backoff (0.5s, 1.5s) 로 최대 2회 재시도
-- **rate_limit / model_not_allowed / not_found**: 즉시 raise
-
-## CLI
-
-```bash
-# 환경 점검
-unified-cli doctor
-
-# 모델 리스트 (전부 / provider별)
-unified-cli models
-unified-cli models claude --refresh
-
-# 단일 호출
-unified-cli chat "hi" -m haiku
-unified-cli chat "오늘 최신 Python?" -m claude/haiku --stream
-
-# stdin 으로 프롬프트
-cat prompt.txt | unified-cli chat -m gpt-5.4-mini
-```
-
-## OpenAI 호환 HTTP 서버
-
-```bash
-uvicorn unified_cli.server:app --port 8000
-```
-
-```bash
-# non-streaming, 자동 라우팅
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"haiku","messages":[{"role":"user","content":"hi"}]}'
-
-# streaming + 대화 지속 (user 필드로 conv id 지정)
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model":"claude/haiku",
-    "messages":[{"role":"user","content":"내 이름 민우"}],
-    "stream":true,
-    "user":"chat-42"
-  }'
-
-# 같은 user 로 다른 provider 에 이어 보내기 (컨텍스트 자동 주입)
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model":"codex/gpt-5.4-mini",
-    "messages":[{"role":"user","content":"내 이름?"}],
-    "user":"chat-42"
-  }'
-
-# 모델 목록
-curl http://localhost:8000/v1/models
-curl http://localhost:8000/v1/models?provider=gemini
-```
-
-OpenAI Python SDK 그대로 사용:
-```python
-from openai import OpenAI
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="dummy")
-r = client.chat.completions.create(
-    model="haiku",
-    messages=[{"role":"user","content":"hi"}],
-    user="my-conv",
-)
-```
-
-에러는 OpenAI 스키마로 정규화 매핑:
-| UnifiedError.kind | HTTP | OpenAI `type` |
-|---|---|---|
-| auth_expired | 401 | authentication_error |
-| rate_limit | 429 | rate_limit_error |
-| model_not_allowed / config | 400 | invalid_request_error |
-| not_found | 404 | not_found_error |
-| network | 502 | upstream_error |
-| internal | 500 | internal_error |
-
-## 신규 모델 자동 반영
-
-`list_models()` 는 각 provider에서 다음 소스로 가져옴:
-
-| Provider | 소스 | TTL |
-|---|---|---|
-| Claude | `GET https://api.anthropic.com/v1/models` (`$ANTHROPIC_API_KEY` 있을 때) | 1시간 메모리 캐시 |
-| Codex | `~/.codex/models_cache.json` (Codex CLI가 5분마다 업데이트) | 파일 기준 |
-| Gemini | `GET https://generativelanguage.googleapis.com/v1/models` (`$GEMINI_API_KEY`) | 1시간 |
-
-API 키 없을 때는 하드코딩된 주요 모델 리스트로 폴백. **임의 모델 ID 는 리스트에 없어도 그대로 CLI 에 전달** — allowlist 는 정보용.
-
-## 패키지 구조
+## Project structure
 
 ```
-cli-wrapper-unified/
-├── pyproject.toml
-├── README.md
-└── src/unified_cli/
-    ├── __init__.py      # 공개 심볼 re-export
-    ├── core.py          # Message, Response, Usage, ModelInfo
-    ├── errors.py        # UnifiedError + classify (정규식 매칭 테이블)
-    ├── discovery.py     # find_{claude,codex,gemini}_bin()
-    ├── base.py          # BaseProvider (retry + api-key fallback 포함)
-    ├── models.py        # list_models() dispatcher
-    ├── factory.py       # create() + route()
-    ├── conversation.py  # UnifiedConversation
-    ├── cli.py           # unified-cli 명령어
-    ├── server.py        # FastAPI OpenAI-호환 (선택 의존성)
-    └── providers/
-        ├── claude.py    # ClaudeProvider
-        ├── codex.py     # CodexProvider (web_search: `-c tools.web_search=true`)
-        └── gemini.py    # GeminiProvider (UUID ↔ index 자동 매핑)
+unified_cli/
+├── src/unified_cli/
+│   ├── core.py          # Message, Response, Usage, ModelInfo dataclasses
+│   ├── errors.py        # UnifiedError + classify() per-provider matchers
+│   ├── discovery.py     # find_{claude,codex,gemini}_bin()
+│   ├── base.py          # BaseProvider ABC + retry/fallback
+│   ├── providers/       # claude.py, codex.py, gemini.py
+│   ├── conversation.py  # UnifiedConversation (cross-provider context)
+│   ├── state.py         # ~/.unified-cli/state.json read/write
+│   ├── usage.py         # UsageTracker (per-process aggregates)
+│   ├── factory.py       # create() + route()
+│   ├── cli.py           # doctor / setup / status / chat / repl / models
+│   ├── repl.py          # interactive REPL with slash commands
+│   ├── server.py        # FastAPI OpenAI-compat server + /dashboard
+│   └── ui.py            # rich helpers (tables, panels)
+├── tests/               # 46 unit tests, stdlib only
+└── examples/            # 8 runnable scripts
 ```
 
-## 주의
+## License
 
-- 구독 기반 호출은 **3자 서비스로 재판매 금지** (각 provider ToS). 개인 로컬 자동화 전용
-- `auth_expired` 자동 복구는 API 키 환경변수 fallback 뿐. 브라우저 로그인은 수동으로
-- 호출당 Node/Rust 프로세스 spawn 오버헤드 ~수백 ms — 초저지연 시스템엔 부적합
-- Gemini resume 은 UUID→index 조회로 turn당 `--list-sessions` 1회 추가 호출 (~0.5s)
+MIT. Personal use of provider subscriptions is your responsibility under each
+provider's ToS.
+
+## Contributing
+
+Issues and PRs welcome. Please run `python tests/test_errors.py` (and the
+other `tests/test_*.py`) before opening a PR — all 46 should stay green.
