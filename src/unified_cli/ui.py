@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -48,11 +50,41 @@ _AUTH_FILES = {
     "gemini": Path.home() / ".gemini" / "oauth_creds.json",
 }
 
+# macOS Keychain service names — Claude Code stores OAuth creds there by default
+# on macOS, so the credentials.json file may not exist even when logged in.
+_KEYCHAIN_SERVICES = {
+    "claude": "Claude Code-credentials",
+    # codex/gemini appear to use files on macOS, so no keychain fallback needed.
+}
+
 _API_KEY_ENVS = {
     "claude": "ANTHROPIC_API_KEY",
     "codex": "OPENAI_API_KEY",
     "gemini": "GEMINI_API_KEY",
 }
+
+
+def _has_keychain_creds(provider: ProviderName) -> bool:
+    """Check macOS Keychain for a provider's OAuth credentials.
+
+    Only probes — does NOT read the secret (no auth prompt triggered).
+    Returns False on non-macOS or when `security` command is unavailable.
+    """
+    if sys.platform != "darwin":
+        return False
+    service = _KEYCHAIN_SERVICES.get(provider)
+    if not service:
+        return False
+    try:
+        # `find-generic-password` without -w returns metadata only (no secret).
+        # Exit 0 = entry exists, 44 = not found.
+        r = subprocess.run(
+            ["security", "find-generic-password", "-s", service],
+            capture_output=True, timeout=3,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
 
 
 def collect_states() -> list[ProviderState]:
@@ -67,10 +99,12 @@ def collect_states() -> list[ProviderState]:
             count = len(mods)
         except Exception:
             count, source = 0, "error"
+        has_oauth = (_AUTH_FILES[name].exists()
+                     or _has_keychain_creds(name))  # type: ignore[arg-type]
         out.append(ProviderState(
             name=name,  # type: ignore[arg-type]
             bin_path=bin_path,
-            has_oauth=_AUTH_FILES[name].exists(),
+            has_oauth=has_oauth,
             has_api_key=api_env in os.environ,
             api_key_env=api_env,
             model_count=count,
