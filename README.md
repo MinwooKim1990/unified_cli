@@ -2,7 +2,7 @@
 
 **One Python + CLI interface for Claude Code, OpenAI Codex, and Google Gemini.**
 
-🇰🇷 [한국어 README](README.ko.md) · 📖 [Detailed usage (KR)](USAGE.md)
+🇰🇷 [한국어 README](README.ko.md) · 📖 [Detailed usage (EN)](USAGE.md) · 📖 [상세 가이드 (한국어)](USAGE.ko.md)
 
 Use all three AI coding CLIs — each signed in with your personal subscription
 (Claude Pro/Max, ChatGPT Plus/Pro, Google AI Pro) — from a single unified
@@ -151,9 +151,9 @@ for p in ("claude", "codex", "gemini"):
         raise
 ```
 
-See [USAGE.md](USAGE.md) for the full cookbook (7 patterns: sync, async,
-streaming, tool events, error fallback, CLI↔Python state sharing, advanced
-provider options).
+See [USAGE.md](USAGE.md) (English) or [USAGE.ko.md](USAGE.ko.md) (Korean) for
+the full cookbook — 8 patterns including sync, async, streaming, tool events,
+error fallback, CLI↔Python state sharing, and advanced provider options.
 
 ## Known limitations
 
@@ -243,8 +243,13 @@ unified_cli/
 
 ## License
 
-MIT. Personal use of provider subscriptions is your responsibility under each
-provider's ToS.
+MIT License · Copyright (c) 2026 Minwoo Kim — see [LICENSE](LICENSE).
+
+Anyone is free to use, modify, and redistribute this software, provided the
+copyright notice and license text are preserved in the redistribution.
+Personal use of provider subscriptions (Claude Pro/Max, ChatGPT Plus/Pro,
+Google AI Pro) is your own responsibility under each provider's Terms of
+Service — see "Known limitations" above.
 
 ## Contributing
 
