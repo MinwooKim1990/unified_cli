@@ -12,6 +12,7 @@ from typing import AsyncIterator, ClassVar, Iterator, Optional
 
 from .core import Message, ModelInfo, ProviderName, Response, Usage
 from .errors import UnifiedError, classify
+from .usage import tracker as _usage_tracker
 
 
 # Max 2 retries (0.5s, 1.5s) for network errors; 1 retry for auth fallback.
@@ -152,8 +153,27 @@ class BaseProvider(ABC):
             prompt, session_id=session_id, resume_last=resume_last,
             model=model, streaming=False,
         )
-        stdout = self._run(args)
-        return self._parse_json_response(stdout, model or self.model)
+        t0 = time.time()
+        try:
+            stdout = self._run(args)
+            resp = self._parse_json_response(stdout, model or self.model)
+        except UnifiedError as e:
+            _usage_tracker.record(
+                self.name, model or self.model,
+                latency_ms=int((time.time() - t0) * 1000),
+                prompt_preview=prompt, error_kind=e.kind,
+            )
+            raise
+        _usage_tracker.record(
+            self.name, resp.model,
+            input_tokens=resp.usage.input_tokens or 0,
+            output_tokens=resp.usage.output_tokens or 0,
+            cached_tokens=resp.usage.cached_tokens or 0,
+            latency_ms=int((time.time() - t0) * 1000),
+            session_id=resp.session_id,
+            prompt_preview=prompt,
+        )
+        return resp
 
     def stream(
         self,
@@ -167,7 +187,32 @@ class BaseProvider(ABC):
             prompt, session_id=session_id, resume_last=resume_last,
             model=model, streaming=True,
         )
-        yield from self._stream_run(args)
+        t0 = time.time()
+        final_usage = Usage()
+        final_session = ""
+        try:
+            for msg in self._stream_run(args):
+                if msg.kind == "usage" and msg.usage:
+                    final_usage = msg.usage
+                if msg.kind == "session" and msg.session_id:
+                    final_session = msg.session_id
+                yield msg
+        except UnifiedError as e:
+            _usage_tracker.record(
+                self.name, model or self.model,
+                latency_ms=int((time.time() - t0) * 1000),
+                prompt_preview=prompt, error_kind=e.kind,
+            )
+            raise
+        _usage_tracker.record(
+            self.name, model or self.model,
+            input_tokens=final_usage.input_tokens or 0,
+            output_tokens=final_usage.output_tokens or 0,
+            cached_tokens=final_usage.cached_tokens or 0,
+            latency_ms=int((time.time() - t0) * 1000),
+            session_id=final_session,
+            prompt_preview=prompt,
+        )
 
     async def achat(self, prompt: str, **kw) -> Response:
         loop = asyncio.get_event_loop()

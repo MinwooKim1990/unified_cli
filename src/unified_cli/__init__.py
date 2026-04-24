@@ -7,6 +7,7 @@ from .errors import ErrorKind, UnifiedError, classify
 from .factory import PROVIDERS, create, route
 from .models import DEFAULT_MODELS, list_models
 from .providers import ClaudeProvider, CodexProvider, GeminiProvider
+from .usage import UsageTracker, tracker
 
 __all__ = [
     "BaseProvider",
@@ -15,6 +16,7 @@ __all__ = [
     "GeminiProvider",
     "UnifiedConversation",
     "UnifiedError",
+    "UsageTracker",
     "ErrorKind",
     "Message",
     "ModelInfo",
@@ -27,4 +29,5 @@ __all__ = [
     "create",
     "list_models",
     "route",
+    "tracker",
 ]
