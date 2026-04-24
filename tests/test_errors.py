@@ -51,10 +51,21 @@ def test_gemini_auth_expired():
     assert err.kind == "auth_expired"
 
 
-def test_gemini_not_found():
+def test_gemini_requested_entity_is_model_not_allowed():
+    # "Requested entity was not found" from Gemini almost always means a bad
+    # model id (session lookup is pre-checked by GeminiProvider before classify
+    # runs). Reclassified to model_not_allowed in F4.
     err = classify(
         "gemini",
         stdout='{"error":{"message":"Requested entity was not found."}}',
+    )
+    assert err.kind == "model_not_allowed"
+
+
+def test_claude_session_not_found_classified():
+    err = classify(
+        "claude",
+        stderr="Error: session 'abc123' not found in local state",
     )
     assert err.kind == "not_found"
 

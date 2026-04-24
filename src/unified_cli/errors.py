@@ -78,6 +78,11 @@ MATCHERS: dict[ProviderName, list[_Matcher]] = {
          "auth_expired", "claude_login"),
         (re.compile(r"\b401\b", re.I), "auth_expired", "claude_login"),
         (re.compile(r"\b429\b|rate[_ -]?limit", re.I), "rate_limit", "wait_and_retry"),
+        (re.compile(r"session[^\n]{0,60}(not found|does not exist|invalid|expired)"
+                    r"|could not find session|unknown session"
+                    r"|no conversation found with session",
+                    re.I),
+         "not_found", "check_resource"),
         (re.compile(r"model[^\n]{0,80}(not exist|not accessible|invalid|unknown)", re.I),
          "model_not_allowed", "check_model_list"),
         (re.compile(r"\bENOTFOUND\b|\bECONNRESET\b|getaddrinfo|network|ETIMEDOUT", re.I),
@@ -102,8 +107,10 @@ MATCHERS: dict[ProviderName, list[_Matcher]] = {
         (re.compile(r"\b401\b", re.I), "auth_expired", "gemini_login"),
         (re.compile(r"\b429\b|RESOURCE_EXHAUSTED|rateLimitExceeded|Quota exceeded", re.I),
          "rate_limit", "wait_and_retry"),
-        (re.compile(r"Requested entity was not found", re.I), "not_found", "check_resource"),
-        (re.compile(r"\b404\b|model.{0,40}not found", re.I),
+        # Gemini's "Requested entity was not found" overwhelmingly means an invalid
+        # model ID. Session lookup by UUID is pre-checked in GeminiProvider._find_session_index
+        # which raises our own UnifiedError(kind="not_found") before classify runs.
+        (re.compile(r"Requested entity was not found|\b404\b|model.{0,40}not found", re.I),
          "model_not_allowed", "check_model_list"),
         (re.compile(r"\bENOTFOUND\b|\bECONNRESET\b|network|ETIMEDOUT", re.I),
          "network", "network_retry"),
