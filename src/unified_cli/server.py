@@ -25,7 +25,7 @@ from typing import Optional
 
 try:
     from fastapi import FastAPI, HTTPException
-    from fastapi.responses import StreamingResponse
+    from fastapi.responses import HTMLResponse, StreamingResponse
     from pydantic import BaseModel
 except ImportError as e:  # pragma: no cover
     raise ImportError(
@@ -34,9 +34,12 @@ except ImportError as e:  # pragma: no cover
     ) from e
 
 from .conversation import UnifiedConversation
+from .dashboard_tpl import DASHBOARD_HTML
 from .errors import ErrorKind, UnifiedError
 from .factory import route
 from .models import list_models
+from .ui import collect_states
+from .usage import tracker
 
 
 app = FastAPI(title="unified-cli OpenAI-compat")
@@ -210,3 +213,49 @@ def list_all_models(provider: Optional[str] = None):
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
+
+
+@app.get("/v1/doctor")
+def doctor_endpoint():
+    """Provider health/state snapshot (drives /dashboard)."""
+    return [
+        {
+            "provider": s.name,
+            "bin_path": s.bin_path,
+            "has_oauth": s.has_oauth,
+            "has_api_key": s.has_api_key,
+            "api_key_env": s.api_key_env,
+            "model_count": s.model_count,
+            "model_source": s.model_source,
+            "default_model": s.default_model,
+            "health": s.health,
+        }
+        for s in collect_states()
+    ]
+
+
+@app.get("/v1/usage")
+def usage_endpoint():
+    """Process-lifetime usage aggregates + recent calls."""
+    return tracker.snapshot()
+
+
+@app.get("/v1/conversations")
+def conversations_endpoint():
+    """Active UnifiedConversations tracked by this server."""
+    out = []
+    for conv_id, conv in CONVS.items():
+        last_provider = conv.turns[-1].provider if conv.turns else None
+        out.append({
+            "conversation_id": conv_id,
+            "last_provider": last_provider,
+            "turn_count": len(conv.turns),
+            "sessions": dict(conv.sessions),
+        })
+    return {"conversations": out}
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    """Browser dashboard (localhost only — no auth)."""
+    return HTMLResponse(DASHBOARD_HTML)
