@@ -17,6 +17,8 @@ class ClaudeProvider(BaseProvider):
     api_key_env = "ANTHROPIC_API_KEY"
     login_hint = "`claude /login` 을 재실행하세요."
 
+    _TERSE_RULE = "답변은 질문이 요구하는 만큼만 간결하게 하세요. 추가 설명은 요청받을 때만 덧붙이세요."
+
     def __init__(
         self,
         *,
@@ -26,6 +28,7 @@ class ClaudeProvider(BaseProvider):
         disallowed_tools: Optional[list[str]] = None,
         permission_mode: Optional[str] = None,
         add_dirs: Optional[list[str]] = None,
+        terse: bool = False,
         **kw,
     ):
         super().__init__(**kw)
@@ -35,6 +38,12 @@ class ClaudeProvider(BaseProvider):
         self.disallowed_tools = list(disallowed_tools or [])
         self.permission_mode = permission_mode
         self.add_dirs = list(add_dirs or [])
+
+        if terse:
+            self.append_system_prompt = (
+                f"{self.append_system_prompt}\n\n{self._TERSE_RULE}"
+                if self.append_system_prompt else self._TERSE_RULE
+            )
 
         if self.web_search:
             for t in ("WebSearch", "WebFetch"):
@@ -127,6 +136,10 @@ class ClaudeProvider(BaseProvider):
             return
 
         if t == "result":
+            # Note: Claude's stream-json emits the final text as an `assistant`
+            # event before emitting `result`. `result.result` contains the same
+            # text, so yielding it again would double-print during streaming.
+            # We deliberately skip it here — the text was already streamed.
             usage = obj.get("usage") or {}
             if usage:
                 yield Message(
@@ -138,9 +151,6 @@ class ClaudeProvider(BaseProvider):
                     ),
                     raw=obj,
                 )
-            result_text = obj.get("result") or ""
-            if result_text:
-                yield Message(kind="text", provider="claude", text=result_text, raw=obj)
             if sid:
                 yield Message(kind="session", provider="claude", session_id=sid, raw=obj)
             yield Message(kind="done", provider="claude", raw=obj)

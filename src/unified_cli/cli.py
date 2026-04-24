@@ -216,13 +216,17 @@ def _cmd_chat(args: argparse.Namespace) -> int:
             console.print(f"[red]모델 라우팅 실패:[/red] {e}")
             return 2
 
+    create_kwargs: dict = {
+        "model": model,
+        "web_search": args.web_search,
+        "cwd": args.cwd,
+    }
+    # --terse is Claude-specific (others already default to concise replies).
+    if args.terse and (provider or "claude") == "claude":
+        create_kwargs["terse"] = True
+
     try:
-        client = create(
-            provider or "claude",
-            model=model,
-            web_search=args.web_search,
-            cwd=args.cwd,
-        )
+        client = create(provider or "claude", **create_kwargs)
     except UnifiedError as e:
         console.print(f"[red]{e}[/red]")
         return 3
@@ -231,13 +235,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
 
     try:
         if args.stream:
-            for msg in client.stream(prompt):
-                if msg.kind == "text" and msg.text:
-                    print(msg.text, end="", flush=True)
-                elif msg.kind == "tool_use":
-                    name = (msg.tool or {}).get("name")
-                    console.print(f"\n[dim][tool_use: {name}][/dim]")
-            print()
+            _run_stream_with_spinner(client, prompt)
         else:
             resp = client.chat(prompt)
             print(resp.text)
@@ -253,46 +251,111 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_stream_with_spinner(client, prompt: str) -> None:
+    """Show a rich spinner until the first text event arrives.
+
+    Claude's TTFT is often 3–6 seconds on subscription auth; without a spinner
+    users can't tell if the CLI is stuck. Spinner switches to 'tool: X' label
+    when tool calls fire before the first text chunk.
+    """
+    from rich.status import Status
+
+    status = Status("[cyan]응답 대기 중…[/cyan]", console=console, spinner="dots")
+    status.start()
+    started = False
+    try:
+        for msg in client.stream(prompt):
+            if msg.kind == "text" and msg.text:
+                if not started:
+                    status.stop()
+                    started = True
+                print(msg.text, end="", flush=True)
+            elif msg.kind == "tool_use":
+                name = (msg.tool or {}).get("name")
+                if not started:
+                    status.update(f"[cyan]도구 사용 중: {name}[/cyan]")
+                else:
+                    console.print(f"\n[dim][tool_use: {name}][/dim]")
+    finally:
+        status.stop()
+    if started:
+        print()
+
+
 # ----- entrypoint -----
 
+def _print_no_arg_hint() -> None:
+    console.print("[bold cyan]unified-cli[/bold cyan] — Claude / Codex / Gemini 통합 CLI 래퍼")
+    console.print()
+    console.print("처음이면: [bold]unified-cli setup[/bold]  (대화형 온보딩 마법사)")
+    console.print("상태 확인: [bold]unified-cli doctor[/bold] · [bold]unified-cli status[/bold]")
+    console.print("바로 쓰기: [bold]unified-cli chat \"안녕\" -m haiku[/bold]")
+    console.print("모델 목록: [bold]unified-cli models[/bold]")
+    console.print()
+    console.print("[dim]전체 도움말: unified-cli --help[/dim]")
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="unified-cli")
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if not raw:
+        _print_no_arg_hint()
+        return 0
+
+    parser = argparse.ArgumentParser(
+        prog="unified-cli",
+        description="3개 AI CLI (claude / codex / gemini) 통합 래퍼. "
+                    "첫 실행 시 `unified-cli setup` 을 권장합니다.",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_doc = sub.add_parser("doctor", help="check binaries, auth, and models")
-    p_doc.add_argument("--json", action="store_true")
+    p_doc = sub.add_parser("doctor", help="바이너리 · auth · 모델 개수 점검")
+    p_doc.add_argument("--json", action="store_true",
+                       help="machine-readable JSON 출력 (자동화 스크립트용)")
     p_doc.set_defaults(func=_cmd_doctor)
 
-    p_setup = sub.add_parser("setup", help="interactive onboarding wizard")
-    p_setup.add_argument("--provider", choices=["claude", "codex", "gemini"])
-    p_setup.add_argument("--skip-install", action="store_true")
-    p_setup.add_argument("--skip-verify", action="store_true")
+    p_setup = sub.add_parser("setup", help="대화형 온보딩 마법사 (설치 + 로그인 + 검증)")
+    p_setup.add_argument("--provider", choices=["claude", "codex", "gemini"],
+                         help="특정 provider 만 진행 (기본: 세 개 모두)")
+    p_setup.add_argument("--skip-install", action="store_true",
+                         help="설치 단계 건너뛰기")
+    p_setup.add_argument("--skip-verify", action="store_true",
+                         help="테스트 호출 건너뛰기 (토큰 절약)")
     p_setup.set_defaults(func=_cmd_setup)
 
-    p_stat = sub.add_parser("status", help="live status dashboard in terminal")
+    p_stat = sub.add_parser("status", help="사용량 스냅샷 + (옵션) 실시간 대시보드")
     p_stat.add_argument("--watch", action="store_true",
-                        help="refresh every --watch-interval seconds")
+                        help="rich.live 로 주기 갱신 대시보드 (Ctrl+C 로 종료)")
     p_stat.add_argument("--watch-interval", default=5,
-                        help="refresh interval in seconds (default 5)")
-    p_stat.add_argument("--json", action="store_true")
+                        help="갱신 주기 초 (기본 5)")
+    p_stat.add_argument("--json", action="store_true",
+                        help="JSON 출력 (자동화 스크립트용)")
     p_stat.set_defaults(func=_cmd_status)
 
-    p_mod = sub.add_parser("models", help="list available models")
-    p_mod.add_argument("provider", nargs="?", choices=["claude", "codex", "gemini"])
-    p_mod.add_argument("--refresh", action="store_true")
-    p_mod.add_argument("--json", action="store_true")
+    p_mod = sub.add_parser("models", help="사용 가능한 모델 목록")
+    p_mod.add_argument("provider", nargs="?", choices=["claude", "codex", "gemini"],
+                       help="provider 필터 (생략 시 전부)")
+    p_mod.add_argument("--refresh", action="store_true",
+                       help="캐시 무시하고 API 재조회")
+    p_mod.add_argument("--json", action="store_true", help="JSON 출력")
     p_mod.set_defaults(func=_cmd_models)
 
-    p_chat = sub.add_parser("chat", help="single-turn chat")
-    p_chat.add_argument("prompt", nargs="?", help="prompt (or stdin)")
-    p_chat.add_argument("-m", "--model", help="provider/model or model name")
-    p_chat.add_argument("--stream", action="store_true")
+    p_chat = sub.add_parser("chat", help="단일 프롬프트 호출 (stdin 입력도 가능)")
+    p_chat.add_argument("prompt", nargs="?",
+                        help="프롬프트 텍스트. 생략 시 stdin 에서 읽음")
+    p_chat.add_argument("-m", "--model",
+                        help="모델명 또는 provider/model (예: haiku, claude/sonnet, gpt-5.4-mini)")
+    p_chat.add_argument("--stream", action="store_true",
+                        help="토큰 단위 스트리밍 출력 (첫 토큰 대기 중엔 스피너 표시)")
     p_chat.add_argument("--no-web-search", dest="web_search",
-                        action="store_false", default=True)
-    p_chat.add_argument("--cwd")
+                        action="store_false", default=True,
+                        help="웹서치 도구 비활성화 (기본 ON)")
+    p_chat.add_argument("--terse", action="store_true",
+                        help="Claude 가 짧은 질문에 장황하게 답하는 걸 억제")
+    p_chat.add_argument("--cwd",
+                        help="하위 CLI 의 작업 디렉토리 (도구 사용 시 영향)")
     p_chat.set_defaults(func=_cmd_chat)
 
-    ns = parser.parse_args(argv)
+    ns = parser.parse_args(raw)
     return ns.func(ns)
 
 
