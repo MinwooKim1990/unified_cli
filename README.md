@@ -16,8 +16,27 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[server,dev]'
 
-unified-cli doctor     # 환경 점검
+unified-cli setup      # 최초 1회: 대화형 온보딩 (CLI 설치 + 로그인 + 검증)
+unified-cli doctor     # 언제든지 환경 상태 점검
+unified-cli status     # 사용량/최근 호출 스냅샷
 ```
+
+`unified-cli setup` 은 3개 CLI(`claude`/`codex`/`gemini`) 중 빠진 것을 감지해서:
+1. 패키지 매니저(brew/npm) 로 설치 명령 제안 → Y/n 동의 후 실행
+2. 로그인 안 된 provider 는 `login` 명령 spawn → 브라우저 OAuth 로 유도
+3. 각 provider 에 "say hi" 테스트 호출로 최종 검증
+
+중간에 거부하면 수동으로 실행할 명령만 출력하고 넘어갑니다.
+
+### 웹 대시보드
+
+서버 기동 후 브라우저에서 **`http://localhost:8000/dashboard`** 접속하면:
+- 3 provider 헬스 상태
+- 누적 사용량 (provider/모델별 호출수, 토큰, 평균 지연)
+- 최근 30개 호출 로그
+- 활성 대화 목록
+
+5초마다 자동 갱신. 외부 의존성 없는 단일 HTML + inline JS.
 
 의존성: Python 3.9+, 각 provider의 CLI (자동 탐색).
 

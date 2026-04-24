@@ -12,9 +12,65 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[server,dev]'
 
+# 온보딩 마법사 (권장 첫 실행)
+unified-cli setup
+
 # 환경 점검
 unified-cli doctor
+
+# 사용량 대시보드 (터미널)
+unified-cli status             # 스냅샷 한 번
+unified-cli status --watch     # 5초 주기 자동 갱신
 ```
+
+## 온보딩 마법사 (`unified-cli setup`)
+
+5단계로 구성된 대화형 온보딩:
+
+1. **환경 검사** — 각 provider 의 binary/OAuth/API key 유무 표로 표시
+2. **설치** — binary 없는 provider 에 대해 `brew install codex` / `npm install -g @openai/codex` 같은 명령 제안 → Confirm → 실행
+3. **로그인** — OAuth 도 API key 도 없는 provider 에 대해 해당 CLI 의 login 명령 spawn (터미널 TTY 인계)
+   - Claude: `claude` 실행 → TUI 에서 `/login` 슬래시 명령 → `/exit`
+   - Codex: `codex login` (자동으로 브라우저 열림)
+   - Gemini: `gemini` 첫 실행 (자동으로 OAuth)
+4. **검증** — 각 provider 에 `say hi` 1회 호출 → 성공/실패 + 토큰 표시
+5. **요약** — 최종 상태 표 + 다음 단계 안내
+
+거부(`n`) 하면 해당 단계는 명령만 출력하고 스킵. 모두 건너뛰어도 안전.
+
+### 선택적 플래그
+
+```bash
+unified-cli setup --provider claude     # 특정 provider 만
+unified-cli setup --skip-install        # 설치 건너뛰고 로그인/검증만
+unified-cli setup --skip-verify         # 테스트 호출 건너뛰어 토큰 아끼기
+```
+
+## 상태 확인 방법
+
+### 터미널
+
+`unified-cli doctor` — rich 컬러 표로 3 provider 의 health + 바이너리 경로 + auth 상태 + 모델 수 + 기본 모델. `--json` 으로 machine-readable.
+
+`unified-cli status` — doctor 정보 + 누적 사용량 + 최근 10개 호출. `--watch` 는 `rich.live.Live` 로 5초마다 갱신되는 대시보드.
+
+### 웹 대시보드
+
+서버 기동:
+```bash
+uvicorn unified_cli.server:app --port 8000
+```
+
+브라우저에서 `http://localhost:8000/dashboard` → 5초마다 자동 갱신:
+- Providers (health, binary, auth, 모델 수)
+- Usage totals (provider별 호출/에러/토큰/평균 지연)
+- Active conversations (conversation id → 현재 provider → session_id)
+- Recent calls (최근 30개, 시간/provider/모델/토큰/지연/프롬프트 일부/에러)
+
+JSON 으로 가져오려면:
+- `GET /v1/doctor` — provider 상태
+- `GET /v1/usage` — aggregates + recent
+- `GET /v1/conversations` — 활성 대화 목록
 
 `doctor` 가 3개 CLI 경로 + auth 상태 + 모델 개수를 출력합니다. 뭐든 ✗ 가 뜨면
 해당 CLI 를 먼저 설치/로그인하세요.
