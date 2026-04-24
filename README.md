@@ -21,6 +21,43 @@ unified-cli doctor     # 언제든지 환경 상태 점검
 unified-cli status     # 사용량/최근 호출 스냅샷
 ```
 
+### CLI 세션 관리
+
+`unified-cli chat` 은 매 호출마다 session_id 를 `~/.unified-cli/state.json` 에 저장.
+다음 호출에서 `--continue` 로 이어쓰기 가능:
+
+```bash
+unified-cli chat "내 이름은 민우"              # 새 대화 → state 저장
+unified-cli chat "내 이름?" --continue         # 직전 세션 이어쓰기 → "민우" 답변
+unified-cli chat "..." --resume <session_id>   # 특정 세션 이어쓰기
+unified-cli chat "..." --new                    # state 리셋 + 새 대화
+```
+
+### 대화형 REPL (`unified-cli repl`)
+
+한 프로세스에서 multi-turn + provider 교체:
+
+```bash
+unified-cli repl                          # 기본 Claude 로 시작
+unified-cli repl --provider codex -m gpt-5.4-mini
+```
+
+슬래시 명령:
+
+| 명령 | 동작 |
+|---|---|
+| `/help` | 명령 목록 |
+| `/model <name>` | 같은 provider 에서 모델 변경 |
+| `/provider <name>` | provider 전환 (이전 8턴 컨텍스트 자동 주입) |
+| `/new` | 대화 초기화 |
+| `/save` | 현재 session_id + 이어쓰기 명령 표시 |
+| `/history [N]` | 최근 N 턴 표시 |
+| `/tokens` | 누적 사용량 |
+| `/doctor` | provider 헬스 한 줄 |
+| `/exit` or Ctrl+D | 종료 (마지막 session_id 자동 저장) |
+
+REPL 종료 후 `unified-cli chat "..." --continue` 로도 대화가 이어집니다.
+
 `unified-cli setup` 은 3개 CLI(`claude`/`codex`/`gemini`) 중 빠진 것을 감지해서:
 1. 패키지 매니저(brew/npm) 로 설치 명령 제안 → Y/n 동의 후 실행
 2. 로그인 안 된 provider 는 `login` 명령 spawn → 브라우저 OAuth 로 유도

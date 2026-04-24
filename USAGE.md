@@ -75,7 +75,112 @@ JSON 으로 가져오려면:
 `doctor` 가 3개 CLI 경로 + auth 상태 + 모델 개수를 출력합니다. 뭐든 ✗ 가 뜨면
 해당 CLI 를 먼저 설치/로그인하세요.
 
-## Python 으로 쓰기
+## Python API 쿡북
+
+### 임포트 한 줄
+
+```python
+from unified_cli import (
+    create, UnifiedConversation,             # 핵심 진입점
+    Message, Response, Usage,                # 데이터 타입
+    UnifiedError, ErrorKind,                 # 에러 처리
+    list_models, route,                      # 유틸
+    tracker,                                 # 누적 사용량
+)
+```
+
+### 패턴 1 — 단발 호출
+
+```python
+resp = create("claude").chat("hi")
+print(resp.text, resp.session_id, resp.usage.output_tokens)
+```
+
+### 패턴 2 — 외부 코드가 히스토리 관리 (session_id 수동 전달)
+
+```python
+cli = create("codex")                         # 한 번만 만들고 재사용
+sessions: dict[str, str] = {}                 # 본인 앱의 user_id → session_id
+
+def reply(user_id: str, prompt: str) -> str:
+    resp = cli.chat(prompt, session_id=sessions.get(user_id))
+    sessions[user_id] = resp.session_id       # 다음 턴을 위해 저장
+    return resp.text
+```
+
+### 패턴 3 — 래퍼가 히스토리 관리 (+ provider 전환)
+
+```python
+conv = UnifiedConversation()                  # sticky=False 기본
+conv.send("내 이름은 민우", provider="claude")
+conv.send("내 이름?", provider="gemini")      # 직전 8턴 컨텍스트 자동 주입
+for turn in conv.history():
+    print(turn.provider, turn.prompt, "→", turn.text[:40])
+```
+
+### 패턴 4 — 스트리밍 + 도구 이벤트
+
+```python
+for msg in create("claude").stream("오늘 최신 Python 버전?"):
+    if msg.kind == "text":
+        print(msg.text, end="", flush=True)
+    elif msg.kind == "tool_use":
+        print(f"\n[{msg.tool['name']}]", flush=True)
+    elif msg.kind == "usage":
+        print(f"\n(tokens: {msg.usage.input_tokens}/{msg.usage.output_tokens})")
+```
+
+### 패턴 5 — async 병렬
+
+```python
+import asyncio
+from unified_cli import create
+
+async def main():
+    r = await asyncio.gather(
+        create("claude").achat("A"),
+        create("codex").achat("B"),
+        create("gemini").achat("C"),
+    )
+    for resp in r:
+        print(resp.provider, resp.text.strip()[:30])
+
+asyncio.run(main())
+```
+
+### 패턴 6 — 에러 분류 기반 폴백
+
+```python
+from unified_cli import create, UnifiedError
+
+def try_chat(prompt: str):
+    for provider in ("claude", "codex", "gemini"):
+        try:
+            return create(provider).chat(prompt)
+        except UnifiedError as e:
+            if e.kind in ("auth_expired", "rate_limit"):
+                continue                      # 다음 provider
+            raise                             # 그 외는 즉시 전파
+    raise RuntimeError("all providers unavailable")
+```
+
+### 패턴 7 — CLI 가 저장한 세션을 Python 에서 이어쓰기
+
+```python
+from unified_cli import create, load_last_session
+
+state = load_last_session()                   # ~/.unified-cli/state.json
+if state:
+    cli = create(state.provider, model=state.model)
+    resp = cli.chat("추가 질문", session_id=state.session_id)
+    print(resp.text)
+```
+
+반대 방향 (Python 에서 저장 → CLI 에서 `--continue`): `save_last_session(provider, model, session_id)`.
+
+---
+
+## Python 으로 쓰기 (기본 예시)
 
 ```python
 from unified_cli import create, UnifiedConversation, UnifiedError
