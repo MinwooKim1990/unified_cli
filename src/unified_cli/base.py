@@ -19,6 +19,44 @@ from .usage import tracker as _usage_tracker
 _NETWORK_BACKOFF = (0.5, 1.5)
 
 
+def _reject_empty_prompt(prompt: str, provider: str) -> None:
+    """Raise UnifiedError(kind='config') for empty/whitespace-only prompts.
+
+    Applied to chat() and stream() at entry. Without this, Claude in particular
+    produces hallucinated responses for blank input.
+    """
+    if not prompt or not prompt.strip():
+        raise UnifiedError(
+            kind="config", provider=provider,  # type: ignore[arg-type]
+            message="프롬프트가 비어있습니다.",
+            hint="공백이 아닌 텍스트를 전달하세요. stdin 에서 읽는 경우 파이프 입력을 확인하세요.",
+        )
+
+
+def _check_session_match(
+    provider: str, requested: Optional[str], got: Optional[str]
+) -> None:
+    """If the user asked to resume `requested` but we got a different session back,
+    raise `not_found` instead of silently continuing in a new conversation.
+
+    Catches the Codex-specific behaviour where `codex exec resume <unknown-uuid>`
+    succeeds with a fresh session instead of erroring. Claude/Gemini fail loudly
+    or pre-check, so this is only meaningful for Codex in practice — but the
+    guard is provider-agnostic for safety.
+    """
+    if not requested or not got:
+        return
+    if requested != got:
+        raise UnifiedError(
+            kind="not_found", provider=provider,  # type: ignore[arg-type]
+            message=(f"요청한 세션 {requested[:12]}… 을 찾을 수 없어 "
+                     f"새 세션 {got[:12]}… 이 생성되었습니다."),
+            hint="세션이 만료되었거나 다른 cwd 에서 생성됐을 수 있습니다. "
+                 "session_id 를 새로 받거나 Conversation 을 재시작하세요.",
+            cause=f"requested={requested} got={got}",
+        )
+
+
 class BaseProvider(ABC):
     """Base class for a single-provider CLI wrapper.
 
@@ -149,6 +187,7 @@ class BaseProvider(ABC):
         resume_last: bool = False,
         model: Optional[str] = None,
     ) -> Response:
+        _reject_empty_prompt(prompt, self.name)
         args = self._build_args(
             prompt, session_id=session_id, resume_last=resume_last,
             model=model, streaming=False,
@@ -157,6 +196,7 @@ class BaseProvider(ABC):
         try:
             stdout = self._run(args)
             resp = self._parse_json_response(stdout, model or self.model)
+            _check_session_match(self.name, session_id, resp.session_id)
         except UnifiedError as e:
             _usage_tracker.record(
                 self.name, model or self.model,
@@ -183,6 +223,7 @@ class BaseProvider(ABC):
         resume_last: bool = False,
         model: Optional[str] = None,
     ) -> Iterator[Message]:
+        _reject_empty_prompt(prompt, self.name)
         args = self._build_args(
             prompt, session_id=session_id, resume_last=resume_last,
             model=model, streaming=True,
@@ -190,12 +231,16 @@ class BaseProvider(ABC):
         t0 = time.time()
         final_usage = Usage()
         final_session = ""
+        session_checked = False
         try:
             for msg in self._stream_run(args):
                 if msg.kind == "usage" and msg.usage:
                     final_usage = msg.usage
                 if msg.kind == "session" and msg.session_id:
                     final_session = msg.session_id
+                    if not session_checked:
+                        _check_session_match(self.name, session_id, msg.session_id)
+                        session_checked = True
                 yield msg
         except UnifiedError as e:
             _usage_tracker.record(
@@ -226,6 +271,7 @@ class BaseProvider(ABC):
         resume_last: bool = False,
         model: Optional[str] = None,
     ) -> AsyncIterator[Message]:
+        _reject_empty_prompt(prompt, self.name)
         args = self._build_args(
             prompt, session_id=session_id, resume_last=resume_last,
             model=model, streaming=True,
@@ -237,6 +283,7 @@ class BaseProvider(ABC):
             cwd=self.cwd, env=self._env(),
         )
         assert proc.stdout is not None
+        session_checked = False
         try:
             async for raw in proc.stdout:
                 line = raw.decode().strip()
@@ -247,6 +294,10 @@ class BaseProvider(ABC):
                 except json.JSONDecodeError:
                     continue
                 for msg in self._normalize(obj):
+                    if (msg.kind == "session" and msg.session_id
+                            and not session_checked):
+                        _check_session_match(self.name, session_id, msg.session_id)
+                        session_checked = True
                     yield msg
         finally:
             await proc.wait()
