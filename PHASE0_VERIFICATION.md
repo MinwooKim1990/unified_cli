@@ -56,36 +56,29 @@ Run: 2026-05-08, MinwooKim1990 macOS, OAuth-authenticated CLIs (no API keys).
 
 ## Gemini (`gemini` CLI 0.39.1)
 
-**Could not run live verification — account quota exhausted at probe time
-("You have exhausted your capacity on this model. Your quota will reset after
-14h19m0s.")**
+**Quota exhausted at probe time** — every probe returned the same `429
+QUOTA_EXHAUSTED` error regardless of model ID, so this matrix could not
+distinguish "invalid model ID" from "rate-limited model". Treat any
+"not found"-looking outcome below as **inconclusive**, not authoritative.
 
-`gemini -p "say:ok" -m <id> --output-format json --skip-trust` returned
-`TerminalQuotaError` (HTTP 429, `QUOTA_EXHAUSTED`) for every probed ID, so
-this matrix is built from earlier audit data + official docs at
-[ai.google.dev/gemini-api/docs/models](https://ai.google.dev/gemini-api/docs/models).
-
-| Model | Verified earlier | Source |
+| Model | Live status | Notes |
 |---|---|---|
-| `gemini-3.1-pro-preview` | ⏳ pending re-test | docs (release 2026-02-19) |
-| `gemini-3-flash-preview` | ⏳ pending re-test | docs (3.x flash, **note: not 3.1**) |
-| `gemini-3.1-flash-lite-preview` | ✅ (default; previously verified) | docs |
-| `gemini-3.1-flash-lite` | ⏳ pending re-test | docs (stable promotion) |
-| `gemini-2.5-pro` | ⏳ pending re-test | docs (legacy, shutdown 2026-10-16) |
-| `gemini-2.5-flash` | ⏳ pending re-test | docs (legacy) |
-| `gemini-2.5-flash-lite` | ⏳ pending re-test | docs (legacy) |
+| `gemini-3.1-pro-preview` | ⏳ inconclusive | from docs |
+| `gemini-3.1-pro` | ⏳ inconclusive | bare form — may or may not resolve |
+| `gemini-3-flash-preview` | ⏳ inconclusive | docs (note 3 not 3.1) |
+| `gemini-3.1-flash` | ⏳ inconclusive | bare form |
+| `gemini-3.1-flash-lite-preview` | ✅ default; verified in earlier audit | |
+| `gemini-3.1-flash-lite` | ⏳ inconclusive | possible stable promotion |
+| `gemini-2.5-{pro,flash,flash-lite}` | ⏳ inconclusive | legacy, shutdown 2026-10-16 |
 
-**Bad IDs to remove** (previously in `_HARDCODED["gemini"]`):
-- `gemini-3.1-pro` (no `-preview`) — does not exist (per agent docs research)
-- `gemini-3.1-flash` (no `-preview`) — does not exist
+The user later confirmed: "my subscription has access to every flagship — the
+only thing that should fail is when I'm rate-limited for the day". Acting on
+that, `_HARDCODED["gemini"]` lists **both** `-preview` and bare-form variants
+of each tier so users can try whichever resolves on their account. The
+authoritative list for any given subscription is the in-app `/model` picker
+inside `gemini` itself.
 
-The current default `gemini-3.1-flash-lite-preview` is known to work from the
-previous audit cycle. Other model IDs in Phase 1's updated `_HARDCODED` are
-based on official documentation; users should be aware these may not all be
-accessible to every account tier (Free / AI Pro / API key) — this caveat is
-documented in README and USAGE.
-
-A re-verification pass should be scheduled after the Gemini quota resets.
+A re-verification pass should be scheduled after Gemini quota resets.
 
 ## Wrapper conclusions
 

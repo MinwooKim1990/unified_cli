@@ -49,16 +49,16 @@ def test_f1_codex_hardcoded_includes_flagship_and_codex_specialists():
     assert "gpt-5.3-codex-spark" in ids
 
 
-def test_f1_gemini_hardcoded_uses_correct_preview_ids():
+def test_f1_gemini_hardcoded_includes_both_preview_and_bare_variants():
     ids = _HARDCODED["gemini"]
-    # The previously-broken bare IDs are gone:
-    assert "gemini-3.1-pro" not in ids       # this 404s
-    assert "gemini-3.1-flash" not in ids     # this 404s
-    # The correct -preview suffixed IDs:
+    # Both -preview and bare variants are listed so users can try whichever
+    # their subscription resolves to (see PHASE0_VERIFICATION.md).
     assert "gemini-3.1-pro-preview" in ids
+    assert "gemini-3.1-pro" in ids                # bare form also included
     assert "gemini-3-flash-preview" in ids
+    assert "gemini-3.1-flash" in ids
     assert "gemini-3.1-flash-lite-preview" in ids
-    assert "gemini-3.1-flash-lite" in ids   # stable promotion
+    assert "gemini-3.1-flash-lite" in ids
 
 
 # ---- F2: empty API key env guards ----

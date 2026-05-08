@@ -71,10 +71,12 @@ the underlying CLI; `unified-cli models` shows the verified hardcoded list as
 a starting point. For the absolute fastest interactive feel use
 `-m gpt-5.3-codex-spark` (~2.5s per turn vs Claude's 5–6s).
 
-> **Note on Gemini IDs**: Google's 3.x model IDs frequently include a
-> `-preview` suffix (e.g. `gemini-3.1-pro-preview`, `gemini-3-flash-preview`).
-> Bare `gemini-3.1-pro` / `gemini-3.1-flash` (no suffix) currently 404. The
-> only stable 3.x ID at the moment is `gemini-3.1-flash-lite`. Quotas are
+> **Note on Gemini IDs**: Google's 3.x model IDs are in flux — both
+> `gemini-3.1-pro-preview` and bare `gemini-3.1-pro` style IDs exist
+> depending on the rollout state for your account. The wrapper lists both
+> variants in the hardcoded fallback so you can try whichever your
+> subscription actually accepts. The in-app `/model` picker in
+> `gemini` itself is the authoritative list for your account. Quotas are
 > per-model on the free tier.
 
 ## Install

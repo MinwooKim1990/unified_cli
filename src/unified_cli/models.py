@@ -60,13 +60,17 @@ _HARDCODED: dict[ProviderName, list[str]] = {
         "codex-auto-review",       # review specialist
     ],
     "gemini": [
-        # NOTE: Bare `gemini-3.1-pro` and `gemini-3.1-flash` (without
-        # `-preview`) do NOT exist — they 404 against the API. The real
-        # current IDs are below. See PHASE0_VERIFICATION.md for details.
-        "gemini-3.1-pro-preview",          # current flagship
-        "gemini-3-flash-preview",          # 3.x flash (note: not "3.1")
-        "gemini-3.1-flash-lite-preview",   # default
-        "gemini-3.1-flash-lite",           # stable promotion
+        # NOTE: We list both the `-preview` suffixed and bare form for the
+        # current 3.x line. The actual valid IDs depend on your subscription
+        # and Google's deployment state — try the one in your account's
+        # /model picker. Phase 0 quota exhaustion blocked us from
+        # distinguishing "invalid ID" from "rate-limited" definitively.
+        "gemini-3.1-pro-preview",
+        "gemini-3.1-pro",                  # may resolve where preview suffix doesn't
+        "gemini-3-flash-preview",
+        "gemini-3.1-flash",
+        "gemini-3.1-flash-lite-preview",   # default (verified live previously)
+        "gemini-3.1-flash-lite",
         # Legacy 2.5 line — scheduled for shutdown 2026-10-16 per Google docs.
         "gemini-2.5-pro",
         "gemini-2.5-flash",
