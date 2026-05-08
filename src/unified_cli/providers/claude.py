@@ -171,12 +171,31 @@ class ClaudeProvider(BaseProvider):
                 cause=text[:300],
             )
         data = json.loads(text[start:])
+
+        # Claude CLI returns 200 + a normal-looking JSON envelope even for
+        # provider-side errors (bad model name, content policy, etc); the only
+        # signal is `is_error: true`. Without this guard the error message
+        # silently masquerades as a successful response.
+        if data.get("is_error"):
+            raise UnifiedError(
+                kind="internal", provider="claude",
+                message=str(data.get("result") or "Claude returned is_error"),
+                cause=text[:300],
+            )
+
         usage_raw = data.get("usage") or {}
+        # Prefer the model the CLI actually resolved to (e.g. when alias `opus`
+        # was passed, the resolved id is `claude-opus-4-7`). Surfaces silent
+        # fallback to the user via Response.model.
+        resolved_model = (
+            (data.get("modelUsage") and next(iter(data["modelUsage"]), None))
+            or model
+        )
         return Response(
             text=data.get("result", ""),
             session_id=data.get("session_id", ""),
             provider="claude",
-            model=model,
+            model=resolved_model,
             usage=Usage(
                 input_tokens=usage_raw.get("input_tokens"),
                 output_tokens=usage_raw.get("output_tokens"),
