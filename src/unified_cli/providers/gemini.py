@@ -113,15 +113,55 @@ class GeminiProvider(BaseProvider):
         resume_last: bool,
         model: Optional[str],
         streaming: bool,
-    ) -> list[str]:
+        images: Optional[list] = None,
+    ) -> tuple[list[str], Optional[str]]:
         args = [self.bin_path] + self._common_flags(model, streaming)
         if session_id:
             idx = self._find_session_index(session_id)
             args += ["-r", str(idx)]
         elif resume_last:
             args += ["-r", "latest"]
-        args += ["-p", prompt]
-        return args
+
+        # Gemini CLI has no dedicated image flag in `-p` headless mode. Its
+        # interactive parser recognizes `@path` references inside the prompt
+        # and inlines the file content. We splice those in front of the user
+        # prompt and rely on this same syntax surviving headless mode (which
+        # current Gemini CLI versions appear to). Bytes/URL inputs are
+        # materialized to a temp file first.
+        full_prompt = self._inject_image_refs(prompt, images)
+        args += ["-p", full_prompt]
+        return args, None
+
+    def _inject_image_refs(self, prompt: str, images) -> str:
+        if not images:
+            return prompt
+        from ..core import normalize_images
+        refs = []
+        for att in normalize_images(images):
+            path = self._materialize(att)
+            refs.append(f"@{path}")
+        return " ".join(refs) + " " + prompt
+
+    def _materialize(self, att) -> str:
+        if att.path:
+            return att.path
+        if att.bytes_:
+            import tempfile
+            ext = (att.media_type or "image/png").split("/")[-1]
+            ext = "jpg" if ext == "jpeg" else ext
+            fd, tmp = tempfile.mkstemp(prefix="unified_cli_img_", suffix=f".{ext}")
+            with os.fdopen(fd, "wb") as f:
+                f.write(att.bytes_)
+            return tmp
+        if att.url:
+            raise UnifiedError(
+                kind="config", provider="gemini",
+                message="Gemini @<path> 는 로컬 파일만 받습니다. URL 은 미리 다운로드하세요.",
+            )
+        raise UnifiedError(
+            kind="config", provider="gemini",
+            message="비어있는 이미지 첨부.",
+        )
 
     def _normalize(self, obj: dict) -> Iterator[Message]:
         t = obj.get("type", "")

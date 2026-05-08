@@ -69,7 +69,8 @@ class ClaudeProvider(BaseProvider):
         resume_last: bool,
         model: Optional[str],
         streaming: bool,
-    ) -> list[str]:
+        images: Optional[list] = None,
+    ) -> tuple[list[str], Optional[str]]:
         args: list[str] = [self.bin_path, "-p"]
         args += ["--output-format", "stream-json", "--verbose"] if streaming \
             else ["--output-format", "json"]
@@ -94,8 +95,125 @@ class ClaudeProvider(BaseProvider):
         elif resume_last:
             args += ["--continue"]
 
+        # Image input: Claude Code CLI in headless `-p` mode does NOT have a
+        # native inline-image flag, and stream-json stdin with Anthropic
+        # Messages-style image content blocks is silently dropped (the model
+        # sees a textual hint of bytes but cannot vision-process the image).
+        # The only documented headless image path is `--file file_id:path`
+        # which requires a prior upload via the Claude API — incompatible
+        # with OAuth-only auth that this wrapper relies on.
+        # → reject with a clear error directing users to Codex or Gemini.
+        if images:
+            raise UnifiedError(
+                kind="config", provider="claude",
+                message="Claude headless 모드 (`claude -p`) 는 현재 inline image 입력을 지원하지 않습니다.",
+                hint=("이미지가 필요하면 -m 으로 Codex 나 Gemini 를 쓰세요. "
+                      "Claude Code 가 향후 `--image` 같은 native 플래그를 추가하면 자동으로 풀립니다."),
+            )
+
         args.append(prompt)
-        return args
+        return args, None
+
+    @staticmethod
+    def _aggregate_stream_json(body: str) -> dict:
+        """Collect a Claude stream-json NDJSON output into a single dict
+        compatible with the `--output-format json` shape (`result`, `usage`,
+        `session_id`, `is_error`, `modelUsage`).
+        """
+        result_text_parts: list[str] = []
+        session_id = ""
+        usage: dict = {}
+        model_usage: dict = {}
+        is_error = False
+
+        for line in body.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            t = obj.get("type")
+            if t == "system" and obj.get("session_id"):
+                session_id = obj["session_id"]
+            elif t == "assistant":
+                msg = obj.get("message") or {}
+                for block in msg.get("content") or []:
+                    if block.get("type") == "text":
+                        result_text_parts.append(block.get("text") or "")
+            elif t == "result":
+                if obj.get("is_error"):
+                    is_error = True
+                if obj.get("result"):
+                    # `result.result` carries the final concatenated text.
+                    # Prefer it over piecewise assistant chunks if present.
+                    result_text_parts = [obj["result"]]
+                if obj.get("usage"):
+                    usage = obj["usage"]
+                if obj.get("modelUsage"):
+                    model_usage = obj["modelUsage"]
+                if obj.get("session_id"):
+                    session_id = obj["session_id"]
+
+        return {
+            "result": "".join(result_text_parts),
+            "session_id": session_id,
+            "usage": usage,
+            "modelUsage": model_usage,
+            "is_error": is_error,
+        }
+
+    @staticmethod
+    def _upgrade_output_to_stream_json(args: list[str]) -> list[str]:
+        """Replace `--output-format json` with `stream-json --verbose` if present."""
+        out: list[str] = []
+        i = 0
+        while i < len(args):
+            if args[i] == "--output-format" and i + 1 < len(args) and args[i + 1] == "json":
+                out += ["--output-format", "stream-json", "--verbose"]
+                i += 2
+            else:
+                out.append(args[i])
+                i += 1
+        return out
+
+    def _build_stream_json_input(self, prompt: str, images: list) -> str:
+        """Build an Anthropic Messages-style stream-json envelope for stdin.
+
+        Format expected by `claude -p --input-format stream-json` (one JSON
+        object per line, terminated by EOF / pipe close):
+
+            {"type":"user","message":{"role":"user","content":[
+                {"type":"image","source":{"type":"base64",
+                    "media_type":"image/png","data":"..."}},
+                {"type":"text","text":"prompt"}
+            ]}}
+        """
+        from ..core import normalize_images, attachment_b64
+        content = []
+        for att in normalize_images(images):
+            if att.url:
+                content.append({
+                    "type": "image",
+                    "source": {"type": "url", "url": att.url},
+                })
+            else:
+                content.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": att.media_type or "image/png",
+                        "data": attachment_b64(att),
+                    },
+                })
+        content.append({"type": "text", "text": prompt})
+
+        envelope = {
+            "type": "user",
+            "message": {"role": "user", "content": content},
+        }
+        return json.dumps(envelope, ensure_ascii=False) + "\n"
 
     def _normalize(self, obj: dict) -> Iterator[Message]:
         t = obj.get("type", "")
@@ -170,7 +288,17 @@ class ClaudeProvider(BaseProvider):
                 message="Claude CLI 응답에 JSON이 없습니다.",
                 cause=text[:300],
             )
-        data = json.loads(text[start:])
+
+        # Two output forms:
+        #   1. `--output-format json` → single JSON object
+        #   2. `--output-format stream-json` → NDJSON, one event per line.
+        #      Used when image input is attached (forced by --input-format
+        #      stream-json). We aggregate the `result` event's data.
+        body = text[start:].strip()
+        if "\n{" in body:  # NDJSON
+            data = self._aggregate_stream_json(body)
+        else:
+            data = json.loads(body)
 
         # Claude CLI returns 200 + a normal-looking JSON envelope even for
         # provider-side errors (bad model name, content policy, etc); the only
