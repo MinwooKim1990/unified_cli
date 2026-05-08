@@ -95,24 +95,88 @@ class ClaudeProvider(BaseProvider):
         elif resume_last:
             args += ["--continue"]
 
-        # Image input: Claude Code CLI in headless `-p` mode does NOT have a
-        # native inline-image flag, and stream-json stdin with Anthropic
-        # Messages-style image content blocks is silently dropped (the model
-        # sees a textual hint of bytes but cannot vision-process the image).
-        # The only documented headless image path is `--file file_id:path`
-        # which requires a prior upload via the Claude API — incompatible
-        # with OAuth-only auth that this wrapper relies on.
-        # → reject with a clear error directing users to Codex or Gemini.
+        # Image input via the Read tool. Claude Code's built-in `Read` tool
+        # natively vision-processes PNG/JPEG/GIF/WebP files. We don't pipe
+        # base64 (which the headless mode silently drops); instead we ensure
+        # the file is on disk somewhere accessible, allow the Read tool, and
+        # prepend the path to the prompt so the model picks it up.
+        #
+        # Bytes/URL inputs are materialized to a temp file under cwd so that
+        # `--add-dir` (already in args via self.add_dirs) doesn't need to be
+        # extended dynamically — the model only needs Read access to the
+        # absolute path.
         if images:
-            raise UnifiedError(
-                kind="config", provider="claude",
-                message="Claude headless 모드 (`claude -p`) 는 현재 inline image 입력을 지원하지 않습니다.",
-                hint=("이미지가 필요하면 -m 으로 Codex 나 Gemini 를 쓰세요. "
-                      "Claude Code 가 향후 `--image` 같은 native 플래그를 추가하면 자동으로 풀립니다."),
+            allowed_for_image = list(self.allowed_tools)
+            if "Read" not in allowed_for_image:
+                allowed_for_image.append("Read")
+            # Replace any earlier --allowedTools we already added with the
+            # extended list (last write wins).
+            args = self._strip_existing_allowed_tools(args)
+            args += ["--allowedTools", ",".join(allowed_for_image)]
+            # Bypass permissions for unattended image processing.
+            args = self._strip_existing_permission_mode(args)
+            args += ["--permission-mode", "bypassPermissions"]
+
+            paths = [self._materialize_image(att) for att in self._normalize_images(images)]
+            path_lines = "\n".join(f"이미지 파일: {p}" for p in paths)
+            prompt = (
+                f"{path_lines}\n위 이미지를 Read 도구로 읽고 다음 질문에 답해주세요:\n{prompt}"
             )
 
         args.append(prompt)
         return args, None
+
+    @staticmethod
+    def _normalize_images(images):
+        from ..core import normalize_images
+        return normalize_images(images)
+
+    def _materialize_image(self, att) -> str:
+        """Return absolute path to image — write bytes to temp file if needed."""
+        from pathlib import Path as _Path
+        if att.path:
+            return str(_Path(att.path).resolve())
+        if att.bytes_:
+            import tempfile, os as _os
+            ext = (att.media_type or "image/png").split("/")[-1]
+            ext = "jpg" if ext == "jpeg" else ext
+            fd, tmp = tempfile.mkstemp(prefix="unified_cli_img_", suffix=f".{ext}")
+            with _os.fdopen(fd, "wb") as f:
+                f.write(att.bytes_)
+            return tmp
+        if att.url:
+            raise UnifiedError(
+                kind="config", provider="claude",
+                message="Claude Read 도구는 로컬 파일만 받습니다. URL 은 미리 다운로드하세요.",
+            )
+        raise UnifiedError(
+            kind="config", provider="claude",
+            message="비어있는 이미지 첨부.",
+        )
+
+    @staticmethod
+    def _strip_existing_allowed_tools(args: list[str]) -> list[str]:
+        out: list[str] = []
+        i = 0
+        while i < len(args):
+            if args[i] == "--allowedTools" and i + 1 < len(args):
+                i += 2
+            else:
+                out.append(args[i])
+                i += 1
+        return out
+
+    @staticmethod
+    def _strip_existing_permission_mode(args: list[str]) -> list[str]:
+        out: list[str] = []
+        i = 0
+        while i < len(args):
+            if args[i] == "--permission-mode" and i + 1 < len(args):
+                i += 2
+            else:
+                out.append(args[i])
+                i += 1
+        return out
 
     @staticmethod
     def _aggregate_stream_json(body: str) -> dict:

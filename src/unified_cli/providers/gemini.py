@@ -64,15 +64,24 @@ class GeminiProvider(BaseProvider):
             env.setdefault("GEMINI_CLI_TRUST_WORKSPACE", "true")
         return env
 
-    def _common_flags(self, model: Optional[str], streaming: bool) -> list[str]:
+    def _common_flags(
+        self, model: Optional[str], streaming: bool,
+        *, allow_tools: bool = False,
+    ) -> list[str]:
         args: list[str] = [
             "--output-format", "stream-json" if streaming else "json",
         ]
         if self.skip_trust:
             args += ["--skip-trust"]
         args += ["-m", model or self.model]
-        if self.approval_mode:
-            args += ["--approval-mode", self.approval_mode]
+        # `--approval-mode plan` is read-only and blocks tool calls — but
+        # Gemini treats `@<path>` image refs as a tool invocation, so plan
+        # mode silently swallows them. When the caller wires up images we
+        # bypass plan and rely on the default approval policy instead.
+        approval = None if allow_tools and self.approval_mode == "plan" \
+                        else self.approval_mode
+        if approval:
+            args += ["--approval-mode", approval]
         if self.sandbox:
             args += ["-s"]
         if self.include_directories:
@@ -115,7 +124,9 @@ class GeminiProvider(BaseProvider):
         streaming: bool,
         images: Optional[list] = None,
     ) -> tuple[list[str], Optional[str]]:
-        args = [self.bin_path] + self._common_flags(model, streaming)
+        args = [self.bin_path] + self._common_flags(
+            model, streaming, allow_tools=bool(images),
+        )
         if session_id:
             idx = self._find_session_index(session_id)
             args += ["-r", str(idx)]

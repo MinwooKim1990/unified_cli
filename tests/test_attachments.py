@@ -169,21 +169,27 @@ def test_codex_build_args_no_image_uses_argv():
     assert argv[-1] == "hi"
 
 
-def test_claude_build_args_with_image_raises():
+def test_claude_build_args_with_image_uses_read_tool():
+    """Claude routes image input through the Read tool: --allowedTools Read +
+    bypassPermissions + path prepended to the prompt."""
     from unified_cli import create
     p = _make_dummy_png()
     try:
         cli = create("claude", web_search=False)
-        try:
-            cli._build_args(
-                "describe", session_id=None, resume_last=False,
-                model="haiku", streaming=False, images=[p],
-            )
-        except UnifiedError as e:
-            assert e.kind == "config"
-            assert "headless" in e.message or "지원하지 않" in e.message
-        else:
-            assert False, "Claude with image should raise"
+        argv, stdin = cli._build_args(
+            "describe", session_id=None, resume_last=False,
+            model="haiku", streaming=False, images=[p],
+        )
+        joined = " ".join(argv)
+        assert "--allowedTools" in joined
+        # Read tool must appear in the allowed list
+        idx = argv.index("--allowedTools")
+        assert "Read" in argv[idx + 1]
+        assert "--permission-mode" in joined
+        assert "bypassPermissions" in joined
+        # Image absolute path must be in the (last) prompt argument
+        assert p in argv[-1]
+        assert stdin is None
     finally:
         os.unlink(p)
 

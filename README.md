@@ -50,10 +50,15 @@ can import**.
   the three native JSONL schemas
 - **Web search by default**: Claude `WebSearch`, Codex `web_search`, Gemini
   `google_web_search` — all ON unless you pass `web_search=False`
-- **Image input** (multimodal): pass `images=[paths]` to `chat()` /
-  `stream()` or `--image foo.png` on the CLI. **Codex and Gemini supported**;
-  Claude headless mode does not currently accept inline images and the
-  wrapper raises a clear `UnifiedError(kind="config")` if you try.
+- **Image input** (multimodal, all 3 providers): pass `images=[paths]` to
+  `chat()` / `stream()` or `--image foo.png` on the CLI. Each provider uses
+  its native vision path:
+  - **Codex** — `-i, --image <FILE>` flag (codex CLI 0.129+).
+  - **Gemini** — `@<path>` reference embedded in the prompt; `--approval-mode plan`
+    is automatically relaxed to allow the file read.
+  - **Claude** — Routed through Claude Code's built-in `Read` tool with
+    `--permission-mode bypassPermissions`; the image path is prepended to
+    the prompt. PNG / JPEG / GIF / WebP all supported.
 - **Structured errors**: every failure → `UnifiedError(kind=...)` from one of
   seven categories (`auth_expired` / `rate_limit` / `model_not_allowed` /
   `not_found` / `network` / `config` / `internal`) with Korean recovery hints

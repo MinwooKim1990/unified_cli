@@ -166,8 +166,13 @@ class BaseProvider(ABC):
 
         for attempt in range(len(_NETWORK_BACKOFF) + 1):
             try:
+                # When no stdin is supplied we still pass empty input ("")
+                # rather than letting the child inherit our stdin — Gemini
+                # CLI in particular blocks waiting for stdin input even
+                # though `-p` is supplied, which causes the wrapper to hang.
                 result = subprocess.run(
-                    args, capture_output=True, text=True, input=stdin_data,
+                    args, capture_output=True, text=True,
+                    input=stdin_data if stdin_data is not None else "",
                     cwd=self.cwd, env=self._env(), timeout=self.timeout,
                 )
             except subprocess.TimeoutExpired:
@@ -190,7 +195,7 @@ class BaseProvider(ABC):
                     try:
                         result = subprocess.run(
                             args_retry, capture_output=True, text=True,
-                            input=stdin_data,
+                            input=stdin_data if stdin_data is not None else "",
                             cwd=self.cwd, env=self._env(fallback_api_key=True),
                             timeout=self.timeout,
                         )
