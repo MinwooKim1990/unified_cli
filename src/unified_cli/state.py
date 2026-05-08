@@ -67,6 +67,13 @@ def save_last_session(
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, STATE_FILE)
+        # Restrict to user-only — session_id is not a secret per se but it
+        # references local conversation state and shouldn't be world-readable
+        # on multi-user systems.
+        try:
+            os.chmod(STATE_FILE, 0o600)
+        except OSError:
+            pass
     except Exception:
         try:
             os.unlink(tmp_path)

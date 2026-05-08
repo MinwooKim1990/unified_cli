@@ -57,6 +57,10 @@ def _setup_readline() -> None:
 def _save_history_silent(readline_mod) -> None:
     try:
         readline_mod.write_history_file(str(_HISTORY_FILE))
+        try:
+            os.chmod(_HISTORY_FILE, 0o600)
+        except OSError:
+            pass
     except Exception:
         pass
 
