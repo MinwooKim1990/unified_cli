@@ -75,6 +75,69 @@ JSON 으로 가져오려면:
 `doctor` 가 3개 CLI 경로 + auth 상태 + 모델 개수를 출력합니다. 뭐든 ✗ 가 뜨면
 해당 CLI 를 먼저 설치/로그인하세요.
 
+## 이미지 입력 (멀티모달, 3 provider 모두)
+
+```python
+from unified_cli import create
+create("claude").chat("describe", images=["cat.png"])
+create("codex").chat("describe", images=["cat.png"])
+create("gemini", model="gemini-3-flash-preview").chat("describe", images=["cat.png"])
+```
+
+지원하는 입력 형식 (한 호출에 섞어 써도 됨):
+
+```python
+images=[
+    "cat.png",                                 # 로컬 파일 경로 (str)
+    Path("/tmp/dog.jpg"),                      # pathlib.Path
+    open("photo.webp","rb").read(),            # bytes
+    "https://example.com/image.png",           # http(s) URL
+    "data:image/png;base64,iVBOR...",          # data URL
+    Attachment(path="cat.png", media_type="image/png"),  # 명시
+]
+```
+
+provider 별 메커니즘 (래퍼가 자동 처리):
+
+| Provider | 방식 | 비고 |
+|---|---|---|
+| **Codex** | `-i, --image <FILE>` 플래그 | native, 반복 가능. codex CLI ≥ 0.129 필요. image 첨부 시 prompt 가 stdin 으로 전송됨 (CLI 요구사항). |
+| **Claude** | Read 도구 | 자동으로 `--allowedTools Read` + `--permission-mode bypassPermissions` 추가. prompt 앞에 `이미지 파일: <path>\n위 이미지를 Read 도구로 읽고 ...` 가 prepend 되어 Claude Code 의 Read 가 vision 처리. |
+| **Gemini** | `@<path>` 참조 | 경로가 prompt 앞에 삽입됨. `web_search=False` 였다면 `--approval-mode plan` 이 image 처리도 막는데, image 가 있으면 자동 우회. |
+
+bytes / data URL 은 임시 파일로 materialize 후 경로 사용. http(s) URL 은
+local CLI 가 fetch 못 하므로 명시적 거부 (`UnifiedError(kind="config")`) —
+직접 다운로드 후 path 로 전달.
+
+provider 별 형식 / 한도:
+- **Claude** — PNG / JPEG / GIF / WebP. 한 요청 ~100매, 32MB
+- **Codex** — vision 가능 모델이 받는 형식 (보통 PNG/JPEG/WebP)
+- **Gemini** — PNG / JPEG / WEBP / HEIC / HEIF. 3,600매/req, inline 20MB
+
+CLI:
+```bash
+unified-cli chat "describe" --image foo.png --image bar.jpg -m gpt-5.4-mini
+```
+
+REPL:
+```text
+[claude/haiku] > /image photo.png
+[claude/haiku] > /image second.jpg
+[claude/haiku] > 두 사진의 차이?
+```
+
+OpenAI 호환 서버 (multi-content 스키마):
+```python
+client.chat.completions.create(
+    model="haiku",
+    messages=[{"role":"user","content":[
+        {"type":"text","text":"describe"},
+        {"type":"image_url",
+         "image_url":{"url":"data:image/png;base64,iVBOR..."}}
+    ]}],
+)
+```
+
 ## Python API 쿡북
 
 ### 임포트 한 줄
@@ -177,6 +240,36 @@ if state:
 ```
 
 반대 방향 (Python 에서 저장 → CLI 에서 `--continue`): `save_last_session(provider, model, session_id)`.
+
+### 패턴 8 — 이미지 입력 (멀티모달)
+
+```python
+from unified_cli import create
+
+# 3 provider 모두 같은 images= 파라미터
+for p, m in [("claude","haiku"), ("codex","gpt-5.4-mini"),
+             ("gemini","gemini-3-flash-preview")]:
+    r = create(p, model=m).chat(
+        "이 이미지에 무슨 색?",
+        images=["/path/to/cat.png"],
+    )
+    print(p, "→", r.text.strip())
+
+# 한 호출에 여러 형식 섞기
+create("codex").chat(
+    "두 사진 비교",
+    images=["left.png", b"\\x89PNG...raw...", "https://example.com/r.jpg"],
+)
+
+# 스트리밍 + image
+for msg in create("gemini", model="gemini-3-flash-preview").stream(
+    "각각 묘사해", images=["a.png", "b.png"],
+):
+    if msg.kind == "text":
+        print(msg.text, end="", flush=True)
+```
+
+세부 동작 / 한도는 위의 **이미지 입력 (멀티모달, 3 provider 모두)** 섹션 참고.
 
 ---
 

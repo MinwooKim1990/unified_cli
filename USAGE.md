@@ -76,6 +76,104 @@ unified-cli chat "hi" --no-web-search
 
 # read prompt from stdin (long content)
 cat error.log | unified-cli chat "diagnose this error" -m sonnet
+
+# image input (one or many; works for all 3 providers)
+unified-cli chat "what's in this photo?" --image cat.png -m haiku
+unified-cli chat "compare these two charts" --image a.png --image b.png -m gpt-5.4-mini
+```
+
+## Interactive REPL
+
+```bash
+unified-cli repl                              # default provider (claude)
+unified-cli repl --provider codex -m gpt-5.4-mini
+unified-cli repl --no-web-search              # disable web search
+```
+
+Inside the REPL, slash commands let you change context without restarting:
+
+| Command | What it does |
+|---|---|
+| `/help` | List all commands |
+| `/model <name>` | Switch model within the current provider |
+| `/provider <claude\|codex\|gemini>` | Switch provider; previous 8 turns are auto-injected as context |
+| `/new` | Reset the conversation (drop history) |
+| `/save` | Show current `session_id` + how to resume from CLI |
+| `/history [N]` | Show last N turns (default 10) |
+| `/tokens` | Per-provider usage aggregate for this REPL session |
+| `/doctor` | One-line health for each provider |
+| `/image <path>` | Attach an image for the next user message (repeatable) |
+| `/images` | List currently pending image attachments |
+| `/clear-images` | Drop pending attachments |
+| `/exit`, `/quit`, Ctrl+D | Exit (the last session_id is saved → `chat --continue`) |
+
+Arrow-key history is enabled (stdlib `readline`; persists to
+`~/.unified-cli/repl_history` between sessions).
+
+## Image input (multimodal)
+
+All three providers can read images. The wrapper hides the per-provider
+mechanism behind one common API:
+
+```python
+from unified_cli import create
+create("claude").chat("describe", images=["cat.png"])
+create("codex").chat("describe", images=["cat.png"])
+create("gemini", model="gemini-3-flash-preview").chat("describe", images=["cat.png"])
+```
+
+Accepted input forms (mix freely in one call):
+
+```python
+images=[
+    "cat.png",                                 # local file path (str)
+    Path("/tmp/dog.jpg"),                      # pathlib.Path
+    open("photo.webp","rb").read(),            # raw bytes
+    "https://example.com/image.png",           # http(s) URL
+    "data:image/png;base64,iVBOR...",          # data URL (Anthropic style)
+    Attachment(path="cat.png", media_type="image/png"),  # explicit
+]
+```
+
+How each provider handles it (handled automatically by the wrapper):
+
+| Provider | Mechanism | Notes |
+|---|---|---|
+| **Codex** | `-i, --image <FILE>` flag | Native, repeatable. Requires `codex` CLI ≥ 0.129. With images, prompt is sent via stdin (CLI requirement). |
+| **Claude** | Read tool | The wrapper auto-adds `--allowedTools Read` and `--permission-mode bypassPermissions`, then prepends `이미지 파일: <path>\n위 이미지를 Read 도구로 읽고 ...` to the prompt so Claude Code's built-in Read tool vision-processes the image. |
+| **Gemini** | `@<path>` prompt reference | The path is inserted at the start of the prompt; if `web_search=False` set `--approval-mode plan` would normally block this, the wrapper auto-relaxes when images are attached. |
+
+Bytes / data-URL / http(s) URL inputs are materialized to a temp file first
+(except Claude, which always uses a path; URL inputs raise `UnifiedError(kind="config")`
+because the local CLI cannot fetch remotes for you — download yourself first).
+
+Per-provider supported formats / limits (subject to upstream changes):
+- **Claude** — PNG, JPEG, GIF, WebP. ~100 images and 32 MB total per request.
+- **Codex** — Whatever the underlying ChatGPT vision-capable models accept (typically PNG, JPEG, WebP).
+- **Gemini** — PNG, JPEG, WEBP, HEIC, HEIF. Up to 3,600 images per request, ~20 MB inline.
+
+CLI:
+```bash
+unified-cli chat "describe" --image foo.png --image bar.jpg -m gpt-5.4-mini
+```
+
+REPL:
+```text
+[claude/haiku] > /image photo.png
+[claude/haiku] > /image second.jpg
+[claude/haiku] > what's different about these two?
+```
+
+OpenAI-compatible server (multi-content schema):
+```python
+client.chat.completions.create(
+    model="haiku",
+    messages=[{"role":"user","content":[
+        {"type":"text","text":"describe"},
+        {"type":"image_url",
+         "image_url":{"url":"data:image/png;base64,iVBOR..."}}
+    ]}],
+)
 ```
 
 ## OpenAI-compatible server
@@ -222,7 +320,42 @@ r = create("claude").chat("starting from Python")
 save_last_session(r.provider, r.model, r.session_id)
 ```
 
-### Pattern 8 — provider-specific options
+### Pattern 8 — image input (multimodal)
+```python
+from unified_cli import create
+
+# All three providers accept the same `images=` argument
+for provider, model in [("claude", "haiku"),
+                         ("codex",  "gpt-5.4-mini"),
+                         ("gemini", "gemini-3-flash-preview")]:
+    r = create(provider, model=model).chat(
+        "what color is this image?",
+        images=["/path/to/cat.png"],
+    )
+    print(provider, "→", r.text.strip())
+
+# Mix multiple input forms in a single call
+r = create("codex").chat(
+    "compare these",
+    images=[
+        "left.png",
+        b"\\x89PNG...raw bytes...",
+        "https://example.com/right.jpg",
+    ],
+)
+
+# Streaming + image
+for msg in create("gemini", model="gemini-3-flash-preview").stream(
+    "describe each", images=["a.png", "b.png"],
+):
+    if msg.kind == "text":
+        print(msg.text, end="", flush=True)
+```
+
+See the **Image input (multimodal)** section above for per-provider
+mechanism details and limits.
+
+### Pattern 9 — provider-specific options
 ```python
 from unified_cli import ClaudeProvider, CodexProvider, GeminiProvider
 

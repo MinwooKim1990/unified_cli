@@ -126,11 +126,30 @@ unified-cli chat "latest Python release?" --stream
 # Cheapest fast query
 unified-cli chat "quick q" -m gpt-5.3-codex-spark
 
+# Image input (works with all 3 providers — see Features above for details)
+unified-cli chat "what's in this photo?" --image cat.png -m haiku
+unified-cli chat "compare these two" --image a.jpg --image b.jpg -m gpt-5.4-mini
+
 # Status & dashboard
 unified-cli doctor          # one-time health check
 unified-cli status --watch  # live terminal dashboard (5s refresh)
 uvicorn unified_cli.server:app --port 8000  # + http://localhost:8000/dashboard
 ```
+
+### Interactive REPL — `unified-cli repl`
+
+```text
+[claude/haiku] > hello
+[claude/haiku] > /provider codex          # switch providers (context auto-injected)
+[codex/gpt-5.4-mini] > /image photo.png   # attach image for the next turn
+[codex/gpt-5.4-mini] > describe this
+[codex/gpt-5.4-mini] > /history           # last 10 turns
+[codex/gpt-5.4-mini] > /save              # current session_id + resume hint
+[codex/gpt-5.4-mini] > /exit              # state saved → `chat --continue` from here
+```
+
+Slash commands: `/help` `/model` `/provider` `/new` `/save` `/history`
+`/tokens` `/doctor` `/image` `/images` `/clear-images` `/exit`.
 
 ### Python
 
@@ -169,20 +188,69 @@ for p in ("claude", "codex", "gemini"):
             continue
         raise
 
-# Pattern 6 — image input (Codex / Gemini)
-resp = create("codex").chat(
-    "Describe this image in one word.",
+# Pattern 6 — image input (works on all 3 providers)
+resp = create("claude").chat(
+    "What single color is this image?",
     images=["/path/to/photo.png"],
 )
 print(resp.text)
-# Bytes / data-URLs / http(s) URLs also accepted:
-# images=[image_bytes, "https://example.com/cat.jpg",
-#         "data:image/png;base64,iVBOR..."]
+# `images` accepts mixed inputs:
+#   - file path (str or pathlib.Path)
+#   - raw bytes
+#   - http(s) URL or "data:image/png;base64,..." (Anthropic Attachment)
+images = [
+    "cat.png",
+    b"\\x89PNG...",                                  # bytes
+    "https://example.com/dog.jpg",                  # URL
+    "data:image/png;base64,iVBOR...",               # data URL
+]
+# CLI equivalent:
+#   unified-cli chat "describe" --image a.png --image b.jpg -m gpt-5.4-mini
 ```
 
 See [USAGE.md](USAGE.md) (English) or [USAGE.ko.md](USAGE.ko.md) (Korean) for
-the full cookbook — 8 patterns including sync, async, streaming, tool events,
-error fallback, CLI↔Python state sharing, and advanced provider options.
+the full cookbook — 9 patterns including sync, async, streaming, tool events,
+error fallback, image input, CLI↔Python state sharing, and advanced provider
+options.
+
+### OpenAI-compatible server
+
+```bash
+uvicorn unified_cli.server:app --port 8000
+# Browse:  http://localhost:8000/dashboard   (live usage / sessions)
+```
+
+Drop-in for any OpenAI client — model is auto-routed by name; the `user`
+field acts as a conversation id (preserves history across calls):
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8000/v1", api_key="unused")
+
+# Plain text turn
+client.chat.completions.create(
+    model="haiku",                              # → claude
+    messages=[{"role":"user","content":"hi"}],
+    user="session-1",
+)
+
+# Image input (OpenAI multi-content schema, works for all 3 providers)
+client.chat.completions.create(
+    model="gpt-5.4-mini",                       # → codex
+    messages=[{"role":"user","content":[
+        {"type":"text","text":"describe"},
+        {"type":"image_url",
+         "image_url":{"url":"data:image/png;base64,iVBOR..."}}
+    ]}],
+)
+
+# Continue in a different provider (cross-provider conversation)
+client.chat.completions.create(
+    model="gemini-3-flash-preview",             # → gemini
+    messages=[{"role":"user","content":"summarize what we discussed"}],
+    user="session-1",                            # last 8 turns auto-injected
+)
+```
 
 ## Known limitations
 
