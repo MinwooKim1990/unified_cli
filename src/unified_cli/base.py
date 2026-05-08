@@ -126,7 +126,16 @@ class BaseProvider(ABC):
         resume_last: bool,
         model: Optional[str],
         streaming: bool,
-    ) -> list[str]: ...
+        images: Optional[list] = None,
+    ) -> tuple[list[str], Optional[str]]:
+        """Build (argv, stdin_data) for the subprocess call.
+
+        `stdin_data` is `None` for the typical argv-only case, or a string
+        that should be piped into the child's stdin (used by Claude when
+        images are attached, since `claude -p` requires `--input-format
+        stream-json` + an Anthropic Messages JSON envelope on stdin to carry
+        image content blocks).
+        """
 
     @abstractmethod
     def _normalize(self, obj: dict) -> Iterator[Message]: ...
@@ -143,8 +152,11 @@ class BaseProvider(ABC):
             env[self.api_key_env] = os.environ[self.api_key_env]
         return env
 
-    def _run(self, args: list[str]) -> str:
+    def _run(self, args: list[str], stdin_data: Optional[str] = None) -> str:
         """Run subprocess with non-streaming output. Returns stdout on success.
+
+        `stdin_data` (if given) is piped to the child's stdin — used by
+        Claude's stream-json image input mode.
 
         Handles auth-expired fallback (retry once with API key env) and network
         retries (up to 2 with exponential backoff).
@@ -155,7 +167,7 @@ class BaseProvider(ABC):
         for attempt in range(len(_NETWORK_BACKOFF) + 1):
             try:
                 result = subprocess.run(
-                    args, capture_output=True, text=True,
+                    args, capture_output=True, text=True, input=stdin_data,
                     cwd=self.cwd, env=self._env(), timeout=self.timeout,
                 )
             except subprocess.TimeoutExpired:
@@ -178,6 +190,7 @@ class BaseProvider(ABC):
                     try:
                         result = subprocess.run(
                             args_retry, capture_output=True, text=True,
+                            input=stdin_data,
                             cwd=self.cwd, env=self._env(fallback_api_key=True),
                             timeout=self.timeout,
                         )
@@ -211,15 +224,16 @@ class BaseProvider(ABC):
         session_id: Optional[str] = None,
         resume_last: bool = False,
         model: Optional[str] = None,
+        images: Optional[list] = None,
     ) -> Response:
         _reject_empty_prompt(prompt, self.name)
-        args = self._build_args(
+        args, stdin_data = self._build_args(
             prompt, session_id=session_id, resume_last=resume_last,
-            model=model, streaming=False,
+            model=model, streaming=False, images=images,
         )
         t0 = time.time()
         try:
-            stdout = self._run(args)
+            stdout = self._run(args, stdin_data=stdin_data)
             resp = self._parse_json_response(stdout, model or self.model)
             _check_session_match(self.name, session_id, resp.session_id)
         except UnifiedError as e:
@@ -247,18 +261,19 @@ class BaseProvider(ABC):
         session_id: Optional[str] = None,
         resume_last: bool = False,
         model: Optional[str] = None,
+        images: Optional[list] = None,
     ) -> Iterator[Message]:
         _reject_empty_prompt(prompt, self.name)
-        args = self._build_args(
+        args, stdin_data = self._build_args(
             prompt, session_id=session_id, resume_last=resume_last,
-            model=model, streaming=True,
+            model=model, streaming=True, images=images,
         )
         t0 = time.time()
         final_usage = Usage()
         final_session = ""
         session_checked = False
         try:
-            for msg in self._stream_run(args):
+            for msg in self._stream_run(args, stdin_data=stdin_data):
                 if msg.kind == "usage" and msg.usage:
                     final_usage = msg.usage
                 if msg.kind == "session" and msg.session_id:
@@ -295,18 +310,24 @@ class BaseProvider(ABC):
         session_id: Optional[str] = None,
         resume_last: bool = False,
         model: Optional[str] = None,
+        images: Optional[list] = None,
     ) -> AsyncIterator[Message]:
         _reject_empty_prompt(prompt, self.name)
-        args = self._build_args(
+        args, stdin_data = self._build_args(
             prompt, session_id=session_id, resume_last=resume_last,
-            model=model, streaming=True,
+            model=model, streaming=True, images=images,
         )
         proc = await asyncio.create_subprocess_exec(
             *args,
+            stdin=asyncio.subprocess.PIPE if stdin_data else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self.cwd, env=self._env(),
         )
+        if stdin_data and proc.stdin:
+            proc.stdin.write(stdin_data.encode())
+            await proc.stdin.drain()
+            proc.stdin.close()
         assert proc.stdout is not None
         session_checked = False
         try:
@@ -335,13 +356,23 @@ class BaseProvider(ABC):
         args: list[str],
         *,
         fallback: bool,
+        stdin_data: Optional[str] = None,
     ) -> Iterator[Message]:
         """Run subprocess once, yield normalized messages, raise on failure."""
         proc = subprocess.Popen(
-            args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            args,
+            stdin=subprocess.PIPE if stdin_data else None,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, cwd=self.cwd,
             env=self._env(fallback_api_key=fallback), bufsize=1,
         )
+        if stdin_data and proc.stdin:
+            try:
+                proc.stdin.write(stdin_data)
+                proc.stdin.flush()
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
         assert proc.stdout is not None
         produced_any = False
         try:
@@ -375,16 +406,18 @@ class BaseProvider(ABC):
             err._produced_any = produced_any  # type: ignore[attr-defined]
             raise err
 
-    def _stream_run(self, args: list[str]) -> Iterator[Message]:
+    def _stream_run(
+        self, args: list[str], stdin_data: Optional[str] = None
+    ) -> Iterator[Message]:
         """Sync streaming with one auth-fallback retry on pre-stream failure."""
         try:
-            yield from self._stream_once(args, fallback=False)
+            yield from self._stream_once(args, fallback=False, stdin_data=stdin_data)
             return
         except UnifiedError as err:
             produced = getattr(err, "_produced_any", False)
             if (err.kind == "auth_expired"
                     and not produced
                     and self.api_key_env in os.environ):
-                yield from self._stream_once(args, fallback=True)
+                yield from self._stream_once(args, fallback=True, stdin_data=stdin_data)
                 return
             raise
