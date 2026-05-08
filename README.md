@@ -60,14 +60,22 @@ can import**.
 
 ## Default models (lightweight, subscription-friendly)
 
-| Provider | Default | Why |
+| Provider | Default | Latest flagship (override with `-m`) |
 |---|---|---|
-| Claude | `claude-haiku-4-5` | Fastest tier of Claude 4.x |
-| Codex | `gpt-5.4-mini` | Fastest model allowed on ChatGPT subscription |
-| Gemini | `gemini-3.1-flash-lite-preview` | Fastest Gemini 3.x variant |
+| Claude | `claude-haiku-4-5` | `claude-opus-4-7` (or alias `opus`) |
+| Codex | `gpt-5.4-mini` | `gpt-5.4` (or `gpt-5.5` if your `codex` CLI is up to date) |
+| Gemini | `gemini-3.1-flash-lite-preview` | `gemini-3.1-pro-preview` |
 
-Override via `-m <name>`. Use `-m gpt-5.3-codex-spark` for the absolute fastest
-(tends to respond in ~2.5s vs Claude's 5-6s).
+Override via `-m <name>`. The wrapper passes any model ID straight through to
+the underlying CLI; `unified-cli models` shows the verified hardcoded list as
+a starting point. For the absolute fastest interactive feel use
+`-m gpt-5.3-codex-spark` (~2.5s per turn vs Claude's 5–6s).
+
+> **Note on Gemini IDs**: Google's 3.x model IDs frequently include a
+> `-preview` suffix (e.g. `gemini-3.1-pro-preview`, `gemini-3-flash-preview`).
+> Bare `gemini-3.1-pro` / `gemini-3.1-flash` (no suffix) currently 404. The
+> only stable 3.x ID at the moment is `gemini-3.1-flash-lite`. Quotas are
+> per-model on the free tier.
 
 ## Install
 
@@ -212,8 +220,8 @@ server + live dashboard + rich REPL + state-file sharing between CLI and
 Python code.
 
 **Closest library-only alternative**: `coding-cli-runtime` on PyPI — pure
-Python library covering 4 CLIs (adds GitHub Copilot), but no CLI entry point,
-no server, no REPL.
+Python library that wraps multiple coding CLIs per its PyPI page (verify the
+exact set yourself). No CLI entry point, no server, no REPL.
 
 If your use case is *just* "spawn a CLI and get text back" — `coding-cli-runtime`
 is smaller. If you want dual-mode + richer infrastructure (state, server,
