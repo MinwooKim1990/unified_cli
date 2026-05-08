@@ -18,6 +18,13 @@ from .usage import tracker as _usage_tracker
 # Max 2 retries (0.5s, 1.5s) for network errors; 1 retry for auth fallback.
 _NETWORK_BACKOFF = (0.5, 1.5)
 
+# Default subprocess timeouts. The wrapped CLIs occasionally hang (network
+# stalls, OAuth refresh edge cases, etc); without timeouts a REPL or HTTP
+# server backed by this wrapper can wedge indefinitely. Override via
+# `BaseProvider(timeout=N)` if you need shorter or longer.
+DEFAULT_CHAT_TIMEOUT = 120        # seconds — non-streaming
+DEFAULT_STREAM_TIMEOUT = 300      # seconds — streaming may take longer for long replies
+
 
 def _reject_empty_prompt(prompt: str, provider: str) -> None:
     """Raise UnifiedError(kind='config') for empty/whitespace-only prompts.
@@ -85,7 +92,10 @@ class BaseProvider(ABC):
         self.model = model or self.default_model
         self.cwd = cwd
         self.extra_env = extra_env or {}
-        self.timeout = timeout
+        # `timeout` semantics: explicit value applies to both modes; `None` →
+        # mode-specific defaults (chat 120s, stream 300s).
+        self.timeout = timeout if timeout is not None else DEFAULT_CHAT_TIMEOUT
+        self.stream_timeout = timeout if timeout is not None else DEFAULT_STREAM_TIMEOUT
         self.web_search = web_search
 
         resolved = bin_path or self._discover_bin()
@@ -143,10 +153,18 @@ class BaseProvider(ABC):
         last_err: Optional[UnifiedError] = None
 
         for attempt in range(len(_NETWORK_BACKOFF) + 1):
-            result = subprocess.run(
-                args, capture_output=True, text=True,
-                cwd=self.cwd, env=self._env(), timeout=self.timeout,
-            )
+            try:
+                result = subprocess.run(
+                    args, capture_output=True, text=True,
+                    cwd=self.cwd, env=self._env(), timeout=self.timeout,
+                )
+            except subprocess.TimeoutExpired:
+                raise UnifiedError(
+                    kind="network", provider=self.name,
+                    message=f"{self.name} 응답이 {self.timeout}초 안에 오지 않음.",
+                    hint=("네트워크/CLI hang 가능성. timeout 을 늘리거나 다시 시도하세요. "
+                          "BaseProvider(timeout=N) 으로 조정 가능."),
+                )
             if result.returncode == 0:
                 return result.stdout
 
@@ -157,11 +175,18 @@ class BaseProvider(ABC):
                 if self.api_key_env in os.environ:
                     tried_api_fallback = True
                     args_retry = args
-                    result = subprocess.run(
-                        args_retry, capture_output=True, text=True,
-                        cwd=self.cwd, env=self._env(fallback_api_key=True),
-                        timeout=self.timeout,
-                    )
+                    try:
+                        result = subprocess.run(
+                            args_retry, capture_output=True, text=True,
+                            cwd=self.cwd, env=self._env(fallback_api_key=True),
+                            timeout=self.timeout,
+                        )
+                    except subprocess.TimeoutExpired:
+                        raise UnifiedError(
+                            kind="network", provider=self.name,
+                            message=f"{self.name} API key fallback 중 timeout.",
+                            hint="네트워크 확인 후 재시도.",
+                        )
                     if result.returncode == 0:
                         return result.stdout
                     err = classify(self.name, result.stderr, result.stdout, result.returncode)
@@ -332,7 +357,16 @@ class BaseProvider(ABC):
                     produced_any = True
                     yield msg
         finally:
-            proc.wait(timeout=self.timeout)
+            try:
+                proc.wait(timeout=self.stream_timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                raise UnifiedError(
+                    kind="network", provider=self.name,
+                    message=f"{self.name} 스트림이 {self.stream_timeout}초 안에 끝나지 않음.",
+                    hint="긴 응답이면 BaseProvider(timeout=N) 으로 늘리세요.",
+                )
             stderr_text = proc.stderr.read() if proc.stderr else ""
 
         if proc.returncode not in (0, None):
