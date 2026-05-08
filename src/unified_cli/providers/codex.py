@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Iterator, Optional
 
 from ..base import BaseProvider
@@ -78,8 +79,18 @@ class CodexProvider(BaseProvider):
         resume_last: bool,
         model: Optional[str],
         streaming: bool,
-    ) -> list[str]:
+        images: Optional[list] = None,
+    ) -> tuple[list[str], Optional[str]]:
         argv: list[str] = [self.bin_path, "exec"]
+
+        # Codex `exec` natively supports `-i <FILE>` (repeatable) for inline
+        # image attachments. NOTE: as of codex CLI 0.129, when `-i` is used
+        # the prompt MUST be passed via stdin (argv prompt is ignored and
+        # the CLI complains "No prompt provided via stdin"). We therefore
+        # send prompt via stdin whenever images are attached, and via argv
+        # otherwise.
+        image_args = self._image_args(images)
+        use_stdin = bool(image_args)
 
         if session_id or resume_last:
             # `resume` subcommand: no -s / --add-dir / -C
@@ -93,20 +104,64 @@ class CodexProvider(BaseProvider):
                 argv += ["--dangerously-bypass-approvals-and-sandbox"]
             for k, v in self.config_overrides.items():
                 argv += ["-c", f"{k}={v}"]
+            argv += image_args
             if resume_last:
                 argv += ["--last"]
             else:
                 argv += [session_id]  # type: ignore[list-item]
-            argv += [prompt]
-            return argv
+            if not use_stdin:
+                argv += [prompt]
+            return argv, (prompt if use_stdin else None)
 
         argv += self._common_flags(model, streaming)
         if self.cwd:
             argv += ["-C", self.cwd]
         for d in self.add_dirs:
             argv += ["--add-dir", d]
-        argv += [prompt]
-        return argv
+        argv += image_args
+        if not use_stdin:
+            argv += [prompt]
+        return argv, (prompt if use_stdin else None)
+
+    def _image_args(self, images) -> list[str]:
+        """Translate normalized images into `-i <path>` repeated args.
+
+        Bytes / URL inputs are written to a temp file so the CLI can read them
+        as paths. Temp files are kept for the process lifetime (small leak,
+        acceptable for short-lived CLI calls).
+        """
+        if not images:
+            return []
+        from ..core import normalize_images
+        out: list[str] = []
+        for att in normalize_images(images):
+            path = self._materialize(att)
+            out += ["-i", path]
+        return out
+
+    def _materialize(self, att) -> str:
+        """Ensure attachment is on disk; return path."""
+        if att.path:
+            return att.path
+        if att.bytes_:
+            import tempfile
+            ext = (att.media_type or "image/png").split("/")[-1]
+            ext = "jpg" if ext == "jpeg" else ext
+            fd, tmp = tempfile.mkstemp(prefix="unified_cli_img_", suffix=f".{ext}")
+            with os.fdopen(fd, "wb") as f:
+                f.write(att.bytes_)
+            return tmp
+        if att.url:
+            # Codex CLI wants a local path; a URL would need download.
+            # Defer that to the caller — explicit error here.
+            raise UnifiedError(
+                kind="config", provider="codex",
+                message="Codex `-i` 는 로컬 파일만 받습니다. URL 은 미리 다운로드하세요.",
+            )
+        raise UnifiedError(
+            kind="config", provider="codex",
+            message="비어있는 이미지 첨부.",
+        )
 
     def _normalize(self, obj: dict) -> Iterator[Message]:
         t = obj.get("type", "")
