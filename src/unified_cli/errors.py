@@ -57,8 +57,9 @@ HINTS: dict[str, str] = {
         "잠시 후 다시 시도하거나 다른 provider/모델로 전환하세요.",
     "check_model_list":
         "사용 가능한 모델은 `unified-cli models` 로 확인하세요.",
-    "codex_subscription_models":
-        "ChatGPT 구독에서는 gpt-5.4-mini / gpt-5.4 / gpt-5.2 / gpt-5.3-codex-spark 만 사용 가능합니다.",
+    # Codex subscription-allowed models — dynamically pulled from
+    # models._HARDCODED["codex"] so they stay in sync. See _build_hints below.
+    "codex_subscription_models": "",  # populated at import time
     "network_retry":
         "네트워크 연결을 확인하세요. 통합 래퍼는 이미 2회 재시도했습니다.",
     "check_resource":
@@ -66,6 +67,27 @@ HINTS: dict[str, str] = {
     "install_cli":
         "CLI 바이너리를 찾을 수 없습니다. 해당 provider CLI를 설치하고 PATH를 확인하세요.",
 }
+
+
+def _build_codex_hint() -> str:
+    """Compose the codex subscription-models hint from the hardcoded list.
+
+    Avoids drift between the displayed model list and the error hint text.
+    Imported lazily to avoid a circular import (models.py → errors.py).
+    """
+    try:
+        from .models import _HARDCODED
+        models = " / ".join(m for m in _HARDCODED["codex"] if not m.startswith("codex-"))
+        return (
+            f"ChatGPT 구독으로 사용 가능한 Codex 모델: {models}. "
+            "신규 모델 (예: gpt-5.5) 을 쓰려면 `brew upgrade codex` 또는 "
+            "`npm i -g @openai/codex@latest` 로 CLI 부터 업그레이드하세요."
+        )
+    except Exception:
+        return "사용 가능한 모델은 `unified-cli models codex` 로 확인하세요."
+
+
+HINTS["codex_subscription_models"] = _build_codex_hint()
 
 
 # ---- matcher tables: ordered list of (regex, kind, hint_key) per provider ----
@@ -83,7 +105,12 @@ MATCHERS: dict[ProviderName, list[_Matcher]] = {
                     r"|no conversation found with session",
                     re.I),
          "not_found", "check_resource"),
-        (re.compile(r"model[^\n]{0,80}(not exist|not accessible|invalid|unknown)", re.I),
+        (re.compile(
+            r"model[^\n]{0,80}(not exist|not accessible|invalid|unknown|not allowed)"
+            r"|is not a valid model"
+            r"|requested model[^\n]{0,40}(is not|not available|not supported)"
+            r"|invalid model identifier",
+            re.I),
          "model_not_allowed", "check_model_list"),
         (re.compile(r"\bENOTFOUND\b|\bECONNRESET\b|getaddrinfo|network|ETIMEDOUT", re.I),
          "network", "network_retry"),
