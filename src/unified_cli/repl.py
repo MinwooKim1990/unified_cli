@@ -92,6 +92,9 @@ def run_repl(
     # state-file write at exit.
     current = {"provider": provider, "model": model or DEFAULT_MODELS[provider]}
 
+    # Pending images attached for the next user prompt.
+    pending_images: list[str] = []
+
     _banner(current)
 
     while True:
@@ -110,14 +113,16 @@ def run_repl(
             continue
 
         if line.startswith("/"):
-            stop = _handle_slash(line, conv, current, provider_opts)
+            stop = _handle_slash(line, conv, current, provider_opts, pending_images)
             if stop:
                 _on_exit(conv, current)
                 return 0
             continue
 
-        # Normal chat turn.
-        _run_turn(conv, current, line)
+        # Normal chat turn — consumes pending images (one-shot per turn).
+        imgs = pending_images[:] if pending_images else None
+        pending_images.clear()
+        _run_turn(conv, current, line, images=imgs)
 
 
 # ---------- slash commands ----------
@@ -126,6 +131,9 @@ _SLASH_HELP = [
     ("/help", "이 목록"),
     ("/model <name>", "같은 provider 에서 모델 변경"),
     ("/provider <claude|codex|gemini>", "provider 전환 (컨텍스트 자동 주입)"),
+    ("/image <path>", "다음 prompt 에 이미지 첨부 (Codex/Gemini, 반복 가능)"),
+    ("/images", "현재 첨부된 이미지 목록"),
+    ("/clear-images", "첨부된 이미지 지우기"),
     ("/new", "대화 초기화 (컨텍스트 버리기)"),
     ("/save", "현재 session_id + 이어쓰기 명령 표시"),
     ("/history [N]", "최근 N (기본 10) 턴 표시"),
@@ -140,6 +148,7 @@ def _handle_slash(
     conv: UnifiedConversation,
     current: dict,
     provider_opts: dict,
+    pending_images: list[str],
 ) -> bool:
     """Return True if REPL should exit."""
     parts = line.split()
@@ -147,6 +156,35 @@ def _handle_slash(
 
     if cmd in ("/exit", "/quit"):
         return True
+
+    if cmd == "/image":
+        if not rest:
+            console.print("[red]/image <path>[/red]")
+            return False
+        path = " ".join(rest)
+        if not Path(path).expanduser().exists():
+            console.print(f"[red]파일을 찾을 수 없음: {path}[/red]")
+            return False
+        pending_images.append(str(Path(path).expanduser().resolve()))
+        console.print(
+            f"[dim]이미지 첨부됨 ({len(pending_images)}개 대기 중). "
+            f"다음 메시지에 같이 보냄.[/dim]"
+        )
+        return False
+
+    if cmd == "/images":
+        if not pending_images:
+            console.print("[dim](첨부된 이미지 없음)[/dim]")
+        else:
+            for i, p in enumerate(pending_images, 1):
+                console.print(f"  {i}. {p}")
+        return False
+
+    if cmd == "/clear-images":
+        n = len(pending_images)
+        pending_images.clear()
+        console.print(f"[dim]{n}개 첨부 지움.[/dim]")
+        return False
 
     if cmd == "/help":
         t = Table(show_header=False, box=None, padding=(0, 2))
@@ -253,7 +291,13 @@ def _handle_slash(
 
 # ---------- turn execution ----------
 
-def _run_turn(conv: UnifiedConversation, current: dict, prompt: str) -> None:
+def _run_turn(
+    conv: UnifiedConversation,
+    current: dict,
+    prompt: str,
+    *,
+    images: Optional[list] = None,
+) -> None:
     """Stream a single user-prompt turn with spinner + tool indicators."""
     status = Status("[cyan]응답 대기 중…[/cyan]", console=console, spinner="dots")
     status.start()
@@ -263,6 +307,7 @@ def _run_turn(conv: UnifiedConversation, current: dict, prompt: str) -> None:
             prompt,
             provider=current["provider"],
             model=current["model"],
+            images=images,
         ):
             if msg.kind == "text" and msg.text:
                 if not started:

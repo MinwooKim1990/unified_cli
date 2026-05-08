@@ -21,7 +21,8 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from typing import Optional
+import base64 as _b64
+from typing import Any, Optional, Union
 
 try:
     from fastapi import FastAPI, HTTPException
@@ -49,8 +50,12 @@ CONVS: dict[str, UnifiedConversation] = {}
 
 
 class ChatMessage(BaseModel):
+    """OpenAI-compatible message — content can be a plain string OR a list of
+    content blocks (`{"type":"text", "text": ...}`, `{"type":"image_url",
+    "image_url":{"url": "..."}}`).
+    """
     role: str
-    content: str
+    content: Union[str, list[dict]]
 
 
 class ChatRequest(BaseModel):
@@ -103,10 +108,48 @@ def _raise_http(err: UnifiedError) -> None:
 
 # ---- helpers ----
 
-def _last_user(messages: list[ChatMessage]) -> str:
+def _extract_user_message(messages: list[ChatMessage]) -> tuple[str, list[Any]]:
+    """Return (prompt_text, images) from the last user message.
+
+    Supports both plain string content and OpenAI multi-content arrays:
+        content = "hello"
+        content = [{"type":"text","text":"..."}, {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}]
+
+    `image_url` URLs may be either `data:` (base64) or http(s)://. Both forms
+    are passed to the wrapper as-is — the provider layer will materialize
+    bytes to disk if a CLI needs a path.
+    """
     for m in reversed(messages):
-        if m.role == "user":
-            return m.content
+        if m.role != "user":
+            continue
+        if isinstance(m.content, str):
+            return m.content, []
+        # multi-content list
+        text_parts: list[str] = []
+        images: list[Any] = []
+        for block in m.content:
+            btype = block.get("type")
+            if btype == "text":
+                text_parts.append(block.get("text", ""))
+            elif btype == "image_url":
+                url = (block.get("image_url") or {}).get("url", "")
+                if not url:
+                    continue
+                if url.startswith("data:"):
+                    # data:image/png;base64,XXXX → decode to bytes
+                    head, _, b64 = url.partition(",")
+                    media_type = head[5:].split(";", 1)[0] or None
+                    try:
+                        from .core import Attachment
+                        images.append(Attachment(
+                            bytes_=_b64.b64decode(b64),
+                            media_type=media_type,
+                        ))
+                    except Exception:
+                        pass
+                else:
+                    images.append(url)   # http(s) URL — passed as-is
+        return "\n".join(p for p in text_parts if p).strip(), images
     raise HTTPException(status_code=400, detail="no user message")
 
 
@@ -125,7 +168,8 @@ def chat_completions(req: ChatRequest):
     except UnifiedError as e:
         _raise_http(e)
 
-    prompt = _last_user(req.messages)
+    prompt, images = _extract_user_message(req.messages)
+    images = images or None
     conv_id = req.user or str(uuid.uuid4())
     conv = _get_conv(conv_id)
 
@@ -135,7 +179,8 @@ def chat_completions(req: ChatRequest):
     if req.stream:
         def gen():
             try:
-                for msg in conv.stream(prompt, provider=provider, model=model):
+                for msg in conv.stream(prompt, provider=provider, model=model,
+                                        images=images):
                     if msg.kind == "text" and msg.text:
                         chunk = {
                             "id": response_id,
@@ -166,7 +211,7 @@ def chat_completions(req: ChatRequest):
         return StreamingResponse(gen(), media_type="text/event-stream")
 
     try:
-        resp = conv.send(prompt, provider=provider, model=model)
+        resp = conv.send(prompt, provider=provider, model=model, images=images)
     except UnifiedError as e:
         _raise_http(e)
 

@@ -310,11 +310,12 @@ def _cmd_chat(args: argparse.Namespace) -> int:
 
     prompt = args.prompt or sys.stdin.read()
 
+    images = getattr(args, "images", None) or None
     t0 = _t.time()
     try:
         if args.stream:
             resp_session, resp_model, text_tokens = _run_stream_with_spinner(
-                client, prompt, session_id=session_id
+                client, prompt, session_id=session_id, images=images,
             )
             # Build a lightweight Response-like object for the info panel.
             class _R:
@@ -328,7 +329,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
                 input_tokens=text_tokens[0], output_tokens=text_tokens[1],
             )
         else:
-            resp = client.chat(prompt, session_id=session_id)
+            resp = client.chat(prompt, session_id=session_id, images=images)
             print(resp.text)
     except UnifiedError as e:
         console.print(f"[red]{e}[/red]")
@@ -352,7 +353,9 @@ def _cmd_chat(args: argparse.Namespace) -> int:
 
 
 def _run_stream_with_spinner(
-    client, prompt: str, *, session_id: Optional[str] = None
+    client, prompt: str, *,
+    session_id: Optional[str] = None,
+    images: Optional[list] = None,
 ) -> tuple[Optional[str], Optional[str], tuple[Optional[int], Optional[int]]]:
     """Show a rich spinner until the first text event arrives.
 
@@ -373,7 +376,7 @@ def _run_stream_with_spinner(
     in_tok: Optional[int] = None
     out_tok: Optional[int] = None
     try:
-        for msg in client.stream(prompt, session_id=session_id):
+        for msg in client.stream(prompt, session_id=session_id, images=images):
             if msg.kind == "session" and msg.session_id:
                 resolved_sid = msg.session_id
                 init_model = (msg.raw or {}).get("model")
@@ -487,6 +490,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="Claude 가 짧은 질문에 장황하게 답하는 걸 억제")
     p_chat.add_argument("--cwd",
                         help="하위 CLI 의 작업 디렉토리 (도구 사용 시 영향)")
+    p_chat.add_argument("--image", action="append", dest="images",
+                        metavar="PATH",
+                        help="이미지 첨부 (반복 가능). Codex/Gemini 지원, "
+                             "Claude headless 는 현재 미지원")
 
     # Session continuity flags (mutually exclusive).
     session_grp = p_chat.add_mutually_exclusive_group()

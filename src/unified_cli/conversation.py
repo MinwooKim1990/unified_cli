@@ -122,6 +122,7 @@ class UnifiedConversation:
         *,
         provider: Optional[ProviderName] = None,
         model: Optional[str] = None,
+        images: Optional[list] = None,
     ) -> Response:
         prov, mdl = self._resolve(provider, model)
         client = self._get_client(prov, mdl)
@@ -132,6 +133,7 @@ class UnifiedConversation:
         resp = client.chat(
             prefix + prompt if prefix else prompt,
             session_id=native_session,
+            images=images,
         )
         self._record(prov, prompt, resp.text, resp.session_id)
         return resp
@@ -142,6 +144,7 @@ class UnifiedConversation:
         *,
         provider: Optional[ProviderName] = None,
         model: Optional[str] = None,
+        images: Optional[list] = None,
     ) -> Iterator[Message]:
         prov, mdl = self._resolve(provider, model)
         client = self._get_client(prov, mdl)
@@ -154,6 +157,7 @@ class UnifiedConversation:
         for msg in client.stream(
             prefix + prompt if prefix else prompt,
             session_id=native_session,
+            images=images,
         ):
             if msg.kind == "text" and msg.text:
                 chunks.append(msg.text)
@@ -169,6 +173,7 @@ class UnifiedConversation:
         *,
         provider: Optional[ProviderName] = None,
         model: Optional[str] = None,
+        images: Optional[list] = None,
     ) -> Response:
         prov, mdl = self._resolve(provider, model)
         client = self._get_client(prov, mdl)
@@ -179,6 +184,7 @@ class UnifiedConversation:
         resp = await client.achat(
             prefix + prompt if prefix else prompt,
             session_id=native_session,
+            images=images,
         )
         self._record(prov, prompt, resp.text, resp.session_id)
         return resp
@@ -189,6 +195,7 @@ class UnifiedConversation:
         *,
         provider: Optional[ProviderName] = None,
         model: Optional[str] = None,
+        images: Optional[list] = None,
     ) -> AsyncIterator[Message]:
         prov, mdl = self._resolve(provider, model)
         client = self._get_client(prov, mdl)
@@ -201,6 +208,7 @@ class UnifiedConversation:
         async for msg in client.astream(
             prefix + prompt if prefix else prompt,
             session_id=native_session,
+            images=images,
         ):
             if msg.kind == "text" and msg.text:
                 chunks.append(msg.text)
