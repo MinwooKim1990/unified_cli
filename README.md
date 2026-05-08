@@ -50,6 +50,10 @@ can import**.
   the three native JSONL schemas
 - **Web search by default**: Claude `WebSearch`, Codex `web_search`, Gemini
   `google_web_search` — all ON unless you pass `web_search=False`
+- **Image input** (multimodal): pass `images=[paths]` to `chat()` /
+  `stream()` or `--image foo.png` on the CLI. **Codex and Gemini supported**;
+  Claude headless mode does not currently accept inline images and the
+  wrapper raises a clear `UnifiedError(kind="config")` if you try.
 - **Structured errors**: every failure → `UnifiedError(kind=...)` from one of
   seven categories (`auth_expired` / `rate_limit` / `model_not_allowed` /
   `not_found` / `network` / `config` / `internal`) with Korean recovery hints
@@ -159,6 +163,16 @@ for p in ("claude", "codex", "gemini"):
         if e.kind in ("auth_expired", "rate_limit"):
             continue
         raise
+
+# Pattern 6 — image input (Codex / Gemini)
+resp = create("codex").chat(
+    "Describe this image in one word.",
+    images=["/path/to/photo.png"],
+)
+print(resp.text)
+# Bytes / data-URLs / http(s) URLs also accepted:
+# images=[image_bytes, "https://example.com/cat.jpg",
+#         "data:image/png;base64,iVBOR..."]
 ```
 
 See [USAGE.md](USAGE.md) (English) or [USAGE.ko.md](USAGE.ko.md) (Korean) for
