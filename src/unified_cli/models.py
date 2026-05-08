@@ -31,17 +31,46 @@ DEFAULT_MODELS: dict[ProviderName, str] = {
     "gemini": "gemini-3.1-flash-lite-preview",
 }
 
+# Hardcoded fallback model IDs, used when the official API isn't reachable
+# (no API key set, or the request fails). These are the IDs verified end-to-end
+# via Phase 0 live testing — see PHASE0_VERIFICATION.md.
+#
+# Single source of truth for both `unified-cli models` output AND the hint text
+# in errors.py; do not duplicate elsewhere.
 _HARDCODED: dict[ProviderName, list[str]] = {
     "claude": [
-        "claude-haiku-4-5", "claude-sonnet-4-5", "claude-opus-4-5",
+        # 2026-04 GA tiers (verified live; aliases map to these snapshots)
+        "claude-opus-4-7",       # latest flagship (GA 2026-04-16)
+        "claude-sonnet-4-6",     # GA 2026-02-17
+        "claude-haiku-4-5",      # GA — fastest tier (this wrapper's default)
+        # Aliases — Claude CLI maps these to the latest snapshot of each tier.
         "haiku", "sonnet", "opus",
     ],
     "codex": [
-        "gpt-5.4-mini", "gpt-5.4", "gpt-5.2", "gpt-5.3-codex-spark",
+        # Verified live on ChatGPT subscription auth.
+        # `gpt-5.5` is the true flagship per ~/.codex/models_cache.json but
+        # requires an upgraded codex CLI; users on older CLIs see a clear
+        # "requires newer Codex" error and can `brew upgrade codex`.
+        "gpt-5.5",                 # frontier (needs codex >= ~0.130)
+        "gpt-5.4",                 # strong everyday
+        "gpt-5.4-mini",            # fastest mini (this wrapper's default)
+        "gpt-5.3-codex",           # coding-specialized
+        "gpt-5.3-codex-spark",     # lightweight, fastest
+        "gpt-5.2",                 # older flagship
+        "codex-auto-review",       # review specialist
     ],
     "gemini": [
-        "gemini-3.1-flash-lite-preview", "gemini-3.1-flash",
-        "gemini-3.1-pro", "gemini-2.5-flash-lite",
+        # NOTE: Bare `gemini-3.1-pro` and `gemini-3.1-flash` (without
+        # `-preview`) do NOT exist — they 404 against the API. The real
+        # current IDs are below. See PHASE0_VERIFICATION.md for details.
+        "gemini-3.1-pro-preview",          # current flagship
+        "gemini-3-flash-preview",          # 3.x flash (note: not "3.1")
+        "gemini-3.1-flash-lite-preview",   # default
+        "gemini-3.1-flash-lite",           # stable promotion
+        # Legacy 2.5 line — scheduled for shutdown 2026-10-16 per Google docs.
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
     ],
 }
 
@@ -82,7 +111,7 @@ def _hardcoded(provider: ProviderName) -> list[ModelInfo]:
 # ---- Claude ----
 
 def _list_claude() -> list[ModelInfo]:
-    key = os.environ.get("ANTHROPIC_API_KEY")
+    key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
     if not key:
         return _hardcoded("claude")
     try:
@@ -133,7 +162,10 @@ def _list_codex() -> list[ModelInfo]:
 # ---- Gemini ----
 
 def _list_gemini() -> list[ModelInfo]:
-    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    key = (
+        (os.environ.get("GEMINI_API_KEY") or "").strip()
+        or (os.environ.get("GOOGLE_API_KEY") or "").strip()
+    )
     if not key:
         return _hardcoded("gemini")
     try:
