@@ -130,11 +130,11 @@ class BaseProvider(ABC):
     ) -> tuple[list[str], Optional[str]]:
         """Build (argv, stdin_data) for the subprocess call.
 
-        `stdin_data` is `None` for the typical argv-only case, or a string
-        that should be piped into the child's stdin (used by Claude when
-        images are attached, since `claude -p` requires `--input-format
-        stream-json` + an Anthropic Messages JSON envelope on stdin to carry
-        image content blocks).
+        `stdin_data` is `None` for the typical argv-only case, or a string to
+        pipe into the child's stdin. Currently used by Codex, whose CLI reads
+        the prompt from stdin when an image (`-i`) is attached. (Claude routes
+        images through its Read tool, not stdin; agy uses `@path` in the
+        prompt — both return stdin_data=None.)
         """
 
     @abstractmethod

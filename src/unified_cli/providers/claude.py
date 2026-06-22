@@ -228,57 +228,6 @@ class ClaudeProvider(BaseProvider):
             "is_error": is_error,
         }
 
-    @staticmethod
-    def _upgrade_output_to_stream_json(args: list[str]) -> list[str]:
-        """Replace `--output-format json` with `stream-json --verbose` if present."""
-        out: list[str] = []
-        i = 0
-        while i < len(args):
-            if args[i] == "--output-format" and i + 1 < len(args) and args[i + 1] == "json":
-                out += ["--output-format", "stream-json", "--verbose"]
-                i += 2
-            else:
-                out.append(args[i])
-                i += 1
-        return out
-
-    def _build_stream_json_input(self, prompt: str, images: list) -> str:
-        """Build an Anthropic Messages-style stream-json envelope for stdin.
-
-        Format expected by `claude -p --input-format stream-json` (one JSON
-        object per line, terminated by EOF / pipe close):
-
-            {"type":"user","message":{"role":"user","content":[
-                {"type":"image","source":{"type":"base64",
-                    "media_type":"image/png","data":"..."}},
-                {"type":"text","text":"prompt"}
-            ]}}
-        """
-        from ..core import normalize_images, attachment_b64
-        content = []
-        for att in normalize_images(images):
-            if att.url:
-                content.append({
-                    "type": "image",
-                    "source": {"type": "url", "url": att.url},
-                })
-            else:
-                content.append({
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": att.media_type or "image/png",
-                        "data": attachment_b64(att),
-                    },
-                })
-        content.append({"type": "text", "text": prompt})
-
-        envelope = {
-            "type": "user",
-            "message": {"role": "user", "content": content},
-        }
-        return json.dumps(envelope, ensure_ascii=False) + "\n"
-
     def _normalize(self, obj: dict) -> Iterator[Message]:
         t = obj.get("type", "")
         sid = obj.get("session_id")

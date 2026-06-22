@@ -32,7 +32,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import subprocess
+import threading
+import time
 from typing import AsyncIterator, Iterator, Optional
 
 from ..base import BaseProvider
@@ -41,7 +44,11 @@ from ..discovery import find_agy_bin
 from ..errors import UnifiedError, classify
 
 
-_INELIGIBLE_MARKERS = ("IneligibleTierError", "no longer supported", "migrate to")
+# The legacy `gemini` CLI prints this when an individual account is blocked.
+# Distinctive enough on its own; matched case-insensitively.
+_INELIGIBLE_RE = re.compile(
+    r"IneligibleTier|no longer supported for Gemini Code Assist", re.I
+)
 
 
 class GeminiProvider(BaseProvider):
@@ -72,9 +79,10 @@ class GeminiProvider(BaseProvider):
         if kw.get("timeout") is None:
             self.timeout = max(self.timeout, 300)
             self.stream_timeout = max(self.stream_timeout, 600)
-        # Tracks the session id requested for the current call so the response
-        # reports the same id (avoids spurious session-mismatch errors).
-        self._pending_session: Optional[str] = None
+        # Per-call state lives in thread-local storage so concurrent calls on a
+        # shared instance (e.g. the server's threadpool) don't clobber each
+        # other's requested session / launch snapshot.
+        self._tl = threading.local()
 
     @classmethod
     def _discover_bin(cls) -> Optional[str]:
@@ -97,12 +105,18 @@ class GeminiProvider(BaseProvider):
         streaming: bool,
         images: Optional[list] = None,
     ) -> tuple[list[str], Optional[str]]:
-        self._pending_session = session_id
+        # Per-call state (thread-local): requested session + a snapshot of the
+        # conversations dir taken just before launch, used to recover the
+        # actually-written conversation id afterwards.
+        self._tl.pending_session = session_id
+        self._tl.launch_time = time.time()
+        self._tl.db_snapshot = self._db_mtimes()
 
         argv: list[str] = [self.bin_path]
 
         model_str = model or self.model
         if model_str:
+            self._validate_model(model_str)
             argv += ["--model", model_str]
 
         if session_id:
@@ -154,32 +168,80 @@ class GeminiProvider(BaseProvider):
             kind="config", provider="gemini", message="비어있는 이미지 첨부.",
         )
 
+    # ----- model validation -----
+
+    def _validate_model(self, model_str: str) -> None:
+        """Reject clearly-unknown models. agy silently falls back to the default
+        for an unknown `--model`, which would otherwise hand the user a
+        different model's answer without warning. Only enforced when we have a
+        real `agy models` list (source="cache"); skipped if agy is unreachable
+        so we never false-reject a brand-new model agy actually supports.
+        """
+        try:
+            from ..models import list_models
+            infos = list_models("gemini")
+        except Exception:
+            return
+        have_live = any(getattr(i, "source", "") == "cache" for i in infos)
+        if not have_live:
+            return
+        valid = {i.id for i in infos}
+        if model_str not in valid:
+            raise UnifiedError(
+                kind="model_not_allowed", provider="gemini",
+                message=f"agy 모델 '{model_str}' 을 찾을 수 없습니다.",
+                hint="`unified-cli models gemini` 로 확인하세요 "
+                     "(agy 는 잘못된 모델명을 조용히 default 로 폴백합니다).",
+            )
+
     # ----- session id recovery -----
 
-    def _latest_conversation_id(self) -> Optional[str]:
-        """Newest <UUID>.db in the conversations dir = the conversation just
-        used/created by agy."""
+    def _db_mtimes(self) -> dict:
+        """Map of <name>.db → mtime in the conversations dir (best-effort)."""
+        out: dict = {}
         try:
-            entries = [
-                f for f in os.listdir(self._conv_dir) if f.endswith(".db")
-            ]
+            names = [f for f in os.listdir(self._conv_dir) if f.endswith(".db")]
         except OSError:
-            return None
-        if not entries:
-            return None
-        newest = max(
-            entries,
-            key=lambda f: os.path.getmtime(os.path.join(self._conv_dir, f)),
-        )
-        return newest[:-3]  # strip ".db"
+            return out
+        for f in names:
+            try:
+                out[f] = os.path.getmtime(os.path.join(self._conv_dir, f))
+            except OSError:
+                continue
+        return out
 
     def _resolve_session_id(self) -> str:
-        return self._pending_session or self._latest_conversation_id() or ""
+        """Recover the conversation id agy just wrote, using the pre-launch
+        snapshot: pick the `.db` that is new or whose mtime advanced past
+        launch. If the requested session was the one touched, return it (so a
+        valid resume reports the same id); otherwise return the actually-written
+        id so base's _check_session_match can flag a silent new-session.
+        """
+        pending = getattr(self._tl, "pending_session", None)
+        launch = getattr(self._tl, "launch_time", 0.0)
+        snapshot = getattr(self._tl, "db_snapshot", {}) or {}
+
+        now = self._db_mtimes()
+        touched = [
+            f for f, m in now.items()
+            if f not in snapshot or m > snapshot.get(f, 0.0) or m >= launch
+        ]
+        if touched:
+            newest = max(touched, key=lambda f: now[f])[:-3]
+            if pending and any(f[:-3] == pending for f in touched):
+                return pending
+            return newest
+        # Fallback: nothing detected as touched (clock skew / fs quirks).
+        if pending:
+            return pending
+        if now:
+            return max(now, key=lambda f: now[f])[:-3]
+        return ""
 
     # ----- response parsing (plain text) -----
 
     def _check_ineligible(self, text: str) -> None:
-        if any(m in text for m in _INELIGIBLE_MARKERS) and "IneligibleTier" in text:
+        if _INELIGIBLE_RE.search(text):
             raise UnifiedError(
                 kind="auth_expired", provider="gemini",
                 message="이 클라이언트는 더 이상 지원되지 않습니다 — Antigravity(`agy`)로 마이그레이션됨.",
@@ -191,8 +253,16 @@ class GeminiProvider(BaseProvider):
         # NOTE: method name kept for the BaseProvider contract, but agy emits
         # plain text (markdown), not JSON. The entire stdout IS the answer.
         self._check_ineligible(text)
+        body = text.strip()
+        if not body:
+            raise UnifiedError(
+                kind="internal", provider="gemini",
+                message="agy 가 빈 응답을 반환했습니다.",
+                hint="모델/네트워크 상태를 확인하거나 다시 시도하세요.",
+                cause=text[:200],
+            )
         return Response(
-            text=text.strip(),
+            text=body,
             session_id=self._resolve_session_id(),
             provider="gemini",
             model=model,
@@ -255,6 +325,12 @@ class GeminiProvider(BaseProvider):
             raise err
 
         self._check_ineligible(full)
+        if not full.strip():
+            raise UnifiedError(
+                kind="internal", provider="gemini",
+                message="agy 가 빈 응답을 반환했습니다.",
+                hint="모델/네트워크 상태를 확인하거나 다시 시도하세요.",
+            )
         sid = self._resolve_session_id()
         if sid:
             yield Message(kind="session", provider="gemini", session_id=sid, raw={})
@@ -290,18 +366,8 @@ class GeminiProvider(BaseProvider):
 
     def list_sessions(self) -> list[dict]:
         """List conversations from the agy conversations dir (newest first)."""
-        try:
-            entries = [
-                f for f in os.listdir(self._conv_dir) if f.endswith(".db")
-            ]
-        except OSError:
-            return []
-        entries.sort(
-            key=lambda f: os.path.getmtime(os.path.join(self._conv_dir, f)),
-            reverse=True,
-        )
+        mtimes = self._db_mtimes()  # OSError-guarded per file
         return [
-            {"session_id": f[:-3],
-             "mtime": os.path.getmtime(os.path.join(self._conv_dir, f))}
-            for f in entries
+            {"session_id": f[:-3], "mtime": m}
+            for f, m in sorted(mtimes.items(), key=lambda kv: kv[1], reverse=True)
         ]

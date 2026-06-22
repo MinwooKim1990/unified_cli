@@ -201,7 +201,7 @@ def test_gemini_build_args_with_image_injects_at_path():
         cli = create("gemini", web_search=False)
         argv, stdin = cli._build_args(
             "describe", session_id=None, resume_last=False,
-            model="gemini-3.1-flash-lite-preview", streaming=False, images=[p],
+            model="gemini-3.5-flash", streaming=False, images=[p],
         )
         # The prompt now starts with @<path>
         assert argv[-1].startswith("@")
