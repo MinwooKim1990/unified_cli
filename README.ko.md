@@ -2,11 +2,13 @@
 
 🇺🇸 [English README](README.md) · 📖 [상세 가이드 (한국어)](USAGE.ko.md) · 📖 [Detailed usage (EN)](USAGE.md)
 
-Claude Code / OpenAI Codex / Google Gemini 세 CLI를 **하나의 Python API** 로 통합.
+Claude Code / OpenAI Codex / Google Antigravity(`agy`) 세 CLI를 **하나의 Python API + CLI** 로 통합.
 
-- 구독 OAuth (Pro/Max, ChatGPT Plus/Pro, Google) 로 로그인되어 있으면 **구독 크레딧으로** 실행
-- API 키 환경변수만 있으면 **자동 폴백**
-- **이미지 입력 멀티모달** — 3 provider 전부. Claude 는 Read 도구, Codex 는 `-i` 플래그, Gemini 는 `@<path>` 참조
+> Google 쪽 provider 키는 여전히 `"gemini"` (그리고 `-m gemini-3.5-flash` 등도 그대로 라우팅) 이지만, 내부적으로 **Antigravity `agy` CLI** 를 래핑합니다 — 2026년 구 `gemini` CLI 가 개인 계정에서 차단됐기 때문. 아래 마이그레이션 노트 참고.
+
+- 구독 OAuth (Pro/Max, ChatGPT Plus/Pro, Antigravity) 로 로그인되어 있으면 **구독 크레딧으로** 실행
+- Claude/Codex 는 API 키 환경변수로 **자동 폴백** (agy 는 OAuth 전용)
+- **이미지 입력 멀티모달** — 3 provider 전부. Claude 는 Read 도구, Codex 는 `-i` 플래그, Gemini(`agy`) 는 `@<path>` 참조
 - 히스토리 · 스트리밍 · 도구 사용 · **웹서치 기본 ON** · OpenAI 호환 HTTP 서버
 - 대화형 **REPL** (`unified-cli repl`) + 슬래시 명령
 - 명시적 에러 분류 (auth_expired / rate_limit / model_not_allowed / not_found / network / config / internal)

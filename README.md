@@ -1,13 +1,19 @@
 # unified-cli
 
-**One Python + CLI interface for Claude Code, OpenAI Codex, and Google Gemini.**
+**One Python + CLI interface for Claude Code, OpenAI Codex, and Google
+Antigravity (`agy`).**
 
 🇰🇷 [한국어 README](README.ko.md) · 📖 [Detailed usage (EN)](USAGE.md) · 📖 [상세 가이드 (한국어)](USAGE.ko.md)
 
 Use all three AI coding CLIs — each signed in with your personal subscription
-(Claude Pro/Max, ChatGPT Plus/Pro, Google AI Pro) — from a single unified
+(Claude Pro/Max, ChatGPT Plus/Pro, Google Antigravity) — from a single unified
 interface, both as a **terminal CLI** and as a **Python library you can
 `import` in your own code**.
+
+> The provider key for the Google side is still `"gemini"` (and `-m
+> gemini-3.5-flash` etc. still route to it), but it now wraps the **Antigravity
+> `agy` CLI** — Google blocked the old `gemini` CLI for individual accounts in
+> 2026. See the migration note below.
 
 ```bash
 # CLI
@@ -26,7 +32,7 @@ conv.send("Continue", provider="gemini")   # context auto-injected
 
 ## Why this exists
 
-Each of the three CLIs (`claude`, `codex`, `gemini`) ships great subscription
+Each of the three CLIs (`claude`, `codex`, `agy`) ships great subscription
 auth but lives in its own world. Want to route "quick query" to the fastest
 model regardless of provider? Want a single OpenAI-compatible `/v1/chat/completions`
 endpoint backed by whatever CLI is cheapest/freshest? Want your Python app to
@@ -38,9 +44,9 @@ can import**.
 
 - **Dual mode**: full-featured CLI (`unified-cli chat`, `repl`, `status`, ...)
   AND clean Python API (`from unified_cli import ...`) — same code, same state
-- **Subscription-aware**: uses your existing `claude login` / `codex login` /
-  `gemini` OAuth. Falls back automatically to `ANTHROPIC_API_KEY` /
-  `OPENAI_API_KEY` / `GEMINI_API_KEY` if OAuth expires
+- **Subscription-aware**: uses your existing `claude` / `codex login` / `agy`
+  OAuth. Claude/Codex fall back automatically to `ANTHROPIC_API_KEY` /
+  `OPENAI_API_KEY` if OAuth expires (agy is OAuth-only)
 - **Multi-turn history**: CLI via `--continue` / `--resume`, Python via
   `session_id=` or `UnifiedConversation`
 - **Cross-provider conversation**: one `UnifiedConversation` can switch providers
@@ -104,8 +110,9 @@ pip install -e '.[server,dev]'
 unified-cli setup     # first-time onboarding (installs + logs into 3 CLIs)
 ```
 
-Requires Python 3.9+ and at least one of `claude`, `codex`, `gemini` already
-installed (or the setup wizard will install the missing ones for you).
+Requires Python 3.9+ and at least one of `claude`, `codex`, `agy` already
+installed (the setup wizard installs Claude/Codex via npm/brew; `agy` ships
+with the Antigravity suite — https://antigravity.google).
 
 ## Usage at a glance
 
