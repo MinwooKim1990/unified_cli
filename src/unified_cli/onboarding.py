@@ -48,8 +48,12 @@ _INSTALL: dict[ProviderName, list[InstallCommand]] = {
         InstallCommand("Homebrew", ["brew", "install", "codex"]),
         InstallCommand("npm", ["npm", "install", "-g", "@openai/codex"]),
     ],
+    # The "gemini" provider now wraps the Antigravity `agy` CLI (the old
+    # `gemini` CLI is blocked for individual accounts). `agy` isn't installed
+    # via npm/brew — it ships with the Antigravity suite. If `agy` isn't on
+    # PATH the wizard prints this as manual guidance.
     "gemini": [
-        InstallCommand("npm", ["npm", "install", "-g", "@google/gemini-cli"]),
+        InstallCommand("Antigravity (manual: https://antigravity.google)", ["agy"]),
     ],
 }
 
@@ -61,8 +65,8 @@ _LOGIN: dict[ProviderName, list[str]] = {
     # an in-TUI slash command.
     "claude": ["claude"],
     "codex":  ["codex", "login"],
-    # First-run `gemini` triggers OAuth automatically.
-    "gemini": ["gemini"],
+    # First-run `agy` opens the browser OAuth flow (Antigravity).
+    "gemini": ["agy"],
 }
 
 

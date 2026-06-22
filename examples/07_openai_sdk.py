@@ -29,7 +29,7 @@ print("[2]", r.choices[0].message.content)
 # 3) 스트리밍
 print("[3] ", end="", flush=True)
 for chunk in client.chat.completions.create(
-    model="gemini/gemini-3.1-flash-lite-preview",  # 명시 prefix
+    model="gemini/gemini-3.5-flash",  # 명시 prefix
     messages=[{"role": "user", "content": "1부터 5까지 세."}],
     user="demo-conv-2",
     stream=True,

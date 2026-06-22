@@ -119,7 +119,7 @@ mechanism behind one common API:
 from unified_cli import create
 create("claude").chat("describe", images=["cat.png"])
 create("codex").chat("describe", images=["cat.png"])
-create("gemini", model="gemini-3-flash-preview").chat("describe", images=["cat.png"])
+create("gemini").chat("describe", images=["cat.png"])  # default gemini-3.5-flash
 ```
 
 Accepted input forms (mix freely in one call):
@@ -141,7 +141,7 @@ How each provider handles it (handled automatically by the wrapper):
 |---|---|---|
 | **Codex** | `-i, --image <FILE>` flag | Native, repeatable. Requires `codex` CLI ≥ 0.129. With images, prompt is sent via stdin (CLI requirement). |
 | **Claude** | Read tool | The wrapper auto-adds `--allowedTools Read` and `--permission-mode bypassPermissions`, then prepends `이미지 파일: <path>\n위 이미지를 Read 도구로 읽고 ...` to the prompt so Claude Code's built-in Read tool vision-processes the image. |
-| **Gemini** | `@<path>` prompt reference | The path is inserted at the start of the prompt; if `web_search=False` set `--approval-mode plan` would normally block this, the wrapper auto-relaxes when images are attached. |
+| **Gemini (`agy`)** | `@<path>` prompt reference | The path is prepended to the prompt + `--dangerously-skip-permissions` so the agent can read the file. |
 
 Bytes / data-URL / http(s) URL inputs are materialized to a temp file first
 (except Claude, which always uses a path; URL inputs raise `UnifiedError(kind="config")`
@@ -327,7 +327,7 @@ from unified_cli import create
 # All three providers accept the same `images=` argument
 for provider, model in [("claude", "haiku"),
                          ("codex",  "gpt-5.4-mini"),
-                         ("gemini", "gemini-3-flash-preview")]:
+                         ("gemini", "gemini-3.5-flash")]:
     r = create(provider, model=model).chat(
         "what color is this image?",
         images=["/path/to/cat.png"],
@@ -345,7 +345,7 @@ r = create("codex").chat(
 )
 
 # Streaming + image
-for msg in create("gemini", model="gemini-3-flash-preview").stream(
+for msg in create("gemini", model="gemini-3.5-flash").stream(
     "describe each", images=["a.png", "b.png"],
 ):
     if msg.kind == "text":

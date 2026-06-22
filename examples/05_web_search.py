@@ -1,9 +1,9 @@
 """Example 5 — 웹서치 (3개 provider 모두 기본 ON).
 
-웹서치 이벤트는 Message{kind="tool_use"} 로 통일됨:
+웹서치 이벤트(Message{kind="tool_use"}):
   Claude:  tool.name = "WebSearch"
   Codex:   tool.name = "web_search"
-  Gemini:  tool.name = "google_web_search"
+  Gemini(agy): 에이전틱이라 tool_use 이벤트를 별도로 방출하지 않음 — 평문 답변만.
 """
 from unified_cli import create
 

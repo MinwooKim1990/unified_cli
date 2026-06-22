@@ -81,7 +81,7 @@ JSON 으로 가져오려면:
 from unified_cli import create
 create("claude").chat("describe", images=["cat.png"])
 create("codex").chat("describe", images=["cat.png"])
-create("gemini", model="gemini-3-flash-preview").chat("describe", images=["cat.png"])
+create("gemini").chat("describe", images=["cat.png"])  # default gemini-3.5-flash
 ```
 
 지원하는 입력 형식 (한 호출에 섞어 써도 됨):
@@ -103,7 +103,7 @@ provider 별 메커니즘 (래퍼가 자동 처리):
 |---|---|---|
 | **Codex** | `-i, --image <FILE>` 플래그 | native, 반복 가능. codex CLI ≥ 0.129 필요. image 첨부 시 prompt 가 stdin 으로 전송됨 (CLI 요구사항). |
 | **Claude** | Read 도구 | 자동으로 `--allowedTools Read` + `--permission-mode bypassPermissions` 추가. prompt 앞에 `이미지 파일: <path>\n위 이미지를 Read 도구로 읽고 ...` 가 prepend 되어 Claude Code 의 Read 가 vision 처리. |
-| **Gemini** | `@<path>` 참조 | 경로가 prompt 앞에 삽입됨. `web_search=False` 였다면 `--approval-mode plan` 이 image 처리도 막는데, image 가 있으면 자동 우회. |
+| **Gemini (`agy`)** | `@<path>` 참조 | 경로가 prompt 앞에 삽입됨 + `--dangerously-skip-permissions` 로 에이전트가 파일 읽음. |
 
 bytes / data URL 은 임시 파일로 materialize 후 경로 사용. http(s) URL 은
 local CLI 가 fetch 못 하므로 명시적 거부 (`UnifiedError(kind="config")`) —
@@ -248,7 +248,7 @@ from unified_cli import create
 
 # 3 provider 모두 같은 images= 파라미터
 for p, m in [("claude","haiku"), ("codex","gpt-5.4-mini"),
-             ("gemini","gemini-3-flash-preview")]:
+             ("gemini","gemini-3.5-flash")]:
     r = create(p, model=m).chat(
         "이 이미지에 무슨 색?",
         images=["/path/to/cat.png"],
@@ -262,7 +262,7 @@ create("codex").chat(
 )
 
 # 스트리밍 + image
-for msg in create("gemini", model="gemini-3-flash-preview").stream(
+for msg in create("gemini", model="gemini-3.5-flash").stream(
     "각각 묘사해", images=["a.png", "b.png"],
 ):
     if msg.kind == "text":
@@ -379,11 +379,13 @@ print(r.choices[0].message.content)
 - 파일 편집이 필요하면 `create("codex", full_auto=True, cwd=...)` 로
 - 웹서치는 내부적으로 `-c tools.web_search=true` 로 활성화 (wrapper가 자동 처리)
 
-### Gemini
-- 기본 모델 `gemini-3.1-flash-lite-preview` (★ `-preview` 접미사 꼭 포함)
-- 세션 resume 은 **인덱스 기반**이라 래퍼가 `--list-sessions` 로 UUID→index 매핑 (turn당 ~0.5s)
-- `google_web_search` 는 구조적으로 항상 ON. `web_search=False` 는 `--approval-mode plan` 으로 근사
-- 아무 디렉토리에서나 실행되도록 `skip_trust=True` 가 기본
+### Gemini (이제 Antigravity `agy` CLI)
+- 구 `gemini` CLI 는 개인 계정 차단(IneligibleTier). `gemini` provider 는 `agy`(`~/.local/bin/agy`)를 래핑.
+- 기본 모델 `gemini-3.5-flash`. `agy --model` 은 슬러그(`gemini-3.5-flash`, `gemini-3.1-pro`) 와 `agy models` 의 display name(`Gemini 3.5 Flash (Medium)`, `Claude Sonnet 4.6 (Thinking)`, `GPT-OSS 120B (Medium)` 등) 둘 다 허용. 잘못된 이름은 조용히 default 로 폴백.
+- 세션은 `--conversation <UUID>`/`--continue`; id 는 `~/.gemini/antigravity-cli/conversations/` 의 최신 .db 에서 복구.
+- 에이전틱이라 웹서치를 스스로 판단해 수행 — on/off 토글 없음(`web_search=` 사실상 no-op).
+- 헤드리스 출력이 평문이라 토큰 usage 보고 없음(usage=None). 에이전틱 루프라 기본 timeout 300s.
+- 도구 무인 승인을 위해 `--dangerously-skip-permissions` 기본 부착(`skip_permissions=False` 로 끔).
 
 ## 에러 대처
 

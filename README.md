@@ -250,7 +250,7 @@ client.chat.completions.create(
 
 # Continue in a different provider (cross-provider conversation)
 client.chat.completions.create(
-    model="gemini-3-flash-preview",             # → gemini
+    model="gemini-3.5-flash",                   # → gemini (agy)
     messages=[{"role":"user","content":"summarize what we discussed"}],
     user="session-1",                            # last 8 turns auto-injected
 )

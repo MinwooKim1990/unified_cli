@@ -43,7 +43,7 @@ unified-cli chat "..." --new                    # state 리셋 + 새 대화
 # CLI
 unified-cli chat "이 이미지에 무슨 색?" --image cat.png -m haiku
 unified-cli chat "두 그림 비교해" --image a.jpg --image b.jpg -m gpt-5.4-mini
-unified-cli chat "describe" --image photo.png -m gemini-3-flash-preview
+unified-cli chat "describe" --image photo.png -m gemini-3.5-flash
 ```
 
 ```python
@@ -57,7 +57,7 @@ create("gemini").chat("describe", images=["https://example.com/x.jpg"])
 provider 별 처리:
 - **Claude** — Read 도구 자동 활성화 + bypassPermissions, prompt 앞에 경로 prepend
 - **Codex** — native `-i, --image` 플래그 (codex CLI 0.129+ 필요)
-- **Gemini** — `@<path>` 참조를 prompt 앞에 삽입; image 있으면 plan 모드 자동 우회
+- **Gemini (`agy`)** — `@<path>` 참조를 prompt 앞에 삽입 + `--dangerously-skip-permissions` 로 에이전트가 파일을 읽게 함
 
 ### 대화형 REPL (`unified-cli repl`)
 
@@ -139,7 +139,7 @@ Provider별 기본 모델:
 |---|---|
 | claude | `claude-haiku-4-5` |
 | codex | `gpt-5.4-mini` |
-| gemini | `gemini-3.1-flash-lite-preview` |
+| gemini (`agy`) | `gemini-3.5-flash` |
 
 모델명만 알면 provider 자동 라우팅:
 
@@ -147,7 +147,7 @@ Provider별 기본 모델:
 from unified_cli import route
 route("haiku")                    # ('claude', 'haiku')
 route("gpt-5.4-mini")             # ('codex', 'gpt-5.4-mini')
-route("gemini-3.1-flash-lite-preview")  # ('gemini', '...')
+route("gemini-3.5-flash")         # ('gemini', 'gemini-3.5-flash')
 route("claude/sonnet")            # 명시 prefix도 지원
 ```
 
@@ -182,7 +182,7 @@ for msg in cli.stream("오늘 최신 Python 버전은?"):
 cli = create("claude", web_search=False)
 ```
 
-> Gemini CLI는 `google_web_search`가 구조적으로 항상 ON이라 `web_search=False` 설정 시 `--approval-mode plan` 으로 근사 차단.
+> Gemini provider는 이제 Antigravity `agy` CLI를 래핑합니다. agy는 에이전틱이라 웹서치를 스스로 판단해 수행하며 on/off 토글이 없습니다 (`web_search=`는 사실상 no-op).
 
 ## 에러 분류 + 자동 복구
 
@@ -330,7 +330,7 @@ cli-wrapper-unified/
 - 구독 기반 호출은 **3자 서비스로 재판매 금지** (각 provider ToS). 개인 로컬 자동화 전용
 - `auth_expired` 자동 복구는 API 키 환경변수 fallback 뿐. 브라우저 로그인은 수동으로
 - 호출당 Node/Rust 프로세스 spawn 오버헤드 ~수백 ms — 초저지연 시스템엔 부적합
-- Gemini resume 은 UUID→index 조회로 turn당 `--list-sessions` 1회 추가 호출 (~0.5s)
+- Gemini(`agy`)는 헤드리스 출력이 평문이라 토큰 사용량 보고가 없음(usage=None). 세션은 `--conversation <UUID>`/`--continue`, id는 `~/.gemini/antigravity-cli/conversations/`의 최신 .db에서 복구. 에이전틱 루프라 기본 timeout 300s
 
 ## 라이선스
 
