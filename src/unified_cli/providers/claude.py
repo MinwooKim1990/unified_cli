@@ -376,13 +376,21 @@ class ClaudeProvider(BaseProvider):
             )
 
         usage_raw = data.get("usage") or {}
-        # Prefer the model the CLI actually resolved to (e.g. when alias `opus`
-        # was passed, the resolved id is `claude-opus-4-7`). Surfaces silent
-        # fallback to the user via Response.model.
-        resolved_model = (
-            (data.get("modelUsage") and next(iter(data["modelUsage"]), None))
-            or model
-        )
+        # Prefer the requested model when Claude reports multiple modelUsage
+        # entries. Claude Code can include a small haiku classifier/preamble entry
+        # before the actual requested model (e.g. opus), so blindly taking the
+        # first key misreports audits as haiku.
+        model_usage = data.get("modelUsage") or {}
+        if model in model_usage:
+            resolved_model = model
+        elif model == "opus" and "claude-opus-4-7" in model_usage:
+            resolved_model = "claude-opus-4-7"
+        elif model == "sonnet" and "claude-sonnet-4-6" in model_usage:
+            resolved_model = "claude-sonnet-4-6"
+        elif model == "haiku" and "claude-haiku-4-5-20251001" in model_usage:
+            resolved_model = "claude-haiku-4-5-20251001"
+        else:
+            resolved_model = next(iter(model_usage), None) or model
         return Response(
             text=data.get("result", ""),
             session_id=data.get("session_id", ""),
