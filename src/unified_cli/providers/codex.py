@@ -127,8 +127,8 @@ class CodexProvider(BaseProvider):
         """Translate normalized images into `-i <path>` repeated args.
 
         Bytes / URL inputs are written to a temp file so the CLI can read them
-        as paths. Temp files are kept for the process lifetime (small leak,
-        acceptable for short-lived CLI calls).
+        as paths. Temp files are registered for cleanup after the call (see
+        BaseProvider._register_temp_file / _cleanup_temp_files).
         """
         if not images:
             return []
@@ -150,6 +150,7 @@ class CodexProvider(BaseProvider):
             fd, tmp = tempfile.mkstemp(prefix="unified_cli_img_", suffix=f".{ext}")
             with os.fdopen(fd, "wb") as f:
                 f.write(att.bytes_)
+            self._register_temp_file(tmp)  # cleaned up after the call
             return tmp
         if att.url:
             # Codex CLI wants a local path; a URL would need download.

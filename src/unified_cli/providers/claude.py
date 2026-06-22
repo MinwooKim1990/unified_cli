@@ -143,6 +143,7 @@ class ClaudeProvider(BaseProvider):
             fd, tmp = tempfile.mkstemp(prefix="unified_cli_img_", suffix=f".{ext}")
             with _os.fdopen(fd, "wb") as f:
                 f.write(att.bytes_)
+            self._register_temp_file(tmp)  # cleaned up after the call
             return tmp
         if att.url:
             raise UnifiedError(

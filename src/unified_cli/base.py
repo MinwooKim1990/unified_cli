@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import os
 import subprocess
+import threading
 import time
 from abc import ABC, abstractmethod
 from typing import AsyncIterator, ClassVar, Iterator, Optional
@@ -13,6 +15,21 @@ from typing import AsyncIterator, ClassVar, Iterator, Optional
 from .core import Message, ModelInfo, ProviderName, Response, Usage
 from .errors import UnifiedError, classify
 from .usage import tracker as _usage_tracker
+
+
+# Materialized temp files registered for cleanup on interpreter exit (defense
+# in depth; per-call cleanup happens in chat/stream finally blocks).
+_GLOBAL_TEMP_FILES: set[str] = set()
+
+
+@atexit.register
+def _cleanup_global_temp_files() -> None:
+    for p in list(_GLOBAL_TEMP_FILES):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+    _GLOBAL_TEMP_FILES.clear()
 
 
 # Max 2 retries (0.5s, 1.5s) for network errors; 1 retry for auth fallback.
@@ -97,6 +114,10 @@ class BaseProvider(ABC):
         self.timeout = timeout if timeout is not None else DEFAULT_CHAT_TIMEOUT
         self.stream_timeout = timeout if timeout is not None else DEFAULT_STREAM_TIMEOUT
         self.web_search = web_search
+        # Per-call temp files (e.g. image bytes materialized to disk). Tracked
+        # thread-locally and unlinked after each call so the long-running server
+        # doesn't leak files. See _register_temp_file / _cleanup_temp_files.
+        self._tmp = threading.local()
 
         resolved = bin_path or self._discover_bin()
         if not resolved:
@@ -142,6 +163,29 @@ class BaseProvider(ABC):
 
     @abstractmethod
     def _parse_json_response(self, text: str, model: str) -> Response: ...
+
+    # ----- temp file lifecycle -----
+
+    def _reset_temp_files(self) -> None:
+        self._tmp.files = []
+
+    def _register_temp_file(self, path: str) -> None:
+        """Providers call this when they materialize image bytes/URLs to disk,
+        so the file is unlinked after the call completes."""
+        files = getattr(self._tmp, "files", None)
+        if files is None:
+            files = self._tmp.files = []
+        files.append(path)
+        _GLOBAL_TEMP_FILES.add(path)  # atexit safety net
+
+    def _cleanup_temp_files(self) -> None:
+        for p in getattr(self._tmp, "files", None) or []:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+            _GLOBAL_TEMP_FILES.discard(p)
+        self._tmp.files = []
 
     # ----- env + subprocess -----
 
@@ -232,32 +276,36 @@ class BaseProvider(ABC):
         images: Optional[list] = None,
     ) -> Response:
         _reject_empty_prompt(prompt, self.name)
+        self._reset_temp_files()
         args, stdin_data = self._build_args(
             prompt, session_id=session_id, resume_last=resume_last,
             model=model, streaming=False, images=images,
         )
         t0 = time.time()
         try:
-            stdout = self._run(args, stdin_data=stdin_data)
-            resp = self._parse_json_response(stdout, model or self.model)
-            _check_session_match(self.name, session_id, resp.session_id)
-        except UnifiedError as e:
+            try:
+                stdout = self._run(args, stdin_data=stdin_data)
+                resp = self._parse_json_response(stdout, model or self.model)
+                _check_session_match(self.name, session_id, resp.session_id)
+            except UnifiedError as e:
+                _usage_tracker.record(
+                    self.name, model or self.model,
+                    latency_ms=int((time.time() - t0) * 1000),
+                    prompt_preview=prompt, error_kind=e.kind,
+                )
+                raise
             _usage_tracker.record(
-                self.name, model or self.model,
+                self.name, resp.model,
+                input_tokens=resp.usage.input_tokens or 0,
+                output_tokens=resp.usage.output_tokens or 0,
+                cached_tokens=resp.usage.cached_tokens or 0,
                 latency_ms=int((time.time() - t0) * 1000),
-                prompt_preview=prompt, error_kind=e.kind,
+                session_id=resp.session_id,
+                prompt_preview=prompt,
             )
-            raise
-        _usage_tracker.record(
-            self.name, resp.model,
-            input_tokens=resp.usage.input_tokens or 0,
-            output_tokens=resp.usage.output_tokens or 0,
-            cached_tokens=resp.usage.cached_tokens or 0,
-            latency_ms=int((time.time() - t0) * 1000),
-            session_id=resp.session_id,
-            prompt_preview=prompt,
-        )
-        return resp
+            return resp
+        finally:
+            self._cleanup_temp_files()
 
     def stream(
         self,
@@ -269,6 +317,7 @@ class BaseProvider(ABC):
         images: Optional[list] = None,
     ) -> Iterator[Message]:
         _reject_empty_prompt(prompt, self.name)
+        self._reset_temp_files()
         args, stdin_data = self._build_args(
             prompt, session_id=session_id, resume_last=resume_last,
             model=model, streaming=True, images=images,
@@ -278,31 +327,34 @@ class BaseProvider(ABC):
         final_session = ""
         session_checked = False
         try:
-            for msg in self._stream_run(args, stdin_data=stdin_data):
-                if msg.kind == "usage" and msg.usage:
-                    final_usage = msg.usage
-                if msg.kind == "session" and msg.session_id:
-                    final_session = msg.session_id
-                    if not session_checked:
-                        _check_session_match(self.name, session_id, msg.session_id)
-                        session_checked = True
-                yield msg
-        except UnifiedError as e:
+            try:
+                for msg in self._stream_run(args, stdin_data=stdin_data):
+                    if msg.kind == "usage" and msg.usage:
+                        final_usage = msg.usage
+                    if msg.kind == "session" and msg.session_id:
+                        final_session = msg.session_id
+                        if not session_checked:
+                            _check_session_match(self.name, session_id, msg.session_id)
+                            session_checked = True
+                    yield msg
+            except UnifiedError as e:
+                _usage_tracker.record(
+                    self.name, model or self.model,
+                    latency_ms=int((time.time() - t0) * 1000),
+                    prompt_preview=prompt, error_kind=e.kind,
+                )
+                raise
             _usage_tracker.record(
                 self.name, model or self.model,
+                input_tokens=final_usage.input_tokens or 0,
+                output_tokens=final_usage.output_tokens or 0,
+                cached_tokens=final_usage.cached_tokens or 0,
                 latency_ms=int((time.time() - t0) * 1000),
-                prompt_preview=prompt, error_kind=e.kind,
+                session_id=final_session,
+                prompt_preview=prompt,
             )
-            raise
-        _usage_tracker.record(
-            self.name, model or self.model,
-            input_tokens=final_usage.input_tokens or 0,
-            output_tokens=final_usage.output_tokens or 0,
-            cached_tokens=final_usage.cached_tokens or 0,
-            latency_ms=int((time.time() - t0) * 1000),
-            session_id=final_session,
-            prompt_preview=prompt,
-        )
+        finally:
+            self._cleanup_temp_files()
 
     async def achat(self, prompt: str, **kw) -> Response:
         loop = asyncio.get_event_loop()
@@ -318,10 +370,15 @@ class BaseProvider(ABC):
         images: Optional[list] = None,
     ) -> AsyncIterator[Message]:
         _reject_empty_prompt(prompt, self.name)
+        self._reset_temp_files()
         args, stdin_data = self._build_args(
             prompt, session_id=session_id, resume_last=resume_last,
             model=model, streaming=True, images=images,
         )
+        t0 = time.time()
+        final_usage = Usage()
+        final_session = ""
+        session_checked = False
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdin=asyncio.subprocess.PIPE if stdin_data else None,
@@ -334,7 +391,6 @@ class BaseProvider(ABC):
             await proc.stdin.drain()
             proc.stdin.close()
         assert proc.stdout is not None
-        session_checked = False
         try:
             async for raw in proc.stdout:
                 line = raw.decode().strip()
@@ -345,16 +401,42 @@ class BaseProvider(ABC):
                 except json.JSONDecodeError:
                     continue
                 for msg in self._normalize(obj):
+                    if msg.kind == "usage" and msg.usage:
+                        final_usage = msg.usage
                     if (msg.kind == "session" and msg.session_id
                             and not session_checked):
+                        final_session = msg.session_id
                         _check_session_match(self.name, session_id, msg.session_id)
                         session_checked = True
                     yield msg
-        finally:
             await proc.wait()
             if proc.returncode != 0:
                 err_bytes = await proc.stderr.read() if proc.stderr else b""
-                raise classify(self.name, err_bytes.decode(), "", proc.returncode)
+                err = classify(self.name, err_bytes.decode(), "", proc.returncode)
+                # Mirror sync stream(): record the error turn before raising.
+                _usage_tracker.record(
+                    self.name, model or self.model,
+                    latency_ms=int((time.time() - t0) * 1000),
+                    prompt_preview=prompt, error_kind=err.kind,
+                )
+                raise err
+            # Success — record usage parity with sync stream().
+            _usage_tracker.record(
+                self.name, model or self.model,
+                input_tokens=final_usage.input_tokens or 0,
+                output_tokens=final_usage.output_tokens or 0,
+                cached_tokens=final_usage.cached_tokens or 0,
+                latency_ms=int((time.time() - t0) * 1000),
+                session_id=final_session,
+                prompt_preview=prompt,
+            )
+        finally:
+            if proc.returncode is None:
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+            self._cleanup_temp_files()
 
     def _stream_once(
         self,
