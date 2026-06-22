@@ -402,14 +402,24 @@ gemini = GeminiProvider(
 - Web search is enabled via `-c tools.web_search=true` internally (wrapper
   handles this — just pass `web_search=True`).
 
-### Gemini
-- Default model `gemini-3.1-flash-lite-preview`. Note the `-preview` suffix —
-  dropping it yields a 404.
-- Session resume is index-based, so the wrapper does a `--list-sessions`
-  lookup each turn to translate your UUID to an index (~500 ms overhead).
-- `google_web_search` is structurally always available. `web_search=False` is
-  approximated by `--approval-mode plan` (blocks tool use).
-- `skip_trust=True` is the default so the wrapper works in any directory.
+### Gemini (now the Antigravity `agy` CLI)
+- The old `gemini` CLI is blocked for individual accounts
+  (`IneligibleTierError → migrate to Antigravity`). The `gemini` provider now
+  wraps `agy` (`~/.local/bin/agy`), discovered via `AGY_CLI_PATH` / PATH /
+  `~/.local/bin/agy`.
+- Default model `gemini-3.5-flash`. `agy --model` accepts both slugs
+  (`gemini-3.5-flash`, `gemini-3.1-pro`) and the display names from
+  `agy models` (`Gemini 3.5 Flash (Medium)`, `Claude Sonnet 4.6 (Thinking)`,
+  `GPT-OSS 120B (Medium)`, ...). Unknown names silently fall back to default.
+- Fully agentic: web search / shell / file tools run on the agent's own
+  decision. `--dangerously-skip-permissions` is passed for unattended use, so
+  `skip_permissions=False` if you want it to refuse tool actions.
+- `web_search=` is effectively a no-op — `agy` always may search.
+- Headless output is plain text, so there is **no token-usage reporting**
+  (`usage` fields are `None`).
+- Sessions: `--conversation <UUID>` / `--continue`; the id is read back from
+  the newest `.db` in `~/.gemini/antigravity-cli/conversations/`.
+- This provider defaults to a 300s timeout because agentic loops take longer.
 
 ## Error handling
 

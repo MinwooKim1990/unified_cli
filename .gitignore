@@ -27,3 +27,8 @@ htmlcov/
 
 # Local overrides — anything under .local/ is ignored
 .local/
+
+# Tooling / scratch artifacts (not part of the package)
+.codegraph/
+simulation.md
+workflows/

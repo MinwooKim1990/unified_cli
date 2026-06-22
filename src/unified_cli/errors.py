@@ -52,7 +52,11 @@ HINTS: dict[str, str] = {
     "codex_login":
         "`codex login` 을 재실행하거나 OPENAI_API_KEY 환경변수를 설정하세요.",
     "gemini_login":
-        "`gemini /auth` 를 재실행하거나 GEMINI_API_KEY 환경변수를 설정하세요.",
+        "`agy` 를 실행해 브라우저로 다시 로그인하세요 (Antigravity). "
+        "구 gemini CLI 는 개인 계정에서 차단됨.",
+    "antigravity_migrate":
+        "구 gemini CLI 는 개인 계정 지원 종료 — Antigravity `agy` 로 마이그레이션됨. "
+        "`agy` 설치/로그인 후 사용하세요 (https://antigravity.google).",
     "wait_and_retry":
         "잠시 후 다시 시도하거나 다른 provider/모델로 전환하세요.",
     "check_model_list":
@@ -128,18 +132,24 @@ MATCHERS: dict[ProviderName, list[_Matcher]] = {
         (re.compile(r"\bENOTFOUND\b|\bECONNRESET\b|network|ETIMEDOUT|stream disconnected", re.I),
          "network", "network_retry"),
     ],
+    # "gemini" provider now wraps the Antigravity `agy` CLI (see
+    # providers/gemini.py). Matchers cover both agy errors and the legacy
+    # gemini-CLI IneligibleTier message in case of a fallback binary.
     "gemini": [
-        (re.compile(r"No refresh token is set|invalid_grant|Access blocked: Authorization", re.I),
+        # Legacy gemini CLI individual-tier shutdown → tell user to use agy.
+        (re.compile(r"IneligibleTierError|no longer supported for Gemini Code Assist", re.I),
+         "auth_expired", "antigravity_migrate"),
+        (re.compile(r"No refresh token is set|invalid_grant|Access blocked: Authorization"
+                    r"|not (logged|signed) in|please (log|sign) in|unauthenticated", re.I),
          "auth_expired", "gemini_login"),
         (re.compile(r"\b401\b", re.I), "auth_expired", "gemini_login"),
-        (re.compile(r"\b429\b|RESOURCE_EXHAUSTED|rateLimitExceeded|Quota exceeded", re.I),
+        (re.compile(r"\b429\b|RESOURCE_EXHAUSTED|rateLimitExceeded|Quota exceeded"
+                    r"|quota|G1 credit|credits exhausted|out of credits", re.I),
          "rate_limit", "wait_and_retry"),
-        # Gemini's "Requested entity was not found" overwhelmingly means an invalid
-        # model ID. Session lookup by UUID is pre-checked in GeminiProvider._find_session_index
-        # which raises our own UnifiedError(kind="not_found") before classify runs.
-        (re.compile(r"Requested entity was not found|\b404\b|model.{0,40}not found", re.I),
+        (re.compile(r"Requested entity was not found|\b404\b|model.{0,40}not found"
+                    r"|unknown model|invalid model", re.I),
          "model_not_allowed", "check_model_list"),
-        (re.compile(r"\bENOTFOUND\b|\bECONNRESET\b|network|ETIMEDOUT", re.I),
+        (re.compile(r"\bENOTFOUND\b|\bECONNRESET\b|network|ETIMEDOUT|timed? ?out", re.I),
          "network", "network_retry"),
     ],
 }

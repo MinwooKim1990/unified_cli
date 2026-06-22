@@ -28,7 +28,10 @@ from .core import ModelInfo, ProviderName
 DEFAULT_MODELS: dict[ProviderName, str] = {
     "claude": "claude-haiku-4-5",
     "codex": "gpt-5.4-mini",
-    "gemini": "gemini-3.1-flash-lite-preview",
+    # "gemini" now wraps the Antigravity `agy` CLI. `agy --model` accepts both
+    # slugs ("gemini-3.5-flash") and display names; the slug routes through
+    # factory.route()'s `^gemini` regex, so we default to the slug.
+    "gemini": "gemini-3.5-flash",
 }
 
 # Hardcoded fallback model IDs, used when the official API isn't reachable
@@ -60,21 +63,13 @@ _HARDCODED: dict[ProviderName, list[str]] = {
         "codex-auto-review",       # review specialist
     ],
     "gemini": [
-        # NOTE: We list both the `-preview` suffixed and bare form for the
-        # current 3.x line. The actual valid IDs depend on your subscription
-        # and Google's deployment state — try the one in your account's
-        # /model picker. Phase 0 quota exhaustion blocked us from
-        # distinguishing "invalid ID" from "rate-limited" definitively.
-        "gemini-3.1-pro-preview",
-        "gemini-3.1-pro",                  # may resolve where preview suffix doesn't
-        "gemini-3-flash-preview",
-        "gemini-3.1-flash",
-        "gemini-3.1-flash-lite-preview",   # default (verified live previously)
-        "gemini-3.1-flash-lite",
-        # Legacy 2.5 line — scheduled for shutdown 2026-10-16 per Google docs.
-        "gemini-2.5-pro",
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite",
+        # Antigravity `agy` models. `agy --model` accepts these slug forms as
+        # well as the display names shown by `agy models`. Default fallback if
+        # `agy models` can't be run. Multi-family models (Claude / GPT-OSS) are
+        # also routable through agy but listed under their display names from
+        # `agy models` at runtime.
+        "gemini-3.5-flash",   # default
+        "gemini-3.1-pro",
     ],
 }
 
@@ -163,28 +158,40 @@ def _list_codex() -> list[ModelInfo]:
         return _hardcoded("codex")
 
 
-# ---- Gemini ----
+# ---- Gemini / Antigravity (agy) ----
 
 def _list_gemini() -> list[ModelInfo]:
-    key = (
-        (os.environ.get("GEMINI_API_KEY") or "").strip()
-        or (os.environ.get("GOOGLE_API_KEY") or "").strip()
-    )
-    if not key:
+    """List models via `agy models`. The display names it prints (e.g.
+    "Gemini 3.5 Flash (Medium)", "Claude Sonnet 4.6 (Thinking)") are valid
+    `--model` values. Falls back to the hardcoded slug list if `agy` isn't
+    found or the call fails.
+    """
+    import subprocess
+    from .discovery import find_agy_bin
+
+    agy = find_agy_bin()
+    if not agy:
         return _hardcoded("gemini")
     try:
-        url = f"https://generativelanguage.googleapis.com/v1/models?key={key}"
-        with urllib.request.urlopen(url, timeout=5) as resp:
-            data = json.load(resp)
+        out = subprocess.run(
+            [agy, "models"], capture_output=True, text=True, input="", timeout=15,
+        )
+        if out.returncode != 0:
+            return _hardcoded("gemini")
         items: list[ModelInfo] = []
-        for m in data.get("models") or []:
-            raw_name = m.get("name") or ""  # "models/gemini-3.1-flash"
-            mid = raw_name.split("/", 1)[-1] if raw_name else ""
-            if mid:
+        for line in out.stdout.splitlines():
+            name = line.strip()
+            if not name:
+                continue
+            items.append(ModelInfo(
+                id=name, display_name=name, provider="gemini", source="cache",
+            ))
+        # Also expose the convenient slugs so `-m gemini-3.5-flash` keeps
+        # working and route()'s ^gemini regex matches.
+        for slug in _HARDCODED["gemini"]:
+            if not any(i.id == slug for i in items):
                 items.append(ModelInfo(
-                    id=mid,
-                    display_name=m.get("displayName", ""),
-                    provider="gemini", source="api",
+                    id=slug, provider="gemini", source="hardcoded",
                 ))
         return _mark_defaults(items, "gemini") if items else _hardcoded("gemini")
     except Exception:

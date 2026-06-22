@@ -48,14 +48,15 @@ can import**.
 - **Unified streaming events**: `kind="text" | "tool_use" | "tool_result" |
   "reasoning" | "usage" | "session" | "done" | "error"` — normalized across
   the three native JSONL schemas
-- **Web search by default**: Claude `WebSearch`, Codex `web_search`, Gemini
-  `google_web_search` — all ON unless you pass `web_search=False`
+- **Web search by default**: Claude `WebSearch`, Codex `web_search`. The
+  `gemini` provider (now the Antigravity `agy` CLI) is agentic and decides
+  when to web-search on its own — always available.
 - **Image input** (multimodal, all 3 providers): pass `images=[paths]` to
   `chat()` / `stream()` or `--image foo.png` on the CLI. Each provider uses
   its native vision path:
   - **Codex** — `-i, --image <FILE>` flag (codex CLI 0.129+).
-  - **Gemini** — `@<path>` reference embedded in the prompt; `--approval-mode plan`
-    is automatically relaxed to allow the file read.
+  - **Gemini (`agy`)** — `@<path>` reference embedded in the prompt +
+    `--dangerously-skip-permissions` so the agent can read the file.
   - **Claude** — Routed through Claude Code's built-in `Read` tool with
     `--permission-mode bypassPermissions`; the image path is prepended to
     the prompt. PNG / JPEG / GIF / WebP all supported.
@@ -73,20 +74,23 @@ can import**.
 |---|---|---|
 | Claude | `claude-haiku-4-5` | `claude-opus-4-7` (or alias `opus`) |
 | Codex | `gpt-5.4-mini` | `gpt-5.4` (or `gpt-5.5` if your `codex` CLI is up to date) |
-| Gemini | `gemini-3.1-flash-lite-preview` | `gemini-3.1-pro-preview` |
+| Gemini (`agy`) | `gemini-3.5-flash` | `gemini-3.1-pro` |
 
 Override via `-m <name>`. The wrapper passes any model ID straight through to
-the underlying CLI; `unified-cli models` shows the verified hardcoded list as
-a starting point. For the absolute fastest interactive feel use
-`-m gpt-5.3-codex-spark` (~2.5s per turn vs Claude's 5–6s).
+the underlying CLI; `unified-cli models` shows the available list as a starting
+point. For the absolute fastest interactive feel use `-m gpt-5.3-codex-spark`.
 
-> **Note on Gemini IDs**: Google's 3.x model IDs are in flux — both
-> `gemini-3.1-pro-preview` and bare `gemini-3.1-pro` style IDs exist
-> depending on the rollout state for your account. The wrapper lists both
-> variants in the hardcoded fallback so you can try whichever your
-> subscription actually accepts. The in-app `/model` picker in
-> `gemini` itself is the authoritative list for your account. Quotas are
-> per-model on the free tier.
+> **Gemini → Antigravity migration**: As of 2026, Google blocked the old
+> `gemini` CLI for individual accounts (`IneligibleTierError: ... migrate to
+> the Antigravity suite`). The `gemini` provider now wraps the **Antigravity
+> `agy` CLI** (`~/.local/bin/agy`). `agy` is fully agentic (web search,
+> shell, file tools) and routes to several model families — run
+> `unified-cli models gemini` (which calls `agy models`) to see them, e.g.
+> `Gemini 3.5 Flash (Medium)`, `Gemini 3.1 Pro (High)`,
+> `Claude Sonnet 4.6 (Thinking)`, `GPT-OSS 120B (Medium)`. Both the display
+> names and slugs like `gemini-3.5-flash` work with `-m`. Unknown names
+> silently fall back to the default. Note: `agy` headless mode outputs plain
+> text (no token-usage reporting).
 
 ## Install
 
@@ -280,9 +284,13 @@ Linux/Windows the `claude` binary needs to be on `$PATH`. REPL's arrow-key
 history needs `readline` (stdlib on macOS/Linux; Windows users may need
 `pyreadline3`).
 
-**Gemini session resume** is index-based (CLI limitation). The wrapper does a
-`--list-sessions` lookup each turn to translate UUID → index (~500 ms
-overhead). Works, just slower than the other two.
+**Gemini (`agy`) specifics**: `agy` headless mode prints plain text (no JSON
+event stream), so the wrapper can't surface per-token usage — `tokens in/out`
+shows as `None`. Session resume uses `--conversation <UUID>` / `--continue`;
+the conversation id is recovered from the newest `.db` in
+`~/.gemini/antigravity-cli/conversations/`. Because `agy` runs full agentic
+loops (web/shell/file), a turn can take longer than a one-shot completion, so
+this provider defaults to a larger timeout (300s).
 
 **No persistent usage tracking**: `UsageTracker` keeps per-provider aggregates
 and recent-call history in process memory only. Restart = counters reset. For

@@ -49,16 +49,12 @@ def test_f1_codex_hardcoded_includes_flagship_and_codex_specialists():
     assert "gpt-5.3-codex-spark" in ids
 
 
-def test_f1_gemini_hardcoded_includes_both_preview_and_bare_variants():
+def test_f1_gemini_hardcoded_uses_agy_slugs():
+    # The "gemini" provider now wraps the Antigravity `agy` CLI. The hardcoded
+    # fallback uses agy slug forms; runtime listing comes from `agy models`.
     ids = _HARDCODED["gemini"]
-    # Both -preview and bare variants are listed so users can try whichever
-    # their subscription resolves to (see PHASE0_VERIFICATION.md).
-    assert "gemini-3.1-pro-preview" in ids
-    assert "gemini-3.1-pro" in ids                # bare form also included
-    assert "gemini-3-flash-preview" in ids
-    assert "gemini-3.1-flash" in ids
-    assert "gemini-3.1-flash-lite-preview" in ids
-    assert "gemini-3.1-flash-lite" in ids
+    assert "gemini-3.5-flash" in ids   # default
+    assert "gemini-3.1-pro" in ids
 
 
 # ---- F2: empty API key env guards ----
@@ -75,11 +71,16 @@ def test_f2_whitespace_only_anthropic_key_falls_back():
     assert all(m.source == "hardcoded" for m in models)
 
 
-def test_f2_empty_gemini_key_falls_back():
+def test_f2_gemini_lists_models():
+    # The gemini provider now lists via `agy models` (no API key needed) and
+    # falls back to hardcoded slugs if agy is unavailable. Either way the list
+    # is non-empty and the default slug is present.
     env = {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": ""}
     with patch.dict(os.environ, env, clear=False):
         models = _list_gemini()
-    assert all(m.source == "hardcoded" for m in models)
+    ids = [m.id for m in models]
+    assert models, "gemini model list should not be empty"
+    assert "gemini-3.5-flash" in ids
 
 
 # ---- F3: Claude is_error raise ----

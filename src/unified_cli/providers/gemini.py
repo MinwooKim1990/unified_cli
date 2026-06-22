@@ -1,118 +1,91 @@
-"""Google Gemini CLI provider."""
+"""Antigravity (`agy`) provider — successor to the Google Gemini CLI.
+
+As of 2026, the `gemini` CLI returns `IneligibleTierError: This client is no
+longer supported for Gemini Code Assist for individuals` for personal accounts
+and directs users to migrate to the Antigravity suite (https://antigravity.google).
+The Antigravity CLI is the binary `agy` (typically at ~/.local/bin/agy).
+
+`agy` differs from the old `gemini -p` in important ways, all handled here:
+
+  * **Plain-text output** — `agy -p "<prompt>"` prints a markdown answer to
+    stdout. There is NO `--output-format json|stream-json`; we therefore parse
+    stdout as plain text instead of JSON events.
+  * **Agentic by default** — `agy` runs shell/file/web tools on its own and
+    decides when to web-search (there is no per-call web-search flag). We pass
+    `--dangerously-skip-permissions` so unattended headless calls don't block
+    on tool-approval prompts.
+  * **Sessions** — `--continue`/`-c` resumes the most recent conversation;
+    `--conversation <UUID>` resumes a specific one. Conversations are stored as
+    `~/.gemini/antigravity-cli/conversations/<UUID>.db` (SQLite); the newest by
+    mtime is the one just used, which is how we recover a session id.
+  * **Models** — `agy models` lists human names ("Gemini 3.5 Flash (Medium)",
+    "Claude Sonnet 4.6 (Thinking)", "GPT-OSS 120B (Medium)", ...). `--model`
+    accepts both those display names and slugs like `gemini-3.5-flash`. Unknown
+    model names silently fall back to the default (no error).
+  * **Images** — `@/path/to/img.png` references in the prompt + skip-permissions.
+
+The provider key stays `"gemini"` for backward compatibility (route regex,
+factory registration, server/CLI surfaces, docs).
+"""
 
 from __future__ import annotations
 
-import json
+import asyncio
 import os
-import re
 import subprocess
-from typing import Iterator, Optional
+from typing import AsyncIterator, Iterator, Optional
 
 from ..base import BaseProvider
 from ..core import Message, Response, Usage
-from ..discovery import find_gemini_bin
+from ..discovery import find_agy_bin
 from ..errors import UnifiedError, classify
 
 
-_SESSION_LINE = re.compile(
-    r"^\s*(\d+)\.\s+(.*?)\s+\([^)]*\)\s+\[([0-9a-fA-F\-]+)\]\s*$"
-)
+_INELIGIBLE_MARKERS = ("IneligibleTierError", "no longer supported", "migrate to")
 
 
 class GeminiProvider(BaseProvider):
     name = "gemini"
-    default_model = "gemini-3.1-flash-lite-preview"
-    api_key_env = "GEMINI_API_KEY"
-    login_hint = "`gemini /auth` 를 재실행하세요."
+    default_model = "gemini-3.5-flash"
+    api_key_env = "GEMINI_API_KEY"   # agy uses OAuth; kept for base fallback API
+    login_hint = "`agy` 를 실행해 브라우저로 로그인하세요 (Antigravity)."
 
     def __init__(
         self,
         *,
-        approval_mode: Optional[str] = None,   # default | auto_edit | yolo | plan
-        yolo: bool = False,
+        skip_permissions: bool = True,   # auto-approve tools (unattended use)
         sandbox: bool = False,
-        skip_trust: bool = True,
-        include_directories: Optional[list[str]] = None,
-        extensions: Optional[list[str]] = None,
-        allowed_mcp_servers: Optional[list[str]] = None,
+        add_dirs: Optional[list[str]] = None,
+        conversations_dir: Optional[str] = None,
         **kw,
     ):
         super().__init__(**kw)
-        self.approval_mode = "yolo" if yolo else approval_mode
+        self.skip_permissions = skip_permissions
         self.sandbox = sandbox
-        self.skip_trust = skip_trust
-        self.include_directories = list(include_directories or [])
-        self.extensions = extensions
-        self.allowed_mcp_servers = allowed_mcp_servers
-        # Gemini's google_web_search is ON by default. `web_search=False` is
-        # approximated by switching approval_mode to "plan" (read-only, no
-        # tool calls), unless user explicitly set another approval_mode.
-        if not self.web_search and self.approval_mode is None:
-            self.approval_mode = "plan"
+        self.add_dirs = list(add_dirs or [])
+        self._conv_dir = conversations_dir or os.path.expanduser(
+            "~/.gemini/antigravity-cli/conversations"
+        )
+        # agy runs full agentic loops (shell, web, files) which take longer
+        # than a one-shot completion. If the caller didn't pin a timeout, give
+        # agy more room than the base default.
+        if kw.get("timeout") is None:
+            self.timeout = max(self.timeout, 300)
+            self.stream_timeout = max(self.stream_timeout, 600)
+        # Tracks the session id requested for the current call so the response
+        # reports the same id (avoids spurious session-mismatch errors).
+        self._pending_session: Optional[str] = None
 
     @classmethod
     def _discover_bin(cls) -> Optional[str]:
-        return find_gemini_bin()
+        return find_agy_bin()
 
     @classmethod
     def _install_hint(cls) -> str:
-        return "`npm i -g @google/gemini-cli`."
+        return ("Antigravity CLI `agy` 를 설치하세요 (https://antigravity.google). "
+                "또는 AGY_CLI_PATH 환경변수로 경로 지정.")
 
-    def _env(self, fallback_api_key: bool = False) -> dict:
-        env = super()._env(fallback_api_key)
-        if self.skip_trust:
-            env.setdefault("GEMINI_CLI_TRUST_WORKSPACE", "true")
-        return env
-
-    def _common_flags(
-        self, model: Optional[str], streaming: bool,
-        *, allow_tools: bool = False,
-    ) -> list[str]:
-        args: list[str] = [
-            "--output-format", "stream-json" if streaming else "json",
-        ]
-        if self.skip_trust:
-            args += ["--skip-trust"]
-        args += ["-m", model or self.model]
-        # `--approval-mode plan` is read-only and blocks tool calls — but
-        # Gemini treats `@<path>` image refs as a tool invocation, so plan
-        # mode silently swallows them. When the caller wires up images we
-        # bypass plan and rely on the default approval policy instead.
-        approval = None if allow_tools and self.approval_mode == "plan" \
-                        else self.approval_mode
-        if approval:
-            args += ["--approval-mode", approval]
-        if self.sandbox:
-            args += ["-s"]
-        if self.include_directories:
-            args += ["--include-directories", ",".join(self.include_directories)]
-        if self.extensions is not None:
-            for e in self.extensions:
-                args += ["-e", e]
-        if self.allowed_mcp_servers is not None:
-            args += ["--allowed-mcp-server-names", ",".join(self.allowed_mcp_servers)]
-        return args
-
-    def _find_session_index(self, session_id: str) -> int:
-        """Parse --list-sessions output to find the index for a given UUID."""
-        args = [self.bin_path, "--list-sessions"]
-        if self.skip_trust:
-            args += ["--skip-trust"]
-        out = subprocess.run(
-            args, capture_output=True, text=True,
-            cwd=self.cwd, env=self._env(), timeout=self.timeout,
-        )
-        if out.returncode != 0:
-            raise classify(self.name, out.stderr, out.stdout, out.returncode)
-        for line in out.stdout.splitlines():
-            m = _SESSION_LINE.match(line)
-            if m and m.group(3).lower() == session_id.lower():
-                return int(m.group(1))
-        raise UnifiedError(
-            kind="not_found", provider="gemini",
-            message=f"session_id {session_id} 를 현재 프로젝트에서 찾을 수 없습니다.",
-            hint="같은 cwd 에서 실행 중인지 확인하세요.",
-        )
+    # ----- argv construction -----
 
     def _build_args(
         self,
@@ -124,24 +97,33 @@ class GeminiProvider(BaseProvider):
         streaming: bool,
         images: Optional[list] = None,
     ) -> tuple[list[str], Optional[str]]:
-        args = [self.bin_path] + self._common_flags(
-            model, streaming, allow_tools=bool(images),
-        )
-        if session_id:
-            idx = self._find_session_index(session_id)
-            args += ["-r", str(idx)]
-        elif resume_last:
-            args += ["-r", "latest"]
+        self._pending_session = session_id
 
-        # Gemini CLI has no dedicated image flag in `-p` headless mode. Its
-        # interactive parser recognizes `@path` references inside the prompt
-        # and inlines the file content. We splice those in front of the user
-        # prompt and rely on this same syntax surviving headless mode (which
-        # current Gemini CLI versions appear to). Bytes/URL inputs are
-        # materialized to a temp file first.
+        argv: list[str] = [self.bin_path]
+
+        model_str = model or self.model
+        if model_str:
+            argv += ["--model", model_str]
+
+        if session_id:
+            argv += ["--conversation", session_id]
+        elif resume_last:
+            argv += ["--continue"]
+
+        if self.skip_permissions:
+            argv += ["--dangerously-skip-permissions"]
+        if self.sandbox:
+            argv += ["--sandbox"]
+        for d in self.add_dirs:
+            argv += ["--add-dir", d]
+
+        # Align agy's own print timeout with our subprocess timeout window.
+        window = int(self.stream_timeout if streaming else self.timeout)
+        argv += ["--print-timeout", f"{window}s"]
+
         full_prompt = self._inject_image_refs(prompt, images)
-        args += ["-p", full_prompt]
-        return args, None
+        argv += ["-p", full_prompt]
+        return argv, None
 
     def _inject_image_refs(self, prompt: str, images) -> str:
         if not images:
@@ -149,13 +131,12 @@ class GeminiProvider(BaseProvider):
         from ..core import normalize_images
         refs = []
         for att in normalize_images(images):
-            path = self._materialize(att)
-            refs.append(f"@{path}")
+            refs.append(f"@{self._materialize(att)}")
         return " ".join(refs) + " " + prompt
 
     def _materialize(self, att) -> str:
         if att.path:
-            return att.path
+            return os.path.abspath(os.path.expanduser(att.path))
         if att.bytes_:
             import tempfile
             ext = (att.media_type or "image/png").split("/")[-1]
@@ -167,130 +148,160 @@ class GeminiProvider(BaseProvider):
         if att.url:
             raise UnifiedError(
                 kind="config", provider="gemini",
-                message="Gemini @<path> 는 로컬 파일만 받습니다. URL 은 미리 다운로드하세요.",
+                message="agy `@<path>` 는 로컬 파일만 받습니다. URL 은 미리 다운로드하세요.",
             )
         raise UnifiedError(
-            kind="config", provider="gemini",
-            message="비어있는 이미지 첨부.",
+            kind="config", provider="gemini", message="비어있는 이미지 첨부.",
+        )
+
+    # ----- session id recovery -----
+
+    def _latest_conversation_id(self) -> Optional[str]:
+        """Newest <UUID>.db in the conversations dir = the conversation just
+        used/created by agy."""
+        try:
+            entries = [
+                f for f in os.listdir(self._conv_dir) if f.endswith(".db")
+            ]
+        except OSError:
+            return None
+        if not entries:
+            return None
+        newest = max(
+            entries,
+            key=lambda f: os.path.getmtime(os.path.join(self._conv_dir, f)),
+        )
+        return newest[:-3]  # strip ".db"
+
+    def _resolve_session_id(self) -> str:
+        return self._pending_session or self._latest_conversation_id() or ""
+
+    # ----- response parsing (plain text) -----
+
+    def _check_ineligible(self, text: str) -> None:
+        if any(m in text for m in _INELIGIBLE_MARKERS) and "IneligibleTier" in text:
+            raise UnifiedError(
+                kind="auth_expired", provider="gemini",
+                message="이 클라이언트는 더 이상 지원되지 않습니다 — Antigravity(`agy`)로 마이그레이션됨.",
+                hint="`agy` 로 로그인했는지 확인하세요. 구 gemini CLI 는 개인 계정에서 차단됨.",
+                cause=text[:300],
+            )
+
+    def _parse_json_response(self, text: str, model: str) -> Response:
+        # NOTE: method name kept for the BaseProvider contract, but agy emits
+        # plain text (markdown), not JSON. The entire stdout IS the answer.
+        self._check_ineligible(text)
+        return Response(
+            text=text.strip(),
+            session_id=self._resolve_session_id(),
+            provider="gemini",
+            model=model,
+            usage=Usage(),  # agy headless does not report token usage
+            messages=[],
+            raw=[{"text": text}],
         )
 
     def _normalize(self, obj: dict) -> Iterator[Message]:
-        t = obj.get("type", "")
+        # Unused: agy produces no JSON event stream. Streaming is handled by the
+        # overridden _stream_run / astream below. Required by the ABC.
+        yield from ()
 
-        if t == "init":
-            sid = obj.get("session_id")
-            if sid:
-                yield Message(kind="session", provider="gemini",
-                              session_id=sid, raw=obj)
-            return
+    # ----- streaming (plain text, line-buffered) -----
 
-        if t == "message":
-            role = obj.get("role")
-            content = obj.get("content")
-            if role == "assistant" and content:
-                yield Message(kind="text", provider="gemini",
-                              text=content, raw=obj)
-            return
-
-        if t == "tool_use":
-            yield Message(
-                kind="tool_use", provider="gemini",
-                tool={"name": obj.get("tool_name"),
-                      "input": obj.get("parameters"),
-                      "id": obj.get("tool_id")},
-                raw=obj,
-            )
-            return
-
-        if t == "tool_result":
-            yield Message(
-                kind="tool_result", provider="gemini",
-                tool={"id": obj.get("tool_id"),
-                      "output": obj.get("output"),
-                      "is_error": obj.get("status") != "success"},
-                raw=obj,
-            )
-            return
-
-        if t == "result":
-            stats = obj.get("stats") or {}
-            yield Message(
-                kind="usage", provider="gemini",
-                usage=Usage(
-                    input_tokens=stats.get("input_tokens"),
-                    output_tokens=stats.get("output_tokens"),
-                    cached_tokens=stats.get("cached"),
-                    total_tokens=stats.get("total_tokens"),
-                ),
-                raw=obj,
-            )
-            yield Message(kind="done", provider="gemini", raw=obj)
-            return
-
-        if t == "error":
-            err = obj.get("error") or obj.get("message") or obj
-            yield Message(kind="error", provider="gemini",
-                          error=str(err), raw=obj)
-
-    def _parse_json_response(self, text: str, model: str) -> Response:
-        start = text.find("{")
-        if start < 0:
-            raise UnifiedError(
-                kind="internal", provider="gemini",
-                message="Gemini CLI 응답에 JSON이 없습니다.",
-                cause=text[:300],
-            )
-        data = json.loads(text[start:])
-
-        # Aggregate router+main model token stats.
-        tot_in = tot_out = tot_cached = tot = 0
-        models_stats = (data.get("stats") or {}).get("models") or {}
-        for m in models_stats.values():
-            tks = (m.get("tokens") or {})
-            tot_in += tks.get("input", 0) or tks.get("prompt", 0)
-            tot_out += tks.get("candidates", 0) or tks.get("output", 0)
-            tot_cached += tks.get("cached", 0)
-            tot += tks.get("total", 0)
-
-        if data.get("error"):
-            raise UnifiedError(
-                kind="internal", provider="gemini",
-                message=str(data["error"].get("message")
-                            if isinstance(data["error"], dict)
-                            else data["error"]),
-                cause=text[:300],
-            )
-
-        return Response(
-            text=data.get("response", ""),
-            session_id=data.get("session_id", ""),
-            provider="gemini",
-            model=model,
-            usage=Usage(
-                input_tokens=tot_in or None,
-                output_tokens=tot_out or None,
-                cached_tokens=tot_cached or None,
-                total_tokens=tot or None,
-            ),
-            messages=[],
-            raw=[data],
+    def _stream_run(
+        self, args: list[str], stdin_data: Optional[str] = None
+    ) -> Iterator[Message]:
+        proc = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE if stdin_data else None,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, cwd=self.cwd, env=self._env(), bufsize=1,
         )
+        if stdin_data and proc.stdin:
+            try:
+                proc.stdin.write(stdin_data)
+                proc.stdin.flush()
+                proc.stdin.close()
+            except BrokenPipeError:
+                pass
+        assert proc.stdout is not None
+        produced = False
+        collected: list[str] = []
+        try:
+            for line in proc.stdout:
+                collected.append(line)
+                if line.strip():
+                    produced = True
+                    yield Message(kind="text", provider="gemini",
+                                  text=line, raw={"line": line})
+        finally:
+            try:
+                proc.wait(timeout=self.stream_timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                raise UnifiedError(
+                    kind="network", provider="gemini",
+                    message=f"agy 스트림이 {self.stream_timeout}초 안에 끝나지 않음.",
+                    hint="긴 에이전트 작업이면 timeout 을 늘리세요.",
+                )
+            stderr_text = proc.stderr.read() if proc.stderr else ""
+
+        full = "".join(collected)
+        if proc.returncode not in (0, None):
+            self._check_ineligible(full + "\n" + stderr_text)
+            err = classify(self.name, stderr_text, full, proc.returncode)
+            err._produced_any = produced  # type: ignore[attr-defined]
+            raise err
+
+        self._check_ineligible(full)
+        sid = self._resolve_session_id()
+        if sid:
+            yield Message(kind="session", provider="gemini", session_id=sid, raw={})
+        yield Message(kind="done", provider="gemini", raw={})
+
+    async def astream(
+        self,
+        prompt: str,
+        *,
+        session_id: Optional[str] = None,
+        resume_last: bool = False,
+        model: Optional[str] = None,
+        images: Optional[list] = None,
+    ) -> AsyncIterator[Message]:
+        # agy has no async event stream; run the blocking call in an executor
+        # and surface the result as text → session → done.
+        loop = asyncio.get_event_loop()
+        resp = await loop.run_in_executor(
+            None,
+            lambda: self.chat(
+                prompt, session_id=session_id, resume_last=resume_last,
+                model=model, images=images,
+            ),
+        )
+        if resp.text:
+            yield Message(kind="text", provider="gemini", text=resp.text, raw={})
+        if resp.session_id:
+            yield Message(kind="session", provider="gemini",
+                          session_id=resp.session_id, raw={})
+        yield Message(kind="done", provider="gemini", raw={})
+
+    # ----- session listing -----
 
     def list_sessions(self) -> list[dict]:
-        args = [self.bin_path, "--list-sessions"]
-        if self.skip_trust:
-            args += ["--skip-trust"]
-        out = subprocess.run(
-            args, capture_output=True, text=True,
-            cwd=self.cwd, env=self._env(), timeout=self.timeout,
+        """List conversations from the agy conversations dir (newest first)."""
+        try:
+            entries = [
+                f for f in os.listdir(self._conv_dir) if f.endswith(".db")
+            ]
+        except OSError:
+            return []
+        entries.sort(
+            key=lambda f: os.path.getmtime(os.path.join(self._conv_dir, f)),
+            reverse=True,
         )
-        sessions: list[dict] = []
-        for line in out.stdout.splitlines():
-            m = _SESSION_LINE.match(line)
-            if m:
-                sessions.append({
-                    "index": int(m.group(1)),
-                    "title": m.group(2),
-                    "session_id": m.group(3),
-                })
-        return sessions
+        return [
+            {"session_id": f[:-3],
+             "mtime": os.path.getmtime(os.path.join(self._conv_dir, f))}
+            for f in entries
+        ]
