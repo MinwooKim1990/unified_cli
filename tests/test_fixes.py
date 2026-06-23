@@ -1,4 +1,4 @@
-"""Regression tests for the fixes in FIX_PLAN.md (F1–F4 + U3).
+"""Regression tests for the audit fixes (F1–F4 + U3).
 
 UI fixes (U1/U2/U4) are exercised via manual smoke and not unit-tested
 because they depend on argparse/rich output formatting.

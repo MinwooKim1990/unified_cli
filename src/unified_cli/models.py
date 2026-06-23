@@ -36,7 +36,7 @@ DEFAULT_MODELS: dict[ProviderName, str] = {
 
 # Hardcoded fallback model IDs, used when the official API isn't reachable
 # (no API key set, or the request fails). These are the IDs verified end-to-end
-# via Phase 0 live testing — see PHASE0_VERIFICATION.md.
+# via Phase 0 live testing against each CLI.
 #
 # Single source of truth for both `unified-cli models` output AND the hint text
 # in errors.py; do not duplicate elsewhere.
