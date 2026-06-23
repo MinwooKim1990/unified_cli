@@ -1,0 +1,65 @@
+name: Publish to PyPI
+
+# Publishes via PyPI Trusted Publishing (OIDC) — no stored API token.
+# Configure the trusted publisher on PyPI before the first automated run
+# (see RELEASING.md): owner MinwooKim1990, repo unified_cli,
+# workflow publish.yml, environment pypi.
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build distributions
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade pip build twine
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Check distribution metadata
+        run: twine check dist/*
+
+      - name: Upload distributions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # Trusted Publishing requires an OIDC token; the `pypi` environment
+    # must match the one configured on the PyPI publisher.
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distributions artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        # No username/password/token: OIDC Trusted Publishing handles auth.

@@ -1,10 +1,42 @@
 # unified-cli
 
+[![PyPI version](https://img.shields.io/pypi/v/unified-cli)](https://pypi.org/project/unified-cli/)
+[![Python versions](https://img.shields.io/pypi/pyversions/unified-cli)](https://pypi.org/project/unified-cli/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 🇺🇸 [English README](README.md) · 📖 [상세 가이드 (한국어)](USAGE.ko.md) · 📖 [Detailed usage (EN)](USAGE.md)
 
 Claude Code / OpenAI Codex / Google Antigravity(`agy`) 세 CLI를 **하나의 Python API + CLI** 로 통합.
 
 > Google 쪽 provider 키는 여전히 `"gemini"` (그리고 `-m gemini-3.5-flash` 등도 그대로 라우팅) 이지만, 내부적으로 **Antigravity `agy` CLI** 를 래핑합니다 — 2026년 구 `gemini` CLI 가 개인 계정에서 차단됐기 때문. 아래 마이그레이션 노트 참고.
+
+## 설치
+
+```bash
+pip install unified-cli
+```
+
+OpenAI 호환 HTTP 서버까지 쓰려면 `server` 옵션 의존성을 함께 설치:
+
+```bash
+pip install "unified-cli[server]"
+```
+
+> **사전 준비 — 이 패키지는 아무것도 설치하거나 로그인시키지 않습니다.**
+> `unified-cli` 는 이미 설치된 공식 에이전틱 CLI 들에 그저 명령을 위임하는 얇은
+> 래퍼입니다. **API 키도 자격증명도 포함하지 않으며**, 자체적으로 **어떤
+> 자격증명도 저장하거나 전송하지 않습니다** — 모든 호출은 사용자 머신에 이미
+> 되어 있는 로그인을 그대로 재사용합니다.
+>
+> 각 provider 를 쓰려면 해당 CLI 가 설치되어 있고 **본인 구독으로 로그인**되어
+> 있어야 합니다:
+>
+> - **Claude** → `claude` CLI (Claude Code), Claude Pro/Max 로그인
+> - **Codex** → `codex` CLI, ChatGPT Plus/Pro 로그인
+> - **Gemini** → `agy` CLI (Google Antigravity), Google Antigravity 계정 로그인
+>
+> 셋 다 필요하지 않습니다 — **일부만 있어도 동작**합니다. 래퍼는 `$PATH` 에서
+> 발견되는 `claude` / `codex` / `agy` 만 사용합니다.
 
 - 구독 OAuth (Pro/Max, ChatGPT Plus/Pro, Antigravity) 로 로그인되어 있으면 **구독 크레딧으로** 실행
 - Claude/Codex 는 API 키 환경변수로 **자동 폴백** (agy 는 OAuth 전용)
@@ -13,19 +45,24 @@ Claude Code / OpenAI Codex / Google Antigravity(`agy`) 세 CLI를 **하나의 Py
 - 대화형 **REPL** (`unified-cli repl`) + 슬래시 명령
 - 명시적 에러 분류 (auth_expired / rate_limit / model_not_allowed / not_found / network / config / internal)
 
-## 설치
+## 소스에서 설치 (개발용)
 
 ```bash
-git clone <repo-url> cli-wrapper-unified   # 또는 로컬 경로로 이동
+git clone https://github.com/MinwooKim1990/unified_cli.git cli-wrapper-unified
 cd cli-wrapper-unified
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[server,dev]'
 
-unified-cli setup      # 최초 1회: 대화형 온보딩 (CLI 설치 + 로그인 + 검증)
+unified-cli setup      # 최초 1회: 대화형 온보딩 위저드 (아래 설명 참고)
 unified-cli doctor     # 언제든지 환경 상태 점검
 unified-cli status     # 사용량/최근 호출 스냅샷
 ```
+
+Python 3.9+ 와 `claude` / `codex` / `agy` 중 **최소 하나가 이미 설치 + 로그인**되어
+있어야 합니다 — 위 **사전 준비** 참고. `setup` 위저드는 빠진 CLI 의 공식 설치
+명령을 *제안*하고 각 provider 의 브라우저 로그인을 열어줄 뿐이며, 자격증명을
+저장하지 않고 어느 단계든 거부할 수 있습니다.
 
 ### CLI 세션 관리
 
@@ -201,7 +238,7 @@ except UnifiedError as e:
 ```
 
 동작:
-- **auth_expired**: `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` 환경변수가 있으면 **자동으로 1회 재시도**. 없으면 hint 포함한 에러 raise
+- **auth_expired**: Claude/Codex 는 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` 환경변수가 있으면 **자동으로 1회 재시도**. 없으면 hint 포함한 에러 raise. Gemini provider(Antigravity `agy`)는 **OAuth 전용**이라 API 키 폴백이 없으니 `agy` 재로그인이 필요
 - **network**: exponential backoff (0.5s, 1.5s) 로 최대 2회 재시도
 - **rate_limit / model_not_allowed / not_found**: 즉시 raise
 
@@ -300,9 +337,10 @@ r = client.chat.completions.create(
 |---|---|---|
 | Claude | `GET https://api.anthropic.com/v1/models` (`$ANTHROPIC_API_KEY` 있을 때) | 1시간 메모리 캐시 |
 | Codex | `~/.codex/models_cache.json` (Codex CLI가 5분마다 업데이트) | 파일 기준 |
-| Gemini | `GET https://generativelanguage.googleapis.com/v1/models` (`$GEMINI_API_KEY`) | 1시간 |
+| Gemini (`agy`) | `agy models` 출력 (Antigravity CLI 가 직접 표시) | 1시간 |
 
-API 키 없을 때는 하드코딩된 주요 모델 리스트로 폴백. **임의 모델 ID 는 리스트에 없어도 그대로 CLI 에 전달** — allowlist 는 정보용.
+`agy` 를 찾지 못하거나 호출에 실패하면 하드코딩된 주요 모델 리스트로 폴백.
+**임의 모델 ID 는 리스트에 없어도 그대로 CLI 에 전달** — allowlist 는 정보용.
 
 ## 패키지 구조
 

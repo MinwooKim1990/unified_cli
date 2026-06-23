@@ -1,0 +1,28 @@
+# Documentation and metadata to ship in the sdist
+include LICENSE
+include README.md
+include README.ko.md
+include USAGE.md
+include USAGE.ko.md
+include CHANGELOG.md
+
+# Typed marker
+include src/unified_cli/py.typed
+
+# Keep the test suite in the sdist
+recursive-include tests *.py
+
+# Exclude internal development docs
+exclude FIX_PLAN.md
+exclude PHASE0_VERIFICATION.md
+exclude UX_TEST_REPORT.md
+exclude simulation.md
+
+# Prune build/dev/cache noise
+prune .venv
+prune .codegraph
+prune .pytest_cache
+prune workflows
+
+# Drop bytecode and OS cruft everywhere
+global-exclude __pycache__ *.py[cod] .DS_Store

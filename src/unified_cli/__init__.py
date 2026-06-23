@@ -36,6 +36,8 @@ Error handling:
         e.hint  # 사용자용 복구 힌트
 """
 
+__version__ = "0.1.0"
+
 from .base import BaseProvider
 from .conversation import UnifiedConversation
 from .core import Message, ModelInfo, ProviderName, Response, Usage
@@ -47,6 +49,7 @@ from .state import SessionState, load_last_session, save_last_session
 from .usage import UsageTracker, tracker
 
 __all__ = [
+    "__version__",
     "BaseProvider",
     "ClaudeProvider",
     "CodexProvider",

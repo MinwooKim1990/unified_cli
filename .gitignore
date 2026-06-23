@@ -10,6 +10,7 @@ __pycache__/
 
 # Package build artifacts
 *.egg-info/
+*.egg
 dist/
 build/
 .eggs/
@@ -31,4 +32,5 @@ htmlcov/
 # Tooling / scratch artifacts (not part of the package)
 .codegraph/
 simulation.md
-workflows/
+# Root-level scratch dir only — anchored so it does NOT match .github/workflows/
+/workflows/

@@ -3,7 +3,40 @@
 **One Python + CLI interface for Claude Code, OpenAI Codex, and Google
 Antigravity (`agy`).**
 
+[![PyPI version](https://img.shields.io/pypi/v/unified-cli)](https://pypi.org/project/unified-cli/)
+[![Python versions](https://img.shields.io/pypi/pyversions/unified-cli)](https://pypi.org/project/unified-cli/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 🇰🇷 [한국어 README](README.ko.md) · 📖 [Detailed usage (EN)](USAGE.md) · 📖 [상세 가이드 (한국어)](USAGE.ko.md)
+
+## Install
+
+```bash
+pip install unified-cli
+```
+
+For the OpenAI-compatible HTTP server, install the optional `server` extra:
+
+```bash
+pip install "unified-cli[server]"
+```
+
+> **Prerequisites — this package installs and authenticates _nothing_.**
+> `unified-cli` is a thin wrapper that shells out to the official agentic CLIs
+> you already have. It ships **no API keys and no credentials**, and it
+> **stores or transmits no credentials of its own** — every call reuses the
+> login already on your machine.
+>
+> Before using a provider you must have installed the corresponding CLI **and
+> signed in with your own subscription**:
+>
+> - **Claude** → the `claude` CLI (Claude Code), logged in with Claude Pro/Max
+> - **Codex** → the `codex` CLI, logged in with ChatGPT Plus/Pro
+> - **Gemini** → the `agy` CLI (Google Antigravity), logged in with your Google
+>   Antigravity account
+>
+> **Any subset works** — you do not need all three. The wrapper simply uses
+> whichever of `claude` / `codex` / `agy` it finds on your `$PATH`.
 
 Use all three AI coding CLIs — each signed in with your personal subscription
 (Claude Pro/Max, ChatGPT Plus/Pro, Google Antigravity) — from a single unified
@@ -98,7 +131,7 @@ point. For the absolute fastest interactive feel use `-m gpt-5.3-codex-spark`.
 > silently fall back to the default. Note: `agy` headless mode outputs plain
 > text (no token-usage reporting).
 
-## Install
+## Install from source (development)
 
 ```bash
 git clone https://github.com/MinwooKim1990/unified_cli.git
@@ -107,12 +140,15 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -e '.[server,dev]'
 
-unified-cli setup     # first-time onboarding (installs + logs into 3 CLIs)
+unified-cli setup     # first-time onboarding wizard (see note below)
 ```
 
 Requires Python 3.9+ and at least one of `claude`, `codex`, `agy` already
-installed (the setup wizard installs Claude/Codex via npm/brew; `agy` ships
-with the Antigravity suite — https://antigravity.google).
+installed and logged in — see **Prerequisites** above. The optional `setup`
+wizard only *suggests* the official install commands for any missing CLI (e.g.
+npm/brew for Claude/Codex; `agy` ships with the Antigravity suite —
+https://antigravity.google) and opens each provider's own browser login; it
+never stores credentials and you can decline any step.
 
 ## Usage at a glance
 
@@ -266,7 +302,8 @@ client.chat.completions.create(
 ## Known limitations
 
 **Speed**: every call spawns a fresh subprocess (`claude -p` / `codex exec` /
-`gemini -p`) — these CLIs don't support a long-lived daemon. Measured latency:
+`agy` for the `gemini` provider) — these CLIs don't support a long-lived
+daemon. Measured latency:
 
 | Stage | Claude | Codex | Gemini |
 |---|---|---|---|
@@ -278,8 +315,8 @@ For the absolute fastest interactive feel, use `-m gpt-5.3-codex-spark`. Even
 then, expect 2–3 seconds per turn. This is a **structural limit of the
 subprocess architecture** — not something the wrapper can fix without either
 (a) losing subscription auth by calling provider APIs directly, or (b) using
-experimental daemon modes (`codex app-server`, `gemini --acp`) that aren't
-fully stable yet.
+experimental daemon modes (e.g. `codex app-server`) that aren't fully stable
+yet.
 
 **Subscription ToS**: each provider's terms forbid reselling/exposing your
 personal subscription as a third-party service. This wrapper is designed for
