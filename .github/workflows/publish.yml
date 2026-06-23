@@ -15,6 +15,13 @@ on:
 permissions:
   contents: read
 
+# A GitHub Release that creates a new tag fires BOTH `release: published` and
+# `push: tags` — two runs for the same ref. Serialize them (don't cancel, so an
+# in-flight upload finishes) and let `skip-existing` make the second a no-op.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     name: Build distributions
@@ -63,3 +70,7 @@ jobs:
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         # No username/password/token: OIDC Trusted Publishing handles auth.
+        with:
+          # If the other trigger already uploaded these files, skip instead of
+          # failing with "file already exists" (400).
+          skip-existing: true
