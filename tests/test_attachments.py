@@ -139,12 +139,17 @@ def test_attachment_url_bytes_raises():
 
 
 # ---- provider _build_args integration (no live calls) ----
+# These construct providers only to exercise _build_args. We pass an explicit
+# `bin_path` stub so the constructor skips binary discovery — otherwise the
+# tests would require claude/codex/agy to be installed (they fail in CI, which
+# has none of the CLIs). _build_args never executes the binary; argv[0] is the
+# stub and no assertion below depends on it.
 
 def test_codex_build_args_with_image_uses_stdin():
     from unified_cli import create
     p = _make_dummy_png()
     try:
-        cli = create("codex", web_search=False)
+        cli = create("codex", web_search=False, bin_path="codex")
         argv, stdin = cli._build_args(
             "describe", session_id=None, resume_last=False,
             model="gpt-5.4-mini", streaming=False, images=[p],
@@ -160,7 +165,7 @@ def test_codex_build_args_with_image_uses_stdin():
 
 def test_codex_build_args_no_image_uses_argv():
     from unified_cli import create
-    cli = create("codex", web_search=False)
+    cli = create("codex", web_search=False, bin_path="codex")
     argv, stdin = cli._build_args(
         "hi", session_id=None, resume_last=False,
         model="gpt-5.4-mini", streaming=False, images=None,
@@ -175,7 +180,7 @@ def test_claude_build_args_with_image_uses_read_tool():
     from unified_cli import create
     p = _make_dummy_png()
     try:
-        cli = create("claude", web_search=False)
+        cli = create("claude", web_search=False, bin_path="claude")
         argv, stdin = cli._build_args(
             "describe", session_id=None, resume_last=False,
             model="haiku", streaming=False, images=[p],
@@ -198,7 +203,7 @@ def test_gemini_build_args_with_image_injects_at_path():
     from unified_cli import create
     p = _make_dummy_png()
     try:
-        cli = create("gemini", web_search=False)
+        cli = create("gemini", web_search=False, bin_path="agy")
         argv, stdin = cli._build_args(
             "describe", session_id=None, resume_last=False,
             model="gemini-3.5-flash", streaming=False, images=[p],
