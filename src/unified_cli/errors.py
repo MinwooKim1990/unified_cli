@@ -1,8 +1,14 @@
 """Unified error classification.
 
 Every subprocess failure is funneled through `classify(provider, stderr, stdout,
-exitcode)` which returns a `UnifiedError` with a stable `kind` + Korean user
+exitcode)` which returns a `UnifiedError` with a stable `kind` + localized user
 message + recovery hint + short `cause` summary.
+
+The regex matcher tables that classify external CLI output (claude/codex/agy
+stderr) are intentionally NOT localized — they match the wrapped CLIs' own
+English/JSON output and must stay verbatim. Only the messages/hints WE present
+to the user are routed through `i18n.t()`, resolved at call time so the active
+language (which may be set after import) is honored.
 """
 
 from __future__ import annotations
@@ -12,6 +18,7 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 
 from .core import ProviderName
+from .i18n import t
 
 
 ErrorKind = Literal[
@@ -40,58 +47,68 @@ class UnifiedError(Exception):
         if self.hint:
             base += f"\n  → {self.hint}"
         if self.cause:
-            base += f"\n  (원인: {self.cause[:200]})"
+            base += f"\n  ({t('err.cause_label')}: {self.cause[:200]})"
         return base
 
 
 # ---- hint texts (referenced by matcher tables) ----
+#
+# Each entry maps a matcher hint_key → the i18n key whose template is resolved
+# at classify() time (so the active language wins, not the import-time one).
 
-HINTS: dict[str, str] = {
-    "claude_login":
-        "`claude /login` 을 재실행하거나 ANTHROPIC_API_KEY 환경변수를 설정하세요.",
-    "codex_login":
-        "`codex login` 을 재실행하거나 OPENAI_API_KEY 환경변수를 설정하세요.",
-    "gemini_login":
-        "`agy` 를 실행해 브라우저로 다시 로그인하세요 (Antigravity). "
-        "구 gemini CLI 는 개인 계정에서 차단됨.",
-    "antigravity_migrate":
-        "구 gemini CLI 는 개인 계정 지원 종료 — Antigravity `agy` 로 마이그레이션됨. "
-        "`agy` 설치/로그인 후 사용하세요 (https://antigravity.google).",
-    "wait_and_retry":
-        "잠시 후 다시 시도하거나 다른 provider/모델로 전환하세요.",
-    "check_model_list":
-        "사용 가능한 모델은 `unified-cli models` 로 확인하세요.",
-    # Codex subscription-allowed models — dynamically pulled from
-    # models._HARDCODED["codex"] so they stay in sync. See _build_hints below.
-    "codex_subscription_models": "",  # populated at import time
-    "network_retry":
-        "네트워크 연결을 확인하세요. 통합 래퍼는 이미 2회 재시도했습니다.",
-    "check_resource":
-        "요청한 리소스(모델/세션)가 존재하는지 확인하세요.",
-    "install_cli":
-        "CLI 바이너리를 찾을 수 없습니다. 해당 provider CLI를 설치하고 PATH를 확인하세요.",
+_HINT_KEYS: dict[str, str] = {
+    "claude_login": "err.hint.claude_login",
+    "codex_login": "err.hint.codex_login",
+    "gemini_login": "err.hint.gemini_login",
+    "antigravity_migrate": "err.hint.antigravity_migrate",
+    "wait_and_retry": "err.hint.wait_and_retry",
+    "check_model_list": "err.hint.check_model_list",
+    "codex_subscription_models": "err.hint.codex_subscription_models",
+    "network_retry": "err.hint.network_retry",
+    "check_resource": "err.hint.check_resource",
+    "install_cli": "err.hint.install_cli",
 }
 
 
-def _build_codex_hint() -> str:
-    """Compose the codex subscription-models hint from the hardcoded list.
+def _codex_subscription_models() -> str:
+    """List the codex subscription-allowed models from the hardcoded table.
 
     Avoids drift between the displayed model list and the error hint text.
     Imported lazily to avoid a circular import (models.py → errors.py).
     """
     try:
         from .models import _HARDCODED
-        models = " / ".join(m for m in _HARDCODED["codex"] if not m.startswith("codex-"))
-        return (
-            f"ChatGPT 구독으로 사용 가능한 Codex 모델: {models}. "
-            "신규 모델 (예: gpt-5.5) 을 쓰려면 `brew upgrade codex` 또는 "
-            "`npm i -g @openai/codex@latest` 로 CLI 부터 업그레이드하세요."
+        return " / ".join(
+            m for m in _HARDCODED["codex"] if not m.startswith("codex-")
         )
     except Exception:
-        return "사용 가능한 모델은 `unified-cli models codex` 로 확인하세요."
+        return ""
 
 
-HINTS["codex_subscription_models"] = _build_codex_hint()
+def _resolve_hint(hint_key: str) -> str:
+    """Resolve a matcher hint_key to localized text at call time."""
+    if not hint_key:
+        return ""
+    if hint_key == "codex_subscription_models":
+        models = _codex_subscription_models()
+        if not models:
+            return t("err.hint.codex_subscription_fallback")
+        return t("err.hint.codex_subscription_models", models=models)
+    i18n_key = _HINT_KEYS.get(hint_key)
+    return t(i18n_key) if i18n_key else ""
+
+
+# Backwards-compatible read-only view (some callers/tests may inspect HINTS).
+# Resolves each key for the active language on access.
+class _HintsView:
+    def get(self, key: str, default: str = "") -> str:
+        return _resolve_hint(key) or default
+
+    def __getitem__(self, key: str) -> str:
+        return _resolve_hint(key)
+
+
+HINTS = _HintsView()
 
 
 # ---- matcher tables: ordered list of (regex, kind, hint_key) per provider ----
@@ -173,28 +190,20 @@ def classify(
                 kind=kind,
                 provider=provider,
                 message=_default_message(kind, provider),
-                hint=HINTS.get(hint_key, ""),
+                hint=_resolve_hint(hint_key),
                 cause=_extract_cause(stderr, stdout),
             )
     return UnifiedError(
         kind="internal",
         provider=provider,
-        message=f"{provider} CLI 종료 코드 {exitcode}: 알 수 없는 오류",
-        hint="stderr 전체를 확인하세요.",
+        message=t("err.msg.unknown", provider=provider, exitcode=exitcode),
+        hint=t("err.hint.check_stderr"),
         cause=_extract_cause(stderr, stdout),
     )
 
 
 def _default_message(kind: ErrorKind, provider: str) -> str:
-    return {
-        "auth_expired": f"{provider} 인증이 만료되었습니다.",
-        "rate_limit": f"{provider} 사용량 한도를 초과했습니다.",
-        "model_not_allowed": f"{provider} 이 모델을 허용하지 않습니다.",
-        "not_found": f"{provider} 요청한 리소스를 찾을 수 없습니다.",
-        "network": f"{provider} 네트워크 오류가 발생했습니다.",
-        "config": f"{provider} 설정이 잘못되었습니다.",
-        "internal": f"{provider} 내부 오류가 발생했습니다.",
-    }[kind]
+    return t(f"err.msg.{kind}", provider=provider)
 
 
 def _extract_cause(stderr: str, stdout: str) -> str:

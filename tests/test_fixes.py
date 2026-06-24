@@ -46,7 +46,7 @@ def test_f2_empty_prompt_raises_config():
             _reject_empty_prompt(bad, "claude")
         except UnifiedError as e:
             assert e.kind == "config"
-            assert "비어" in e.message or "빈" in e.message
+            assert e.message  # localized message present (text is i18n'd)
         else:
             assert False, f"empty prompt {bad!r} should have raised"
 

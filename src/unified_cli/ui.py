@@ -5,18 +5,23 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 from rich.console import Console
+from rich.layout import Layout
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
 from .core import ProviderName
 from .discovery import FINDERS
+from .i18n import t
 from .models import DEFAULT_MODELS, list_models
+from .usage import tracker
 
 
 console = Console()
@@ -116,16 +121,18 @@ def collect_states() -> list[ProviderState]:
 
 # ---- rendering ----
 
+# (icon, color) per health state. The label is resolved via i18n at call time
+# (the active language may be set after this module imports).
 _HEALTH_STYLE = {
-    "ok":              ("🟢", "green", "OK"),
-    "setup_needed":    ("🟡", "yellow", "setup needed"),
-    "missing_binary":  ("🔴", "red", "missing binary"),
+    "ok":              ("🟢", "green", "ui.health.ok"),
+    "setup_needed":    ("🟡", "yellow", "ui.health.setup_needed"),
+    "missing_binary":  ("🔴", "red", "ui.health.missing_binary"),
 }
 
 
 def health_cell(state: ProviderState) -> Text:
-    icon, color, label = _HEALTH_STYLE[state.health]
-    return Text(f"{icon} {label}", style=color)
+    icon, color, label_key = _HEALTH_STYLE[state.health]
+    return Text(f"{icon} {t(label_key)}", style=color)
 
 
 def auth_cell(state: ProviderState) -> Text:
@@ -135,29 +142,30 @@ def auth_cell(state: ProviderState) -> Text:
     if state.has_api_key:
         parts.append(f"${state.api_key_env}")
     if not parts:
-        return Text("(none)", style="red")
+        return Text(t("ui.auth.none"), style="red")
     return Text(" + ".join(parts), style="green" if state.has_oauth else "yellow")
 
 
 def bin_cell(state: ProviderState) -> Text:
     if not state.bin_path:
-        return Text("(not found)", style="red")
+        return Text(t("ui.bin.not_found"), style="red")
     short = state.bin_path
     if len(short) > 48:
         short = "…" + short[-45:]
     return Text(short, style="dim")
 
 
-def status_table(states: list[ProviderState], *, title: str = "Provider status") -> Table:
-    t = Table(title=title, show_lines=False, header_style="bold cyan")
-    t.add_column("Provider", style="bold")
-    t.add_column("Health")
-    t.add_column("Binary")
-    t.add_column("Auth")
-    t.add_column("Models", justify="right")
-    t.add_column("Default model")
+def status_table(states: list[ProviderState], *, title: Optional[str] = None) -> Table:
+    tbl = Table(title=title if title is not None else t("ui.table.status_title"),
+                show_lines=False, header_style="bold cyan")
+    tbl.add_column(t("ui.table.col.provider"), style="bold")
+    tbl.add_column(t("ui.table.col.health"))
+    tbl.add_column(t("ui.table.col.binary"))
+    tbl.add_column(t("ui.table.col.auth"))
+    tbl.add_column(t("ui.table.col.models"), justify="right")
+    tbl.add_column(t("ui.table.col.default_model"))
     for s in states:
-        t.add_row(
+        tbl.add_row(
             s.name,
             health_cell(s),
             bin_cell(s),
@@ -165,7 +173,7 @@ def status_table(states: list[ProviderState], *, title: str = "Provider status")
             f"{s.model_count} ({s.model_source})",
             s.default_model,
         )
-    return t
+    return tbl
 
 
 def panel(title: str, body: str, *, style: str = "cyan") -> Panel:
@@ -178,3 +186,66 @@ def banner(text: str) -> Panel:
         border_style="cyan",
         padding=(0, 2),
     )
+
+
+# ---- live status layout (shared by `status --watch` and the REPL `/status`) ----
+
+def recent_table(limit: int = 10) -> Table:
+    tbl = Table(title=t("ui.recent.title", limit=limit), show_lines=False,
+                header_style="bold magenta")
+    tbl.add_column(t("ui.recent.col.time"), style="dim")
+    tbl.add_column(t("ui.recent.col.provider"))
+    tbl.add_column(t("ui.recent.col.model"))
+    tbl.add_column(t("ui.recent.col.in"), justify="right")
+    tbl.add_column(t("ui.recent.col.out"), justify="right")
+    tbl.add_column(t("ui.recent.col.latency"), justify="right")
+    tbl.add_column(t("ui.recent.col.prompt"), style="dim")
+    tbl.add_column(t("ui.recent.col.error"), style="red")
+    for r in tracker.recent(limit):
+        tbl.add_row(
+            time.strftime("%H:%M:%S", time.localtime(r.ts)),
+            r.provider, escape(r.model),
+            str(r.input_tokens), str(r.output_tokens),
+            f"{r.latency_ms} ms",
+            escape(r.prompt_preview[:40]),
+            r.error_kind or "",
+        )
+    return tbl
+
+
+def aggregate_table() -> Table:
+    tbl = Table(title=t("ui.agg.title"), show_lines=False,
+                header_style="bold green")
+    tbl.add_column(t("ui.agg.col.provider"), style="bold")
+    tbl.add_column(t("ui.agg.col.calls"), justify="right")
+    tbl.add_column(t("ui.agg.col.errors"), justify="right", style="red")
+    tbl.add_column(t("ui.agg.col.tokens"), justify="right")
+    tbl.add_column(t("ui.agg.col.cached"), justify="right", style="dim")
+    tbl.add_column(t("ui.agg.col.avg_latency"), justify="right")
+    aggs = tracker.aggregates()
+    for a in aggs:
+        tbl.add_row(
+            a.provider, str(a.calls), str(a.errors),
+            f"{a.input_tokens}/{a.output_tokens}",
+            str(a.cached_tokens), f"{a.avg_latency_ms:.0f} ms",
+        )
+    if not aggs:
+        tbl.add_row("-", "0", "0", "-", "-", "-")
+    return tbl
+
+
+def status_layout() -> Layout:
+    layout = Layout()
+    layout.split_column(
+        Layout(name="head", size=1),
+        Layout(name="providers", ratio=2),
+        Layout(name="agg", ratio=2),
+        Layout(name="recent", ratio=3),
+    )
+    layout["head"].update(Panel(t("ui.layout.title"), border_style="cyan",
+                                style="bold", padding=(0, 1)))
+    layout["providers"].update(status_table(collect_states(),
+                                            title=t("ui.layout.providers_title")))
+    layout["agg"].update(aggregate_table())
+    layout["recent"].update(recent_table(10))
+    return layout

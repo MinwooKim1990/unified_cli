@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-24
+
+REPL UX, internationalization, and dashboard release, hardened by a 9-round
+adversarial audit. The interactive REPL is now a first-class, discoverable
+surface (live slash-command menu, model/provider pickers, live status), the
+whole CLI/REPL is localized (English default + Korean), and the web dashboard
+was redesigned. `prompt_toolkit` becomes a core dependency, so a plain
+`pip install unified-cli` ships the full REPL out of the box.
+
+### Added
+
+- **prompt_toolkit-powered interactive REPL** (`unified-cli repl`):
+  - **Live slash-command menu** — type `/` to get an as-you-type dropdown of
+    every slash command (in a real terminal).
+  - **Model picker** — `/model` with no argument opens a picker listing each
+    provider's latest models, with the default marked ★, so you never have to
+    hand-type a model name. `/model <name>` still works (multi-word `agy`
+    display names supported). `/provider` likewise opens a picker.
+  - **Live `/status` panel** inside the REPL (auto-refreshing; Ctrl+C returns
+    you to the prompt).
+  - Localized `/help`. Falls back to a plain `input()` loop (with the same
+    commands) when stdin/stdout is not a TTY.
+- **Internationalization (i18n), English default + Korean.** The entire
+  CLI/REPL is localized. Resolution order: `--lang {en,ko}` flag >
+  `~/.unified-cli/settings.json` > `$UNIFIED_CLI_LANG` > default English. New
+  global `--lang` flag and `UNIFIED_CLI_LANG` env var; in the REPL, `/lang ko`
+  and `/lang en` switch language live and persist the choice.
+- **Redesigned web dashboard** (`/dashboard`): quick-stat cards, per-provider
+  health cards, inline-SVG sparklines (latency / token volume), per-model usage
+  bars, and a responsive layout.
+- **`http://127.0.0.1:PORT/` now redirects to `/dashboard`** (previously a 404).
+
+### Changed
+
+- **`prompt_toolkit` is now a core dependency.** A plain
+  `pip install unified-cli` now includes the full interactive REPL — there is
+  **no `[repl]` extra**. The optional extras remain `server`, `dev`, and `all`.
+- **The default CLI language is English.** Use `--lang ko` (or `/lang ko` in
+  the REPL, or `UNIFIED_CLI_LANG=ko`) for Korean.
+
+### Fixed
+
+- **Rich-markup-safe terminal output.** Untrusted model names, file paths, and
+  raw CLI output can no longer corrupt or crash the display via Rich markup.
+- **Streaming subprocess robustness.** Fixed an stderr-pipe deadlock and ensure
+  the child process is killed on abort — for sync, async, and the `agy`-backed
+  provider.
+- **`--terse` no longer crashes the REPL on non-Claude providers.**
+- **`status --watch-interval` now validates its input** instead of accepting
+  bad values.
+
+### Security
+
+- **The `gemini`/`agy` provider's model listing now respects the
+  `UNIFIED_CLI_ENABLE_GEMINI` ToS gate** — it will not spawn `agy` when gated
+  (e.g. from `doctor` or the dashboard).
+- **The REPL prompt-history file is now created with `0o600` permissions.**
+- **The dashboard model chart is prototype-pollution-safe.**
+
 ## [0.1.1] - 2026-06-24
 
 Safety release. No new capabilities — adds Terms-of-Service guardrails and
@@ -82,6 +141,7 @@ Initial public release.
   `gemini-3.5-flash` continue to route to it. Note: `agy` headless output is
   plain text and does **not** report token usage.
 
-[Unreleased]: https://github.com/MinwooKim1990/unified_cli/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/MinwooKim1990/unified_cli/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/MinwooKim1990/unified_cli/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/MinwooKim1990/unified_cli/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/MinwooKim1990/unified_cli/releases/tag/v0.1.0

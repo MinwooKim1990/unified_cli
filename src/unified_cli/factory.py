@@ -8,6 +8,7 @@ from typing import Optional
 from .base import BaseProvider
 from .core import ProviderName
 from .errors import UnifiedError
+from .i18n import t
 from .models import DEFAULT_MODELS
 from .providers import ClaudeProvider, CodexProvider, GeminiProvider
 
@@ -29,8 +30,8 @@ def create(
     if provider not in PROVIDERS:
         raise UnifiedError(
             kind="config", provider=provider,  # type: ignore[arg-type]
-            message=f"알 수 없는 provider: {provider}",
-            hint="provider 는 claude / codex / gemini 중 하나여야 합니다.",
+            message=t("err.factory.unknown_provider", provider=provider),
+            hint=t("err.factory.unknown_provider.hint"),
         )
     return PROVIDERS[provider](model=model or DEFAULT_MODELS[provider], **opts)
 
@@ -63,7 +64,6 @@ def route(model_str: str) -> tuple[ProviderName, str]:
 
     raise UnifiedError(
         kind="config", provider="claude",  # unknown; annotated as config error
-        message=f"모델 '{model_str}' 의 provider 를 추론할 수 없습니다.",
-        hint=("`provider/model` 형식 (예: claude/haiku) 또는 알려진 접두사 "
-              "(claude-, gpt-, gemini-, haiku/sonnet/opus) 을 사용하세요."),
+        message=t("err.factory.cannot_route", model=model_str),
+        hint=t("err.factory.cannot_route.hint"),
     )

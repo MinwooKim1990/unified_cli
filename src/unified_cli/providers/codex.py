@@ -9,13 +9,17 @@ from ..base import BaseProvider
 from ..core import Message, Response, Usage
 from ..discovery import find_codex_bin
 from ..errors import UnifiedError
+from ..i18n import t
 
 
 class CodexProvider(BaseProvider):
     name = "codex"
     default_model = "gpt-5.4-mini"
     api_key_env = "OPENAI_API_KEY"
-    login_hint = "`codex login` 을 재실행하세요."
+
+    @classmethod
+    def login_hint(cls) -> str:
+        return t("err.codex.login_hint")
 
     def __init__(
         self,
@@ -49,7 +53,7 @@ class CodexProvider(BaseProvider):
 
     @classmethod
     def _install_hint(cls) -> str:
-        return "`brew install codex` 또는 `npm i -g @openai/codex`."
+        return t("err.codex.install_hint")
 
     def _common_flags(self, model: Optional[str], streaming: bool) -> list[str]:
         args = ["--json"] if streaming else ["--json"]
@@ -157,11 +161,11 @@ class CodexProvider(BaseProvider):
             # Defer that to the caller — explicit error here.
             raise UnifiedError(
                 kind="config", provider="codex",
-                message="Codex `-i` 는 로컬 파일만 받습니다. URL 은 미리 다운로드하세요.",
+                message=t("err.codex.image_url_only"),
             )
         raise UnifiedError(
             kind="config", provider="codex",
-            message="비어있는 이미지 첨부.",
+            message=t("err.codex.empty_image"),
         )
 
     def _normalize(self, obj: dict) -> Iterator[Message]:
@@ -258,7 +262,7 @@ class CodexProvider(BaseProvider):
         if has_error and not texts:
             raise UnifiedError(
                 kind="internal", provider="codex",
-                message="Codex 턴이 에러로 종료되었습니다.",
+                message=t("err.codex.turn_error"),
                 cause=str(has_error)[:300],
             )
 

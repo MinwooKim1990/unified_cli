@@ -168,6 +168,14 @@ def _list_gemini() -> list[ModelInfo]:
     """
     import subprocess
     from .discovery import find_agy_bin
+    from .providers.gemini import gemini_enabled
+
+    # The agy/gemini provider is gated off by default for ToS/account-ban
+    # reasons. Listing models must NOT spawn `agy` (doctor/status/dashboard/
+    # server all call this) unless the user has opted in — otherwise the very
+    # subprocess the gate exists to prevent runs anyway.
+    if not gemini_enabled():
+        return _hardcoded("gemini")
 
     agy = find_agy_bin()
     if not agy:

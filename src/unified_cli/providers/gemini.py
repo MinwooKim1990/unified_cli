@@ -42,6 +42,7 @@ from ..base import BaseProvider
 from ..core import Message, Response, Usage
 from ..discovery import find_agy_bin
 from ..errors import UnifiedError, classify
+from ..i18n import t
 
 
 # The legacy `gemini` CLI prints this when an individual account is blocked.
@@ -72,14 +73,10 @@ def _require_gemini_enabled() -> None:
         return
     raise UnifiedError(
         kind="config", provider="gemini",
-        message=(
-            "agy(Antigravity) 프로바이더는 기본 비활성화되어 있습니다. "
-            "agy 자동화는 Google ToS 위반으로 계정 정지/차단(밴) 위험이 있습니다."
-        ),
-        hint=(
-            f"위험을 감수하고 직접 사용하려면 환경변수 {_ENABLE_ENV}=1 을 "
-            "설정하세요. claude / codex 는 영향받지 않습니다."
-        ),
+        message=t("err.gemini.gate_msg"),
+        # `{env}` substitutes the literal env var name so the opt-in hint always
+        # names UNIFIED_CLI_ENABLE_GEMINI in every language (test_gate asserts it).
+        hint=t("err.gemini.gate_hint", env=_ENABLE_ENV),
     )
 
 
@@ -87,7 +84,10 @@ class GeminiProvider(BaseProvider):
     name = "gemini"
     default_model = "gemini-3.5-flash"
     api_key_env = "GEMINI_API_KEY"   # agy uses OAuth; kept for base fallback API
-    login_hint = "`agy` 를 실행해 브라우저로 로그인하세요 (Antigravity)."
+
+    @classmethod
+    def login_hint(cls) -> str:
+        return t("err.gemini.login_hint")
 
     def __init__(
         self,
@@ -126,8 +126,7 @@ class GeminiProvider(BaseProvider):
 
     @classmethod
     def _install_hint(cls) -> str:
-        return ("Antigravity CLI `agy` 를 설치하세요 (https://antigravity.google). "
-                "또는 AGY_CLI_PATH 환경변수로 경로 지정.")
+        return t("err.gemini.install_hint")
 
     # ----- argv construction -----
 
@@ -199,10 +198,10 @@ class GeminiProvider(BaseProvider):
         if att.url:
             raise UnifiedError(
                 kind="config", provider="gemini",
-                message="agy `@<path>` 는 로컬 파일만 받습니다. URL 은 미리 다운로드하세요.",
+                message=t("err.gemini.image_url_only"),
             )
         raise UnifiedError(
-            kind="config", provider="gemini", message="비어있는 이미지 첨부.",
+            kind="config", provider="gemini", message=t("err.gemini.empty_image"),
         )
 
     # ----- model validation -----
@@ -226,9 +225,8 @@ class GeminiProvider(BaseProvider):
         if model_str not in valid:
             raise UnifiedError(
                 kind="model_not_allowed", provider="gemini",
-                message=f"agy 모델 '{model_str}' 을 찾을 수 없습니다.",
-                hint="`unified-cli models gemini` 로 확인하세요 "
-                     "(agy 는 잘못된 모델명을 조용히 default 로 폴백합니다).",
+                message=t("err.gemini.model_not_found", model=model_str),
+                hint=t("err.gemini.model_not_found.hint"),
             )
 
     # ----- session id recovery -----
@@ -281,8 +279,8 @@ class GeminiProvider(BaseProvider):
         if _INELIGIBLE_RE.search(text):
             raise UnifiedError(
                 kind="auth_expired", provider="gemini",
-                message="이 클라이언트는 더 이상 지원되지 않습니다 — Antigravity(`agy`)로 마이그레이션됨.",
-                hint="`agy` 로 로그인했는지 확인하세요. 구 gemini CLI 는 개인 계정에서 차단됨.",
+                message=t("err.gemini.ineligible"),
+                hint=t("err.gemini.ineligible.hint"),
                 cause=text[:300],
             )
 
@@ -294,8 +292,8 @@ class GeminiProvider(BaseProvider):
         if not body:
             raise UnifiedError(
                 kind="internal", provider="gemini",
-                message="agy 가 빈 응답을 반환했습니다.",
-                hint="모델/네트워크 상태를 확인하거나 다시 시도하세요.",
+                message=t("err.gemini.empty_response"),
+                hint=t("err.gemini.empty_response.hint"),
                 cause=text[:200],
             )
         return Response(
@@ -332,8 +330,15 @@ class GeminiProvider(BaseProvider):
             except BrokenPipeError:
                 pass
         assert proc.stdout is not None
+        # Drain stderr concurrently (pipe-deadlock guard — see base._stream_once).
+        from ..base import _drain_into
+        _stderr_chunks: list[str] = []
+        _stderr_thread = threading.Thread(
+            target=_drain_into, args=(proc.stderr, _stderr_chunks), daemon=True)
+        _stderr_thread.start()
         produced = False
         collected: list[str] = []
+        loop_done = False
         try:
             for line in proc.stdout:
                 collected.append(line)
@@ -341,7 +346,13 @@ class GeminiProvider(BaseProvider):
                     produced = True
                     yield Message(kind="text", provider="gemini",
                                   text=line, raw={"line": line})
+            loop_done = True
         finally:
+            # Aborted (Ctrl+C / generator close): agy is agentic and may run for
+            # a long time, and stream_timeout is forced to >=600s — so kill
+            # rather than wait it out.
+            if not loop_done and proc.poll() is None:
+                proc.kill()
             try:
                 proc.wait(timeout=self.stream_timeout)
             except subprocess.TimeoutExpired:
@@ -349,10 +360,11 @@ class GeminiProvider(BaseProvider):
                 proc.wait()
                 raise UnifiedError(
                     kind="network", provider="gemini",
-                    message=f"agy 스트림이 {self.stream_timeout}초 안에 끝나지 않음.",
-                    hint="긴 에이전트 작업이면 timeout 을 늘리세요.",
+                    message=t("err.gemini.stream_timeout", timeout=self.stream_timeout),
+                    hint=t("err.gemini.stream_timeout.hint"),
                 )
-            stderr_text = proc.stderr.read() if proc.stderr else ""
+            _stderr_thread.join(timeout=5)
+            stderr_text = "".join(_stderr_chunks)
 
         full = "".join(collected)
         if proc.returncode not in (0, None):
@@ -365,8 +377,8 @@ class GeminiProvider(BaseProvider):
         if not full.strip():
             raise UnifiedError(
                 kind="internal", provider="gemini",
-                message="agy 가 빈 응답을 반환했습니다.",
-                hint="모델/네트워크 상태를 확인하거나 다시 시도하세요.",
+                message=t("err.gemini.empty_response"),
+                hint=t("err.gemini.empty_response.hint"),
             )
         sid = self._resolve_session_id()
         if sid:

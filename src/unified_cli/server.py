@@ -38,7 +38,7 @@ from typing import Any, Optional, Union
 
 try:
     from fastapi import FastAPI, HTTPException
-    from fastapi.responses import HTMLResponse, StreamingResponse
+    from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
     from pydantic import BaseModel
 except ImportError as e:  # pragma: no cover
     raise ImportError(
@@ -50,6 +50,7 @@ from .conversation import UnifiedConversation
 from .dashboard_tpl import DASHBOARD_HTML
 from .errors import ErrorKind, UnifiedError
 from .factory import route
+from .i18n import t
 from .models import list_models
 from .ui import collect_states
 from .usage import tracker
@@ -334,6 +335,12 @@ def conversations_endpoint():
     return {"conversations": out}
 
 
+@app.get("/")
+def root():
+    """Send the bare host to the dashboard so `http://127.0.0.1:PORT/` just works."""
+    return RedirectResponse(url="/dashboard")
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     """Browser dashboard (localhost only — no auth)."""
@@ -363,22 +370,16 @@ def run(host: str = "127.0.0.1", port: int = 8000, **uvicorn_kwargs) -> None:
     import uvicorn
 
     if host not in _LOOPBACK:
-        warning = (
-            f"\n⚠️  비-로컬 호스트({host})에 바인딩하려 합니다.\n"
-            "    이 서버는 당신의 구독 인증으로 동작합니다 — 외부에서 접근하면\n"
-            "    타인의 요청이 당신 구독으로 처리되어 각 제공자 ToS 위반(계정\n"
-            "    정지/차단 위험)이 됩니다. 개인 로컬 용도로만 쓰세요.\n"
-        )
+        warning = t("server.external_bind.warning", host=host)
         if not _external_bind_allowed():
             raise UnifiedError(
                 kind="config", provider="claude",
                 message=warning.strip(),
-                hint=(
-                    f"정말 외부 노출이 필요하면 {_ALLOW_EXTERNAL_ENV}=1 을 "
-                    "설정하세요 (권장하지 않음)."
-                ),
+                # `{env}` substitutes the literal env var name so the opt-in
+                # hint always names UNIFIED_CLI_ALLOW_EXTERNAL_BIND (test_gate).
+                hint=t("server.external_bind.hint", env=_ALLOW_EXTERNAL_ENV),
             )
-        print(warning + f"    {_ALLOW_EXTERNAL_ENV}=1 설정됨 — 본인 책임 하에 진행합니다.\n",
+        print(warning + t("server.external_bind.proceeding", env=_ALLOW_EXTERNAL_ENV),
               file=sys.stderr)
 
     uvicorn.run(app, host=host, port=port, **uvicorn_kwargs)

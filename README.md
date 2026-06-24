@@ -15,6 +15,10 @@ Antigravity (`agy`).**
 pip install unified-cli
 ```
 
+This includes the full interactive REPL (live `/` slash-menu, model/provider
+pickers, live `/status`) — `prompt_toolkit` ships as a core dependency, so no
+extra is needed for it.
+
 For the OpenAI-compatible HTTP server, install the optional `server` extra:
 
 ```bash
@@ -137,10 +141,15 @@ can import**.
 - **Structured errors**: every failure → `UnifiedError(kind=...)` from one of
   seven categories (`auth_expired` / `rate_limit` / `model_not_allowed` /
   `not_found` / `network` / `config` / `internal`) with Korean recovery hints
-- **OpenAI-compatible server**: drop-in `/v1/chat/completions` + auto-updating
-  dashboard at `/dashboard`
+- **OpenAI-compatible server**: drop-in `/v1/chat/completions` + redesigned
+  auto-updating dashboard at `/dashboard` (and `/` redirects there)
 - **Rich terminal UI**: `doctor` health table, `status --watch` live dashboard,
   `setup` interactive wizard, streaming spinner
+- **Interactive REPL** (`unified-cli repl`): live `/` slash-command menu,
+  `/model` and `/provider` pickers (latest models listed, default marked ★),
+  live `/status`, cross-provider switching — powered by `prompt_toolkit`
+- **Localized (i18n)**: English by default, Korean with `--lang ko` (or
+  `/lang ko` in the REPL, or `UNIFIED_CLI_LANG=ko`)
 
 ## Default models (lightweight, subscription-friendly)
 
@@ -205,7 +214,7 @@ unified-cli chat "what about in-place?" --continue
 # Resume a specific session
 unified-cli chat "continue from earlier" --resume <session_id>
 
-# Interactive REPL with slash commands (/provider, /model, /history, /save, ...)
+# Interactive REPL — type `/` for a live menu (/model & /provider pickers, /status, /lang, ...)
 unified-cli repl
 
 # Stream + web-search (both defaults)
@@ -221,23 +230,53 @@ unified-cli chat "compare these two" --image a.jpg --image b.jpg -m gpt-5.4-mini
 # Status & dashboard
 unified-cli doctor          # one-time health check
 unified-cli status --watch  # live terminal dashboard (5s refresh)
-uvicorn unified_cli.server:app --port 8000  # localhost-only by default → http://localhost:8000/dashboard
+uvicorn unified_cli.server:app --port 8000  # localhost-only by default → http://localhost:8000/dashboard (/ redirects there)
 ```
 
 ### Interactive REPL — `unified-cli repl`
 
+The REPL is powered by `prompt_toolkit` (a core dependency, so it works
+straight from `pip install unified-cli`). In a real terminal, type `/` to get a
+**live as-you-type menu** of every slash command — you don't have to memorize
+them.
+
 ```text
 [claude/haiku] > hello
-[claude/haiku] > /provider codex          # switch providers (context auto-injected)
-[codex/gpt-5.4-mini] > /image photo.png   # attach image for the next turn
+[claude/haiku] > /                         # live dropdown of all slash commands
+[claude/haiku] > /model                    # picker: latest models per provider (default ★)
+[claude/sonnet] > /provider                # picker: choose a provider (context auto-injected)
+[codex/gpt-5.4-mini] > /status             # live status panel (Ctrl+C → back to prompt)
+[codex/gpt-5.4-mini] > /lang ko            # switch the UI to Korean (persists)
+[codex/gpt-5.4-mini] > /image photo.png    # attach image for the next turn
 [codex/gpt-5.4-mini] > describe this
-[codex/gpt-5.4-mini] > /history           # last 10 turns
-[codex/gpt-5.4-mini] > /save              # current session_id + resume hint
-[codex/gpt-5.4-mini] > /exit              # state saved → `chat --continue` from here
+[codex/gpt-5.4-mini] > /save               # current session_id + resume hint
+[codex/gpt-5.4-mini] > /exit               # state saved → `chat --continue` from here
 ```
 
-Slash commands: `/help` `/model` `/provider` `/new` `/save` `/history`
-`/tokens` `/doctor` `/image` `/images` `/clear-images` `/exit`.
+- **`/model`** with no argument opens a picker of each provider's latest models
+  (default marked ★) — `/model <name>` still works too.
+- **`/provider`** likewise opens a picker.
+- **`/status`** shows a live, auto-refreshing status panel inside the REPL.
+- **`/lang en` / `/lang ko`** switches the UI language live and persists it.
+
+Slash commands: `/help` `/model` `/provider` `/status` `/lang` `/new` `/save`
+`/history` `/tokens` `/doctor` `/image` `/images` `/clear-images` `/exit`.
+When stdin/stdout isn't a TTY, the REPL falls back to a plain `input()` loop
+with the same commands.
+
+### Language (English default, Korean optional)
+
+The whole CLI/REPL is localized. English is the default; switch to Korean with
+the global `--lang` flag, the `UNIFIED_CLI_LANG` env var, or `/lang ko` in the
+REPL:
+
+```bash
+unified-cli --lang ko chat "안녕"          # one-off, Korean output
+export UNIFIED_CLI_LANG=ko                  # whole shell session in Korean
+```
+
+Resolution order: `--lang {en,ko}` > `~/.unified-cli/settings.json` (set by
+`/lang`) > `$UNIFIED_CLI_LANG` > English.
 
 ### Python
 
@@ -306,6 +345,7 @@ options.
 ```bash
 uvicorn unified_cli.server:app --port 8000   # binds 127.0.0.1 (localhost) by default
 # Browse:  http://localhost:8000/dashboard   (live usage / sessions)
+#          http://localhost:8000/            (redirects to /dashboard)
 ```
 
 > **Localhost-only by default.** The server binds to `127.0.0.1` and **refuses

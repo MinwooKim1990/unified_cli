@@ -14,6 +14,7 @@ from typing import AsyncIterator, ClassVar, Iterator, Optional
 
 from .core import Message, ModelInfo, ProviderName, Response, Usage
 from .errors import UnifiedError, classify
+from .i18n import t
 from .usage import tracker as _usage_tracker
 
 
@@ -52,8 +53,8 @@ def _reject_empty_prompt(prompt: str, provider: str) -> None:
     if not prompt or not prompt.strip():
         raise UnifiedError(
             kind="config", provider=provider,  # type: ignore[arg-type]
-            message="프롬프트가 비어있습니다.",
-            hint="공백이 아닌 텍스트를 전달하세요. stdin 에서 읽는 경우 파이프 입력을 확인하세요.",
+            message=t("err.base.empty_prompt"),
+            hint=t("err.base.empty_prompt.hint"),
         )
 
 
@@ -73,12 +74,24 @@ def _check_session_match(
     if requested != got:
         raise UnifiedError(
             kind="not_found", provider=provider,  # type: ignore[arg-type]
-            message=(f"요청한 세션 {requested[:12]}… 을 찾을 수 없어 "
-                     f"새 세션 {got[:12]}… 이 생성되었습니다."),
-            hint="세션이 만료되었거나 다른 cwd 에서 생성됐을 수 있습니다. "
-                 "session_id 를 새로 받거나 Conversation 을 재시작하세요.",
+            message=t("err.base.session_mismatch",
+                      requested=requested[:12], got=got[:12]),
+            hint=t("err.base.session_mismatch.hint"),
             cause=f"requested={requested} got={got}",
         )
+
+
+def _drain_into(pipe, sink: list) -> None:
+    """Read `pipe` to EOF into `sink` (used as a daemon-thread target to drain
+    a child's stderr concurrently with the stdout loop — prevents the classic
+    pipe-buffer deadlock where an undrained stderr stalls stdout)."""
+    if pipe is None:
+        return
+    try:
+        for chunk in pipe:
+            sink.append(chunk)
+    except Exception:
+        pass
 
 
 class BaseProvider(ABC):
@@ -94,7 +107,14 @@ class BaseProvider(ABC):
     name: ClassVar[ProviderName]
     default_model: ClassVar[str]
     api_key_env: ClassVar[str]       # e.g., "ANTHROPIC_API_KEY"
-    login_hint: ClassVar[str]        # e.g., "`claude /login` 재실행"
+
+    @classmethod
+    def login_hint(cls) -> str:
+        """Localized login recovery hint. Resolved at CALL time (not import
+        time) so the active language is honored — subclasses override with a
+        `t(...)` lookup. The base default points users at a generic re-login.
+        """
+        return t("err.hint.install_cli")
 
     def __init__(
         self,
@@ -123,7 +143,7 @@ class BaseProvider(ABC):
         if not resolved:
             raise UnifiedError(
                 kind="config", provider=self.name,
-                message=f"{self.name} CLI 바이너리를 찾을 수 없습니다.",
+                message=t("err.base.no_binary", provider=self.name),
                 hint=self._install_hint(),
             )
         self.bin_path = resolved
@@ -222,9 +242,8 @@ class BaseProvider(ABC):
             except subprocess.TimeoutExpired:
                 raise UnifiedError(
                     kind="network", provider=self.name,
-                    message=f"{self.name} 응답이 {self.timeout}초 안에 오지 않음.",
-                    hint=("네트워크/CLI hang 가능성. timeout 을 늘리거나 다시 시도하세요. "
-                          "BaseProvider(timeout=N) 으로 조정 가능."),
+                    message=t("err.base.timeout", provider=self.name, timeout=self.timeout),
+                    hint=t("err.base.timeout.hint"),
                 )
             if result.returncode == 0:
                 return result.stdout
@@ -246,8 +265,8 @@ class BaseProvider(ABC):
                     except subprocess.TimeoutExpired:
                         raise UnifiedError(
                             kind="network", provider=self.name,
-                            message=f"{self.name} API key fallback 중 timeout.",
-                            hint="네트워크 확인 후 재시도.",
+                            message=t("err.base.timeout_fallback", provider=self.name),
+                            hint=t("err.base.timeout_fallback.hint"),
                         )
                     if result.returncode == 0:
                         return result.stdout
@@ -391,6 +410,20 @@ class BaseProvider(ABC):
             await proc.stdin.drain()
             proc.stdin.close()
         assert proc.stdout is not None
+        # Drain stderr concurrently so a chatty child can't fill the stderr pipe
+        # and stall the stdout reader (pipe-buffer deadlock).
+        _stderr_chunks: list[bytes] = []
+
+        async def _drain_stderr():
+            if proc.stderr is None:
+                return
+            try:
+                async for chunk in proc.stderr:
+                    _stderr_chunks.append(chunk)
+            except Exception:
+                pass
+
+        _drain_task = asyncio.ensure_future(_drain_stderr())
         try:
             async for raw in proc.stdout:
                 line = raw.decode().strip()
@@ -411,7 +444,11 @@ class BaseProvider(ABC):
                     yield msg
             await proc.wait()
             if proc.returncode != 0:
-                err_bytes = await proc.stderr.read() if proc.stderr else b""
+                try:
+                    await asyncio.wait_for(_drain_task, timeout=5)
+                except Exception:
+                    pass
+                err_bytes = b"".join(_stderr_chunks)
                 err = classify(self.name, err_bytes.decode(), "", proc.returncode)
                 # Mirror sync stream(): record the error turn before raising.
                 _usage_tracker.record(
@@ -431,11 +468,23 @@ class BaseProvider(ABC):
                 prompt_preview=prompt,
             )
         finally:
+            # Abort/error mid-stream: kill a still-running child rather than
+            # awaiting it (an agentic child may never exit on its own).
             if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
                 try:
                     await proc.wait()
                 except Exception:
                     pass
+            if not _drain_task.done():
+                _drain_task.cancel()
+            try:
+                await _drain_task
+            except (asyncio.CancelledError, Exception):
+                pass
             self._cleanup_temp_files()
 
     def _stream_once(
@@ -461,7 +510,15 @@ class BaseProvider(ABC):
             except BrokenPipeError:
                 pass
         assert proc.stdout is not None
+        # Drain stderr concurrently: if the child writes more than the OS pipe
+        # buffer (~64 KB) to stderr while still streaming stdout, an undrained
+        # stderr pipe blocks the child, which stalls our stdout loop forever.
+        _stderr_chunks: list[str] = []
+        _stderr_thread = threading.Thread(
+            target=_drain_into, args=(proc.stderr, _stderr_chunks), daemon=True)
+        _stderr_thread.start()
         produced_any = False
+        loop_done = False
         try:
             for line in proc.stdout:
                 line = line.strip()
@@ -474,7 +531,12 @@ class BaseProvider(ABC):
                 for msg in self._normalize(obj):
                     produced_any = True
                     yield msg
+            loop_done = True
         finally:
+            # Aborted mid-stream (generator .close()/error): don't wait on a
+            # possibly long-running child — kill it.
+            if not loop_done and proc.poll() is None:
+                proc.kill()
             try:
                 proc.wait(timeout=self.stream_timeout)
             except subprocess.TimeoutExpired:
@@ -482,10 +544,12 @@ class BaseProvider(ABC):
                 proc.wait()
                 raise UnifiedError(
                     kind="network", provider=self.name,
-                    message=f"{self.name} 스트림이 {self.stream_timeout}초 안에 끝나지 않음.",
-                    hint="긴 응답이면 BaseProvider(timeout=N) 으로 늘리세요.",
+                    message=t("err.base.stream_timeout", provider=self.name,
+                              timeout=self.stream_timeout),
+                    hint=t("err.base.stream_timeout.hint"),
                 )
-            stderr_text = proc.stderr.read() if proc.stderr else ""
+            _stderr_thread.join(timeout=5)
+            stderr_text = "".join(_stderr_chunks)
 
         if proc.returncode not in (0, None):
             err = classify(self.name, stderr_text, "", proc.returncode)

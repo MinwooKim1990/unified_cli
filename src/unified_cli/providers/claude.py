@@ -9,15 +9,27 @@ from ..base import BaseProvider
 from ..core import Message, Response, Usage
 from ..discovery import find_claude_bin
 from ..errors import UnifiedError
+from ..i18n import t
 
 
 class ClaudeProvider(BaseProvider):
     name = "claude"
     default_model = "claude-haiku-4-5"
     api_key_env = "ANTHROPIC_API_KEY"
-    login_hint = "`claude /login` 을 재실행하세요."
 
+    @classmethod
+    def login_hint(cls) -> str:
+        return t("err.claude.login_hint")
+
+    # Legacy class attribute kept for backward compatibility (and an existing
+    # test that inspects it). The value actually injected into the prompt is
+    # resolved via i18n at USE time — see _terse_rule() — so the active language
+    # wins; class-body strings evaluate before set_lang() can run.
     _TERSE_RULE = "답변은 질문이 요구하는 만큼만 간결하게 하세요. 추가 설명은 요청받을 때만 덧붙이세요."
+
+    @classmethod
+    def _terse_rule(cls) -> str:
+        return t("err.claude.terse_rule")
 
     def __init__(
         self,
@@ -40,9 +52,10 @@ class ClaudeProvider(BaseProvider):
         self.add_dirs = list(add_dirs or [])
 
         if terse:
+            terse_rule = self._terse_rule()
             self.append_system_prompt = (
-                f"{self.append_system_prompt}\n\n{self._TERSE_RULE}"
-                if self.append_system_prompt else self._TERSE_RULE
+                f"{self.append_system_prompt}\n\n{terse_rule}"
+                if self.append_system_prompt else terse_rule
             )
 
         if self.web_search:
@@ -58,8 +71,7 @@ class ClaudeProvider(BaseProvider):
 
     @classmethod
     def _install_hint(cls) -> str:
-        return ("Claude Desktop 앱 설치 또는 `npm i -g @anthropic-ai/claude-code`. "
-                "또는 CLAUDE_CLI_PATH 환경변수로 경로 지정.")
+        return t("err.claude.install_hint")
 
     def _build_args(
         self,
@@ -118,9 +130,9 @@ class ClaudeProvider(BaseProvider):
             args += ["--permission-mode", "bypassPermissions"]
 
             paths = [self._materialize_image(att) for att in self._normalize_images(images)]
-            path_lines = "\n".join(f"이미지 파일: {p}" for p in paths)
+            path_lines = "\n".join(t("err.claude.image_label", path=p) for p in paths)
             prompt = (
-                f"{path_lines}\n위 이미지를 Read 도구로 읽고 다음 질문에 답해주세요:\n{prompt}"
+                f"{path_lines}\n{t('err.claude.image_instruction')}\n{prompt}"
             )
 
         args.append(prompt)
@@ -148,11 +160,11 @@ class ClaudeProvider(BaseProvider):
         if att.url:
             raise UnifiedError(
                 kind="config", provider="claude",
-                message="Claude Read 도구는 로컬 파일만 받습니다. URL 은 미리 다운로드하세요.",
+                message=t("err.claude.image_url_only"),
             )
         raise UnifiedError(
             kind="config", provider="claude",
-            message="비어있는 이미지 첨부.",
+            message=t("err.claude.empty_image"),
         )
 
     @staticmethod
@@ -299,7 +311,7 @@ class ClaudeProvider(BaseProvider):
         if start < 0:
             raise UnifiedError(
                 kind="internal", provider="claude",
-                message="Claude CLI 응답에 JSON이 없습니다.",
+                message=t("err.claude.no_json"),
                 cause=text[:300],
             )
 

@@ -19,6 +19,7 @@ from .base import BaseProvider
 from .core import Message, ProviderName, Response
 from .errors import UnifiedError
 from .factory import create
+from .i18n import t
 
 
 @dataclass
@@ -64,6 +65,10 @@ class UnifiedConversation:
         key = (provider, model)
         if key not in self._clients:
             opts = {**self.provider_opts}
+            if provider != "claude":
+                # `terse` is a Claude-only constructor option; passing it to
+                # codex/gemini would raise TypeError (unexpected kwarg).
+                opts.pop("terse", None)
             self._clients[key] = create(provider, model=model, **opts)
         return self._clients[key]
 
@@ -79,11 +84,8 @@ class UnifiedConversation:
             elif self._locked_provider != prov:
                 raise UnifiedError(
                     kind="config", provider=prov,
-                    message=(
-                        f"sticky 대화에서 provider 전환 불가: "
-                        f"'{self._locked_provider}' 로 고정됨"
-                    ),
-                    hint="sticky=False 로 Conversation 을 생성하세요.",
+                    message=t("conv.sticky_switch", locked=self._locked_provider),
+                    hint=t("conv.sticky_switch.hint"),
                 )
         mdl = model or self.default_model
         return prov, mdl
@@ -96,15 +98,15 @@ class UnifiedConversation:
         if last_provider == provider:
             return ""
         recent = self.turns[-self.context_window:]
-        lines = [
-            "[이전 대화 요약 — 다른 provider 에서 진행됨]",
-        ]
-        for t in recent:
-            lines.append(f"사용자: {t.prompt}")
-            reply = (t.text or "").strip().replace("\n", " ")
+        lines = [t("conv.ctx.header")]
+        user_label = t("conv.ctx.user")
+        asst_label = t("conv.ctx.assistant")
+        for turn in recent:
+            lines.append(f"{user_label}: {turn.prompt}")
+            reply = (turn.text or "").strip().replace("\n", " ")
             if len(reply) > 400:
                 reply = reply[:400] + "…"
-            lines.append(f"어시스턴트: {reply}")
+            lines.append(f"{asst_label}: {reply}")
         lines.append("---")
         return "\n".join(lines) + "\n"
 

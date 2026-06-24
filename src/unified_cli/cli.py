@@ -11,13 +11,14 @@ from typing import Optional
 
 from rich.console import Console
 from rich.live import Live
+from rich.markup import escape
 from rich.table import Table
-from rich.layout import Layout
-from rich.panel import Panel
 
+from . import i18n
 from .core import ProviderName
 from .errors import UnifiedError
 from .factory import create, route
+from .i18n import t
 from .models import DEFAULT_MODELS, list_models
 from .onboarding import run_setup
 from .repl import run_repl
@@ -54,17 +55,14 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
 
-    console.print(banner("unified-cli doctor"))
+    console.print(banner(t("cli.doctor.title")))
     console.print(status_table(states))
 
     # Suggestions
     needs_setup = [s for s in states if s.health != "ok"]
     if needs_setup:
         console.print()
-        console.print(
-            "[yellow]⚠ setup 이 필요한 provider 가 있습니다. "
-            "`unified-cli setup` 을 실행하세요.[/yellow]"
-        )
+        console.print(f"[yellow]{t('cli.doctor.needs_setup')}[/yellow]")
     return 0 if not needs_setup else 1
 
 
@@ -83,68 +81,9 @@ def _cmd_setup(args: argparse.Namespace) -> int:
 
 # ----- status -----
 
-def _recent_table(limit: int = 10) -> Table:
-    t = Table(title=f"Recent calls (last {limit})", show_lines=False,
-              header_style="bold magenta")
-    t.add_column("time", style="dim")
-    t.add_column("provider")
-    t.add_column("model")
-    t.add_column("in", justify="right")
-    t.add_column("out", justify="right")
-    t.add_column("latency", justify="right")
-    t.add_column("prompt", style="dim")
-    t.add_column("error", style="red")
-    for r in tracker.recent(limit):
-        t.add_row(
-            time.strftime("%H:%M:%S", time.localtime(r.ts)),
-            r.provider,
-            r.model,
-            str(r.input_tokens),
-            str(r.output_tokens),
-            f"{r.latency_ms} ms",
-            r.prompt_preview[:40],
-            r.error_kind or "",
-        )
-    return t
-
-
-def _aggregate_table() -> Table:
-    t = Table(title="Usage totals (this process)", show_lines=False,
-              header_style="bold green")
-    t.add_column("provider", style="bold")
-    t.add_column("calls", justify="right")
-    t.add_column("errors", justify="right", style="red")
-    t.add_column("tokens in/out", justify="right")
-    t.add_column("cached", justify="right", style="dim")
-    t.add_column("avg latency", justify="right")
-    for a in tracker.aggregates():
-        t.add_row(
-            a.provider,
-            str(a.calls),
-            str(a.errors),
-            f"{a.input_tokens}/{a.output_tokens}",
-            str(a.cached_tokens),
-            f"{a.avg_latency_ms:.0f} ms",
-        )
-    if not tracker.aggregates():
-        t.add_row("-", "0", "0", "-", "-", "-")
-    return t
-
-
-def _status_layout() -> Layout:
-    layout = Layout()
-    layout.split_column(
-        Layout(name="head", size=1),
-        Layout(name="providers", ratio=2),
-        Layout(name="agg", ratio=2),
-        Layout(name="recent", ratio=3),
-    )
-    layout["head"].update(Panel("unified-cli status", border_style="cyan",
-                                style="bold", padding=(0, 1)))
-    layout["providers"].update(status_table(collect_states(), title="Providers"))
-    layout["agg"].update(_aggregate_table())
-    layout["recent"].update(_recent_table(10))
-    return layout
+# Status-layout helpers were relocated to ui.py so the REPL can reuse them
+# without importing cli.py. Re-exported here under their old private names.
+from .ui import status_layout as _status_layout  # noqa: E402
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
@@ -179,7 +118,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
                 time.sleep(interval)
                 live.update(_status_layout())
     except KeyboardInterrupt:
-        console.print("\n[dim]종료[/dim]")
+        console.print(f"\n[dim]{t('cli.status.stopped')}[/dim]")
         return 0
 
 
@@ -194,18 +133,18 @@ def _cmd_models(args: argparse.Namespace) -> int:
             ensure_ascii=False, indent=2,
         ))
         return 0
-    t = Table(title="Available models", show_lines=False, header_style="bold cyan")
-    t.add_column("provider", style="bold")
-    t.add_column("id")
-    t.add_column("display")
-    t.add_column("default", justify="center")
-    t.add_column("source", style="dim")
+    tbl = Table(title=t("cli.models.title"), show_lines=False, header_style="bold cyan")
+    tbl.add_column(t("cli.models.col.provider"), style="bold")
+    tbl.add_column(t("cli.models.col.id"))
+    tbl.add_column(t("cli.models.col.display"))
+    tbl.add_column(t("cli.models.col.default"), justify="center")
+    tbl.add_column(t("cli.models.col.source"), style="dim")
     for m in mods:
-        t.add_row(
-            m.provider, m.id, m.display_name or "-",
+        tbl.add_row(
+            m.provider, escape(m.id), escape(m.display_name or "-"),
             "✓" if m.default else "", m.source,
         )
-    console.print(t)
+    console.print(tbl)
     return 0
 
 
@@ -232,7 +171,7 @@ def _resolve_session_flags(
     if getattr(args, "continue_", False):
         saved = load_last_session()
         if saved is None:
-            console.print("[yellow]⚠ 저장된 세션 없음 — 새 대화로 시작.[/yellow]")
+            console.print(f"[yellow]{t('cli.chat.no_saved_session')}[/yellow]")
             return routed_provider, routed_model, None
         # If user didn't override -m, reuse saved (provider, model).
         if routed_provider is None and routed_model is None:
@@ -240,8 +179,10 @@ def _resolve_session_flags(
         # If user overrode to a different provider, the saved session_id is invalid.
         if routed_provider and routed_provider != saved.provider:
             console.print(
-                f"[yellow]⚠ --continue 는 이전 provider ({saved.provider}) 전용, "
-                f"-m 로 {routed_provider} 지정 — 새 대화로 시작.[/yellow]"
+                "[yellow]"
+                + t("cli.chat.continue_wrong_provider",
+                    saved=saved.provider, routed=routed_provider)
+                + "[/yellow]"
             )
             return routed_provider, routed_model, None
         # Same provider, different model override: keep session_id.
@@ -261,16 +202,18 @@ def _print_session_panel(
     from rich.panel import Panel
     sid = resp.session_id or "(none)"
     sid_short = sid[:12] + "…" if sid and len(sid) > 12 else sid
+    sid, sid_short = escape(sid), escape(sid_short)
+    model = escape(str(resp.model))
     lines = [
         f"[bold]provider[/bold]={resp.provider} · "
-        f"[bold]model[/bold]={resp.model}",
-        f"[bold]session_id[/bold]={sid} [dim](저장됨)[/dim]",
-        f"[dim]이어쓰기:[/dim] [cyan]unified-cli chat \"...\" --continue[/cyan]",
-        f"[dim]     또는:[/dim] [cyan]unified-cli chat \"...\" --resume {sid_short}[/cyan]",
+        f"[bold]model[/bold]={model}",
+        f"[bold]session_id[/bold]={sid} [dim]{t('cli.panel.saved')}[/dim]",
+        f"[dim]{t('cli.panel.resume')}[/dim] [cyan]unified-cli chat \"...\" --continue[/cyan]",
+        f"[dim]{t('cli.panel.or')}[/dim] [cyan]unified-cli chat \"...\" --resume {sid_short}[/cyan]",
         f"[dim]tokens in/out={resp.usage.input_tokens}/{resp.usage.output_tokens}  "
         f"latency={latency_ms} ms[/dim]",
     ]
-    console.print(Panel("\n".join(lines), title="session", border_style="cyan",
+    console.print(Panel("\n".join(lines), title=t("cli.panel.title"), border_style="cyan",
                         expand=False, padding=(0, 1)))
 
 
@@ -283,14 +226,14 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         try:
             provider, model = route(args.model)
         except UnifiedError as e:
-            console.print(f"[red]모델 라우팅 실패:[/red] {e}")
+            console.print(f"[red]{t('cli.chat.route_failed')}[/red] {escape(str(e))}")
             return 2
 
     # Resolve session flags (may override provider/model from state file).
     try:
         provider, model, session_id = _resolve_session_flags(args, provider, model)
     except UnifiedError as e:
-        console.print(f"[red]{e}[/red]")
+        console.print(f"[red]{escape(str(e))}[/red]")
         return 2
 
     create_kwargs: dict = {
@@ -305,7 +248,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     try:
         client = create(provider or "claude", **create_kwargs)
     except UnifiedError as e:
-        console.print(f"[red]{e}[/red]")
+        console.print(f"[red]{escape(str(e))}[/red]")
         return 3
 
     prompt = args.prompt or sys.stdin.read()
@@ -325,14 +268,16 @@ def _cmd_chat(args: argparse.Namespace) -> int:
             resp.model = resp_model or client.model
             resp.session_id = resp_session or ""
             from .core import Usage as _U
+            # Coerce missing counts to 0 — providers like agy report no usage,
+            # otherwise the session panel would render "tokens in/out=None/None".
             resp.usage = _U(
-                input_tokens=text_tokens[0], output_tokens=text_tokens[1],
+                input_tokens=text_tokens[0] or 0, output_tokens=text_tokens[1] or 0,
             )
         else:
             resp = client.chat(prompt, session_id=session_id, images=images)
             print(resp.text)
     except UnifiedError as e:
-        console.print(f"[red]{e}[/red]")
+        console.print(f"[red]{escape(str(e))}[/red]")
         return 4
 
     latency_ms = int((_t.time() - t0) * 1000)
@@ -368,7 +313,7 @@ def _run_stream_with_spinner(
     """
     from rich.status import Status
 
-    status = Status("[cyan]응답 대기 중…[/cyan]", console=console, spinner="dots")
+    status = Status(f"[cyan]{t('cli.chat.waiting')}[/cyan]", console=console, spinner="dots")
     status.start()
     started = False
     resolved_sid: Optional[str] = None
@@ -393,9 +338,9 @@ def _run_stream_with_spinner(
             elif msg.kind == "tool_use":
                 name = (msg.tool or {}).get("name")
                 if not started:
-                    status.update(f"[cyan]도구 사용 중: {name}[/cyan]")
+                    status.update(f"[cyan]{t('cli.chat.using_tool', name=escape(str(name)))}[/cyan]")
                 else:
-                    console.print(f"\n[dim][tool_use: {name}][/dim]")
+                    console.print(f"\n[dim][tool_use: {escape(str(name))}][/dim]")
     finally:
         status.stop()
     if started:
@@ -418,109 +363,150 @@ def _cmd_repl(args: argparse.Namespace) -> int:
 # ----- entrypoint -----
 
 def _print_no_arg_hint() -> None:
-    console.print("[bold cyan]unified-cli[/bold cyan] — Claude / Codex / Gemini 통합 CLI 래퍼")
+    console.print(f"[bold cyan]unified-cli[/bold cyan] — {t('cli.tagline')}")
     console.print()
-    console.print("처음이면: [bold]unified-cli setup[/bold]  (대화형 온보딩 마법사)")
-    console.print("상태 확인: [bold]unified-cli doctor[/bold] · [bold]unified-cli status[/bold]")
-    console.print("단발 호출: [bold]unified-cli chat \"안녕\" -m haiku[/bold]")
-    console.print("이어쓰기: [bold]unified-cli chat \"...\" --continue[/bold]  "
-                  "[dim](마지막 세션)[/dim]")
-    console.print("대화 모드: [bold]unified-cli repl[/bold]  "
-                  "[dim](슬래시 명령 + provider 교체)[/dim]")
-    console.print("모델 목록: [bold]unified-cli models[/bold]")
+    console.print(t("cli.hint.first_time"))
+    console.print(t("cli.hint.status"))
+    console.print(t("cli.hint.oneshot"))
+    console.print(t("cli.hint.continue"))
+    console.print(t("cli.hint.repl"))
+    console.print(t("cli.hint.models"))
     console.print()
-    console.print("[dim]전체 도움말: unified-cli --help[/dim]")
+    console.print(t("cli.hint.full_help"))
+
+
+def _prescan_lang(raw: list[str]) -> None:
+    """Resolve the UI language BEFORE the argparse parser is built.
+
+    argparse `help=`/`description=` text is localized when the parser is
+    constructed, so the language must be set first. We honor `--lang <code>`
+    / `--lang=<code>` from argv if present (highest priority), otherwise fall
+    back to i18n's normal resolution (settings.json → $UNIFIED_CLI_LANG → en).
+    Invalid/unknown values are ignored here — the real parser reports them.
+    """
+    code: Optional[str] = None
+    for i, tok in enumerate(raw):
+        if tok == "--lang" and i + 1 < len(raw):
+            code = raw[i + 1]
+            break
+        if tok.startswith("--lang="):
+            code = tok.split("=", 1)[1]
+            break
+    if code:
+        try:
+            i18n.set_lang(code)
+        except ValueError:
+            pass  # let the parser surface the invalid-choice error
 
 
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
+
+    # Resolve language early so all localized help/description text is correct.
+    _prescan_lang(raw)
+
     if not raw:
         _print_no_arg_hint()
         return 0
 
+    # `--lang` lives on a shared parent parser so it's accepted both before the
+    # subcommand (`unified-cli --lang ko doctor`) and after it
+    # (`unified-cli doctor --lang ko`). The actual language was already resolved
+    # by _prescan_lang() above; this keeps argparse from rejecting it as unknown
+    # and lists it in every --help.
+    lang_parent = argparse.ArgumentParser(add_help=False)
+    lang_parent.add_argument("--lang", choices=["en", "ko"], help=t("cli.help.lang"))
+
     parser = argparse.ArgumentParser(
         prog="unified-cli",
-        description="3개 AI CLI (claude / codex / gemini) 통합 래퍼. "
-                    "첫 실행 시 `unified-cli setup` 을 권장합니다.",
+        description=t("cli.app.desc"),
+        parents=[lang_parent],
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_doc = sub.add_parser("doctor", help="바이너리 · auth · 모델 개수 점검")
+    def _add(name: str, **kw):
+        return sub.add_parser(name, parents=[lang_parent], **kw)
+
+    p_doc = _add("doctor", help=t("cli.help.doctor"))
     p_doc.add_argument("--json", action="store_true",
-                       help="machine-readable JSON 출력 (자동화 스크립트용)")
+                       help=t("cli.help.doctor.json"))
     p_doc.set_defaults(func=_cmd_doctor)
 
-    p_setup = sub.add_parser("setup", help="대화형 온보딩 마법사 (설치 + 로그인 + 검증)")
+    p_setup = _add("setup", help=t("cli.help.setup"))
     p_setup.add_argument("--provider", choices=["claude", "codex", "gemini"],
-                         help="특정 provider 만 진행 (기본: 세 개 모두)")
+                         help=t("cli.help.setup.provider"))
     p_setup.add_argument("--skip-install", action="store_true",
-                         help="설치 단계 건너뛰기")
+                         help=t("cli.help.setup.skip_install"))
     p_setup.add_argument("--skip-verify", action="store_true",
-                         help="테스트 호출 건너뛰기 (토큰 절약)")
+                         help=t("cli.help.setup.skip_verify"))
     p_setup.set_defaults(func=_cmd_setup)
 
-    p_stat = sub.add_parser("status", help="사용량 스냅샷 + (옵션) 실시간 대시보드")
+    p_stat = _add("status", help=t("cli.help.status"))
     p_stat.add_argument("--watch", action="store_true",
-                        help="rich.live 로 주기 갱신 대시보드 (Ctrl+C 로 종료)")
-    p_stat.add_argument("--watch-interval", default=5,
-                        help="갱신 주기 초 (기본 5)")
+                        help=t("cli.help.status.watch"))
+    p_stat.add_argument("--watch-interval", type=float, default=5,
+                        help=t("cli.help.status.watch_interval"))
     p_stat.add_argument("--json", action="store_true",
-                        help="JSON 출력 (자동화 스크립트용)")
+                        help=t("cli.help.status.json"))
     p_stat.set_defaults(func=_cmd_status)
 
-    p_mod = sub.add_parser("models", help="사용 가능한 모델 목록")
+    p_mod = _add("models", help=t("cli.help.models"))
     p_mod.add_argument("provider", nargs="?", choices=["claude", "codex", "gemini"],
-                       help="provider 필터 (생략 시 전부)")
+                       help=t("cli.help.models.provider"))
     p_mod.add_argument("--refresh", action="store_true",
-                       help="캐시 무시하고 API 재조회")
-    p_mod.add_argument("--json", action="store_true", help="JSON 출력")
+                       help=t("cli.help.models.refresh"))
+    p_mod.add_argument("--json", action="store_true", help=t("cli.help.models.json"))
     p_mod.set_defaults(func=_cmd_models)
 
-    p_chat = sub.add_parser("chat", help="단일 프롬프트 호출 (stdin 입력도 가능)")
+    p_chat = _add("chat", help=t("cli.help.chat"))
     p_chat.add_argument("prompt", nargs="?",
-                        help="프롬프트 텍스트. 생략 시 stdin 에서 읽음")
+                        help=t("cli.help.chat.prompt"))
     p_chat.add_argument("-m", "--model",
-                        help="모델명 또는 provider/model (예: haiku, claude/sonnet, gpt-5.4-mini)")
+                        help=t("cli.help.chat.model"))
     p_chat.add_argument("--stream", action="store_true",
-                        help="토큰 단위 스트리밍 출력 (첫 토큰 대기 중엔 스피너 표시)")
+                        help=t("cli.help.chat.stream"))
     p_chat.add_argument("--no-web-search", dest="web_search",
                         action="store_false", default=True,
-                        help="웹서치 도구 비활성화 (기본 ON)")
+                        help=t("cli.help.chat.no_web_search"))
     p_chat.add_argument("--terse", action="store_true",
-                        help="Claude 가 짧은 질문에 장황하게 답하는 걸 억제")
+                        help=t("cli.help.chat.terse"))
     p_chat.add_argument("--cwd",
-                        help="하위 CLI 의 작업 디렉토리 (도구 사용 시 영향)")
+                        help=t("cli.help.chat.cwd"))
     p_chat.add_argument("--image", action="append", dest="images",
                         metavar="PATH",
-                        help="이미지 첨부 (반복 가능). Codex/Gemini 지원, "
-                             "Claude headless 는 현재 미지원")
+                        help=t("cli.help.chat.image"))
 
     # Session continuity flags (mutually exclusive).
     session_grp = p_chat.add_mutually_exclusive_group()
     session_grp.add_argument("-r", "--resume", metavar="SESSION_ID",
-                             help="특정 session_id 이어쓰기")
+                             help=t("cli.help.chat.resume"))
     session_grp.add_argument("-c", "--continue", dest="continue_",
                              action="store_true",
-                             help="마지막 저장된 세션 이어쓰기 (~/.unified-cli/state.json)")
+                             help=t("cli.help.chat.continue"))
     session_grp.add_argument("--new", action="store_true",
-                             help="저장된 세션 무시하고 새 대화 시작 + 상태파일 초기화")
+                             help=t("cli.help.chat.new"))
 
     p_chat.set_defaults(func=_cmd_chat)
 
-    p_repl = sub.add_parser("repl", help="대화형 REPL 모드 (슬래시 명령 /help)")
+    p_repl = _add("repl", help=t("cli.help.repl"))
     p_repl.add_argument("--provider", choices=["claude", "codex", "gemini"],
-                        default="claude", help="시작 provider (기본 claude)")
+                        default="claude", help=t("cli.help.repl.provider"))
     p_repl.add_argument("-m", "--model",
-                        help="시작 모델 (생략 시 provider 기본 모델)")
+                        help=t("cli.help.repl.model"))
     p_repl.add_argument("--no-web-search", dest="web_search",
                         action="store_false", default=True,
-                        help="웹서치 도구 비활성화 (기본 ON)")
+                        help=t("cli.help.repl.no_web_search"))
     p_repl.add_argument("--terse", action="store_true",
-                        help="Claude 짧은 응답 모드")
-    p_repl.add_argument("--cwd", help="하위 CLI 의 작업 디렉토리")
+                        help=t("cli.help.repl.terse"))
+    p_repl.add_argument("--cwd", help=t("cli.help.repl.cwd"))
     p_repl.set_defaults(func=_cmd_repl)
 
     ns = parser.parse_args(raw)
+    # Apply --lang from the parsed namespace too (covers `--lang=ko` placed
+    # after the subcommand, which the prescan above still catches, plus keeps
+    # the override authoritative for the command body).
+    if getattr(ns, "lang", None):
+        i18n.set_lang(ns.lang)
     return ns.func(ns)
 
 

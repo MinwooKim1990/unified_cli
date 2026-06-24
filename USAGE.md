@@ -103,15 +103,25 @@ unified-cli chat "compare these two charts" --image a.png --image b.png -m gpt-5
 unified-cli repl                              # default provider (claude)
 unified-cli repl --provider codex -m gpt-5.4-mini
 unified-cli repl --no-web-search              # disable web search
+unified-cli repl --lang ko                    # Korean UI
 ```
+
+The REPL is powered by `prompt_toolkit` (a **core dependency**, so it works
+straight from `pip install unified-cli` — there is no `[repl]` extra). In a
+real terminal, type `/` to get a **live as-you-type dropdown** of every slash
+command, so you don't have to memorize them. When stdin/stdout is not a TTY
+(e.g. piped input), the REPL falls back to a plain `input()` loop exposing the
+same commands.
 
 Inside the REPL, slash commands let you change context without restarting:
 
 | Command | What it does |
 |---|---|
-| `/help` | List all commands |
-| `/model <name>` | Switch model within the current provider |
-| `/provider <claude\|codex\|gemini>` | Switch provider; previous 8 turns are auto-injected as context |
+| `/help` | List all commands (localized to the current language) |
+| `/model [name]` | No argument → **picker** listing each provider's latest models (default marked ★); `/model <name>` switches model within the current provider (multi-word `agy` display names supported) |
+| `/provider [name]` | No argument → **picker** to choose a provider; either way the previous 8 turns are auto-injected as context |
+| `/status` | Live, auto-refreshing status panel inside the REPL (Ctrl+C returns to the prompt) |
+| `/lang <en\|ko>` | Switch the UI language live and persist it to `~/.unified-cli/settings.json` |
 | `/new` | Reset the conversation (drop history) |
 | `/save` | Show current `session_id` + how to resume from CLI |
 | `/history [N]` | Show last N turns (default 10) |
@@ -122,8 +132,25 @@ Inside the REPL, slash commands let you change context without restarting:
 | `/clear-images` | Drop pending attachments |
 | `/exit`, `/quit`, Ctrl+D | Exit (the last session_id is saved → `chat --continue`) |
 
-Arrow-key history is enabled (stdlib `readline`; persists to
-`~/.unified-cli/repl_history` between sessions).
+Command history persists to `~/.unified-cli/repl_history` between sessions
+(the file is created with `0o600` permissions).
+
+## Language (i18n)
+
+The whole CLI/REPL is localized; English is the default and Korean is
+available. The language is resolved in this order:
+
+1. `--lang {en,ko}` global flag (e.g. `unified-cli --lang ko chat "안녕"`)
+2. `~/.unified-cli/settings.json` (written by the REPL's `/lang` command)
+3. `$UNIFIED_CLI_LANG` environment variable (`export UNIFIED_CLI_LANG=ko`)
+4. Default: English
+
+```bash
+unified-cli --lang ko doctor          # one-off Korean output
+export UNIFIED_CLI_LANG=ko            # whole shell session in Korean
+# In the REPL:
+[claude/haiku] > /lang ko             # switch live + persist
+```
 
 ## Image input (multimodal)
 
@@ -198,6 +225,9 @@ Run the server:
 ```bash
 source .venv/bin/activate
 uvicorn unified_cli.server:app --port 8000   # binds 127.0.0.1 (localhost) by default
+# Dashboard:  http://localhost:8000/dashboard   (redesigned: stat cards, health
+#             cards, latency/token sparklines, per-model usage bars)
+#             http://localhost:8000/             redirects to /dashboard
 ```
 
 > **Localhost-only by default.** The server binds to `127.0.0.1` and **refuses
