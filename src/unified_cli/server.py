@@ -1,8 +1,16 @@
 """OpenAI-compatible HTTP server unifying all three providers.
 
-Run:
-    pip install '.[server]'
-    uvicorn unified_cli.server:app --port 8000
+Run (localhost only — see the ToS warning below):
+    pip install 'unified-cli[server]'
+    python -m unified_cli.server --port 8000      # 127.0.0.1, bind-guarded
+    # or: uvicorn unified_cli.server:app --port 8000
+
+⚠️  This server runs on YOUR CLI subscription auth and has no built-in auth or
+    rate limiting. Keep it on localhost. Exposing it to other people / networks
+    (e.g. `--host 0.0.0.0`) routes their requests through your subscription and
+    violates the providers' Terms of Service (account-ban risk). The `run()` /
+    `python -m unified_cli.server` launcher refuses a non-loopback bind unless
+    UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1 is set.
 
 Model routing:
     "haiku" / "claude-*" / "sonnet" / "opus"     → Claude
@@ -19,9 +27,13 @@ Conversation persistence:
 from __future__ import annotations
 
 import json
+import logging
+import os
+import sys
 import time
 import uuid
 import base64 as _b64
+from contextlib import asynccontextmanager
 from typing import Any, Optional, Union
 
 try:
@@ -43,7 +55,29 @@ from .ui import collect_states
 from .usage import tracker
 
 
-app = FastAPI(title="unified-cli OpenAI-compat")
+_log = logging.getLogger("unified_cli.server")
+
+# Hosts that keep the server reachable only from this machine.
+_LOOPBACK = {"127.0.0.1", "localhost", "::1"}
+_ALLOW_EXTERNAL_ENV = "UNIFIED_CLI_ALLOW_EXTERNAL_BIND"
+
+_PERSONAL_USE_NOTICE = (
+    "unified-cli OpenAI-compat server started — personal / local use only. "
+    "This server runs on YOUR CLI subscription auth; exposing it to other "
+    "people or networks routes their requests through your subscription and "
+    "violates the providers' Terms of Service (account-ban risk)."
+)
+
+
+@asynccontextmanager
+async def _lifespan(app: "FastAPI"):
+    # Fires on every startup, including a direct `uvicorn ...:app` launch that
+    # bypasses run()'s bind guard — so the reminder is always shown.
+    _log.warning(_PERSONAL_USE_NOTICE)
+    yield
+
+
+app = FastAPI(title="unified-cli OpenAI-compat", lifespan=_lifespan)
 
 # conversation-id → UnifiedConversation (sticky=False so providers can mix)
 CONVS: dict[str, UnifiedConversation] = {}
@@ -304,3 +338,63 @@ def conversations_endpoint():
 def dashboard():
     """Browser dashboard (localhost only — no auth)."""
     return HTMLResponse(DASHBOARD_HTML)
+
+
+# ---- launcher with a localhost guard ----
+
+def _external_bind_allowed() -> bool:
+    return os.environ.get(_ALLOW_EXTERNAL_ENV, "").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
+def run(host: str = "127.0.0.1", port: int = 8000, **uvicorn_kwargs) -> None:
+    """Launch the OpenAI-compatible server.
+
+    Binds to loopback (127.0.0.1) by default. Binding to a non-loopback host
+    exposes a server that runs on YOUR subscription auth — anyone who can reach
+    it has their requests served by your Pro/Max (or agy) account, which
+    violates the providers' Terms of Service and risks an account ban. We
+    therefore REFUSE a non-loopback bind unless you explicitly opt in with
+    ``UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1`` (not recommended).
+
+    There is no built-in auth or rate limiting; keep it on localhost.
+    """
+    import uvicorn
+
+    if host not in _LOOPBACK:
+        warning = (
+            f"\n⚠️  비-로컬 호스트({host})에 바인딩하려 합니다.\n"
+            "    이 서버는 당신의 구독 인증으로 동작합니다 — 외부에서 접근하면\n"
+            "    타인의 요청이 당신 구독으로 처리되어 각 제공자 ToS 위반(계정\n"
+            "    정지/차단 위험)이 됩니다. 개인 로컬 용도로만 쓰세요.\n"
+        )
+        if not _external_bind_allowed():
+            raise UnifiedError(
+                kind="config", provider="claude",
+                message=warning.strip(),
+                hint=(
+                    f"정말 외부 노출이 필요하면 {_ALLOW_EXTERNAL_ENV}=1 을 "
+                    "설정하세요 (권장하지 않음)."
+                ),
+            )
+        print(warning + f"    {_ALLOW_EXTERNAL_ENV}=1 설정됨 — 본인 책임 하에 진행합니다.\n",
+              file=sys.stderr)
+
+    uvicorn.run(app, host=host, port=port, **uvicorn_kwargs)
+
+
+if __name__ == "__main__":
+    # `python -m unified_cli.server` → localhost-guarded launch.
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="unified_cli.server",
+                                 description="unified-cli OpenAI-compatible server (localhost by default)")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8000)
+    _args = ap.parse_args()
+    try:
+        run(host=_args.host, port=_args.port)
+    except UnifiedError as _e:
+        print(f"{_e.message}\n{_e.hint or ''}", file=sys.stderr)
+        sys.exit(2)

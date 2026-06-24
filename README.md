@@ -38,6 +38,32 @@ pip install "unified-cli[server]"
 > **Any subset works** — you do not need all three. The wrapper simply uses
 > whichever of `claude` / `codex` / `agy` it finds on your `$PATH`.
 
+## ⚠️ Terms of Service & account-ban risk — read before using
+
+> **You are responsible for complying with each provider's Terms of Service.**
+> Automating these CLIs may breach them — **use at your own risk**. Terms are
+> evolving (clarified Feb 2026); this is not legal advice.
+
+- **Intended safe pattern = personal, local, individual use with your OWN
+  subscription.** Anthropic officially supports headless `claude -p` /
+  programmatic use, so that path is lower risk. Never expose the wrapper to
+  other people.
+- **Do NOT:** run the OpenAI-compatible server on a public/network interface,
+  route other people's requests through your subscription, share credentials,
+  or resell/proxy access. These violate the providers' ToS and **risk account
+  suspension or a permanent ban**.
+- **Antigravity (`agy` / the `gemini` provider) is the riskiest.** Google has
+  **banned individual accounts** for automating it (the ban cascaded across
+  Gemini CLI / Code Assist). For that reason the `gemini` provider is now
+  **disabled by default** — enable it at your own risk by setting
+  `UNIFIED_CLI_ENABLE_GEMINI=1`.
+- **The OpenAI-compatible server binds to `127.0.0.1` (localhost) by default**
+  and **refuses any non-loopback bind unless** you set
+  `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1`. It also logs a personal-use warning on
+  startup.
+- This package ships **no credentials** — each user brings their own
+  subscription, and nothing is stored or transmitted on your behalf.
+
 Use all three AI coding CLIs — each signed in with your personal subscription
 (Claude Pro/Max, ChatGPT Plus/Pro, Google Antigravity) — from a single unified
 interface, both as a **terminal CLI** and as a **Python library you can
@@ -47,6 +73,11 @@ interface, both as a **terminal CLI** and as a **Python library you can
 > gemini-3.5-flash` etc. still route to it), but it now wraps the **Antigravity
 > `agy` CLI** — Google blocked the old `gemini` CLI for individual accounts in
 > 2026. See the migration note below.
+>
+> ⚠️ **The `gemini` provider is disabled by default** because automating `agy`
+> has gotten individual Google accounts banned. Set
+> `UNIFIED_CLI_ENABLE_GEMINI=1` to enable it, at your own risk — see
+> [Terms of Service & account-ban risk](#️-terms-of-service--account-ban-risk--read-before-using).
 
 ```bash
 # CLI
@@ -60,8 +91,12 @@ from unified_cli import create, UnifiedConversation
 resp = create("claude").chat("hi")
 conv = UnifiedConversation()
 conv.send("Hello", provider="claude")
-conv.send("Continue", provider="gemini")   # context auto-injected
+conv.send("Continue", provider="gemini")   # needs UNIFIED_CLI_ENABLE_GEMINI=1
 ```
+
+> The `gemini` provider is **disabled by default** (Antigravity `agy` automation
+> has gotten Google accounts banned). Export `UNIFIED_CLI_ENABLE_GEMINI=1` before
+> any `gemini` example below will work.
 
 ## Why this exists
 
@@ -130,6 +165,12 @@ point. For the absolute fastest interactive feel use `-m gpt-5.3-codex-spark`.
 > names and slugs like `gemini-3.5-flash` work with `-m`. Unknown names
 > silently fall back to the default. Note: `agy` headless mode outputs plain
 > text (no token-usage reporting).
+>
+> ⚠️ **Disabled by default.** Because automating `agy` has gotten individual
+> Google accounts banned, the `gemini` provider only activates when
+> `UNIFIED_CLI_ENABLE_GEMINI=1` is set. Without it, `gemini`/`agy` calls (and
+> the `gemini-*` model examples above) raise a config error. Enable at your
+> own risk.
 
 ## Install from source (development)
 
@@ -180,7 +221,7 @@ unified-cli chat "compare these two" --image a.jpg --image b.jpg -m gpt-5.4-mini
 # Status & dashboard
 unified-cli doctor          # one-time health check
 unified-cli status --watch  # live terminal dashboard (5s refresh)
-uvicorn unified_cli.server:app --port 8000  # + http://localhost:8000/dashboard
+uvicorn unified_cli.server:app --port 8000  # localhost-only by default → http://localhost:8000/dashboard
 ```
 
 ### Interactive REPL — `unified-cli repl`
@@ -263,9 +304,15 @@ options.
 ### OpenAI-compatible server
 
 ```bash
-uvicorn unified_cli.server:app --port 8000
+uvicorn unified_cli.server:app --port 8000   # binds 127.0.0.1 (localhost) by default
 # Browse:  http://localhost:8000/dashboard   (live usage / sessions)
 ```
+
+> **Localhost-only by default.** The server binds to `127.0.0.1` and **refuses
+> to bind a non-loopback host** (e.g. `0.0.0.0`) unless you set
+> `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1`. It also logs a personal-use warning on
+> startup. Exposing your personal subscription to other people / over a network
+> violates the providers' ToS and **risks an account ban** — keep it local.
 
 Drop-in for any OpenAI client — model is auto-routed by name; the `user`
 field acts as a conversation id (preserves history across calls):
@@ -292,6 +339,7 @@ client.chat.completions.create(
 )
 
 # Continue in a different provider (cross-provider conversation)
+# NOTE: gemini is disabled by default — needs UNIFIED_CLI_ENABLE_GEMINI=1
 client.chat.completions.create(
     model="gemini-3.5-flash",                   # → gemini (agy)
     messages=[{"role":"user","content":"summarize what we discussed"}],

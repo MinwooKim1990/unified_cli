@@ -51,6 +51,38 @@ _INELIGIBLE_RE = re.compile(
 )
 
 
+# ---- opt-in gate -----------------------------------------------------------
+# Automating Antigravity (`agy`) can violate Google's Terms of Service, and
+# Google has actually banned individual accounts (and cascaded the block across
+# Gemini CLI / Code Assist) for it. Unlike Claude Code / Codex headless use —
+# which the vendors officially support — agy is high-risk, so this provider is
+# DISABLED BY DEFAULT. A user who deliberately wants it must opt in by setting
+# the env var below. claude / codex are unaffected.
+_ENABLE_ENV = "UNIFIED_CLI_ENABLE_GEMINI"
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def gemini_enabled() -> bool:
+    """True iff the user has explicitly opted into the agy/gemini provider."""
+    return os.environ.get(_ENABLE_ENV, "").strip().lower() in _TRUTHY
+
+
+def _require_gemini_enabled() -> None:
+    if gemini_enabled():
+        return
+    raise UnifiedError(
+        kind="config", provider="gemini",
+        message=(
+            "agy(Antigravity) 프로바이더는 기본 비활성화되어 있습니다. "
+            "agy 자동화는 Google ToS 위반으로 계정 정지/차단(밴) 위험이 있습니다."
+        ),
+        hint=(
+            f"위험을 감수하고 직접 사용하려면 환경변수 {_ENABLE_ENV}=1 을 "
+            "설정하세요. claude / codex 는 영향받지 않습니다."
+        ),
+    )
+
+
 class GeminiProvider(BaseProvider):
     name = "gemini"
     default_model = "gemini-3.5-flash"
@@ -66,6 +98,10 @@ class GeminiProvider(BaseProvider):
         conversations_dir: Optional[str] = None,
         **kw,
     ):
+        # Block construction (chat/stream/server/CLI all funnel through here)
+        # unless the user has explicitly opted in. Checked BEFORE super() so the
+        # ToS message — not a "binary not found" error — is what users see.
+        _require_gemini_enabled()
         super().__init__(**kw)
         self.skip_permissions = skip_permissions
         self.sandbox = sandbox

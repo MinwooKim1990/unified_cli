@@ -202,6 +202,8 @@ def test_claude_build_args_with_image_uses_read_tool():
 def test_gemini_build_args_with_image_injects_at_path():
     from unified_cli import create
     p = _make_dummy_png()
+    # The agy/gemini provider is gated off by default; opt in for this unit test.
+    os.environ["UNIFIED_CLI_ENABLE_GEMINI"] = "1"
     try:
         cli = create("gemini", web_search=False, bin_path="agy")
         argv, stdin = cli._build_args(
@@ -214,6 +216,7 @@ def test_gemini_build_args_with_image_injects_at_path():
         assert "describe" in argv[-1]
         assert stdin is None
     finally:
+        os.environ.pop("UNIFIED_CLI_ENABLE_GEMINI", None)
         os.unlink(p)
 
 

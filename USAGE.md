@@ -5,6 +5,21 @@
 README is the overview; this file covers **day-to-day patterns and
 troubleshooting** for both the CLI and the Python API.
 
+> ## ⚠️ ToS & account-ban risk
+> You are responsible for complying with each provider's Terms of Service;
+> automating these CLIs may breach them — **use at your own risk**. The intended
+> safe pattern is **personal, local, individual use with your OWN subscription**
+> (Anthropic officially supports headless `claude -p`). **Do not** expose the
+> OpenAI-compatible server to others/over a network, route other people's
+> requests through your subscription, share credentials, or resell/proxy access
+> — those violate ToS and risk suspension/ban. Two safety defaults follow from
+> this and are documented below:
+> - The **`gemini` provider (Antigravity `agy`) is disabled by default** —
+>   Google has banned individual accounts for automating it. Opt in with
+>   `UNIFIED_CLI_ENABLE_GEMINI=1`.
+> - The **server binds to `127.0.0.1` by default** and refuses a non-loopback
+>   bind unless `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1` is set.
+
 ## First-time setup
 
 ```bash
@@ -182,8 +197,14 @@ Run the server:
 
 ```bash
 source .venv/bin/activate
-uvicorn unified_cli.server:app --port 8000
+uvicorn unified_cli.server:app --port 8000   # binds 127.0.0.1 (localhost) by default
 ```
+
+> **Localhost-only by default.** The server binds to `127.0.0.1` and **refuses
+> to bind a non-loopback host** (e.g. `--host 0.0.0.0`) unless you explicitly
+> set `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1`. It logs a personal-use warning on
+> startup. Exposing your personal subscription to other people / over a network
+> violates the providers' ToS and **risks an account ban** — keep it local.
 
 Point any OpenAI-compatible client at `http://localhost:8000/v1`:
 
@@ -403,6 +424,14 @@ gemini = GeminiProvider(
   handles this — just pass `web_search=True`).
 
 ### Gemini (now the Antigravity `agy` CLI)
+- ⚠️ **Disabled by default.** Automating `agy` has gotten individual Google
+  accounts **banned**, so the `gemini` provider only activates when
+  `UNIFIED_CLI_ENABLE_GEMINI=1` is set in the environment. Without it, any
+  `gemini`/`agy` call (CLI, Python, or server) raises a config error. Enable
+  at your own risk:
+  ```bash
+  export UNIFIED_CLI_ENABLE_GEMINI=1
+  ```
 - The old `gemini` CLI is blocked for individual accounts
   (`IneligibleTierError → migrate to Antigravity`). The `gemini` provider now
   wraps `agy` (`~/.local/bin/agy`), discovered via `AGY_CLI_PATH` / PATH /

@@ -9,6 +9,8 @@
 Claude Code / OpenAI Codex / Google Antigravity(`agy`) 세 CLI를 **하나의 Python API + CLI** 로 통합.
 
 > Google 쪽 provider 키는 여전히 `"gemini"` (그리고 `-m gemini-3.5-flash` 등도 그대로 라우팅) 이지만, 내부적으로 **Antigravity `agy` CLI** 를 래핑합니다 — 2026년 구 `gemini` CLI 가 개인 계정에서 차단됐기 때문. 아래 마이그레이션 노트 참고.
+>
+> ⚠️ **`gemini` provider 는 기본 비활성화** 입니다. `agy` 자동화로 Google 개인 계정이 차단된 사례가 있어, `UNIFIED_CLI_ENABLE_GEMINI=1` 을 설정해야만 본인 책임 하에 켜집니다 — [이용약관 & 계정 정지 위험](#️-이용약관--계정-정지-위험--사용-전-반드시-읽기) 참고.
 
 ## 설치
 
@@ -37,6 +39,31 @@ pip install "unified-cli[server]"
 >
 > 셋 다 필요하지 않습니다 — **일부만 있어도 동작**합니다. 래퍼는 `$PATH` 에서
 > 발견되는 `claude` / `codex` / `agy` 만 사용합니다.
+
+## ⚠️ 이용약관 & 계정 정지 위험 — 사용 전 반드시 읽기
+
+> **각 provider 의 이용약관(ToS) 준수 책임은 사용자 본인에게 있습니다.** 이
+> CLI 들을 자동화하면 약관을 위반할 수 있으니 **사용에 따른 위험은 본인이
+> 부담**합니다. 약관은 계속 바뀌고 있으며(2026년 2월 명확화), 이 문서는 법률
+> 자문이 아닙니다.
+
+- **권장되는 안전한 사용 방식 = 본인 구독으로 하는 개인·로컬·단독 사용.**
+  Anthropic 은 헤드리스 `claude -p` / 프로그래밍 방식 사용을 **공식적으로
+  지원**하므로 그 경로는 위험이 낮습니다. 래퍼를 절대 다른 사람에게 노출하지
+  마세요.
+- **하지 말 것:** OpenAI 호환 서버를 공개/네트워크 인터페이스로 띄우기, 다른
+  사람의 요청을 본인 구독으로 처리하기, 자격증명 공유, 접근 권한 재판매/프록시.
+  이것들은 provider 의 ToS 위반이며 **계정 정지 또는 영구 차단 위험**이 있습니다.
+- **Antigravity (`agy` / `gemini` provider) 가 가장 위험합니다.** Google 은
+  이를 자동화한 **개인 계정을 실제로 차단**했습니다(차단이 Gemini CLI / Code
+  Assist 까지 연쇄 적용). 그래서 `gemini` provider 는 이제 **기본 비활성화**
+  되어 있으며, 환경변수 `UNIFIED_CLI_ENABLE_GEMINI=1` 을 설정해야만 본인 책임
+  하에 켜집니다.
+- **OpenAI 호환 서버는 기본적으로 `127.0.0.1`(localhost) 에 바인딩**되며,
+  `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1` 을 설정하지 않는 한 **loopback 이 아닌
+  바인딩을 거부**합니다. 기동 시 개인용 경고 로그도 출력합니다.
+- 이 패키지는 **자격증명을 전혀 포함하지 않습니다** — 각 사용자가 본인 구독을
+  가져오며, 어떤 자격증명도 대신 저장·전송하지 않습니다.
 
 - 구독 OAuth (Pro/Max, ChatGPT Plus/Pro, Antigravity) 로 로그인되어 있으면 **구독 크레딧으로** 실행
 - Claude/Codex 는 API 키 환경변수로 **자동 폴백** (agy 는 OAuth 전용)
@@ -199,8 +226,10 @@ conv = UnifiedConversation()   # sticky=False 가 기본
 conv.send("내 이름은 민우야", provider="claude")
 conv.send("내 이름 뭐였지?", provider="codex")     # ← 자동으로 Claude 대화의 직전 8턴을
                                                       #   Codex 프롬프트 앞에 컨텍스트로 주입
-conv.send("내 이름 한 번 더 말해", provider="gemini")
+conv.send("내 이름 한 번 더 말해", provider="gemini")  # UNIFIED_CLI_ENABLE_GEMINI=1 필요
 ```
+
+> `gemini` provider 는 **기본 비활성화** 입니다(Antigravity `agy` 자동화로 Google 계정이 차단된 사례 있음). 위·아래 `gemini` 예제는 `UNIFIED_CLI_ENABLE_GEMINI=1` 을 먼저 설정해야 동작합니다.
 
 같은 provider 로 연속 호출하면 native session (`--resume`) 으로 처리되어 효율적.
 `sticky=True` 로 생성하면 첫 provider 에 고정되고 전환 시 에러.
@@ -221,7 +250,7 @@ for msg in cli.stream("오늘 최신 Python 버전은?"):
 cli = create("claude", web_search=False)
 ```
 
-> Gemini provider는 이제 Antigravity `agy` CLI를 래핑합니다. agy는 에이전틱이라 웹서치를 스스로 판단해 수행하며 on/off 토글이 없습니다 (`web_search=`는 사실상 no-op).
+> Gemini provider는 이제 Antigravity `agy` CLI를 래핑합니다. agy는 에이전틱이라 웹서치를 스스로 판단해 수행하며 on/off 토글이 없습니다 (`web_search=`는 사실상 no-op). 단, **기본 비활성화**라 `UNIFIED_CLI_ENABLE_GEMINI=1` 을 설정해야 사용할 수 있습니다(`agy` 자동화 계정 차단 위험).
 
 ## 에러 분류 + 자동 복구
 
@@ -263,8 +292,14 @@ cat prompt.txt | unified-cli chat -m gpt-5.4-mini
 ## OpenAI 호환 HTTP 서버
 
 ```bash
-uvicorn unified_cli.server:app --port 8000
+uvicorn unified_cli.server:app --port 8000   # 기본 127.0.0.1(localhost) 바인딩
 ```
+
+> **기본 localhost 전용.** 서버는 `127.0.0.1` 에만 바인딩하며,
+> `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1` 을 설정하지 않는 한 loopback 이 아닌
+> 호스트(`0.0.0.0` 등) 바인딩을 **거부**합니다. 기동 시 개인용 경고 로그도
+> 출력합니다. 본인 구독을 다른 사람/네트워크에 노출하면 provider ToS 위반이며
+> **계정 차단 위험**이 있으니 로컬에서만 사용하세요.
 
 ```bash
 # non-streaming, 자동 라우팅

@@ -2,6 +2,21 @@
 
 README 는 개요, 이 파일은 **자주 쓰는 패턴과 트러블슈팅**.
 
+> ## ⚠️ 이용약관 & 계정 정지 위험
+> 각 provider 의 이용약관(ToS) 준수 책임은 사용자 본인에게 있으며, 이 CLI 들을
+> 자동화하면 약관을 위반할 수 있으니 **사용에 따른 위험은 본인이 부담**합니다.
+> 권장되는 안전한 사용 방식은 **본인 구독으로 하는 개인·로컬·단독 사용**입니다
+> (Anthropic 은 헤드리스 `claude -p` 를 공식 지원). OpenAI 호환 서버를 다른
+> 사람/네트워크에 노출하거나, 다른 사람의 요청을 본인 구독으로 처리하거나,
+> 자격증명을 공유하거나, 접근 권한을 재판매/프록시하지 **마세요** — 모두 ToS
+> 위반이며 계정 정지/차단 위험이 있습니다. 이로 인한 두 가지 안전 기본값이
+> 아래에 문서화되어 있습니다:
+> - **`gemini` provider(Antigravity `agy`) 는 기본 비활성화** — Google 이 이를
+>   자동화한 개인 계정을 차단했습니다. `UNIFIED_CLI_ENABLE_GEMINI=1` 로 옵트인.
+> - **서버는 기본적으로 `127.0.0.1` 에 바인딩**되며,
+>   `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1` 을 설정하지 않는 한 loopback 이 아닌
+>   바인딩을 거부합니다.
+
 ## 처음 시작
 
 ```bash
@@ -333,8 +348,14 @@ unified-cli models codex --json
 
 ```bash
 source .venv/bin/activate
-uvicorn unified_cli.server:app --port 8000
+uvicorn unified_cli.server:app --port 8000   # 기본 127.0.0.1(localhost) 바인딩
 ```
+
+> **기본 localhost 전용.** 서버는 `127.0.0.1` 에만 바인딩하며,
+> `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1` 을 설정하지 않는 한 loopback 이 아닌
+> 호스트(`--host 0.0.0.0` 등) 바인딩을 **거부**합니다. 기동 시 개인용 경고
+> 로그도 출력합니다. 본인 구독을 다른 사람/네트워크에 노출하면 provider ToS
+> 위반이며 **계정 차단 위험**이 있으니 로컬에서만 사용하세요.
 
 다른 터미널에서:
 ```bash
@@ -380,6 +401,10 @@ print(r.choices[0].message.content)
 - 웹서치는 내부적으로 `-c tools.web_search=true` 로 활성화 (wrapper가 자동 처리)
 
 ### Gemini (이제 Antigravity `agy` CLI)
+- ⚠️ **기본 비활성화.** `agy` 자동화로 Google 개인 계정이 **차단된** 사례가 있어, `gemini` provider 는 환경변수 `UNIFIED_CLI_ENABLE_GEMINI=1` 이 설정됐을 때만 활성화됩니다. 없으면 `gemini`/`agy` 호출(CLI·Python·서버)이 config 에러를 냅니다. 본인 책임 하에 켜기:
+  ```bash
+  export UNIFIED_CLI_ENABLE_GEMINI=1
+  ```
 - 구 `gemini` CLI 는 개인 계정 차단(IneligibleTier). `gemini` provider 는 `agy`(`~/.local/bin/agy`)를 래핑.
 - 기본 모델 `gemini-3.5-flash`. `agy --model` 은 슬러그(`gemini-3.5-flash`, `gemini-3.1-pro`) 와 `agy models` 의 display name(`Gemini 3.5 Flash (Medium)`, `Claude Sonnet 4.6 (Thinking)`, `GPT-OSS 120B (Medium)` 등) 둘 다 허용. 잘못된 이름은 조용히 default 로 폴백.
 - 세션은 `--conversation <UUID>`/`--continue`; id 는 `~/.gemini/antigravity-cli/conversations/` 의 최신 .db 에서 복구.
