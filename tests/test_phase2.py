@@ -48,9 +48,11 @@ def test_is_loopback_host_rejects_dns_rebinding():
     assert not server._is_loopback_host("127.0.0.1.")   # trailing-dot FQDN
     assert not server._is_loopback_host("0.0.0.0")
     assert not server._is_loopback_host("localhost.evil.com")
-    # An IPv4-mapped IPv6 literal IS genuinely loopback (== 127.0.0.1) — accepting
-    # it is correct, not a bypass (a Host of a real loopback IP is local).
-    assert server._is_loopback_host("::ffff:127.0.0.1")
+    # NB: the IPv4-mapped IPv6 literal "::ffff:127.0.0.1" is deliberately NOT
+    # asserted — `ipaddress`'s is_loopback delegates to the mapped IPv4 only on
+    # Python 3.13+, so it's True there and False on 3.9. Both are safe (it's a
+    # genuine loopback literal; rejecting it is merely stricter), so we don't
+    # pin the version-dependent stdlib behavior here.
 
 
 def test_conversations_endpoint_concurrent_mutation():
