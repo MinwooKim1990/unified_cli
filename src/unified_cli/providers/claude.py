@@ -135,6 +135,11 @@ class ClaudeProvider(BaseProvider):
                 f"{path_lines}\n{t('err.claude.image_instruction')}\n{prompt}"
             )
 
+        # End option parsing so a prompt that happens to start with "-" (e.g.
+        # "--version") is passed as the positional prompt, not parsed as a flag.
+        # Guarded on the leading dash so normal prompts are byte-identical.
+        if prompt.startswith("-"):
+            args.append("--")
         args.append(prompt)
         return args, None
 

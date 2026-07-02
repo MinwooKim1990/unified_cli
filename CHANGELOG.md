@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-03
+
+Reliability, headless/daemon robustness, and security release — the outcome of a
+comprehensive adversarial audit. The headline fix makes the wrapper safe to run
+from **launchd / cron / a server** (the context where `claude` silently hung on
+the macOS Keychain), plus a class of streaming-subprocess correctness fixes, a
+hardened localhost server, and REPL/CLI UX polish. Every phase was verified by an
+independent third-party audit pass.
+
+### Fixed
+
+- **Streaming no longer hangs forever when a wrapped CLI wedges before output.**
+  All streaming paths (sync `stream()`, async `astream()`, and the `agy` path)
+  now read the child on a background thread/task with an **output watchdog**: if
+  the CLI produces no first line within `first_output_timeout` (~60s) or goes
+  idle past `stream_timeout`, the child is killed and an actionable error is
+  raised. Previously the timeout sat in a `finally` after a blocking read and was
+  unreachable — the REPL/server could wedge indefinitely. The watchdog measures
+  the **child's** output cadence, so a slow consumer (SSE backpressure) never
+  kills a healthy child.
+- **macOS Keychain / launchd diagnosis.** When `claude` hangs in a non-interactive
+  context with credentials only in the login Keychain, the error now names the
+  cause and the fix (`claude setup-token` → `CLAUDE_CODE_OAUTH_TOKEN`).
+- **`stdin=DEVNULL`** on all streaming subprocess spawns — a child that reads
+  stdin can no longer hang in a daemon/piped context.
+- **API key no longer leaks into the child by default.** `_env()` now strips an
+  inherited `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` unless the auth-expired
+  fallback needs it, so an exported key can't silently switch you from your
+  subscription to metered API billing. (The old fallback was also a no-op.)
+- **UTF-8 subprocess I/O** (`encoding="utf-8", errors="replace"`) everywhere;
+  `astream()` no longer crashes on stdout lines over 64 KB.
+- **Server: localhost enforced at the ASGI layer.** A middleware rejects
+  non-loopback peers and non-loopback `Host` headers (DNS-rebinding defense,
+  using `ipaddress` — not a `127.` string prefix), so the invariant holds even
+  under a raw `uvicorn ...:app --host 0.0.0.0`. Opt out with
+  `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1`.
+- **Server: `CONVS` is now a bounded LRU** (max 200) with lock-guarded access;
+  anonymous single-turn requests are no longer stored — fixes unbounded growth
+  and an `OrderedDict mutated during iteration` race under concurrency.
+- **Setup wizard honors the gemini gate** — it no longer spawns the `agy` OAuth
+  flow (install/login/verify) unless `UNIFIED_CLI_ENABLE_GEMINI=1`.
+- **Conversation stream: session id / turn preserved on early stop.** A consumer
+  that stops mid-stream (Ctrl+C, SSE disconnect) no longer loses the native
+  session id or the partial turn.
+- Readline history file/dir hardened to `0o600`/`0o700` **before** first write
+  (no world-readable window). A prompt beginning with `-` (e.g. `--version`) is
+  now passed as text via a `--` sentinel, not parsed as a flag.
+
+### Added
+
+- **Headless binary discovery.** `claude`/`codex` are now probed in well-known
+  install locations (`/opt/homebrew/bin`, `~/.local/bin`, npm-global, …) when not
+  on `PATH` — fixes "binary not found" under launchd's minimal `PATH`.
+- **`unified-cli doctor --headless`** — a real per-provider preflight (tiny call,
+  short timeout, closed stdin) you run *from your service context* to prove auth
+  works there instead of discovering a hang at runtime. `doctor` also recognizes
+  `CLAUDE_CODE_OAUTH_TOKEN` and reports a blocked Keychain.
+- **`unified-cli serve`** — first-class subcommand for the dashboard + OpenAI API
+  (`--port`, `--open`), always bound to loopback.
+- **REPL session resume** — `unified-cli repl --continue` / `-c` and a `/resume`
+  slash command reopen your last saved session; a stale session is recovered
+  automatically.
+- **Pipe-friendly `chat`** — diagnostics, spinners, and the session panel go to
+  **stderr**, so `unified-cli chat "…" | jq` gets clean model output on stdout.
+  A missing prompt on an interactive terminal now shows usage instead of blocking.
+- A **"Running under launchd / cron / a server"** section in the README + USAGE
+  (English + Korean).
+
+### Changed
+
+- **Faster startup for `--version` / `--help` / `doctor` / `chat`** — the heavy
+  `prompt_toolkit` / `rich.progress` imports are now lazy (loaded only by `repl`
+  / `setup`).
+- CI matrix expanded to Python 3.9–3.13 on Linux plus macOS (3.9 & 3.13);
+  added `Environment :: Console` / `Typing :: Typed` / Python 3.14 classifiers.
+
 ## [0.2.0] - 2026-06-24
 
 REPL UX, internationalization, and dashboard release, hardened by a 9-round

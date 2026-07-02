@@ -39,6 +39,8 @@ class ProviderState:
     model_count: int
     model_source: str               # "api" / "cache" / "hardcoded" / "mixed"
     default_model: str
+    has_token_env: bool = False     # e.g. CLAUDE_CODE_OAUTH_TOKEN is set
+    keychain: str = "na"            # "present" / "absent" / "blocked" / "na"
 
     @property
     def health(self) -> str:
@@ -68,28 +70,47 @@ _API_KEY_ENVS = {
     "gemini": "GEMINI_API_KEY",
 }
 
+# Long-lived non-metered token env vars (OAuth-equivalent, not per-token API
+# billing). `claude setup-token` mints CLAUDE_CODE_OAUTH_TOKEN — the officially
+# supported way to authenticate Claude Code in a headless/daemon context where
+# the login Keychain is unreachable.
+_TOKEN_ENVS = {
+    "claude": "CLAUDE_CODE_OAUTH_TOKEN",
+}
 
-def _has_keychain_creds(provider: ProviderName) -> bool:
-    """Check macOS Keychain for a provider's OAuth credentials.
 
-    Only probes — does NOT read the secret (no auth prompt triggered).
-    Returns False on non-macOS or when `security` command is unavailable.
+def _keychain_status(provider: ProviderName) -> str:
+    """Probe the macOS Keychain for a provider's OAuth credentials.
+
+    Only probes metadata — does NOT read the secret (no auth prompt triggered).
+    Returns "present" (entry exists), "absent" (no entry), "blocked" (query
+    errored — e.g. locked/not permitted, the daemon case), or "na" (non-macOS /
+    no keychain service / `security` unavailable).
     """
     if sys.platform != "darwin":
-        return False
+        return "na"
     service = _KEYCHAIN_SERVICES.get(provider)
     if not service:
-        return False
+        return "na"
     try:
         # `find-generic-password` without -w returns metadata only (no secret).
-        # Exit 0 = entry exists, 44 = not found.
+        # Exit 0 = entry exists, 44 = not found, other = query blocked/errored.
         r = subprocess.run(
             ["security", "find-generic-password", "-s", service],
             capture_output=True, timeout=3,
         )
-        return r.returncode == 0
     except Exception:
-        return False
+        return "na"
+    if r.returncode == 0:
+        return "present"
+    if r.returncode == 44:
+        return "absent"
+    return "blocked"
+
+
+def _has_keychain_creds(provider: ProviderName) -> bool:
+    """Back-compat boolean wrapper over `_keychain_status`."""
+    return _keychain_status(provider) == "present"
 
 
 def collect_states() -> list[ProviderState]:
@@ -104,8 +125,12 @@ def collect_states() -> list[ProviderState]:
             count = len(mods)
         except Exception:
             count, source = 0, "error"
+        keychain = _keychain_status(name)  # type: ignore[arg-type]
+        token_env = _TOKEN_ENVS.get(name)
+        has_token = bool(token_env and os.environ.get(token_env))
         has_oauth = (_AUTH_FILES[name].exists()
-                     or _has_keychain_creds(name))  # type: ignore[arg-type]
+                     or keychain == "present"
+                     or has_token)
         out.append(ProviderState(
             name=name,  # type: ignore[arg-type]
             bin_path=bin_path,
@@ -115,6 +140,8 @@ def collect_states() -> list[ProviderState]:
             model_count=count,
             model_source=source,
             default_model=DEFAULT_MODELS[name],  # type: ignore[index]
+            has_token_env=has_token,
+            keychain=keychain,
         ))
     return out
 
@@ -138,10 +165,18 @@ def health_cell(state: ProviderState) -> Text:
 def auth_cell(state: ProviderState) -> Text:
     parts: list[str] = []
     if state.has_oauth:
-        parts.append("OAuth")
+        # Distinguish the headless token from interactive OAuth so operators
+        # can see the daemon-safe path is in effect.
+        parts.append("Token" if (state.has_token_env and state.keychain != "present"
+                                  and not _AUTH_FILES[state.name].exists())
+                     else "OAuth")
     if state.has_api_key:
         parts.append(f"${state.api_key_env}")
     if not parts:
+        # No usable auth. If creds live only in a blocked Keychain, say so —
+        # that's the launchd/daemon hang, not a missing login.
+        if state.keychain == "blocked":
+            return Text(t("ui.auth.keychain_blocked"), style="red")
         return Text(t("ui.auth.none"), style="red")
     return Text(" + ".join(parts), style="green" if state.has_oauth else "yellow")
 

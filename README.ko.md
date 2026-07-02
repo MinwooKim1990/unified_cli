@@ -333,7 +333,9 @@ cat prompt.txt | unified-cli chat -m gpt-5.4-mini
 ## OpenAI 호환 HTTP 서버
 
 ```bash
-uvicorn unified_cli.server:app --port 8000   # 기본 127.0.0.1(localhost) 바인딩
+unified-cli serve --port 8000 --open          # ← 권장: localhost 가드 + 대시보드 자동 오픈
+# 또는 raw ASGI 앱 (이제 미들웨어로 localhost 가드됨):
+uvicorn unified_cli.server:app --port 8000    # 기본 127.0.0.1(localhost) 바인딩
 # 브라우저:  http://localhost:8000/dashboard  (리디자인된 라이브 사용량/세션)
 #            http://localhost:8000/           (/dashboard 로 리다이렉트)
 ```
@@ -406,6 +408,54 @@ r = client.chat.completions.create(
 | not_found | 404 | not_found_error |
 | network | 502 | upstream_error |
 | internal | 500 | internal_error |
+
+## launchd / cron / 서버에서 실행 (헤드리스)
+
+래핑하는 CLI들은 **인터랙티브 실행**을 전제로 만들어졌습니다. 백그라운드 런처
+(macOS **launchd**, **cron**, **systemd**, 상시 실행 서버)에서는 두 가지가 문제됩니다.
+
+**1. 최소 `PATH` → "바이너리 없음".** launchd/cron은 빈약한 `PATH`
+(`/usr/bin:/bin:/usr/sbin:/sbin`)로 시작하므로 Homebrew·npm-global·`~/.local/bin`에
+설치된 `claude`/`codex`를 못 찾습니다. 이제 표준 설치 위치도 자동 탐색하지만,
+확실한 방법은 명시하는 것입니다:
+
+```bash
+export CLAUDE_CLI_PATH=/opt/homebrew/bin/claude   # 또는 ~/.local/bin/claude
+export CODEX_CLI_PATH=/opt/homebrew/bin/codex
+# launchd plist: <key>EnvironmentVariables</key> 아래에 설정.
+```
+
+**2. macOS 키체인 → 조용한 hang.** macOS에서 `claude`는 OAuth 자격증명을 **로그인
+키체인**에 저장합니다. launchd/데몬 컨텍스트에는 **키체인을 열 TTY가 없어서** CLI가
+인증 대기로 영원히 멈춥니다 — 호출이 hang 되다 타임아웃. 터미널에선 되고 서버에서만
+죽는 이유입니다. **장기 토큰**(공식 헤드리스 방식)으로 해결하세요:
+
+```bash
+claude setup-token                         # 실제 터미널에서 한 번만 실행
+# → 나온 토큰을 서비스 환경변수로:
+export CLAUDE_CODE_OAUTH_TOKEN=<token>     # OAuth 등가, 종량 과금 아님
+# (종량 API 과금을 원하면 대신:  export ANTHROPIC_API_KEY=sk-...)
+```
+
+> 기본적으로 래퍼는 **구독 OAuth**로 실행되며, 상속된
+> `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`를 자식 환경에서 **제거**합니다 — export된 키
+> 때문에 몰래 종량 과금으로 바뀌지 않게 하기 위함입니다. 헤드리스 인증은
+> `CLAUDE_CODE_OAUTH_TOKEN`을 쓰고, 종량 과금을 *원할 때만* API 키를 export 하세요.
+
+**배포 전에 증명하세요.** 서비스와 **동일한 컨텍스트**(예: launchd 잡 내부)에서
+preflight를 실행하면 provider마다 아주 작은 실제 호출을 해서 거기서 auth가 실제로
+되는지(hang이 아닌지) 알려줍니다:
+
+```bash
+unified-cli doctor --headless
+# ✓ claude: auth OK in this context     → 정상
+# ✗ claude: network — ... Keychain ...   → CLAUDE_CODE_OAUTH_TOKEN 설정
+```
+
+스트리밍 호출에는 짧은 **first-output 워치독**도 있습니다: provider가 ~60초 안에
+아무 출력도 안 내면(전형적인 키체인-hang) 프로세스를 죽이고 키체인 해결책을 안내하는
+에러를 반환합니다 — 무한 대기 대신. `codex`는 키체인이 필요 없고
+(`~/.codex/auth.json`), `agy`는 브라우저 OAuth를 쓰며 어차피 게이트됩니다.
 
 ## 신규 모델 자동 반영
 

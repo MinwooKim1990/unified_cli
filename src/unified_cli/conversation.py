@@ -97,7 +97,12 @@ class UnifiedConversation:
         last_provider = self.turns[-1].provider
         if last_provider == provider:
             return ""
-        recent = self.turns[-self.context_window:]
+        # Skip empty placeholder turns (e.g. the REPL resume seed) so they don't
+        # inject a blank "User:/Assistant:" pair into the switched-to prompt.
+        recent = [tr for tr in self.turns[-self.context_window:]
+                  if tr.prompt.strip() or tr.text.strip()]
+        if not recent:
+            return ""
         lines = [t("conv.ctx.header")]
         user_label = t("conv.ctx.user")
         asst_label = t("conv.ctx.assistant")
@@ -156,18 +161,27 @@ class UnifiedConversation:
 
         chunks: list[str] = []
         session_id: Optional[str] = None
-        for msg in client.stream(
-            prefix + prompt if prefix else prompt,
-            session_id=native_session,
-            images=images,
-        ):
-            if msg.kind == "text" and msg.text:
-                chunks.append(msg.text)
-            if msg.kind == "session" and msg.session_id:
-                session_id = msg.session_id
-            yield msg
-
-        self._record(prov, prompt, "".join(chunks), session_id)
+        try:
+            for msg in client.stream(
+                prefix + prompt if prefix else prompt,
+                session_id=native_session,
+                images=images,
+            ):
+                if msg.kind == "text" and msg.text:
+                    chunks.append(msg.text)
+                if msg.kind == "session" and msg.session_id:
+                    session_id = msg.session_id
+                    # Persist immediately: a consumer that stops early (Ctrl+C,
+                    # SSE disconnect) must not lose the native session id.
+                    self.sessions[prov] = session_id
+                yield msg
+        except GeneratorExit:
+            # Consumer stopped early — record the partial turn so context and
+            # session resume survive, then propagate the close.
+            self._record(prov, prompt, "".join(chunks), session_id)
+            raise
+        else:
+            self._record(prov, prompt, "".join(chunks), session_id)
 
     async def asend(
         self,
@@ -207,18 +221,23 @@ class UnifiedConversation:
 
         chunks: list[str] = []
         session_id: Optional[str] = None
-        async for msg in client.astream(
-            prefix + prompt if prefix else prompt,
-            session_id=native_session,
-            images=images,
-        ):
-            if msg.kind == "text" and msg.text:
-                chunks.append(msg.text)
-            if msg.kind == "session" and msg.session_id:
-                session_id = msg.session_id
-            yield msg
-
-        self._record(prov, prompt, "".join(chunks), session_id)
+        try:
+            async for msg in client.astream(
+                prefix + prompt if prefix else prompt,
+                session_id=native_session,
+                images=images,
+            ):
+                if msg.kind == "text" and msg.text:
+                    chunks.append(msg.text)
+                if msg.kind == "session" and msg.session_id:
+                    session_id = msg.session_id
+                    self.sessions[prov] = session_id  # persist eagerly (see stream())
+                yield msg
+        except GeneratorExit:
+            self._record(prov, prompt, "".join(chunks), session_id)
+            raise
+        else:
+            self._record(prov, prompt, "".join(chunks), session_id)
 
     # ----- state -----
 

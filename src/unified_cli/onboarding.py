@@ -29,6 +29,7 @@ from .core import ProviderName
 from .errors import UnifiedError
 from .factory import create
 from .i18n import t
+from .providers.gemini import gemini_enabled
 from .ui import ProviderState, banner, collect_states, panel, status_table
 
 
@@ -90,9 +91,23 @@ def run_setup(
     console.print(banner(t("setup.banner")))
     console.print()
 
-    states = collect_states()
-    if providers:
-        states = [s for s in states if s.name in providers]
+    # agy/gemini is ToS-gated (opt-in via UNIFIED_CLI_ENABLE_GEMINI). When not
+    # enabled it is excluded from EVERY step — install, login, verify — so the
+    # wizard never spawns the `agy` OAuth flow behind the gate.
+    gem_ok = gemini_enabled()
+
+    def _snapshot() -> list[ProviderState]:
+        s = collect_states()
+        if providers:
+            s = [x for x in s if x.name in providers]
+        if not gem_ok:
+            s = [x for x in s if x.name != "gemini"]
+        return s
+
+    if not gem_ok:
+        console.print(f"[dim]{t('setup.gemini.gated')}[/dim]")
+
+    states = _snapshot()
 
     # Step 1: snapshot
     console.print(Rule(t("setup.rule.env")))
@@ -113,9 +128,7 @@ def run_setup(
     # Step 3: login
     console.print(Rule(t("setup.rule.login")))
     # Re-detect after install
-    states = collect_states()
-    if providers:
-        states = [s for s in states if s.name in providers]
+    states = _snapshot()
     login_results: list[StepResult] = []
     for s in states:
         if s.bin_path and not (s.has_oauth or s.has_api_key):
@@ -128,17 +141,12 @@ def run_setup(
     verify_results: list[StepResult] = []
     if not skip_verify:
         console.print(Rule(t("setup.rule.verify")))
-        states = collect_states()
-        if providers:
-            states = [s for s in states if s.name in providers]
-        verify_results = _verify_all(states, console)
+        verify_results = _verify_all(_snapshot(), console)
         console.print()
 
     # Step 5: summary
     console.print(Rule(t("setup.rule.summary")))
-    console.print(status_table(collect_states() if not providers else
-                               [s for s in collect_states() if s.name in providers],
-                               title=t("setup.summary.final_status")))
+    console.print(status_table(_snapshot(), title=t("setup.summary.final_status")))
     _summary(console, install_results, login_results, verify_results, skip_verify)
 
     # Exit code: 0 if nothing was skipped, 1 if some steps were skipped/failed

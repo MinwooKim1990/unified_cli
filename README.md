@@ -343,9 +343,11 @@ options.
 ### OpenAI-compatible server
 
 ```bash
-uvicorn unified_cli.server:app --port 8000   # binds 127.0.0.1 (localhost) by default
-# Browse:  http://localhost:8000/dashboard   (live usage / sessions)
-#          http://localhost:8000/            (redirects to /dashboard)
+unified-cli serve --port 8000 --open          # ← recommended: localhost-guarded, opens the dashboard
+# or the raw ASGI app (also localhost-guarded by a middleware now):
+uvicorn unified_cli.server:app --port 8000    # binds 127.0.0.1 (localhost) by default
+# Browse:  http://localhost:8000/dashboard    (live usage / sessions)
+#          http://localhost:8000/             (redirects to /dashboard)
 ```
 
 > **Localhost-only by default.** The server binds to `127.0.0.1` and **refuses
@@ -386,6 +388,59 @@ client.chat.completions.create(
     user="session-1",                            # last 8 turns auto-injected
 )
 ```
+
+## Running under launchd / cron / a server (headless)
+
+The wrapped CLIs are designed to run **interactively**. Under a background
+launcher (macOS **launchd**, **cron**, **systemd**, a long-running server
+process) two things bite:
+
+**1. Minimal `PATH` → "binary not found".** launchd/cron start with a bare
+`PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`), so `claude`/`codex` installed in
+Homebrew, npm-global, or `~/.local/bin` aren't found. unified-cli now also
+probes the well-known install locations, but the robust fix is to be explicit:
+
+```bash
+export CLAUDE_CLI_PATH=/opt/homebrew/bin/claude   # or ~/.local/bin/claude
+export CODEX_CLI_PATH=/opt/homebrew/bin/codex
+# launchd plist: set these under <key>EnvironmentVariables</key>.
+```
+
+**2. macOS Keychain → silent hang.** On macOS, `claude` stores its OAuth
+credentials in the **login Keychain**. A launchd/daemon context has **no TTY to
+unlock the Keychain**, so the CLI blocks forever waiting on auth — the call
+appears to hang and then times out. Works in your terminal, dies only on the
+server. Fix it with a **long-lived token** (the officially supported headless
+path):
+
+```bash
+claude setup-token                         # run ONCE in a real terminal
+# → copy the token into your service environment:
+export CLAUDE_CODE_OAUTH_TOKEN=<token>     # OAuth-equivalent, NOT metered
+# (or, to use metered API billing instead:  export ANTHROPIC_API_KEY=sk-...)
+```
+
+> By default the wrapper runs on your **subscription OAuth** and **strips any
+> inherited `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`** from the child env, so an
+> exported key can't silently switch you to per-token billing. Set
+> `CLAUDE_CODE_OAUTH_TOKEN` for headless auth; only export the API key if you
+> *want* metered billing.
+
+**Prove it before you ship.** Run the preflight **from the same context** as
+your service (e.g. inside the launchd job) — it makes a tiny real call per
+provider and reports whether auth actually works there instead of hanging:
+
+```bash
+unified-cli doctor --headless
+# ✓ claude: auth OK in this context     → good to go
+# ✗ claude: network — ... Keychain ...   → set CLAUDE_CODE_OAUTH_TOKEN
+```
+
+Streaming calls also have a short **first-output watchdog**: if a provider
+produces no output within ~60s (the classic wedged-on-Keychain case) the wrapper
+kills it and returns an actionable error naming the Keychain fix, rather than
+blocking indefinitely. `codex` needs no Keychain (`~/.codex/auth.json`); `agy`
+uses browser OAuth and stays gated regardless.
 
 ## Known limitations
 

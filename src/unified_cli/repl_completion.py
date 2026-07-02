@@ -40,6 +40,7 @@ SLASH_COMMANDS: list[SlashCommand] = [
     SlashCommand("/images", "", "slash.desc.images", group="image"),
     SlashCommand("/clear-images", "", "slash.desc.clear-images", group="image"),
     SlashCommand("/new", "", "slash.desc.new", group="session"),
+    SlashCommand("/resume", "", "slash.desc.resume", group="session"),
     SlashCommand("/save", "", "slash.desc.save", group="session"),
     SlashCommand("/history", "[N]", "slash.desc.history", takes="int", group="session"),
     SlashCommand("/tokens", "", "slash.desc.tokens", group="info"),

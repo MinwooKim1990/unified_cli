@@ -36,6 +36,23 @@ unified-cli doctor         # any time: health check
 `doctor` should show 🟢 for all three providers. If one is 🟡, run
 `unified-cli setup --provider <name>` to finish that specific login.
 
+**Running headless (launchd / cron / systemd / a server)?** The wrapped CLIs
+assume an interactive TTY, so a background context can hit two traps: a minimal
+`PATH` (binary "not found") and, on macOS, `claude` hanging on the login
+Keychain (no TTY to unlock it). Fixes:
+
+```bash
+export CLAUDE_CLI_PATH=/opt/homebrew/bin/claude   # if PATH is minimal
+claude setup-token                                # once, in a real terminal
+export CLAUDE_CODE_OAUTH_TOKEN=<token>            # OAuth-equivalent, not metered
+unified-cli doctor --headless   # run FROM the service context to prove auth works
+```
+
+By default the wrapper runs on your subscription OAuth and strips any inherited
+`ANTHROPIC_API_KEY`/`OPENAI_API_KEY` from the child (so an exported key can't
+silently switch you to per-token billing). See the README section “Running under
+launchd / cron / a server” for the full recipe.
+
 ## The four daily usage patterns
 
 | Goal | Tool |

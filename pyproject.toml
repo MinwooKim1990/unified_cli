@@ -26,6 +26,7 @@ keywords = [
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
+    "Environment :: Console",
     "Intended Audience :: Developers",
     "Operating System :: MacOS",
     "Operating System :: POSIX",
@@ -35,9 +36,11 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Libraries",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Utilities",
+    "Typing :: Typed",
 ]
 dependencies = [
     "rich>=13",
@@ -47,8 +50,9 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 server = ["fastapi>=0.100", "uvicorn>=0.23", "pydantic>=2"]
-dev = ["pytest>=7"]
-all = ["fastapi>=0.100", "uvicorn>=0.23", "pydantic>=2", "pytest>=7"]
+# httpx powers starlette's TestClient (server endpoint tests).
+dev = ["pytest>=7", "fastapi>=0.100", "pydantic>=2", "httpx>=0.24"]
+all = ["fastapi>=0.100", "uvicorn>=0.23", "pydantic>=2", "pytest>=7", "httpx>=0.24"]
 
 [project.urls]
 Homepage = "https://github.com/MinwooKim1990/unified_cli"

@@ -20,8 +20,9 @@ from .errors import UnifiedError
 from .factory import create, route
 from .i18n import t
 from .models import DEFAULT_MODELS, list_models
-from .onboarding import run_setup
-from .repl import run_repl
+# NOTE: `.repl` (pulls prompt_toolkit) and `.onboarding` (pulls rich.progress)
+# are imported lazily inside _cmd_repl / _cmd_setup so that fast paths like
+# `--version`, `--help`, `doctor`, `chat` don't pay their import cost.
 from .state import (
     clear_last_session, load_last_session, save_last_session,
 )
@@ -30,6 +31,10 @@ from .usage import tracker
 
 
 console = Console()
+# Diagnostics / spinners / panels go to stderr so `unified-cli chat "..." | jq`
+# keeps stdout as pure model output. Only `print(resp.text)` / streamed text
+# is written to stdout.
+err_console = Console(stderr=True)
 
 
 # ----- doctor -----
@@ -44,6 +49,8 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
                 "bin_path": s.bin_path,
                 "has_oauth": s.has_oauth,
                 "has_api_key": s.has_api_key,
+                "has_token_env": s.has_token_env,
+                "keychain": s.keychain,
                 "api_key_env": s.api_key_env,
                 "model_count": s.model_count,
                 "model_source": s.model_source,
@@ -54,6 +61,9 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         ]
         print(json.dumps(payload, ensure_ascii=False, indent=2))
         return 0
+
+    if getattr(args, "headless", False):
+        return _doctor_headless(states)
 
     console.print(banner(t("cli.doctor.title")))
     console.print(status_table(states))
@@ -66,9 +76,53 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
     return 0 if not needs_setup else 1
 
 
+def _doctor_headless(states) -> int:
+    """Real per-provider preflight: make a tiny call with a short timeout and a
+    closed stdin, proving THIS process context can actually reach auth.
+
+    Run it *from your service context* (launchd/cron/systemd) — that is where a
+    Keychain-blocked `claude` hangs. In an interactive terminal it will usually
+    pass, because the terminal can unlock the Keychain.
+    """
+    from .providers.gemini import gemini_enabled
+
+    console.print(banner(t("cli.doctor.headless.title")))
+    console.print(f"[dim]{t('cli.doctor.headless.intro')}[/dim]")
+    console.print()
+    rc = 0
+    for s in states:
+        if s.name == "gemini" and not gemini_enabled():
+            console.print(f"  [dim]• gemini: {t('cli.doctor.headless.skipped_gate')}[/dim]")
+            continue
+        if not s.bin_path:
+            console.print(f"  [red]✗ {s.name}: {t('cli.doctor.headless.no_binary')}[/red]")
+            rc = 1
+            continue
+        try:
+            client = create(s.name, web_search=False, timeout=15)
+            resp = client.chat("ping")
+            reply = escape((resp.text or "").strip()[:30])
+            console.print(f"  [green]✓ {s.name}: {t('cli.doctor.headless.ok')}[/green] "
+                          f"[dim]{reply}[/dim]")
+        except UnifiedError as e:
+            console.print(f"  [red]✗ {s.name}: {e.kind}[/red] — {escape(e.message)}")
+            if e.hint:
+                console.print(f"     [dim]→ {escape(e.hint)}[/dim]")
+            rc = 1
+        except Exception as e:  # noqa: BLE001 - preflight must not crash
+            console.print(f"  [red]✗ {s.name}: {type(e).__name__}: {escape(str(e))}[/red]")
+            rc = 1
+    console.print()
+    console.print(f"[{'green' if rc == 0 else 'yellow'}]"
+                  f"{t('cli.doctor.headless.done_ok') if rc == 0 else t('cli.doctor.headless.done_fail')}"
+                  f"[/]")
+    return rc
+
+
 # ----- setup -----
 
 def _cmd_setup(args: argparse.Namespace) -> int:
+    from .onboarding import run_setup  # lazy (rich.progress / rich.prompt)
     providers: Optional[list[ProviderName]] = None
     if args.provider:
         providers = [args.provider]
@@ -213,8 +267,8 @@ def _print_session_panel(
         f"[dim]tokens in/out={resp.usage.input_tokens}/{resp.usage.output_tokens}  "
         f"latency={latency_ms} ms[/dim]",
     ]
-    console.print(Panel("\n".join(lines), title=t("cli.panel.title"), border_style="cyan",
-                        expand=False, padding=(0, 1)))
+    err_console.print(Panel("\n".join(lines), title=t("cli.panel.title"), border_style="cyan",
+                            expand=False, padding=(0, 1)))
 
 
 def _cmd_chat(args: argparse.Namespace) -> int:
@@ -226,14 +280,14 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         try:
             provider, model = route(args.model)
         except UnifiedError as e:
-            console.print(f"[red]{t('cli.chat.route_failed')}[/red] {escape(str(e))}")
+            err_console.print(f"[red]{t('cli.chat.route_failed')}[/red] {escape(str(e))}")
             return 2
 
     # Resolve session flags (may override provider/model from state file).
     try:
         provider, model, session_id = _resolve_session_flags(args, provider, model)
     except UnifiedError as e:
-        console.print(f"[red]{escape(str(e))}[/red]")
+        err_console.print(f"[red]{escape(str(e))}[/red]")
         return 2
 
     create_kwargs: dict = {
@@ -248,10 +302,18 @@ def _cmd_chat(args: argparse.Namespace) -> int:
     try:
         client = create(provider or "claude", **create_kwargs)
     except UnifiedError as e:
-        console.print(f"[red]{escape(str(e))}[/red]")
+        err_console.print(f"[red]{escape(str(e))}[/red]")
         return 3
 
-    prompt = args.prompt or sys.stdin.read()
+    # Prompt from arg, or piped stdin. If neither (interactive TTY with no
+    # prompt), don't block forever on stdin.read() — show usage and exit.
+    if args.prompt is not None:
+        prompt = args.prompt
+    elif not sys.stdin.isatty():
+        prompt = sys.stdin.read()
+    else:
+        err_console.print(f"[yellow]{t('cli.chat.need_prompt')}[/yellow]")
+        return 2
 
     images = getattr(args, "images", None) or None
     t0 = _t.time()
@@ -274,10 +336,12 @@ def _cmd_chat(args: argparse.Namespace) -> int:
                 input_tokens=text_tokens[0] or 0, output_tokens=text_tokens[1] or 0,
             )
         else:
-            resp = client.chat(prompt, session_id=session_id, images=images)
+            # Spinner on stderr while the (blocking) call runs; payload to stdout.
+            with err_console.status(f"[cyan]{t('cli.chat.waiting')}[/cyan]", spinner="dots"):
+                resp = client.chat(prompt, session_id=session_id, images=images)
             print(resp.text)
     except UnifiedError as e:
-        console.print(f"[red]{escape(str(e))}[/red]")
+        err_console.print(f"[red]{escape(str(e))}[/red]")
         return 4
 
     latency_ms = int((_t.time() - t0) * 1000)
@@ -293,7 +357,10 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         except OSError:
             pass  # state save is best-effort
 
-    _print_session_panel(resp, resumed_from=session_id, latency_ms=latency_ms)
+    # Session metadata is diagnostics — only render it when stderr is a terminal,
+    # so `... | jq` (stdout piped) or a fully-captured run stays clean.
+    if sys.stderr.isatty():
+        _print_session_panel(resp, resumed_from=session_id, latency_ms=latency_ms)
     return 0
 
 
@@ -313,7 +380,7 @@ def _run_stream_with_spinner(
     """
     from rich.status import Status
 
-    status = Status(f"[cyan]{t('cli.chat.waiting')}[/cyan]", console=console, spinner="dots")
+    status = Status(f"[cyan]{t('cli.chat.waiting')}[/cyan]", console=err_console, spinner="dots")
     status.start()
     started = False
     resolved_sid: Optional[str] = None
@@ -340,7 +407,7 @@ def _run_stream_with_spinner(
                 if not started:
                     status.update(f"[cyan]{t('cli.chat.using_tool', name=escape(str(name)))}[/cyan]")
                 else:
-                    console.print(f"\n[dim][tool_use: {escape(str(name))}][/dim]")
+                    err_console.print(f"\n[dim][tool_use: {escape(str(name))}][/dim]")
     finally:
         status.stop()
     if started:
@@ -351,13 +418,39 @@ def _run_stream_with_spinner(
 # ----- repl -----
 
 def _cmd_repl(args: argparse.Namespace) -> int:
+    from .repl import run_repl  # lazy (prompt_toolkit)
     return run_repl(
         provider=args.provider,
         model=args.model,
         web_search=args.web_search,
         terse=args.terse,
         cwd=args.cwd,
+        continue_session=getattr(args, "continue_", False),
     )
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    """Launch the localhost dashboard + OpenAI-compatible server."""
+    try:
+        from .server import run  # lazy (fastapi/uvicorn — optional extra)
+    except ImportError:
+        console.print(f"[red]{t('cli.serve.missing_deps')}[/red]")
+        console.print(t("cli.serve.install_hint"))
+        return 3
+    url = f"http://127.0.0.1:{args.port}/dashboard"
+    console.print(t("cli.serve.starting", url=url))
+    if args.open:
+        try:
+            import webbrowser
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001 - opening a browser is best-effort
+            pass
+    try:
+        run(host="127.0.0.1", port=args.port)
+    except UnifiedError as e:
+        console.print(f"[red]{escape(str(e))}[/red]")
+        return 2
+    return 0
 
 
 # ----- entrypoint -----
@@ -370,6 +463,7 @@ def _print_no_arg_hint() -> None:
     console.print(t("cli.hint.oneshot"))
     console.print(t("cli.hint.continue"))
     console.print(t("cli.hint.repl"))
+    console.print(t("cli.hint.serve"))
     console.print(t("cli.hint.models"))
     console.print()
     console.print(t("cli.hint.full_help"))
@@ -430,6 +524,8 @@ def main(argv: list[str] | None = None) -> int:
     p_doc = _add("doctor", help=t("cli.help.doctor"))
     p_doc.add_argument("--json", action="store_true",
                        help=t("cli.help.doctor.json"))
+    p_doc.add_argument("--headless", action="store_true",
+                       help=t("cli.help.doctor.headless"))
     p_doc.set_defaults(func=_cmd_doctor)
 
     p_setup = _add("setup", help=t("cli.help.setup"))
@@ -499,7 +595,16 @@ def main(argv: list[str] | None = None) -> int:
     p_repl.add_argument("--terse", action="store_true",
                         help=t("cli.help.repl.terse"))
     p_repl.add_argument("--cwd", help=t("cli.help.repl.cwd"))
+    p_repl.add_argument("-c", "--continue", dest="continue_", action="store_true",
+                        help=t("cli.help.repl.continue"))
     p_repl.set_defaults(func=_cmd_repl)
+
+    p_serve = _add("serve", help=t("cli.help.serve"))
+    p_serve.add_argument("--port", type=int, default=8000,
+                         help=t("cli.help.serve.port"))
+    p_serve.add_argument("--open", action="store_true",
+                         help=t("cli.help.serve.open"))
+    p_serve.set_defaults(func=_cmd_serve)
 
     ns = parser.parse_args(raw)
     # Apply --lang from the parsed namespace too (covers `--lang=ko` placed

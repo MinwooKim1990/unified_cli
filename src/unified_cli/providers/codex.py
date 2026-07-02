@@ -114,6 +114,8 @@ class CodexProvider(BaseProvider):
             else:
                 argv += [session_id]  # type: ignore[list-item]
             if not use_stdin:
+                if prompt.startswith("-"):
+                    argv += ["--"]  # a "--flag"-like prompt is text, not options
                 argv += [prompt]
             return argv, (prompt if use_stdin else None)
 
@@ -124,6 +126,8 @@ class CodexProvider(BaseProvider):
             argv += ["--add-dir", d]
         argv += image_args
         if not use_stdin:
+            if prompt.startswith("-"):
+                argv += ["--"]  # a "--flag"-like prompt is text, not options
             argv += [prompt]
         return argv, (prompt if use_stdin else None)
 

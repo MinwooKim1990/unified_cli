@@ -115,6 +115,10 @@ class GeminiProvider(BaseProvider):
         if kw.get("timeout") is None:
             self.timeout = max(self.timeout, 300)
             self.stream_timeout = max(self.stream_timeout, 600)
+        # agy runs agentic work (shell/web/files) and may emit nothing for a
+        # while before its first line, so the short first-output watchdog would
+        # kill legitimate runs. Bound streaming only by the overall idle timeout.
+        self.first_output_timeout = self.stream_timeout
         # Per-call state lives in thread-local storage so concurrent calls on a
         # shared instance (e.g. the server's threadpool) don't clobber each
         # other's requested session / launch snapshot.
@@ -318,9 +322,10 @@ class GeminiProvider(BaseProvider):
     ) -> Iterator[Message]:
         proc = subprocess.Popen(
             args,
-            stdin=subprocess.PIPE if stdin_data else None,
+            stdin=subprocess.PIPE if stdin_data else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, cwd=self.cwd, env=self._env(), bufsize=1,
+            text=True, encoding="utf-8", errors="replace",
+            cwd=self.cwd, env=self._env(), bufsize=1,
         )
         if stdin_data and proc.stdin:
             try:
@@ -331,16 +336,22 @@ class GeminiProvider(BaseProvider):
                 pass
         assert proc.stdout is not None
         # Drain stderr concurrently (pipe-deadlock guard — see base._stream_once).
-        from ..base import _drain_into
+        from ..base import _StreamReader, _drain_into
         _stderr_chunks: list[str] = []
         _stderr_thread = threading.Thread(
             target=_drain_into, args=(proc.stderr, _stderr_chunks), daemon=True)
         _stderr_thread.start()
+        # Read stdout on a background thread with an output watchdog (kills a
+        # child that stays silent past the deadline, without penalizing a slow
+        # consumer). first_output_timeout == stream_timeout for agy.
+        reader = _StreamReader(
+            proc, first_output=self.first_output_timeout, idle=self.stream_timeout
+        ).start()
         produced = False
         collected: list[str] = []
         loop_done = False
         try:
-            for line in proc.stdout:
+            for line in reader:
                 collected.append(line)
                 if line.strip():
                     produced = True
@@ -348,6 +359,7 @@ class GeminiProvider(BaseProvider):
                                   text=line, raw={"line": line})
             loop_done = True
         finally:
+            reader.close()
             # Aborted (Ctrl+C / generator close): agy is agentic and may run for
             # a long time, and stream_timeout is forced to >=600s — so kill
             # rather than wait it out.
@@ -367,6 +379,8 @@ class GeminiProvider(BaseProvider):
             stderr_text = "".join(_stderr_chunks)
 
         full = "".join(collected)
+        if reader.fired:
+            raise self._hang_error(before_output=reader.fired_before_output)
         if proc.returncode not in (0, None):
             self._check_ineligible(full + "\n" + stderr_text)
             err = classify(self.name, stderr_text, full, proc.returncode)

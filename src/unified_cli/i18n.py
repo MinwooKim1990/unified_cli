@@ -112,6 +112,10 @@ _EN = {
     "conv.ctx.assistant": "Assistant",
     # conversation control
     "repl.new.done": "conversation reset.",
+    "repl.resume.none": "no saved session to resume.",
+    "repl.resume.done": "resumed {provider}/{model} · session {sid}… (age {age}m). "
+                        "Your next message continues it.",
+    "repl.turn.session_reset": "session was stale — starting a fresh one on your next message.",
     "repl.save.none": "no session to save yet (use /save after the first turn).",
     "repl.save.title": "save",
     "repl.save.body": "session_id={sid}\nresume: unified-cli chat \"...\" --resume {sid}\nor:     unified-cli chat \"...\" --continue  (last saved session)",
@@ -151,6 +155,7 @@ _EN = {
     "slash.desc.images": "list attached images",
     "slash.desc.clear-images": "clear attached images",
     "slash.desc.new": "reset the conversation (drop context)",
+    "slash.desc.resume": "reopen your last saved session",
     "slash.desc.save": "show current session_id + resume command",
     "slash.desc.history": "show the last N (default 10) turns",
     "slash.desc.tokens": "this process's cumulative tokens/calls",
@@ -169,6 +174,7 @@ _EN = {
     "cli.hint.oneshot": "One-shot call: [bold]unified-cli chat \"hi\" -m haiku[/bold]",
     "cli.hint.continue": "Continue: [bold]unified-cli chat \"...\" --continue[/bold]  [dim](last session)[/dim]",
     "cli.hint.repl": "Chat mode: [bold]unified-cli repl[/bold]  [dim](slash commands + provider switch)[/dim]",
+    "cli.hint.serve": "Dashboard + API: [bold]unified-cli serve[/bold]  [dim](localhost web UI)[/dim]",
     "cli.hint.models": "List models: [bold]unified-cli models[/bold]",
     "cli.hint.full_help": "[dim]Full help: unified-cli --help[/dim]",
     # global --lang
@@ -176,8 +182,19 @@ _EN = {
     # doctor
     "cli.help.doctor": "Check binaries · auth · model counts",
     "cli.help.doctor.json": "machine-readable JSON output (for automation scripts)",
+    "cli.help.doctor.headless": "live auth preflight — run it from your service "
+                                "(launchd/cron) context to catch a Keychain hang",
     "cli.doctor.title": "unified-cli doctor",
     "cli.doctor.needs_setup": "⚠ Some providers need setup. Run `unified-cli setup`.",
+    "cli.doctor.headless.title": "unified-cli doctor · headless preflight",
+    "cli.doctor.headless.intro": "Making a tiny real call per provider (15s timeout, "
+                                 "closed stdin). Run this in the SAME context as your "
+                                 "service to prove auth works there.",
+    "cli.doctor.headless.ok": "auth OK in this context",
+    "cli.doctor.headless.no_binary": "CLI binary not found (check PATH / $CLAUDE_CLI_PATH)",
+    "cli.doctor.headless.skipped_gate": "skipped (set UNIFIED_CLI_ENABLE_GEMINI to test)",
+    "cli.doctor.headless.done_ok": "✓ All providers reachable from this context.",
+    "cli.doctor.headless.done_fail": "⚠ Some providers failed — see hints above.",
     # setup
     "cli.help.setup": "Interactive onboarding wizard (install + login + verify)",
     "cli.help.setup.provider": "Run only a specific provider (default: all three)",
@@ -214,6 +231,8 @@ _EN = {
     "cli.help.chat.continue": "Continue the last saved session (~/.unified-cli/state.json)",
     "cli.help.chat.new": "Ignore saved session, start a new conversation + reset state file",
     "cli.chat.route_failed": "model routing failed:",
+    "cli.chat.need_prompt": "No prompt given. Usage: unified-cli chat \"your message\" "
+                            "(or pipe text in: echo hi | unified-cli chat).",
     "cli.chat.no_saved_session": "⚠ No saved session — starting a new conversation.",
     "cli.chat.continue_wrong_provider": "⚠ --continue is for the previous provider ({saved}); "
                                         "-m specified {routed} — starting a new conversation.",
@@ -231,9 +250,18 @@ _EN = {
     "cli.help.repl.no_web_search": "Disable the web-search tool (ON by default)",
     "cli.help.repl.terse": "Claude terse-reply mode",
     "cli.help.repl.cwd": "Working directory for the sub-CLI",
+    "cli.help.repl.continue": "Resume your last saved session on start",
+    "cli.help.serve": "Launch the localhost dashboard + OpenAI-compatible API",
+    "cli.help.serve.port": "Port to bind (default 8000)",
+    "cli.help.serve.open": "Open the dashboard in your browser",
+    "cli.serve.starting": "Serving on [cyan]{url}[/cyan]  (Ctrl+C to stop)",
+    "cli.serve.missing_deps": "The server needs extra dependencies (fastapi, uvicorn).",
+    "cli.serve.install_hint": "Install them with: pip install \"unified-cli[server]\"",
 
     # ===== onboarding (onboarding.py) =====
     "setup.banner": "unified-cli setup — onboarding 3 providers",
+    "setup.gemini.gated": "gemini (agy) is disabled by default (ToS risk) — skipping it. "
+                          "Set UNIFIED_CLI_ENABLE_GEMINI=1 to include it in setup.",
     "setup.rule.env": "1. Environment check",
     "setup.rule.install": "2. Install missing CLIs",
     "setup.rule.login": "3. Providers needing login (OAuth)",
@@ -278,6 +306,7 @@ _EN = {
     "ui.health.setup_needed": "setup needed",
     "ui.health.missing_binary": "missing binary",
     "ui.auth.none": "(none)",
+    "ui.auth.keychain_blocked": "Keychain blocked",
     "ui.bin.not_found": "(not found)",
     "ui.table.status_title": "Provider status",
     "ui.table.col.provider": "Provider",
@@ -347,6 +376,17 @@ _EN = {
     "err.base.timeout_fallback.hint": "Check your network and retry.",
     "err.base.stream_timeout": "{provider} stream did not finish within {timeout}s.",
     "err.base.stream_timeout.hint": "For long replies, increase it via BaseProvider(timeout=N).",
+    "err.base.no_first_output": "{provider} produced no output within {timeout}s "
+                                "(the CLI appears wedged before starting).",
+    "err.base.keychain_hint": "On macOS under launchd / cron / a service, `claude` can "
+                              "hang forever waiting on the login Keychain (no TTY to "
+                              "unlock it). Fix: run `claude setup-token` in a terminal, "
+                              "then set CLAUDE_CODE_OAUTH_TOKEN in the service "
+                              "environment (or export ANTHROPIC_API_KEY). See the README "
+                              "section 'Running under launchd / cron / a server'.",
+    "err.base.line_too_long": "{provider} emitted an oversized output line.",
+    "err.base.line_too_long.hint": "A single streamed line exceeded the read buffer; "
+                                   "retry with non-streaming chat if this recurs.",
 
     # ===== factory.py =====
     "err.factory.unknown_provider": "Unknown provider: {provider}",
@@ -427,6 +467,10 @@ _KO = {
     "conv.ctx.user": "사용자",
     "conv.ctx.assistant": "어시스턴트",
     "repl.new.done": "대화 초기화됨.",
+    "repl.resume.none": "이어쓸 저장된 세션이 없습니다.",
+    "repl.resume.done": "{provider}/{model} 재개 · 세션 {sid}… ({age}분 전). "
+                        "다음 메시지부터 이어집니다.",
+    "repl.turn.session_reset": "세션이 만료됨 — 다음 메시지에서 새 세션으로 시작합니다.",
     "repl.save.none": "아직 저장할 세션이 없음 (첫 턴 후에 /save 쓰기).",
     "repl.save.title": "save",
     "repl.save.body": "session_id={sid}\n이어쓰기: unified-cli chat \"...\" --resume {sid}\n또는:    unified-cli chat \"...\" --continue  (마지막 저장 세션)",
@@ -460,6 +504,7 @@ _KO = {
     "slash.desc.images": "첨부된 이미지 목록",
     "slash.desc.clear-images": "첨부 이미지 지우기",
     "slash.desc.new": "대화 초기화 (컨텍스트 버리기)",
+    "slash.desc.resume": "마지막 저장된 세션 다시 열기",
     "slash.desc.save": "현재 session_id + 이어쓰기 명령 표시",
     "slash.desc.history": "최근 N(기본 10)턴 표시",
     "slash.desc.tokens": "이번 프로세스 누적 토큰/호출",
@@ -477,13 +522,24 @@ _KO = {
     "cli.hint.oneshot": "단발 호출: [bold]unified-cli chat \"안녕\" -m haiku[/bold]",
     "cli.hint.continue": "이어쓰기: [bold]unified-cli chat \"...\" --continue[/bold]  [dim](마지막 세션)[/dim]",
     "cli.hint.repl": "대화 모드: [bold]unified-cli repl[/bold]  [dim](슬래시 명령 + provider 교체)[/dim]",
+    "cli.hint.serve": "대시보드 + API: [bold]unified-cli serve[/bold]  [dim](localhost 웹 UI)[/dim]",
     "cli.hint.models": "모델 목록: [bold]unified-cli models[/bold]",
     "cli.hint.full_help": "[dim]전체 도움말: unified-cli --help[/dim]",
     "cli.help.lang": "UI 언어 (en|ko)",
     "cli.help.doctor": "바이너리 · auth · 모델 개수 점검",
     "cli.help.doctor.json": "machine-readable JSON 출력 (자동화 스크립트용)",
+    "cli.help.doctor.headless": "실시간 auth preflight — 서비스(launchd/cron) 컨텍스트에서 "
+                                "실행해 키체인 hang 을 잡아냅니다",
     "cli.doctor.title": "unified-cli doctor",
     "cli.doctor.needs_setup": "⚠ setup 이 필요한 provider 가 있습니다. `unified-cli setup` 을 실행하세요.",
+    "cli.doctor.headless.title": "unified-cli doctor · headless preflight",
+    "cli.doctor.headless.intro": "provider 마다 아주 작은 실제 호출을 합니다(15초 타임아웃, stdin 닫음). "
+                                 "서비스와 동일한 컨텍스트에서 실행해 거기서 auth 가 되는지 증명하세요.",
+    "cli.doctor.headless.ok": "이 컨텍스트에서 auth 정상",
+    "cli.doctor.headless.no_binary": "CLI 바이너리를 찾을 수 없음 (PATH / $CLAUDE_CLI_PATH 확인)",
+    "cli.doctor.headless.skipped_gate": "건너뜀 (테스트하려면 UNIFIED_CLI_ENABLE_GEMINI 설정)",
+    "cli.doctor.headless.done_ok": "✓ 이 컨텍스트에서 모든 provider 도달 가능.",
+    "cli.doctor.headless.done_fail": "⚠ 일부 provider 실패 — 위 힌트를 확인하세요.",
     "cli.help.setup": "대화형 온보딩 마법사 (설치 + 로그인 + 검증)",
     "cli.help.setup.provider": "특정 provider 만 진행 (기본: 세 개 모두)",
     "cli.help.setup.skip_install": "설치 단계 건너뛰기",
@@ -516,6 +572,8 @@ _KO = {
     "cli.help.chat.continue": "마지막 저장된 세션 이어쓰기 (~/.unified-cli/state.json)",
     "cli.help.chat.new": "저장된 세션 무시하고 새 대화 시작 + 상태파일 초기화",
     "cli.chat.route_failed": "모델 라우팅 실패:",
+    "cli.chat.need_prompt": "프롬프트가 없습니다. 사용법: unified-cli chat \"메시지\" "
+                            "(또는 파이프: echo 안녕 | unified-cli chat).",
     "cli.chat.no_saved_session": "⚠ 저장된 세션 없음 — 새 대화로 시작.",
     "cli.chat.continue_wrong_provider": "⚠ --continue 는 이전 provider ({saved}) 전용, "
                                         "-m 로 {routed} 지정 — 새 대화로 시작.",
@@ -531,9 +589,18 @@ _KO = {
     "cli.help.repl.no_web_search": "웹서치 도구 비활성화 (기본 ON)",
     "cli.help.repl.terse": "Claude 짧은 응답 모드",
     "cli.help.repl.cwd": "하위 CLI 의 작업 디렉토리",
+    "cli.help.repl.continue": "시작 시 마지막 저장 세션 이어쓰기",
+    "cli.help.serve": "localhost 대시보드 + OpenAI 호환 API 실행",
+    "cli.help.serve.port": "바인드 포트 (기본 8000)",
+    "cli.help.serve.open": "브라우저에서 대시보드 열기",
+    "cli.serve.starting": "[cyan]{url}[/cyan] 에서 서비스 중  (Ctrl+C 로 중지)",
+    "cli.serve.missing_deps": "서버에는 추가 의존성(fastapi, uvicorn)이 필요합니다.",
+    "cli.serve.install_hint": "설치: pip install \"unified-cli[server]\"",
 
     # ===== onboarding (onboarding.py) =====
     "setup.banner": "unified-cli setup — 3개 provider 온보딩",
+    "setup.gemini.gated": "gemini (agy) 는 기본 비활성(ToS 위험) — 건너뜁니다. "
+                          "setup 에 포함하려면 UNIFIED_CLI_ENABLE_GEMINI=1 을 설정하세요.",
     "setup.rule.env": "1. 환경 검사",
     "setup.rule.install": "2. 누락된 CLI 설치",
     "setup.rule.login": "3. 로그인 (OAuth) 필요한 provider",
@@ -577,6 +644,7 @@ _KO = {
     "ui.health.setup_needed": "설정 필요",
     "ui.health.missing_binary": "바이너리 없음",
     "ui.auth.none": "(없음)",
+    "ui.auth.keychain_blocked": "키체인 차단됨",
     "ui.bin.not_found": "(찾을 수 없음)",
     "ui.table.status_title": "Provider 상태",
     "ui.table.col.provider": "Provider",
@@ -645,6 +713,17 @@ _KO = {
     "err.base.timeout_fallback.hint": "네트워크 확인 후 재시도.",
     "err.base.stream_timeout": "{provider} 스트림이 {timeout}초 안에 끝나지 않음.",
     "err.base.stream_timeout.hint": "긴 응답이면 BaseProvider(timeout=N) 으로 늘리세요.",
+    "err.base.no_first_output": "{provider}가 {timeout}초 안에 아무 출력도 내지 않음 "
+                                "(시작 전에 멈춘 것으로 보입니다).",
+    "err.base.keychain_hint": "macOS에서 launchd / cron / 서비스로 실행하면 `claude`가 "
+                              "로그인 키체인을 여는 TTY가 없어 무한 대기할 수 있습니다. 해결: "
+                              "터미널에서 `claude setup-token` 을 실행한 뒤 "
+                              "CLAUDE_CODE_OAUTH_TOKEN 을 서비스 환경변수로 설정하세요 "
+                              "(또는 ANTHROPIC_API_KEY export). README의 "
+                              "'launchd / cron / 서버에서 실행' 섹션 참고.",
+    "err.base.line_too_long": "{provider} 출력 한 줄이 너무 큽니다.",
+    "err.base.line_too_long.hint": "스트리밍 한 줄이 읽기 버퍼를 초과했습니다. 반복되면 "
+                                   "비스트리밍(chat)으로 재시도하세요.",
 
     # ===== factory.py =====
     "err.factory.unknown_provider": "알 수 없는 provider: {provider}",

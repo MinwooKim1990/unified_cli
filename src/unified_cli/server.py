@@ -26,24 +26,29 @@ Conversation persistence:
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
 import sys
+import threading
 import time
 import uuid
 import base64 as _b64
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import Any, Optional, Union
 
 try:
-    from fastapi import FastAPI, HTTPException
-    from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+    from fastapi import FastAPI, HTTPException, Request
+    from fastapi.responses import (
+        HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse,
+    )
     from pydantic import BaseModel
 except ImportError as e:  # pragma: no cover
     raise ImportError(
         "unified_cli.server requires 'fastapi', 'uvicorn', and 'pydantic'. "
-        "Install with: pip install '.[server]'"
+        "Install with: pip install 'unified-cli[server]'"
     ) from e
 
 from .conversation import UnifiedConversation
@@ -80,8 +85,66 @@ async def _lifespan(app: "FastAPI"):
 
 app = FastAPI(title="unified-cli OpenAI-compat", lifespan=_lifespan)
 
-# conversation-id → UnifiedConversation (sticky=False so providers can mix)
-CONVS: dict[str, UnifiedConversation] = {}
+
+def _is_loopback_host(host: str) -> bool:
+    """True only for a genuine loopback host: the literal name "localhost", or
+    an IP address that parses as loopback (127.0.0.0/8, ::1).
+
+    Uses `ipaddress`, NOT a string prefix — `"127.".startswith` would wrongly
+    accept an attacker DNS name like "127.evil.com" (DNS-rebinding bypass), and
+    a trailing-dot FQDN like "127.0.0.1." — both are rejected here.
+    """
+    h = (host or "").strip().strip("[]")
+    if h.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+def _host_header_name(host_header: str) -> str:
+    """Extract the hostname from a Host header, dropping the port and IPv6
+    brackets: '127.0.0.1:8000' → '127.0.0.1', '[::1]:8000' → '::1'."""
+    h = (host_header or "").strip()
+    if h.startswith("["):
+        return h[1:h.index("]")] if "]" in h else h[1:]
+    return h.rsplit(":", 1)[0] if ":" in h else h
+
+
+@app.middleware("http")
+async def _localhost_guard(request: "Request", call_next):
+    """Enforce localhost-only at the ASGI layer, so the invariant holds even
+    under a raw `uvicorn unified_cli.server:app --host 0.0.0.0` launch that
+    bypasses run()'s bind guard. Rejects a non-loopback peer OR a non-loopback
+    Host header (DNS-rebinding defense). Opt out with the same env var as run()."""
+    if not _external_bind_allowed():
+        client_host = request.client.host if request.client else ""
+        host_name = _host_header_name(request.headers.get("host", ""))
+        if (client_host and not _is_loopback_host(client_host)) or \
+           (host_name and not _is_loopback_host(host_name)):
+            return JSONResponse(
+                status_code=403,
+                content={"error": {
+                    "message": ("This server is localhost-only. Set "
+                                f"{_ALLOW_EXTERNAL_ENV}=1 to allow external access "
+                                "(routes other people's requests through your "
+                                "subscription — violates provider ToS)."),
+                    "type": "invalid_request_error",
+                    "code": "config",
+                }},
+            )
+    return await call_next(request)
+
+
+# conversation-id → UnifiedConversation (sticky=False so providers can mix).
+# Bounded LRU so a long-running server can't grow CONVS without limit. Sync
+# endpoints run on Starlette's threadpool, so every read/mutation of this
+# OrderedDict is guarded by _CONVS_LOCK (move_to_end/popitem mutate the internal
+# linked list — concurrent iteration would otherwise raise RuntimeError).
+CONVS: "OrderedDict[str, UnifiedConversation]" = OrderedDict()
+_CONVS_LOCK = threading.Lock()
+_MAX_CONVS = 200
 
 
 class ChatMessage(BaseModel):
@@ -189,9 +252,16 @@ def _extract_user_message(messages: list[ChatMessage]) -> tuple[str, list[Any]]:
 
 
 def _get_conv(conv_id: str) -> UnifiedConversation:
-    if conv_id not in CONVS:
-        CONVS[conv_id] = UnifiedConversation(sticky=False)
-    return CONVS[conv_id]
+    """Fetch/create a stored conversation, evicting the oldest past _MAX_CONVS."""
+    with _CONVS_LOCK:
+        conv = CONVS.get(conv_id)
+        if conv is None:
+            conv = CONVS[conv_id] = UnifiedConversation(sticky=False)
+            while len(CONVS) > _MAX_CONVS:
+                CONVS.popitem(last=False)  # evict least-recently-used
+        else:
+            CONVS.move_to_end(conv_id)
+        return conv
 
 
 # ---- endpoints ----
@@ -205,8 +275,15 @@ def chat_completions(req: ChatRequest):
 
     prompt, images = _extract_user_message(req.messages)
     images = images or None
-    conv_id = req.user or str(uuid.uuid4())
-    conv = _get_conv(conv_id)
+    # Only conversations with an explicit `user` id are persisted (multi-turn).
+    # Anonymous single-turn requests get a throwaway conv so CONVS can't grow
+    # unboundedly from one-off calls; the id is still returned for reference.
+    if req.user:
+        conv_id = req.user
+        conv = _get_conv(conv_id)
+    else:
+        conv_id = str(uuid.uuid4())
+        conv = UnifiedConversation(sticky=False)
 
     response_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
     created = int(time.time())
@@ -304,6 +381,8 @@ def doctor_endpoint():
             "bin_path": s.bin_path,
             "has_oauth": s.has_oauth,
             "has_api_key": s.has_api_key,
+            "has_token_env": s.has_token_env,
+            "keychain": s.keychain,
             "api_key_env": s.api_key_env,
             "model_count": s.model_count,
             "model_source": s.model_source,
@@ -324,14 +403,25 @@ def usage_endpoint():
 def conversations_endpoint():
     """Active UnifiedConversations tracked by this server."""
     out = []
-    for conv_id, conv in CONVS.items():
-        last_provider = conv.turns[-1].provider if conv.turns else None
-        out.append({
-            "conversation_id": conv_id,
-            "last_provider": last_provider,
-            "turn_count": len(conv.turns),
-            "sessions": dict(conv.sessions),
-        })
+    # Snapshot under the lock so a concurrent _get_conv mutation can't raise
+    # "OrderedDict mutated during iteration"; render details outside the lock.
+    with _CONVS_LOCK:
+        items = list(CONVS.items())
+    for conv_id, conv in items:
+        # A conv's own turns/sessions may be mutated mid-stream by another
+        # threadpool worker (_record writes both). Snapshot defensively so this
+        # read-only diagnostic endpoint degrades (skips a racing entry) instead
+        # of 500-ing under a rare concurrent-mutation race.
+        try:
+            entry = {
+                "conversation_id": conv_id,
+                "last_provider": conv.turns[-1].provider if conv.turns else None,
+                "turn_count": len(conv.turns),
+                "sessions": dict(conv.sessions),
+            }
+        except (RuntimeError, IndexError):
+            continue
+        out.append(entry)
     return {"conversations": out}
 
 

@@ -55,6 +55,15 @@ def _setup_readline() -> None:
     except ImportError:
         return
     _HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # Harden perms BEFORE any write so the history (which can hold secrets typed
+    # at the prompt) never has a world-readable window — mirrors the hardened
+    # prompt_toolkit path (_harden_repl_history) and state.json/settings.json.
+    try:
+        os.chmod(_HISTORY_FILE.parent, 0o700)
+        _HISTORY_FILE.touch(exist_ok=True)
+        os.chmod(_HISTORY_FILE, 0o600)
+    except OSError:
+        pass
     try:
         import readline
         if _HISTORY_FILE.exists():
@@ -106,6 +115,7 @@ def run_repl(
     web_search: bool = True,
     terse: bool = False,
     cwd: Optional[str] = None,
+    continue_session: bool = False,
 ) -> int:
     # If the user asked to start on the gated provider, fall back gracefully.
     if provider == "gemini" and not gemini_enabled():
@@ -126,6 +136,9 @@ def run_repl(
 
     current = {"provider": provider, "model": model or DEFAULT_MODELS[provider]}
     pending_images: list[str] = []
+
+    if continue_session:
+        _apply_resume(conv, current)
 
     # Input driver: prompt_toolkit (live menu) when interactive, else readline.
     use_ptk = has_prompt_toolkit() and _interactive()
@@ -186,6 +199,34 @@ def run_repl(
 
 
 # ---------- slash commands ----------
+
+def _apply_resume(conv: UnifiedConversation, current: dict) -> bool:
+    """Load the last saved session and seed the conversation so the NEXT turn
+    resumes it natively. Returns True on success.
+
+    A placeholder Turn is appended so UnifiedConversation._use_native_session
+    (which requires the previous turn to be the same provider) engages on the
+    first real turn. The gemini gate is honored.
+    """
+    from .conversation import Turn
+    from .state import load_last_session
+
+    saved = load_last_session()
+    if saved is None:
+        console.print(f"[yellow]{t('repl.resume.none')}[/yellow]")
+        return False
+    if saved.provider == "gemini" and not gemini_enabled():
+        console.print(f"[yellow]{t('repl.gemini.locked')}[/yellow]")
+        return False
+
+    current["provider"] = saved.provider
+    current["model"] = saved.model
+    conv.sessions[saved.provider] = saved.session_id
+    conv.turns.append(Turn(provider=saved.provider, prompt="", text=""))
+    age_min = int(saved.age_seconds // 60)
+    console.print(f"[green]{t('repl.resume.done', provider=saved.provider, model=escape(_short(saved.model)), sid=escape(saved.session_id[:12]), age=age_min)}[/green]")
+    return True
+
 
 def _switch_provider(current: dict, new_provider: str) -> bool:
     """Switch provider with the gemini gate enforced. Returns True if switched."""
@@ -314,6 +355,10 @@ def _handle_slash(
         conv._clients.clear()  # type: ignore[attr-defined]
         conv._locked_provider = None  # type: ignore[attr-defined]
         console.print(f"[dim]{t('repl.new.done')}[/dim]")
+        return False
+
+    if cmd == "/resume":
+        _apply_resume(conv, current)
         return False
 
     if cmd == "/save":
@@ -456,6 +501,12 @@ def _run_turn(
         status.stop()
         print()
         console.print(f"[red]{escape(str(e))}[/red]")
+        if e.kind == "not_found":
+            # Stale/expired native session (e.g. a resumed session the CLI has
+            # since dropped) — clear it so the next turn starts fresh instead of
+            # failing the same way again.
+            conv.sessions.pop(current["provider"], None)
+            console.print(f"[dim]{t('repl.turn.session_reset')}[/dim]")
         return
     finally:
         status.stop()

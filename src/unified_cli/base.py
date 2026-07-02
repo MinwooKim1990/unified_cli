@@ -6,7 +6,9 @@ import asyncio
 import atexit
 import json
 import os
+import queue
 import subprocess
+import sys
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -42,6 +44,13 @@ _NETWORK_BACKOFF = (0.5, 1.5)
 # `BaseProvider(timeout=N)` if you need shorter or longer.
 DEFAULT_CHAT_TIMEOUT = 120        # seconds — non-streaming
 DEFAULT_STREAM_TIMEOUT = 300      # seconds — streaming may take longer for long replies
+# Max wait for the FIRST streamed line. claude/codex emit an init event almost
+# immediately, so a long gap before any output means the child is wedged — most
+# often `claude` blocked on a Keychain-protected OAuth read under launchd/cron
+# (no TTY to unlock the Keychain). Kept short so that hang fails fast with an
+# actionable message instead of blocking for the full stream timeout. Providers
+# whose first token is legitimately slow (agy) raise this in their __init__.
+DEFAULT_FIRST_OUTPUT_TIMEOUT = 60
 
 
 def _reject_empty_prompt(prompt: str, provider: str) -> None:
@@ -94,6 +103,81 @@ def _drain_into(pipe, sink: list) -> None:
         pass
 
 
+class _StreamReader:
+    """Reads a child's stdout on a background thread into a queue while a
+    watchdog thread tracks the CHILD's own output cadence.
+
+    Reading on a dedicated thread decouples the child's liveness from the
+    *consumer's* pull rate: a slow consumer (e.g. an SSE HTTP client applying
+    backpressure, or a per-message loop doing slow work) keeps the reader
+    draining the pipe, so the child never blocks on write and is never mistaken
+    for a hang. The watchdog kills the child only when IT goes silent past a
+    deadline: `first_output` before the very first line (catches a child wedged
+    before any output — e.g. `claude` blocked on the login Keychain under
+    launchd, with no TTY to unlock it) and `idle` between subsequent lines.
+
+    Iterate for decoded stdout lines (blocks until the next line or, after a
+    watchdog kill / child exit, EOF). Afterwards inspect `.fired` /
+    `.fired_before_output`, then `close()`.
+    """
+
+    _EOF = object()
+
+    def __init__(self, proc, *, first_output: float, idle: float):
+        self._proc = proc
+        self._first = first_output
+        self._idle = idle
+        self._q: "queue.Queue" = queue.Queue()
+        self._last = time.monotonic()   # last time the CHILD emitted a line
+        self._produced = False
+        self._stop = threading.Event()
+        self.fired = False
+        self.fired_before_output = False
+        self._reader = threading.Thread(target=self._read_loop, daemon=True)
+        self._watch = threading.Thread(target=self._watch_loop, daemon=True)
+
+    def start(self) -> "_StreamReader":
+        self._reader.start()
+        self._watch.start()
+        return self
+
+    def _read_loop(self) -> None:
+        try:
+            for line in self._proc.stdout:
+                self._last = time.monotonic()
+                self._produced = True
+                self._q.put(line)
+        except Exception:
+            pass
+        finally:
+            self._q.put(self._EOF)
+
+    def _watch_loop(self) -> None:
+        while not self._stop.wait(0.5):
+            if self._proc.poll() is not None:
+                return  # child exited on its own; reader will emit EOF
+            deadline = self._idle if self._produced else self._first
+            if time.monotonic() - self._last > deadline:
+                self.fired = True
+                self.fired_before_output = not self._produced
+                try:
+                    self._proc.kill()
+                except (ProcessLookupError, OSError):
+                    pass
+                return
+
+    def __iter__(self):
+        while True:
+            item = self._q.get()
+            if item is self._EOF:
+                return
+            yield item
+
+    def close(self) -> None:
+        self._stop.set()
+        self._watch.join(timeout=1)
+
+
 class BaseProvider(ABC):
     """Base class for a single-provider CLI wrapper.
 
@@ -124,6 +208,7 @@ class BaseProvider(ABC):
         bin_path: Optional[str] = None,
         extra_env: Optional[dict] = None,
         timeout: Optional[float] = None,
+        first_output_timeout: Optional[float] = None,
         web_search: bool = True,
     ):
         self.model = model or self.default_model
@@ -133,6 +218,13 @@ class BaseProvider(ABC):
         # mode-specific defaults (chat 120s, stream 300s).
         self.timeout = timeout if timeout is not None else DEFAULT_CHAT_TIMEOUT
         self.stream_timeout = timeout if timeout is not None else DEFAULT_STREAM_TIMEOUT
+        # First-line deadline for streaming (see DEFAULT_FIRST_OUTPUT_TIMEOUT).
+        # Never exceeds the overall stream timeout.
+        self.first_output_timeout = min(
+            first_output_timeout if first_output_timeout is not None
+            else DEFAULT_FIRST_OUTPUT_TIMEOUT,
+            self.stream_timeout,
+        )
         self.web_search = web_search
         # Per-call temp files (e.g. image bytes materialized to disk). Tracked
         # thread-locally and unlinked after each call so the long-running server
@@ -210,11 +302,58 @@ class BaseProvider(ABC):
     # ----- env + subprocess -----
 
     def _env(self, fallback_api_key: bool = False) -> dict:
+        """Environment for the child CLI.
+
+        The whole point of this wrapper is to run on the user's *subscription*
+        OAuth, not per-token API billing. So by default we STRIP any inherited
+        vendor API key (e.g. an exported ANTHROPIC_API_KEY) — otherwise the
+        wrapped CLI would silently switch to metered API billing and defeat the
+        package's core value. Only the explicit auth-expired fallback path
+        (`fallback_api_key=True`) keeps the key. A deliberate key passed via
+        `extra_env` always wins (applied after the pop).
+        """
         env = os.environ.copy()
+        if not fallback_api_key:
+            env.pop(self.api_key_env, None)
         env.update(self.extra_env)
-        if fallback_api_key and self.api_key_env in os.environ:
-            env[self.api_key_env] = os.environ[self.api_key_env]
         return env
+
+    # ----- hang / auth diagnosis -----
+
+    def _keychain_block_suspected(self) -> bool:
+        """True when a claude hang is most likely a macOS Keychain block.
+
+        `claude` stores OAuth creds in the login Keychain on macOS. Under a
+        launchd/cron/daemon context (no TTY to unlock it) the read blocks
+        forever. We flag this only when: provider is claude, on darwin, stdin is
+        not a TTY (daemon-like), and no file-based credentials exist (so creds
+        really are in the Keychain).
+        """
+        if self.name != "claude" or sys.platform != "darwin":
+            return False
+        try:
+            if sys.stdin is not None and sys.stdin.isatty():
+                return False
+        except (ValueError, OSError):
+            pass  # detached stdin (daemon) → treat as non-interactive
+        return not os.path.exists(
+            os.path.expanduser("~/.claude/.credentials.json")
+        )
+
+    def _hang_error(self, *, before_output: bool) -> UnifiedError:
+        """Build the UnifiedError raised when the streaming watchdog kills a
+        wedged child. Points macOS/launchd users at the Keychain fix."""
+        timeout = self.first_output_timeout if before_output else self.stream_timeout
+        if self._keychain_block_suspected():
+            hint = t("err.base.keychain_hint")
+        else:
+            hint = t("err.base.stream_timeout.hint")
+        key = "err.base.no_first_output" if before_output else "err.base.stream_timeout"
+        return UnifiedError(
+            kind="network", provider=self.name,
+            message=t(key, provider=self.name, timeout=int(timeout)),
+            hint=hint,
+        )
 
     def _run(self, args: list[str], stdin_data: Optional[str] = None) -> str:
         """Run subprocess with non-streaming output. Returns stdout on success.
@@ -236,6 +375,7 @@ class BaseProvider(ABC):
                 # though `-p` is supplied, which causes the wrapper to hang.
                 result = subprocess.run(
                     args, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace",
                     input=stdin_data if stdin_data is not None else "",
                     cwd=self.cwd, env=self._env(), timeout=self.timeout,
                 )
@@ -243,7 +383,9 @@ class BaseProvider(ABC):
                 raise UnifiedError(
                     kind="network", provider=self.name,
                     message=t("err.base.timeout", provider=self.name, timeout=self.timeout),
-                    hint=t("err.base.timeout.hint"),
+                    hint=(t("err.base.keychain_hint")
+                          if self._keychain_block_suspected()
+                          else t("err.base.timeout.hint")),
                 )
             if result.returncode == 0:
                 return result.stdout
@@ -258,6 +400,7 @@ class BaseProvider(ABC):
                     try:
                         result = subprocess.run(
                             args_retry, capture_output=True, text=True,
+                            encoding="utf-8", errors="replace",
                             input=stdin_data if stdin_data is not None else "",
                             cwd=self.cwd, env=self._env(fallback_api_key=True),
                             timeout=self.timeout,
@@ -400,10 +543,11 @@ class BaseProvider(ABC):
         session_checked = False
         proc = await asyncio.create_subprocess_exec(
             *args,
-            stdin=asyncio.subprocess.PIPE if stdin_data else None,
+            stdin=asyncio.subprocess.PIPE if stdin_data else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=self.cwd, env=self._env(),
+            limit=8 * 1024 * 1024,  # allow long JSON lines (asyncio default is 64 KiB)
         )
         if stdin_data and proc.stdin:
             proc.stdin.write(stdin_data.encode())
@@ -424,9 +568,65 @@ class BaseProvider(ABC):
                 pass
 
         _drain_task = asyncio.ensure_future(_drain_stderr())
+        # Reader task drains stdout into a queue, decoupling the child's output
+        # cadence from consumer backpressure: a slow `async for` consumer only
+        # parks us at the `yield` below while the reader keeps pulling, so the
+        # queue stays non-empty and the wait_for deadline never mistakes a slow
+        # consumer for a hung child. `produced` flips after the first line so the
+        # short first-output deadline applies only before any output.
+        _EOF = object()
+        _line_q: "asyncio.Queue" = asyncio.Queue()
+        state = {"produced": False}
+
+        async def _read_stdout():
+            while True:
+                try:
+                    raw = await proc.stdout.readline()
+                except (ValueError, asyncio.LimitOverrunError):
+                    await _line_q.put(("err", None))
+                    return
+                if not raw:
+                    await _line_q.put((_EOF, None))
+                    return
+                state["produced"] = True
+                await _line_q.put(("line", raw))
+
+        _read_task = asyncio.ensure_future(_read_stdout())
         try:
-            async for raw in proc.stdout:
-                line = raw.decode().strip()
+            while True:
+                deadline = (self.stream_timeout if state["produced"]
+                            else self.first_output_timeout)
+                try:
+                    kind, raw = await asyncio.wait_for(_line_q.get(), timeout=deadline)
+                except asyncio.TimeoutError:
+                    # Queue empty for `deadline` with the child alive → the CHILD
+                    # is silent (the consumer only ever fills the queue, never
+                    # drains it) — a wedged process, e.g. claude blocked on the
+                    # Keychain under launchd. Kill it and surface a hang error.
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    err = self._hang_error(before_output=not state["produced"])
+                    _usage_tracker.record(
+                        self.name, model or self.model,
+                        latency_ms=int((time.time() - t0) * 1000),
+                        prompt_preview=prompt, error_kind=err.kind,
+                    )
+                    raise err
+                if kind is _EOF:
+                    break
+                if kind == "err":
+                    try:
+                        proc.kill()
+                    except ProcessLookupError:
+                        pass
+                    raise UnifiedError(
+                        kind="internal", provider=self.name,
+                        message=t("err.base.line_too_long", provider=self.name),
+                        hint=t("err.base.line_too_long.hint"),
+                    )
+                line = raw.decode("utf-8", "replace").strip()
                 if not line or not line.startswith("{"):
                     continue
                 try:
@@ -479,12 +679,13 @@ class BaseProvider(ABC):
                     await proc.wait()
                 except Exception:
                     pass
-            if not _drain_task.done():
-                _drain_task.cancel()
-            try:
-                await _drain_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            for _task in (_read_task, _drain_task):
+                if not _task.done():
+                    _task.cancel()
+                try:
+                    await _task
+                except (asyncio.CancelledError, Exception):
+                    pass
             self._cleanup_temp_files()
 
     def _stream_once(
@@ -497,9 +698,9 @@ class BaseProvider(ABC):
         """Run subprocess once, yield normalized messages, raise on failure."""
         proc = subprocess.Popen(
             args,
-            stdin=subprocess.PIPE if stdin_data else None,
+            stdin=subprocess.PIPE if stdin_data else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, cwd=self.cwd,
+            text=True, encoding="utf-8", errors="replace", cwd=self.cwd,
             env=self._env(fallback_api_key=fallback), bufsize=1,
         )
         if stdin_data and proc.stdin:
@@ -517,10 +718,17 @@ class BaseProvider(ABC):
         _stderr_thread = threading.Thread(
             target=_drain_into, args=(proc.stderr, _stderr_chunks), daemon=True)
         _stderr_thread.start()
+        # Read stdout on a background thread with an output watchdog. This kills
+        # a child that produces no first line within first_output_timeout, or
+        # goes idle past stream_timeout — WITHOUT killing a healthy child just
+        # because the consumer below is slow to pull (see _StreamReader).
+        reader = _StreamReader(
+            proc, first_output=self.first_output_timeout, idle=self.stream_timeout
+        ).start()
         produced_any = False
         loop_done = False
         try:
-            for line in proc.stdout:
+            for line in reader:
                 line = line.strip()
                 if not line or not line.startswith("{"):
                     continue
@@ -533,6 +741,7 @@ class BaseProvider(ABC):
                     yield msg
             loop_done = True
         finally:
+            reader.close()
             # Aborted mid-stream (generator .close()/error): don't wait on a
             # possibly long-running child — kill it.
             if not loop_done and proc.poll() is None:
@@ -542,14 +751,14 @@ class BaseProvider(ABC):
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait()
-                raise UnifiedError(
-                    kind="network", provider=self.name,
-                    message=t("err.base.stream_timeout", provider=self.name,
-                              timeout=self.stream_timeout),
-                    hint=t("err.base.stream_timeout.hint"),
-                )
+                raise self._hang_error(before_output=False)
             _stderr_thread.join(timeout=5)
             stderr_text = "".join(_stderr_chunks)
+
+        if reader.fired:
+            # The watchdog killed a wedged child — report the hang, not the
+            # SIGKILL exit code (which classify() would mislabel as internal).
+            raise self._hang_error(before_output=reader.fired_before_output)
 
         if proc.returncode not in (0, None):
             err = classify(self.name, stderr_text, "", proc.returncode)

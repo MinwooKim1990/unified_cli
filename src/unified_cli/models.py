@@ -182,7 +182,8 @@ def _list_gemini() -> list[ModelInfo]:
         return _hardcoded("gemini")
     try:
         out = subprocess.run(
-            [agy, "models"], capture_output=True, text=True, input="", timeout=15,
+            [agy, "models"], capture_output=True, text=True,
+            encoding="utf-8", errors="replace", input="", timeout=15,
         )
         if out.returncode != 0:
             return _hardcoded("gemini")
