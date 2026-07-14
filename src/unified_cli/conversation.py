@@ -12,6 +12,7 @@ Inside a single provider, resumption uses that provider's native session.
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Iterator, Optional
 
@@ -47,16 +48,42 @@ class UnifiedConversation:
         sticky: bool = False,
         context_window: int = 8,
         provider_opts: Optional[dict] = None,
+        provider_opts_by_provider: Optional[dict[ProviderName, dict]] = None,
+        max_turns: Optional[int] = None,
+        max_turn_chars: Optional[int] = None,
+        max_clients: Optional[int] = None,
     ):
+        for name, value in (
+            ("context_window", context_window),
+            ("max_turns", max_turns),
+            ("max_turn_chars", max_turn_chars),
+            ("max_clients", max_clients),
+        ):
+            if value is not None and value < 1:
+                raise ValueError(f"{name} must be at least 1 when set")
         self.default_provider = default_provider
         self.default_model = default_model
         self.sticky = sticky
         self.context_window = context_window
         self.provider_opts = provider_opts or {}
+        # Global provider_opts remain the backwards-compatible default. A
+        # caller with genuinely provider-specific flags (notably the local
+        # HTTP server's restricted execution profile) can override only the
+        # matching provider without leaking unknown kwargs to the others.
+        self.provider_opts_by_provider = {
+            provider: dict(options)
+            for provider, options in (provider_opts_by_provider or {}).items()
+        }
+        # Public conversations deliberately remain unbounded by default. The
+        # local HTTP server opts into these limits so an arbitrary persistent
+        # user id cannot retain an unlimited transcript/client cache.
+        self.max_turns = max_turns
+        self.max_turn_chars = max_turn_chars
+        self.max_clients = max_clients
 
         self.sessions: dict[ProviderName, str] = {}
         self.turns: list[Turn] = []
-        self._clients: dict[tuple[ProviderName, Optional[str]], BaseProvider] = {}
+        self._clients: "OrderedDict[tuple[ProviderName, Optional[str]], BaseProvider]" = OrderedDict()
         self._locked_provider: Optional[ProviderName] = None
 
     # ----- helpers -----
@@ -64,12 +91,22 @@ class UnifiedConversation:
     def _get_client(self, provider: ProviderName, model: Optional[str]) -> BaseProvider:
         key = (provider, model)
         if key not in self._clients:
-            opts = {**self.provider_opts}
+            if self.max_clients is not None and len(self._clients) >= self.max_clients:
+                # The cache only preserves process/provider configuration; a
+                # native session id remains in self.sessions, so recreating the
+                # least-recently-used client is safe.
+                self._clients.popitem(last=False)
+            opts = {
+                **self.provider_opts,
+                **self.provider_opts_by_provider.get(provider, {}),
+            }
             if provider != "claude":
                 # `terse` is a Claude-only constructor option; passing it to
                 # codex/gemini would raise TypeError (unexpected kwarg).
                 opts.pop("terse", None)
             self._clients[key] = create(provider, model=model, **opts)
+        else:
+            self._clients.move_to_end(key)
         return self._clients[key]
 
     def _resolve(
@@ -250,7 +287,21 @@ class UnifiedConversation:
     ) -> None:
         if session_id:
             self.sessions[provider] = session_id
+        if self.max_turn_chars is not None:
+            prompt = self._truncate_for_storage(prompt)
+            text = self._truncate_for_storage(text)
         self.turns.append(Turn(provider=provider, prompt=prompt, text=text))
+        if self.max_turns is not None and len(self.turns) > self.max_turns:
+            del self.turns[:-self.max_turns]
+
+    def _truncate_for_storage(self, value: str) -> str:
+        """Bound stored server history without changing the live response."""
+        assert self.max_turn_chars is not None
+        if len(value) <= self.max_turn_chars:
+            return value
+        if self.max_turn_chars == 1:
+            return "…"
+        return value[:self.max_turn_chars - 1] + "…"
 
     def history(self) -> list[Turn]:
         return list(self.turns)

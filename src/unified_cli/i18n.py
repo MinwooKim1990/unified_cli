@@ -217,6 +217,15 @@ _EN = {
     "cli.models.col.display": "display",
     "cli.models.col.default": "default",
     "cli.models.col.source": "source",
+    # durable preferences
+    "cli.help.config": "View or update durable CLI preferences",
+    "cli.help.config.default_provider": "View or set the provider used when none is specified",
+    "cli.help.config.default_provider.provider": "claude, codex, or gemini",
+    "cli.help.config.default_provider.reset": "Reset to the built-in Claude default",
+    "cli.config.default_provider.current": "Default provider: {provider}",
+    "cli.config.default_provider.set": "Default provider set to: {provider}",
+    "cli.config.default_provider.reset": "Default provider reset to: claude",
+    "cli.config.default_provider.conflict": "Choose a provider or --reset, not both.",
     # chat
     "cli.help.chat": "Single prompt call (stdin input also supported)",
     "cli.help.chat.prompt": "Prompt text. Read from stdin if omitted",
@@ -225,8 +234,7 @@ _EN = {
     "cli.help.chat.no_web_search": "Disable the web-search tool (ON by default)",
     "cli.help.chat.terse": "Suppress Claude's verbose answers to short questions",
     "cli.help.chat.cwd": "Working directory for the sub-CLI (affects tool use)",
-    "cli.help.chat.image": "Attach an image (repeatable). Supported by Codex/Gemini; "
-                           "Claude headless currently unsupported",
+    "cli.help.chat.image": "Attach a local image (repeatable). Remote URLs are not fetched.",
     "cli.help.chat.resume": "Resume a specific session_id",
     "cli.help.chat.continue": "Continue the last saved session (~/.unified-cli/state.json)",
     "cli.help.chat.new": "Ignore saved session, start a new conversation + reset state file",
@@ -236,6 +244,8 @@ _EN = {
     "cli.chat.no_saved_session": "⚠ No saved session — starting a new conversation.",
     "cli.chat.continue_wrong_provider": "⚠ --continue is for the previous provider ({saved}); "
                                         "-m specified {routed} — starting a new conversation.",
+    "cli.chat.invalid_cwd": "Working directory does not exist or is not a directory: {cwd}",
+    "cli.chat.saved_cwd_missing": "⚠ Saved working directory is unavailable ({cwd}); using the current directory.",
     "cli.chat.waiting": "waiting for response…",
     "cli.chat.using_tool": "using tool: {name}",
     # session panel
@@ -245,7 +255,7 @@ _EN = {
     "cli.panel.title": "session",
     # repl subcommand help
     "cli.help.repl": "Interactive REPL mode (slash commands /help)",
-    "cli.help.repl.provider": "Starting provider (default claude)",
+    "cli.help.repl.provider": "Starting provider (default: saved config or claude)",
     "cli.help.repl.model": "Starting model (default: provider's default model)",
     "cli.help.repl.no_web_search": "Disable the web-search tool (ON by default)",
     "cli.help.repl.terse": "Claude terse-reply mode",
@@ -357,6 +367,7 @@ _EN = {
     "err.msg.model_not_allowed": "{provider} does not allow this model.",
     "err.msg.not_found": "{provider} requested resource not found.",
     "err.msg.network": "{provider} a network error occurred.",
+    "err.msg.resource_limit": "{provider} exceeded a local safety limit.",
     "err.msg.config": "{provider} configuration is invalid.",
     "err.msg.internal": "{provider} an internal error occurred.",
     "err.msg.unknown": "{provider} CLI exit code {exitcode}: unknown error",
@@ -387,6 +398,9 @@ _EN = {
     "err.base.line_too_long": "{provider} emitted an oversized output line.",
     "err.base.line_too_long.hint": "A single streamed line exceeded the read buffer; "
                                    "retry with non-streaming chat if this recurs.",
+    "err.base.output_limit": "{provider} output exceeded the local safety limit.",
+    "err.base.output_limit.hint": "Reduce the requested output or raise the explicit "
+                                  "BaseProvider output limits if this workload is trusted.",
 
     # ===== factory.py =====
     "err.factory.unknown_provider": "Unknown provider: {provider}",
@@ -559,6 +573,15 @@ _KO = {
     "cli.models.col.display": "표시명",
     "cli.models.col.default": "기본",
     "cli.models.col.source": "출처",
+    # 지속 설정
+    "cli.help.config": "지속 저장되는 CLI 설정 조회 또는 변경",
+    "cli.help.config.default_provider": "provider 미지정 시 사용할 provider 조회 또는 설정",
+    "cli.help.config.default_provider.provider": "claude, codex 또는 gemini",
+    "cli.help.config.default_provider.reset": "내장 Claude 기본값으로 초기화",
+    "cli.config.default_provider.current": "기본 provider: {provider}",
+    "cli.config.default_provider.set": "기본 provider 설정: {provider}",
+    "cli.config.default_provider.reset": "기본 provider를 claude로 초기화했습니다",
+    "cli.config.default_provider.conflict": "provider 또는 --reset 중 하나만 지정하세요.",
     "cli.help.chat": "단일 프롬프트 호출 (stdin 입력도 가능)",
     "cli.help.chat.prompt": "프롬프트 텍스트. 생략 시 stdin 에서 읽음",
     "cli.help.chat.model": "모델명 또는 provider/model (예: haiku, claude/sonnet, gpt-5.4-mini)",
@@ -566,8 +589,7 @@ _KO = {
     "cli.help.chat.no_web_search": "웹서치 도구 비활성화 (기본 ON)",
     "cli.help.chat.terse": "Claude 가 짧은 질문에 장황하게 답하는 걸 억제",
     "cli.help.chat.cwd": "하위 CLI 의 작업 디렉토리 (도구 사용 시 영향)",
-    "cli.help.chat.image": "이미지 첨부 (반복 가능). Codex/Gemini 지원, "
-                           "Claude headless 는 현재 미지원",
+    "cli.help.chat.image": "로컬 이미지 첨부 (반복 가능). 원격 URL은 자동 다운로드하지 않음",
     "cli.help.chat.resume": "특정 session_id 이어쓰기",
     "cli.help.chat.continue": "마지막 저장된 세션 이어쓰기 (~/.unified-cli/state.json)",
     "cli.help.chat.new": "저장된 세션 무시하고 새 대화 시작 + 상태파일 초기화",
@@ -577,6 +599,8 @@ _KO = {
     "cli.chat.no_saved_session": "⚠ 저장된 세션 없음 — 새 대화로 시작.",
     "cli.chat.continue_wrong_provider": "⚠ --continue 는 이전 provider ({saved}) 전용, "
                                         "-m 로 {routed} 지정 — 새 대화로 시작.",
+    "cli.chat.invalid_cwd": "작업 디렉토리가 없거나 디렉토리가 아닙니다: {cwd}",
+    "cli.chat.saved_cwd_missing": "⚠ 저장된 작업 디렉토리를 찾을 수 없습니다 ({cwd}). 현재 디렉토리를 사용합니다.",
     "cli.chat.waiting": "응답 대기 중…",
     "cli.chat.using_tool": "도구 사용 중: {name}",
     "cli.panel.saved": "(저장됨)",
@@ -584,7 +608,7 @@ _KO = {
     "cli.panel.or": "     또는:",
     "cli.panel.title": "session",
     "cli.help.repl": "대화형 REPL 모드 (슬래시 명령 /help)",
-    "cli.help.repl.provider": "시작 provider (기본 claude)",
+    "cli.help.repl.provider": "시작 provider (기본: 저장된 설정 또는 claude)",
     "cli.help.repl.model": "시작 모델 (생략 시 provider 기본 모델)",
     "cli.help.repl.no_web_search": "웹서치 도구 비활성화 (기본 ON)",
     "cli.help.repl.terse": "Claude 짧은 응답 모드",
@@ -694,6 +718,7 @@ _KO = {
     "err.msg.model_not_allowed": "{provider} 이 모델을 허용하지 않습니다.",
     "err.msg.not_found": "{provider} 요청한 리소스를 찾을 수 없습니다.",
     "err.msg.network": "{provider} 네트워크 오류가 발생했습니다.",
+    "err.msg.resource_limit": "{provider} 로컬 안전 한도를 초과했습니다.",
     "err.msg.config": "{provider} 설정이 잘못되었습니다.",
     "err.msg.internal": "{provider} 내부 오류가 발생했습니다.",
     "err.msg.unknown": "{provider} CLI 종료 코드 {exitcode}: 알 수 없는 오류",
@@ -724,6 +749,9 @@ _KO = {
     "err.base.line_too_long": "{provider} 출력 한 줄이 너무 큽니다.",
     "err.base.line_too_long.hint": "스트리밍 한 줄이 읽기 버퍼를 초과했습니다. 반복되면 "
                                    "비스트리밍(chat)으로 재시도하세요.",
+    "err.base.output_limit": "{provider} 출력이 로컬 안전 한도를 초과했습니다.",
+    "err.base.output_limit.hint": "요청 출력량을 줄이거나, 신뢰하는 작업이라면 "
+                                  "BaseProvider 출력 한도를 명시적으로 늘리세요.",
 
     # ===== factory.py =====
     "err.factory.unknown_provider": "알 수 없는 provider: {provider}",

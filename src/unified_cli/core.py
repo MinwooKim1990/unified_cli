@@ -78,11 +78,13 @@ class Attachment:
     """An image input — exactly one of `path`, `bytes_`, or `url` is set.
 
     Use `normalize_image()` to coerce arbitrary user input (Path, str path,
-    bytes, str URL, or existing Attachment) into this shape.
+    bytes, str URL/data URI, or existing Attachment) into this shape. The
+    subprocess providers intentionally reject URL/data-URI attachments instead
+    of fetching or decoding untrusted data on a caller's behalf.
     """
     path: Optional[str] = None        # local filesystem path (preferred for CLIs)
     bytes_: Optional[bytes] = None    # raw image bytes
-    url: Optional[str] = None         # remote URL (Anthropic + OpenAI accept)
+    url: Optional[str] = None         # URL/data URI; CLI providers reject it
     media_type: Optional[str] = None  # "image/png" etc; auto-detected if None
 
     @property
@@ -121,7 +123,8 @@ def normalize_image(item) -> Attachment:
     Accepts:
       - `Attachment` (returned as-is, with media_type filled in if missing)
       - `pathlib.Path` or `str` that points to a local file → path attachment
-      - `str` starting with http(s):// → url attachment
+      - `str` starting with http(s):// or `data:` → url attachment (the
+        subprocess providers reject it; callers must download/decode first)
       - `bytes` → bytes attachment (caller can set media_type later)
     """
     if isinstance(item, Attachment):

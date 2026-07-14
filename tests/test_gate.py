@@ -62,6 +62,7 @@ def test_claude_and_codex_not_gated(monkeypatch):
 
 def test_server_refuses_external_bind_without_optin(monkeypatch):
     monkeypatch.delenv("UNIFIED_CLI_ALLOW_EXTERNAL_BIND", raising=False)
+    monkeypatch.delenv("UNIFIED_CLI_SERVER_AUTH_TOKEN", raising=False)
     from unified_cli import server
     with pytest.raises(UnifiedError) as ei:
         server.run(host="0.0.0.0", port=8000)  # raises before any uvicorn.run
@@ -71,6 +72,9 @@ def test_server_refuses_external_bind_without_optin(monkeypatch):
 
 def test_server_allows_external_bind_with_optin(monkeypatch):
     monkeypatch.setenv("UNIFIED_CLI_ALLOW_EXTERNAL_BIND", "1")
+    monkeypatch.setenv(
+        "UNIFIED_CLI_SERVER_AUTH_TOKEN", "test-server-auth-token-at-least-32-bytes"
+    )
     captured = {}
     monkeypatch.setattr("uvicorn.run", lambda app, **kw: captured.update(kw))
     from unified_cli import server
@@ -81,6 +85,7 @@ def test_server_allows_external_bind_with_optin(monkeypatch):
 
 def test_server_loopback_bind_does_not_raise(monkeypatch):
     monkeypatch.delenv("UNIFIED_CLI_ALLOW_EXTERNAL_BIND", raising=False)
+    monkeypatch.delenv("UNIFIED_CLI_SERVER_AUTH_TOKEN", raising=False)
     captured = {}
     monkeypatch.setattr("uvicorn.run", lambda app, **kw: captured.update(kw))
     from unified_cli import server

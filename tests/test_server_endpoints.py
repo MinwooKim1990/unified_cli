@@ -1,7 +1,7 @@
 """HTTP-layer tests for the OpenAI-compatible server (#16).
 
-Uses starlette's TestClient with the localhost guard opted out and the provider
-layer stubbed, so nothing shells out to a real CLI.
+Uses Starlette's TestClient with explicit external-bind authentication and the
+provider layer stubbed, so nothing shells out to a real CLI.
 """
 
 from __future__ import annotations
@@ -23,14 +23,20 @@ from unified_cli.core import Message, Response, Usage  # noqa: E402
 from unified_cli.errors import UnifiedError  # noqa: E402
 
 
+_TEST_AUTH_TOKEN = "test-server-auth-token-at-least-32-bytes"
+
+
 @pytest.fixture
 def client(monkeypatch):
-    # Opt out of the localhost guard (TestClient's peer is non-loopback) and
-    # start each test with a clean conversation store.
+    # TestClient's peer is non-loopback, so exercise the same external auth
+    # contract as a real bind rather than creating a testing-only bypass.
     monkeypatch.setenv("UNIFIED_CLI_ALLOW_EXTERNAL_BIND", "1")
+    monkeypatch.setenv("UNIFIED_CLI_SERVER_AUTH_TOKEN", _TEST_AUTH_TOKEN)
     monkeypatch.delenv("UNIFIED_CLI_ENABLE_GEMINI", raising=False)
     server.CONVS.clear()
-    return TestClient(server.app)
+    return TestClient(server.app, headers={
+        "Authorization": f"Bearer {_TEST_AUTH_TOKEN}",
+    })
 
 
 def _fake_response(provider="claude", model="m"):

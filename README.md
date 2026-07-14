@@ -61,10 +61,15 @@ pip install "unified-cli[server]"
   Gemini CLI / Code Assist). For that reason the `gemini` provider is now
   **disabled by default** — enable it at your own risk by setting
   `UNIFIED_CLI_ENABLE_GEMINI=1`.
-- **The OpenAI-compatible server binds to `127.0.0.1` (localhost) by default**
-  and **refuses any non-loopback bind unless** you set
-  `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1`. It also logs a personal-use warning on
-  startup.
+- **The `unified-cli serve` and `python -m unified_cli.server` launchers bind to
+  `127.0.0.1` (localhost) by default** and **refuse a non-loopback host unless**
+  you set `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1`. A raw `uvicorn` command keeps
+  Uvicorn's own host choice, but the app's ASGI guard returns HTTP 403 for a
+  non-loopback bind, peer, or Host until that opt-in. External opt-in additionally
+  requires a non-whitespace `UNIFIED_CLI_SERVER_AUTH_TOKEN` of at least 32 UTF-8
+  bytes and a matching `Authorization: Bearer …` header on every request. This is
+  for one trusted client behind TLS, not a way to create a public or multi-user
+  proxy.
 - This package ships **no credentials** — each user brings their own
   subscription, and nothing is stored or transmitted on your behalf.
 
@@ -106,9 +111,10 @@ conv.send("Continue", provider="gemini")   # needs UNIFIED_CLI_ENABLE_GEMINI=1
 
 Each of the three CLIs (`claude`, `codex`, `agy`) ships great subscription
 auth but lives in its own world. Want to route "quick query" to the fastest
-model regardless of provider? Want a single OpenAI-compatible `/v1/chat/completions`
-endpoint backed by whatever CLI is cheapest/freshest? Want your Python app to
-switch providers mid-conversation with automatic context handoff? That's what
+model regardless of provider? Want a local OpenAI-compatible `/v1/chat/completions`
+endpoint with a constrained Claude default (and an explicit external-sandbox
+opt-in for agentic providers)? Want your Python app to switch providers
+mid-conversation with automatic context handoff? That's what
 this wrapper does — **as a CLI you can shell into, and as a Python package you
 can import**.
 
@@ -133,16 +139,19 @@ can import**.
   `chat()` / `stream()` or `--image foo.png` on the CLI. Each provider uses
   its native vision path:
   - **Codex** — `-i, --image <FILE>` flag (codex CLI 0.129+).
-  - **Gemini (`agy`)** — `@<path>` reference embedded in the prompt +
-    `--dangerously-skip-permissions` so the agent can read the file.
-  - **Claude** — Routed through Claude Code's built-in `Read` tool with
-    `--permission-mode bypassPermissions`; the image path is prepended to
-    the prompt. PNG / JPEG / GIF / WebP all supported.
+  - **Gemini (`agy`)** — `@<path>` reference embedded in the prompt. Tool
+    approvals stay enabled unless the caller explicitly opts into the risky
+    `skip_permissions=True` mode.
+  - **Claude** — Routed through Claude Code's built-in `Read` tool; the image
+    path is prepended to the prompt. The wrapper does not automatically select
+    `bypassPermissions`. PNG / JPEG / GIF / WebP are supported.
 - **Structured errors**: every failure → `UnifiedError(kind=...)` from one of
-  seven categories (`auth_expired` / `rate_limit` / `model_not_allowed` /
-  `not_found` / `network` / `config` / `internal`) with Korean recovery hints
+  eight categories (`auth_expired` / `rate_limit` / `model_not_allowed` /
+  `not_found` / `network` / `resource_limit` / `config` / `internal`) with
+  recovery hints
 - **OpenAI-compatible server**: drop-in `/v1/chat/completions` + redesigned
-  auto-updating dashboard at `/dashboard` (and `/` redirects there)
+  auto-updating dashboard at `/dashboard` (and `/` redirects there). Its safe
+  default exposes a constrained Claude profile only.
 - **Rich terminal UI**: `doctor` health table, `status --watch` live dashboard,
   `setup` interactive wizard, streaming spinner
 - **Interactive REPL** (`unified-cli repl`): live `/` slash-command menu,
@@ -177,9 +186,11 @@ point. For the absolute fastest interactive feel use `-m gpt-5.3-codex-spark`.
 >
 > ⚠️ **Disabled by default.** Because automating `agy` has gotten individual
 > Google accounts banned, the `gemini` provider only activates when
-> `UNIFIED_CLI_ENABLE_GEMINI=1` is set. Without it, `gemini`/`agy` calls (and
-> the `gemini-*` model examples above) raise a config error. Enable at your
-> own risk.
+> `UNIFIED_CLI_ENABLE_GEMINI=1` is set. Without it, direct `gemini`/`agy` calls
+> (and the `gemini-*` model examples above) raise a config error. The HTTP server
+> is stricter still: it returns HTTP 403 for Gemini until its separate agentic
+> provider opt-in is enabled inside an external sandbox. Enable direct use at
+> your own risk.
 
 ## Install from source (development)
 
@@ -209,7 +220,18 @@ never stores credentials and you can decline any step.
 unified-cli chat "explain python list reversal in one line"
 
 # Continue the last conversation
+# Restores its provider/model and a still-valid saved working directory.
+# An explicit --cwd always wins.
 unified-cli chat "what about in-place?" --continue
+unified-cli chat "use this checkout instead" --continue --cwd ~/work/project
+
+# Persist the provider used when no -m/--provider or saved session chooses one
+unified-cli config default-provider codex
+unified-cli config default-provider            # inspect
+unified-cli config default-provider --reset    # return to Claude
+
+# Print just the installed package version (automation-friendly)
+unified-cli --version
 
 # Resume a specific session
 unified-cli chat "continue from earlier" --resume <session_id>
@@ -321,15 +343,13 @@ resp = create("claude").chat(
     images=["/path/to/photo.png"],
 )
 print(resp.text)
-# `images` accepts mixed inputs:
-#   - file path (str or pathlib.Path)
-#   - raw bytes
-#   - http(s) URL or "data:image/png;base64,..." (Anthropic Attachment)
+# Direct Python/CLI image inputs are trusted local paths (str or pathlib.Path),
+# raw bytes, or Attachment(path=...)/Attachment(bytes_=...). Remote URLs and
+# data URIs are deliberately rejected by the wrapped CLIs: download or decode
+# trusted data yourself before passing it to the wrapper.
 images = [
     "cat.png",
     b"\\x89PNG...",                                  # bytes
-    "https://example.com/dog.jpg",                  # URL
-    "data:image/png;base64,iVBOR...",               # data URL
 ]
 # CLI equivalent:
 #   unified-cli chat "describe" --image a.png --image b.jpg -m gpt-5.4-mini
@@ -344,20 +364,41 @@ options.
 
 ```bash
 unified-cli serve --port 8000 --open          # ← recommended: localhost-guarded, opens the dashboard
-# or the raw ASGI app (also localhost-guarded by a middleware now):
-uvicorn unified_cli.server:app --port 8000    # binds 127.0.0.1 (localhost) by default
+# Raw ASGI mode uses Uvicorn's host setting; its default is localhost and the
+# app rejects non-loopback HTTP requests unless external mode is explicitly enabled.
+uvicorn unified_cli.server:app --port 8000
 # Browse:  http://localhost:8000/dashboard    (live usage / sessions)
 #          http://localhost:8000/             (redirects to /dashboard)
 ```
 
-> **Localhost-only by default.** The server binds to `127.0.0.1` and **refuses
-> to bind a non-loopback host** (e.g. `0.0.0.0`) unless you set
-> `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1`. It also logs a personal-use warning on
-> startup. Exposing your personal subscription to other people / over a network
-> violates the providers' ToS and **risks an account ban** — keep it local.
+> **Localhost-only by default.** `unified-cli serve` and
+> `python -m unified_cli.server` bind `127.0.0.1` and **refuse a non-loopback
+> host** (e.g. `0.0.0.0`) unless you set `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1`.
+> Raw `uvicorn ... --host 0.0.0.0` can still open a listener, but the app's ASGI
+> guard returns HTTP 403 for that non-loopback bind, peer, or Host until the same
+> opt-in is set. It also logs a personal-use warning on startup. Exposing your
+> personal subscription to other people / over a network violates the providers'
+> ToS and **risks an account ban** — keep it local.
 
-Drop-in for any OpenAI client — model is auto-routed by name; the `user`
-field acts as a conversation id (preserves history across calls):
+> **External mode is not a public-service mode.** If an independently managed
+> deployment must bind outside loopback, it needs both
+> `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1` and a non-whitespace
+> `UNIFIED_CLI_SERVER_AUTH_TOKEN` of at least 32 UTF-8 bytes. Every route then
+> requires `Authorization: Bearer <token>`, including diagnostics. Use a TLS
+> reverse proxy and a single trusted client; a Bearer token provides neither
+> HTTPS nor per-user isolation. The browser dashboard is intended for local use.
+
+> **HTTP trust boundary.** By default the server accepts only Claude models,
+> using Claude safe mode with no agent tools for text requests and a scoped
+> read permission for supplied image bytes. Codex and Antigravity (`agy`) are
+> intentionally rejected because their agentic CLIs do not provide
+> confidential-data isolation for arbitrary HTTP input. Set
+> `UNIFIED_CLI_SERVER_ALLOW_AGENTIC_PROVIDERS=1` only in an independently
+> sandboxed container or VM with an intentionally scoped workspace mount; it
+> is not an authentication mechanism or a safe way to expose the server.
+
+Claude model names are auto-routed; the `user` field acts as a conversation id
+(preserves history across calls):
 
 ```python
 from openai import OpenAI
@@ -370,24 +411,35 @@ client.chat.completions.create(
     user="session-1",
 )
 
-# Image input (OpenAI multi-content schema, works for all 3 providers)
+# Image input (OpenAI multi-content schema, Claude server profile)
 client.chat.completions.create(
-    model="gpt-5.4-mini",                       # → codex
+    model="haiku",                              # → claude
     messages=[{"role":"user","content":[
         {"type":"text","text":"describe"},
         {"type":"image_url",
          "image_url":{"url":"data:image/png;base64,iVBOR..."}}
     ]}],
 )
-
-# Continue in a different provider (cross-provider conversation)
-# NOTE: gemini is disabled by default — needs UNIFIED_CLI_ENABLE_GEMINI=1
-client.chat.completions.create(
-    model="gemini-3.5-flash",                   # → gemini (agy)
-    messages=[{"role":"user","content":"summarize what we discussed"}],
-    user="session-1",                            # last 8 turns auto-injected
-)
 ```
+
+For the intentionally restricted external mode, pass the same bearer token as
+the OpenAI SDK API key (and keep the endpoint behind TLS):
+
+```python
+import os
+client = OpenAI(base_url="https://trusted.example/v1",
+                api_key=os.environ["UNIFIED_CLI_SERVER_AUTH_TOKEN"])
+```
+
+For HTTP images, `image_url.url` must be one canonical base64 URI such as
+`data:image/png;base64,...`, `data:image/jpeg;base64,...`,
+`data:image/gif;base64,...`, or `data:image/webp;base64,...`, whose signature
+matches its MIME type. Remote URLs and filesystem paths are rejected. Defaults
+are four images per message, 4 MiB decoded per image,
+and a 24 MiB request body; operators can lower or raise those explicit server
+limits with `UNIFIED_CLI_SERVER_MAX_IMAGES`,
+`UNIFIED_CLI_SERVER_MAX_IMAGE_BYTES`, and
+`UNIFIED_CLI_SERVER_MAX_BODY_BYTES`.
 
 ## Running under launchd / cron / a server (headless)
 
@@ -529,7 +581,7 @@ unified_cli/
 │   ├── repl.py          # interactive REPL with slash commands
 │   ├── server.py        # FastAPI OpenAI-compat server + /dashboard
 │   └── ui.py            # rich helpers (tables, panels)
-├── tests/               # 46 unit tests, stdlib only
+├── tests/               # pytest offline/unit and server-hardening suite
 └── examples/            # 8 runnable scripts
 ```
 
@@ -545,5 +597,5 @@ Service — see "Known limitations" above.
 
 ## Contributing
 
-Issues and PRs welcome. Please run `python tests/test_errors.py` (and the
-other `tests/test_*.py`) before opening a PR — all 46 should stay green.
+Issues and PRs welcome. Please run `pytest -q` before opening a PR — the full
+offline suite should stay green.

@@ -12,13 +12,21 @@ troubleshooting** for both the CLI and the Python API.
 > (Anthropic officially supports headless `claude -p`). **Do not** expose the
 > OpenAI-compatible server to others/over a network, route other people's
 > requests through your subscription, share credentials, or resell/proxy access
-> — those violate ToS and risk suspension/ban. Two safety defaults follow from
+> — those violate ToS and risk suspension/ban. Three safety defaults follow from
 > this and are documented below:
 > - The **`gemini` provider (Antigravity `agy`) is disabled by default** —
 >   Google has banned individual accounts for automating it. Opt in with
 >   `UNIFIED_CLI_ENABLE_GEMINI=1`.
-> - The **server binds to `127.0.0.1` by default** and refuses a non-loopback
->   bind unless `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1` is set.
+> - The **`unified-cli serve` and `python -m unified_cli.server` launchers bind
+>   to `127.0.0.1` by default** and refuse a non-loopback host unless
+>   `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1` is set. Raw `uvicorn` follows its own
+>   host flag, but the app's ASGI guard returns HTTP 403 for a non-loopback bind,
+>   peer, or Host until that opt-in. External mode also requires a non-whitespace
+>   `UNIFIED_CLI_SERVER_AUTH_TOKEN` of at least 32 UTF-8 bytes and
+>   `Authorization: Bearer …` on every request.
+> - The server exposes a constrained **Claude-only** profile by default. Codex
+>   and `agy` are rejected at the HTTP boundary unless an operator opts in from
+>   an independently sandboxed container or VM.
 
 ## First-time setup
 
@@ -33,8 +41,10 @@ unified-cli setup          # interactive: installs missing CLIs + runs login flo
 unified-cli doctor         # any time: health check
 ```
 
-`doctor` should show 🟢 for all three providers. If one is 🟡, run
-`unified-cli setup --provider <name>` to finish that specific login.
+`doctor` reports each discovered provider's state. With the default ToS gate,
+Gemini remains intentionally unavailable until `UNIFIED_CLI_ENABLE_GEMINI=1` is
+set; for another unavailable provider, run `unified-cli setup --provider <name>`
+to finish that specific setup.
 
 **Running headless (launchd / cron / systemd / a server)?** The wrapped CLIs
 assume an interactive TTY, so a background context can hit two traps: a minimal
@@ -86,13 +96,23 @@ python examples/08_async.py             # achat / astream / asyncio.gather
 unified-cli chat "explain list reversal in one line" -m haiku
 
 # continue the conversation you just started
+# Restores its provider/model and a still-valid saved working directory;
+# an explicit --cwd always wins.
 unified-cli chat "what about in-place?" --continue
+unified-cli chat "use this checkout instead" --continue --cwd ~/work/project
 
 # resume a specific session (from a /save or dashboard)
 unified-cli chat "pick up from earlier" --resume <session_id>
 
 # force-start a fresh conversation (clears state file)
 unified-cli chat "totally new topic" --new
+
+# choose the provider for model-unset new chats and REPL sessions
+unified-cli config default-provider codex
+unified-cli config default-provider --reset
+
+# inspect the installed package without any provider discovery
+unified-cli --version
 
 # stream long responses
 unified-cli chat "explain quicksort" -m haiku --stream
@@ -117,7 +137,7 @@ unified-cli chat "compare these two charts" --image a.png --image b.png -m gpt-5
 ## Interactive REPL
 
 ```bash
-unified-cli repl                              # default provider (claude)
+unified-cli repl                              # configured default (Claude until changed)
 unified-cli repl --provider codex -m gpt-5.4-mini
 unified-cli repl --no-web-search              # disable web search
 unified-cli repl --lang ko                    # Korean UI
@@ -181,16 +201,19 @@ create("codex").chat("describe", images=["cat.png"])
 create("gemini").chat("describe", images=["cat.png"])  # default gemini-3.5-flash
 ```
 
-Accepted input forms (mix freely in one call):
+For direct Python and CLI calls, use trusted local data (mix freely in one
+call):
 
 ```python
+from pathlib import Path
+from unified_cli import Attachment
+
 images=[
     "cat.png",                                 # local file path (str)
     Path("/tmp/dog.jpg"),                      # pathlib.Path
     open("photo.webp","rb").read(),            # raw bytes
-    "https://example.com/image.png",           # http(s) URL
-    "data:image/png;base64,iVBOR...",          # data URL (Anthropic style)
     Attachment(path="cat.png", media_type="image/png"),  # explicit
+    Attachment(bytes_=raw_bytes, media_type="image/png"), # explicit bytes
 ]
 ```
 
@@ -199,12 +222,13 @@ How each provider handles it (handled automatically by the wrapper):
 | Provider | Mechanism | Notes |
 |---|---|---|
 | **Codex** | `-i, --image <FILE>` flag | Native, repeatable. Requires `codex` CLI ≥ 0.129. With images, prompt is sent via stdin (CLI requirement). |
-| **Claude** | Read tool | The wrapper auto-adds `--allowedTools Read` and `--permission-mode bypassPermissions`, then prepends `이미지 파일: <path>\n위 이미지를 Read 도구로 읽고 ...` to the prompt so Claude Code's built-in Read tool vision-processes the image. |
-| **Gemini (`agy`)** | `@<path>` prompt reference | The path is prepended to the prompt + `--dangerously-skip-permissions` so the agent can read the file. |
+| **Claude** | Read tool | The wrapper permits `Read` for an attachment and prepends its path to the prompt so Claude Code can vision-process it. It does **not** automatically select `bypassPermissions`. |
+| **Gemini (`agy`)** | `@<path>` prompt reference | The path is prepended to the prompt. Tool approvals remain enabled unless the caller explicitly chooses the risky `skip_permissions=True` option. |
 
-Bytes / data-URL / http(s) URL inputs are materialized to a temp file first
-(except Claude, which always uses a path; URL inputs raise `UnifiedError(kind="config")`
-because the local CLI cannot fetch remotes for you — download yourself first).
+`http(s)` URLs and `data:` URIs are normalized for validation but deliberately
+raise `UnifiedError(kind="config")` in the subprocess providers. The wrapper
+never fetches a remote image or turns an untrusted URL into a local-file read;
+download or decode trusted data yourself and pass a path or bytes.
 
 Per-provider supported formats / limits (subject to upstream changes):
 - **Claude** — PNG, JPEG, GIF, WebP. ~100 images and 32 MB total per request.
@@ -235,23 +259,57 @@ client.chat.completions.create(
 )
 ```
 
+The HTTP boundary is intentionally stricter than the direct API:
+
+- `image_url.url` must be one canonical base64 URI:
+  `data:image/png;base64,...`, `data:image/jpeg;base64,...`,
+  `data:image/gif;base64,...`, or `data:image/webp;base64,...`. Its decoded
+  signature must match the declared MIME type.
+- Remote URLs and filesystem paths are rejected rather than fetched or read.
+- Default limits are 4 images per message, 4 MiB decoded per image, and a
+  24 MiB request body. Operators may tune the explicit
+  `UNIFIED_CLI_SERVER_MAX_IMAGES`, `UNIFIED_CLI_SERVER_MAX_IMAGE_BYTES`, and
+  `UNIFIED_CLI_SERVER_MAX_BODY_BYTES` environment variables.
+
 ## OpenAI-compatible server
 
 Run the server:
 
 ```bash
 source .venv/bin/activate
-uvicorn unified_cli.server:app --port 8000   # binds 127.0.0.1 (localhost) by default
+# Uvicorn defaults to 127.0.0.1; an explicit external host is denied by the
+# app's ASGI guard unless external mode is explicitly enabled.
+uvicorn unified_cli.server:app --port 8000
 # Dashboard:  http://localhost:8000/dashboard   (redesigned: stat cards, health
 #             cards, latency/token sparklines, per-model usage bars)
 #             http://localhost:8000/             redirects to /dashboard
 ```
 
-> **Localhost-only by default.** The server binds to `127.0.0.1` and **refuses
-> to bind a non-loopback host** (e.g. `--host 0.0.0.0`) unless you explicitly
-> set `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1`. It logs a personal-use warning on
-> startup. Exposing your personal subscription to other people / over a network
-> violates the providers' ToS and **risks an account ban** — keep it local.
+> **Localhost-only by default.** `unified-cli serve` and
+> `python -m unified_cli.server` bind `127.0.0.1` and **refuse a non-loopback
+> host** (e.g. `0.0.0.0`) unless you explicitly set
+> `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1`. Raw `uvicorn ... --host 0.0.0.0` can
+> still open a listener, but the app's ASGI guard returns HTTP 403 for that
+> non-loopback bind, peer, or Host until the same opt-in is set. It logs a
+> personal-use warning on startup. Exposing your personal subscription to other
+> people / over a network violates the providers' ToS and **risks an account
+> ban** — keep it local.
+
+> **External mode is for one trusted client, not a public proxy.** It requires
+> both `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1` and a non-whitespace
+> `UNIFIED_CLI_SERVER_AUTH_TOKEN` of at least 32 UTF-8 bytes. All routes,
+> including diagnostics, require `Authorization: Bearer <token>`. Put it behind
+> TLS and do not treat this token as per-user authorization; the dashboard is
+> designed for loopback use.
+
+> **Provider isolation.** The default HTTP profile permits only Claude models:
+> text requests run in Claude safe mode with no tools, and image requests get a
+> scoped read permission for the supplied image bytes only. Codex and `agy`
+> are rejected by default because their agentic CLI sandboxes do not provide
+> confidential-data isolation for arbitrary HTTP requests. Set
+> `UNIFIED_CLI_SERVER_ALLOW_AGENTIC_PROVIDERS=1` only inside an independently
+> sandboxed container or VM with a deliberately scoped workspace mount. That
+> opt-in is not authentication and does not make network exposure safe.
 
 Point any OpenAI-compatible client at `http://localhost:8000/v1`:
 
@@ -274,18 +332,29 @@ r = client.chat.completions.create(
 print(r.choices[0].message.content)
 ```
 
-### Model routing rules
-- `claude/<m>`, `codex/<m>`, `gemini/<m>` — explicit prefix (highest priority)
-- `claude-*`, `haiku`, `sonnet`, `opus` → Claude
-- `gpt-*`, `o1-*`, `o3-*`, `codex-*` → Codex
-- `gemini-*` → Gemini
-- Anything else returns HTTP 400 `invalid_request_error`
+For an intentionally restricted external deployment, use the token as the SDK
+API key and terminate TLS outside the package:
 
-### Cross-provider conversation
-If you call with the same `user` value but a different `model`, the server
-routes to the new provider and auto-injects the last 8 turns as prompt
-prefix. Your OpenAI-compatible client thinks it's just talking to one model
-the whole time.
+```python
+import os
+client = OpenAI(base_url="https://trusted.example/v1",
+                api_key=os.environ["UNIFIED_CLI_SERVER_AUTH_TOKEN"])
+```
+
+### Model routing rules
+- `claude/<m>`, `claude-*`, `haiku`, `sonnet`, `opus` → Claude (available by
+  default)
+- `codex/<m>`, `gpt-*`, `o1-*`, `o3-*`, `codex-*` → Codex (HTTP 403 by
+  default)
+- `gemini/<m>`, `gemini-*` → Gemini / `agy` (HTTP 403 by default)
+- Anything else returns HTTP 400 `invalid_request_error`.
+
+### Conversation continuity
+The same `user` value keeps a bounded local conversation history (the last
+eight turns by default) for subsequent Claude calls. Cross-provider HTTP
+handoff is available only after the explicit, externally sandboxed agentic
+provider opt-in above; direct Python `UnifiedConversation` remains the
+recommended interface for local cross-provider work.
 
 ## Python API cookbook
 
@@ -408,7 +477,6 @@ r = create("codex").chat(
     images=[
         "left.png",
         b"\\x89PNG...raw bytes...",
-        "https://example.com/right.jpg",
     ],
 )
 
@@ -432,7 +500,7 @@ claude = ClaudeProvider(
     system_prompt="You are a terse code reviewer.",
     allowed_tools=["Read", "Grep"],
     disallowed_tools=["Bash", "Write"],
-    permission_mode="bypassPermissions",
+    permission_mode="dontAsk",                 # deny unapproved tool use
     cwd="/path/to/project",
     web_search=False,
     terse=True,
@@ -443,22 +511,33 @@ codex = CodexProvider(
     sandbox="workspace-write",                  # allow file edits
     full_auto=True,
     cwd="/path/to/project",
-    config_overrides={"model_reasoning_effort": "high"},
+    config_overrides={
+        "model_reasoning_effort": "high",       # string is TOML-quoted
+        "tools.web_search": True,
+        "limits.max_tokens": 512,
+    },
 )
 
 gemini = GeminiProvider(
     model="gemini-3.1-flash",
-    approval_mode="plan",                       # read-only
+    skip_permissions=False,                      # default: keep CLI approvals
     cwd="/path/to/project",
 )
 ```
+
+`CodexProvider.config_overrides` accepts dotted bare TOML keys and values of
+type `str`, `bool`, `int`, finite `float`, or nested `list`/`tuple` values of
+those types. Strings are quoted safely before `codex exec` receives them;
+other value types raise `ValueError` instead of being passed ambiguously.
 
 ## Provider-specific tips
 
 ### Claude
 - Default model `claude-haiku-4-5`. Aliases `haiku` / `sonnet` / `opus` all work.
-- For autonomous tool use set `permission_mode="bypassPermissions"` (wrapper
-  does this automatically when `web_search=True`).
+- Choose a permission mode deliberately for unattended tool use. The wrapper
+  never changes it solely because web search or images are enabled.
+  `permission_mode="bypassPermissions"` grants broad authority and is for
+  trusted local inputs only.
 - If you want short answers to short questions pass `--terse` (CLI) or
   `terse=True` (ClaudeProvider).
 
@@ -473,9 +552,11 @@ gemini = GeminiProvider(
 ### Gemini (now the Antigravity `agy` CLI)
 - ⚠️ **Disabled by default.** Automating `agy` has gotten individual Google
   accounts **banned**, so the `gemini` provider only activates when
-  `UNIFIED_CLI_ENABLE_GEMINI=1` is set in the environment. Without it, any
-  `gemini`/`agy` call (CLI, Python, or server) raises a config error. Enable
-  at your own risk:
+  `UNIFIED_CLI_ENABLE_GEMINI=1` is set in the environment. Without it, direct
+  CLI/Python `gemini`/`agy` calls raise a config error. The HTTP server has an
+  independent stricter policy and returns HTTP 403 for Gemini by default, even
+  when this gate is set; it requires the separate agentic-provider opt-in inside
+  an external sandbox. Enable direct use at your own risk:
   ```bash
   export UNIFIED_CLI_ENABLE_GEMINI=1
   ```
@@ -488,8 +569,9 @@ gemini = GeminiProvider(
   `agy models` (`Gemini 3.5 Flash (Medium)`, `Claude Sonnet 4.6 (Thinking)`,
   `GPT-OSS 120B (Medium)`, ...). Unknown names silently fall back to default.
 - Fully agentic: web search / shell / file tools run on the agent's own
-  decision. `--dangerously-skip-permissions` is passed for unattended use, so
-  `skip_permissions=False` if you want it to refuse tool actions.
+  decision. Approvals are enabled by default. `skip_permissions=True` passes
+  `--dangerously-skip-permissions` and is a risky, explicit opt-in for trusted
+  local automation only.
 - `web_search=` is effectively a no-op — `agy` always may search.
 - Headless output is plain text, so there is **no token-usage reporting**
   (`usage` fields are `None`).
@@ -503,11 +585,12 @@ Every failure is a `UnifiedError` with a `kind` field:
 
 | kind | Meaning | What to do |
 |---|---|---|
-| `auth_expired` | OAuth token expired | Re-run the provider's login, or set `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GEMINI_API_KEY` (wrapper auto-retries once with the API key) |
+| `auth_expired` | OAuth token expired | Re-run the provider's login. Claude/Codex may retry once with configured `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`; `agy` is OAuth-only. |
 | `rate_limit` | Weekly/daily quota hit | Switch providers or wait |
 | `model_not_allowed` | Model rejected for your account | Check `unified-cli models` |
 | `not_found` | Session/resource not found (e.g., wrong cwd for Gemini) | Use a fresh session |
 | `network` | DNS/ECONNRESET | Already retried 2x — check connectivity |
+| `resource_limit` | A local output, stream, or HTTP safety ceiling was reached | Reduce the request/output; raise an explicit limit only for a trusted workload |
 | `config` | Bad provider name or routing | Error message + hint |
 | `internal` | Unknown — check `.cause` field | Raw stderr first line |
 
@@ -547,11 +630,16 @@ the request — useful for debugging cross-provider routing.
 `list_models(provider, force_refresh=True)` or `unified-cli models --refresh`.
 
 **Q. How do I deploy this headless (CI / server)?**
-→ OAuth doesn't work headless. Set the API keys directly:
+→ Use the provider's supported headless auth first: for Claude, create a
+`CLAUDE_CODE_OAUTH_TOKEN` with `claude setup-token`; Codex uses its own CLI
+login state. `agy` requires an existing OAuth session and has no API-key
+fallback. `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` are intentional metered
+fallbacks only when you explicitly want that billing mode:
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...
-export OPENAI_API_KEY=sk-...
-export GEMINI_API_KEY=...
+export CLAUDE_CODE_OAUTH_TOKEN=<token>
+# Optional, intentional metered fallbacks:
+# export ANTHROPIC_API_KEY=sk-ant-...
+# export OPENAI_API_KEY=...
 ```
 
 **Q. Can I fork / modify / redistribute?**

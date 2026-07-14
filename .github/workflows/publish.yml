@@ -6,8 +6,6 @@ name: Publish to PyPI
 # workflow publish.yml, environment pypi.
 
 on:
-  release:
-    types: [published]
   push:
     tags:
       - "v*"
@@ -15,28 +13,111 @@ on:
 permissions:
   contents: read
 
-# A GitHub Release that creates a new tag fires BOTH `release: published` and
-# `push: tags` — two runs for the same ref. Serialize them (don't cancel, so an
-# in-flight upload finishes) and let `skip-existing` make the second a no-op.
 concurrency:
   group: publish-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
+  verify-release:
+    name: Verify release provenance
+    runs-on: ubuntu-latest
+    steps:
+      # Full history is required for a trustworthy ancestry check.  A tag alone
+      # must never be enough to authorize a PyPI publish.
+      - name: Checkout the release tag with history
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the tag is a commit already on main
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+
+          tag_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          checkout_commit="$(git rev-parse 'HEAD^{commit}')"
+          event_commit="$(git rev-parse "${RELEASE_SHA}^{commit}")"
+
+          test "$tag_commit" = "$checkout_commit" || {
+            echo "refusing publish: checked-out commit does not match ${RELEASE_TAG}" >&2
+            exit 1
+          }
+          test "$tag_commit" = "$event_commit" || {
+            echo "refusing publish: event SHA does not match ${RELEASE_TAG}" >&2
+            exit 1
+          }
+          git merge-base --is-ancestor "$tag_commit" origin/main || {
+            echo "refusing publish: ${RELEASE_TAG} is not an ancestor of origin/main" >&2
+            exit 1
+          }
+
+  test:
+    name: Test release tag
+    needs: verify-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.14"
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,server]"
+
+      - name: Run offline test suite
+        run: pytest -q
+
   build:
     name: Build distributions
+    needs: [verify-release, test]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Install build tooling
         run: python -m pip install --upgrade pip build twine
+
+      - name: Verify tag matches package version
+        run: |
+          python - <<'PY'
+          import ast
+          import os
+          from pathlib import Path
+
+          module = ast.parse(Path("src/unified_cli/__init__.py").read_text())
+          version = next(
+              node.value.value
+              for node in module.body
+              if isinstance(node, ast.Assign)
+              for target in node.targets
+              if isinstance(target, ast.Name) and target.id == "__version__"
+              and isinstance(node.value, ast.Constant)
+              and isinstance(node.value.value, str)
+          )
+          tag = os.environ["GITHUB_REF_NAME"]
+          expected = f"v{version}"
+          if tag != expected:
+              raise SystemExit(f"refusing publish: tag {tag!r} does not match {expected!r}")
+          PY
 
       - name: Build sdist and wheel
         run: python -m build
@@ -44,8 +125,56 @@ jobs:
       - name: Check distribution metadata
         run: twine check dist/*
 
+      - name: Verify built metadata matches the release tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import tarfile
+          import zipfile
+          from email.parser import BytesParser
+          from pathlib import Path
+
+          expected = os.environ["RELEASE_TAG"].removeprefix("v")
+          wheel = next(Path("dist").glob("*.whl"))
+          sdist = next(Path("dist").glob("*.tar.gz"))
+
+          with zipfile.ZipFile(wheel) as archive:
+              metadata_name = next(
+                  name for name in archive.namelist()
+                  if name.endswith(".dist-info/METADATA")
+              )
+              wheel_version = BytesParser().parsebytes(
+                  archive.read(metadata_name)
+              )["Version"]
+
+          with tarfile.open(sdist) as archive:
+              metadata_member = next(
+                  member for member in archive.getmembers()
+                  if member.name.endswith("/PKG-INFO")
+              )
+              payload = archive.extractfile(metadata_member)
+              assert payload is not None
+              sdist_version = BytesParser().parsebytes(payload.read())["Version"]
+
+          if {wheel_version, sdist_version} != {expected}:
+              raise SystemExit(
+                  "refusing publish: built metadata versions "
+                  f"{wheel_version!r}, {sdist_version!r} do not match {expected!r}"
+              )
+          PY
+
+      - name: Smoke test the built wheel in a clean virtual environment
+        run: |
+          python -m venv /tmp/unified-cli-wheel-smoke
+          /tmp/unified-cli-wheel-smoke/bin/python -m pip install --upgrade pip
+          /tmp/unified-cli-wheel-smoke/bin/python -m pip install dist/*.whl
+          /tmp/unified-cli-wheel-smoke/bin/unified-cli --version
+          /tmp/unified-cli-wheel-smoke/bin/python -c "import unified_cli; print(unified_cli.__version__)"
+
       - name: Upload distributions artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: dist
           path: dist/
@@ -62,15 +191,11 @@ jobs:
       id-token: write
     steps:
       - name: Download distributions artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: dist
           path: dist/
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
         # No username/password/token: OIDC Trusted Publishing handles auth.
-        with:
-          # If the other trigger already uploaded these files, skip instead of
-          # failing with "file already exists" (400).
-          skip-existing: true

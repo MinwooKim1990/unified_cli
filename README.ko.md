@@ -63,20 +63,25 @@ pip install "unified-cli[server]"
   Assist 까지 연쇄 적용). 그래서 `gemini` provider 는 이제 **기본 비활성화**
   되어 있으며, 환경변수 `UNIFIED_CLI_ENABLE_GEMINI=1` 을 설정해야만 본인 책임
   하에 켜집니다.
-- **OpenAI 호환 서버는 기본적으로 `127.0.0.1`(localhost) 에 바인딩**되며,
-  `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1` 을 설정하지 않는 한 **loopback 이 아닌
-  바인딩을 거부**합니다. 기동 시 개인용 경고 로그도 출력합니다.
+- **`unified-cli serve` 및 `python -m unified_cli.server` 런처는 기본적으로
+  `127.0.0.1`(localhost)에 바인딩**되며, `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1`을
+  설정하지 않는 한 **loopback 이 아닌 호스트를 거부**합니다. raw `uvicorn`은
+  Uvicorn 자체 host 설정을 따르지만, 같은 옵트인 전에는 앱의 ASGI 가드가
+  non-loopback bind·peer·Host 요청을 HTTP 403으로 거부합니다. 외부 옵트인에는
+  공백 없는 32 UTF-8 바이트 이상의 `UNIFIED_CLI_SERVER_AUTH_TOKEN`과 모든 요청의
+  `Authorization: Bearer …` 헤더도 필요합니다. 이는 TLS 뒤의 단일 신뢰
+  클라이언트용일 뿐 공개·다중 사용자 프록시를 만드는 방법이 아닙니다.
 - 이 패키지는 **자격증명을 전혀 포함하지 않습니다** — 각 사용자가 본인 구독을
   가져오며, 어떤 자격증명도 대신 저장·전송하지 않습니다.
 
 - 구독 OAuth (Pro/Max, ChatGPT Plus/Pro, Antigravity) 로 로그인되어 있으면 **구독 크레딧으로** 실행
 - Claude/Codex 는 API 키 환경변수로 **자동 폴백** (agy 는 OAuth 전용)
-- **이미지 입력 멀티모달** — 3 provider 전부. Claude 는 Read 도구, Codex 는 `-i` 플래그, Gemini(`agy`) 는 `@<path>` 참조
+- **이미지 입력 멀티모달** — 3 provider 전부. Claude 는 Read 도구, Codex 는 `-i` 플래그, Gemini(`agy`) 는 `@<path>` 참조를 사용합니다. 권한 우회는 자동으로 켜지지 않습니다.
 - 히스토리 · 스트리밍 · 도구 사용 · **웹서치 기본 ON** · OpenAI 호환 HTTP 서버
 - 대화형 **REPL** (`unified-cli repl`): `/` 입력 시 라이브 슬래시 메뉴, `/model`·`/provider` 선택기(최신 모델 표시, 기본값 ★), 라이브 `/status` — `prompt_toolkit` 기반
 - **다국어(i18n)**: 기본 영어, `--lang ko`(또는 REPL 의 `/lang ko`, 또는 `UNIFIED_CLI_LANG=ko`)로 한국어
 - 리디자인된 자동 갱신 **웹 대시보드** `/dashboard` (`/` 접속 시 자동 리다이렉트)
-- 명시적 에러 분류 (auth_expired / rate_limit / model_not_allowed / not_found / network / config / internal)
+- 명시적 에러 분류 (auth_expired / rate_limit / model_not_allowed / not_found / network / resource_limit / config / internal)
 
 ## 소스에서 설치 (개발용)
 
@@ -123,13 +128,18 @@ unified-cli chat "describe" --image photo.png -m gemini-3.5-flash
 from unified_cli import create
 create("claude").chat("describe", images=["photo.png"])
 create("codex").chat("describe", images=[image_bytes])
-create("gemini").chat("describe", images=["https://example.com/x.jpg"])
+create("gemini").chat("describe", images=["local-image.jpg"])
 ```
 
 provider 별 처리:
-- **Claude** — Read 도구 자동 활성화 + bypassPermissions, prompt 앞에 경로 prepend
+- **Claude** — 이미지용 Read 도구를 허용하고 prompt 앞에 경로를 넣음. `bypassPermissions` 는 자동 설정하지 않음
 - **Codex** — native `-i, --image` 플래그 (codex CLI 0.129+ 필요)
-- **Gemini (`agy`)** — `@<path>` 참조를 prompt 앞에 삽입 + `--dangerously-skip-permissions` 로 에이전트가 파일을 읽게 함
+- **Gemini (`agy`)** — `@<path>` 참조를 prompt 앞에 삽입. 권한 승인은 기본 유지되고, 위험한 `skip_permissions=True` 를 명시할 때만 건너뜀
+
+직접 Python/CLI 이미지 입력에는 신뢰하는 로컬 path/`Path`, bytes 또는
+`Attachment(path=...)`/`Attachment(bytes_=...)`를 사용하세요. 원격 URL과 data URI는
+래핑한 CLI에서 의도적으로 거부하므로, 신뢰하는 데이터를 직접 다운로드/디코드한 뒤
+전달해야 합니다.
 
 ### 대화형 REPL (`unified-cli repl`)
 
@@ -139,7 +149,7 @@ provider 별 처리:
 없습니다.
 
 ```bash
-unified-cli repl                          # 기본 Claude 로 시작
+unified-cli repl                          # 설정된 기본 provider (설정 전 Claude)로 시작
 unified-cli repl --provider codex -m gpt-5.4-mini
 ```
 
@@ -328,23 +338,54 @@ unified-cli chat "오늘 최신 Python?" -m claude/haiku --stream
 
 # stdin 으로 프롬프트
 cat prompt.txt | unified-cli chat -m gpt-5.4-mini
+
+# --continue 는 유효한 저장 provider/model/작업 디렉토리를 복원합니다.
+# 명시한 --cwd 가 항상 우선합니다.
+unified-cli chat "이 체크아웃에서 계속" --continue --cwd ~/work/project
+
+# -m/--provider·저장 세션이 없을 때 사용할 기본 provider 설정
+unified-cli config default-provider codex
+unified-cli config default-provider            # 확인
+unified-cli config default-provider --reset    # claude 로 초기화
+
+# 설치된 패키지 버전만 출력 (자동화용)
+unified-cli --version
 ```
 
 ## OpenAI 호환 HTTP 서버
 
 ```bash
 unified-cli serve --port 8000 --open          # ← 권장: localhost 가드 + 대시보드 자동 오픈
-# 또는 raw ASGI 앱 (이제 미들웨어로 localhost 가드됨):
-uvicorn unified_cli.server:app --port 8000    # 기본 127.0.0.1(localhost) 바인딩
+# raw ASGI 모드는 Uvicorn의 host 설정을 따르며, 기본은 localhost입니다.
+# 외부 mode를 명시하지 않으면 앱이 non-loopback HTTP 요청을 거부합니다.
+uvicorn unified_cli.server:app --port 8000
 # 브라우저:  http://localhost:8000/dashboard  (리디자인된 라이브 사용량/세션)
 #            http://localhost:8000/           (/dashboard 로 리다이렉트)
 ```
 
-> **기본 localhost 전용.** 서버는 `127.0.0.1` 에만 바인딩하며,
-> `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1` 을 설정하지 않는 한 loopback 이 아닌
-> 호스트(`0.0.0.0` 등) 바인딩을 **거부**합니다. 기동 시 개인용 경고 로그도
-> 출력합니다. 본인 구독을 다른 사람/네트워크에 노출하면 provider ToS 위반이며
-> **계정 차단 위험**이 있으니 로컬에서만 사용하세요.
+> **기본 localhost 전용.** `unified-cli serve` 및
+> `python -m unified_cli.server`는 `127.0.0.1`에 바인딩하고,
+> `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1` 없이는 loopback 이 아닌 호스트
+> (`0.0.0.0` 등)를 **거부**합니다. raw `uvicorn ... --host 0.0.0.0`은 listener를
+> 열 수 있지만, 같은 옵트인 전에는 앱의 ASGI 가드가 non-loopback bind·peer·Host를
+> HTTP 403으로 거부합니다. 기동 시 개인용 경고 로그도 출력합니다. 본인 구독을
+> 다른 사람/네트워크에 노출하면 provider ToS 위반이며 **계정 차단 위험**이 있으니
+> 로컬에서만 사용하세요.
+
+> **외부 모드는 공개 서비스 모드가 아닙니다.** 독립 관리 배포에서 loopback 밖으로
+> 바인딩해야 한다면 `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1`과 공백 없는 32 UTF-8
+> 바이트 이상의 `UNIFIED_CLI_SERVER_AUTH_TOKEN`을 모두 설정해야 합니다. 모든
+> route(진단 포함)에 `Authorization: Bearer <token>`이 필요합니다. TLS reverse
+> proxy 뒤의 단일 신뢰 클라이언트에만 쓰세요. Bearer 토큰은 HTTPS나 사용자별 격리를
+> 제공하지 않으며 브라우저 대시보드는 로컬 사용용입니다.
+
+> **HTTP 신뢰 경계.** 서버는 기본적으로 Claude 모델만 받습니다. 텍스트 요청은
+> Claude safe mode + 도구 없음으로, 이미지 요청은 전달된 이미지 바이트만 읽을 수
+> 있는 범위 제한 권한으로 실행합니다. Codex와 Antigravity(`agy`)는 임의 HTTP
+> 입력에 대한 기밀 데이터 격리를 보장하지 못하는 에이전틱 CLI라 기본 거부됩니다.
+> `UNIFIED_CLI_SERVER_ALLOW_AGENTIC_PROVIDERS=1` 은 의도적으로 좁힌 workspace
+> mount를 가진 독립 컨테이너/VM 안에서만 설정하세요. 이 값은 인증 기능도 아니고
+> 서버 공개를 안전하게 만드는 기능도 아닙니다.
 
 ```bash
 # non-streaming, 자동 라우팅
@@ -362,18 +403,8 @@ curl http://localhost:8000/v1/chat/completions \
     "user":"chat-42"
   }'
 
-# 같은 user 로 다른 provider 에 이어 보내기 (컨텍스트 자동 주입)
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model":"codex/gpt-5.4-mini",
-    "messages":[{"role":"user","content":"내 이름?"}],
-    "user":"chat-42"
-  }'
-
 # 모델 목록
 curl http://localhost:8000/v1/models
-curl http://localhost:8000/v1/models?provider=gemini
 ```
 
 OpenAI Python SDK 그대로 사용:
@@ -388,9 +419,9 @@ r = client.chat.completions.create(
     user="my-conv",
 )
 
-# 이미지 입력 (OpenAI multi-content 스키마, 3 provider 모두)
+# 이미지 입력 (OpenAI multi-content 스키마, Claude 서버 프로필)
 r = client.chat.completions.create(
-    model="gpt-5.4-mini",
+    model="haiku",
     messages=[{"role":"user","content":[
         {"type":"text","text":"describe"},
         {"type":"image_url",
@@ -398,6 +429,23 @@ r = client.chat.completions.create(
     ]}],
 )
 ```
+
+의도적으로 제한된 외부 모드에서는 OpenAI SDK의 API 키에도 같은 Bearer 토큰을
+넣고, 반드시 TLS 뒤에서만 사용하세요.
+
+```python
+import os
+client = OpenAI(base_url="https://trusted.example/v1",
+                api_key=os.environ["UNIFIED_CLI_SERVER_AUTH_TOKEN"])
+```
+
+HTTP 이미지의 `image_url.url` 은 MIME과 실제 시그니처가 일치하는 정규 base64
+`data:image/png;base64,...`, `data:image/jpeg;base64,...`,
+`data:image/gif;base64,...`, `data:image/webp;base64,...` 중 하나만 허용합니다.
+원격 URL과 파일시스템 경로는 거부합니다. 기본 한도는 메시지당 4장, 이미지 하나당 디코딩 후 4 MiB,
+요청 본문 24 MiB이며 `UNIFIED_CLI_SERVER_MAX_IMAGES`,
+`UNIFIED_CLI_SERVER_MAX_IMAGE_BYTES`, `UNIFIED_CLI_SERVER_MAX_BODY_BYTES`로
+명시적으로 조정할 수 있습니다.
 
 에러는 OpenAI 스키마로 정규화 매핑:
 | UnifiedError.kind | HTTP | OpenAI `type` |
@@ -407,6 +455,7 @@ r = client.chat.completions.create(
 | model_not_allowed / config | 400 | invalid_request_error |
 | not_found | 404 | not_found_error |
 | network | 502 | upstream_error |
+| resource_limit | 413 | invalid_request_error |
 | internal | 500 | internal_error |
 
 ## launchd / cron / 서버에서 실행 (헤드리스)

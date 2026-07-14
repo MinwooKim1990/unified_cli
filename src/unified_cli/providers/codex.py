@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import math
 import os
-from typing import Iterator, Optional
+import re
+from typing import Any, Iterator, Optional
 
 from ..base import BaseProvider
 from ..core import Message, Response, Usage
@@ -17,6 +20,8 @@ class CodexProvider(BaseProvider):
     default_model = "gpt-5.4-mini"
     api_key_env = "OPENAI_API_KEY"
 
+    _CONFIG_KEY_RE = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\Z")
+
     @classmethod
     def login_hint(cls) -> str:
         return t("err.codex.login_hint")
@@ -29,6 +34,8 @@ class CodexProvider(BaseProvider):
         dangerously_bypass: bool = False,
         skip_git_check: bool = True,
         ephemeral: bool = False,
+        ignore_user_config: bool = False,
+        ignore_rules: bool = False,
         add_dirs: Optional[list[str]] = None,
         config_overrides: Optional[dict] = None,
         **kw,
@@ -39,13 +46,18 @@ class CodexProvider(BaseProvider):
         self.dangerously_bypass = dangerously_bypass
         self.skip_git_check = skip_git_check
         self.ephemeral = ephemeral
+        self.ignore_user_config = ignore_user_config
+        self.ignore_rules = ignore_rules
         self.add_dirs = list(add_dirs or [])
         self.config_overrides = dict(config_overrides or {})
 
         # Web search: must use -c tools.web_search=true (not --search, which
         # is only on top-level `codex`, not `codex exec`).
         if self.web_search:
-            self.config_overrides.setdefault("tools.web_search", "true")
+            self.config_overrides.setdefault("tools.web_search", True)
+        # Fail fast on malformed configuration rather than passing a value that
+        # the CLI may parse differently across releases.
+        self._config_args()
 
     @classmethod
     def _discover_bin(cls) -> Optional[str]:
@@ -63,6 +75,10 @@ class CodexProvider(BaseProvider):
             args += ["--skip-git-repo-check"]
         if self.ephemeral:
             args += ["--ephemeral"]
+        if self.ignore_user_config:
+            args += ["--ignore-user-config"]
+        if self.ignore_rules:
+            args += ["--ignore-rules"]
         args += ["-m", model or self.model]
         if self.full_auto:
             args += ["--full-auto"]
@@ -71,8 +87,42 @@ class CodexProvider(BaseProvider):
         else:
             if self.sandbox:
                 args += ["-s", self.sandbox]
-        for k, v in self.config_overrides.items():
-            args += ["-c", f"{k}={v}"]
+        args += self._config_args()
+        return args
+
+    @classmethod
+    def _toml_literal(cls, value: Any) -> str:
+        """Serialize an accepted Python value as one TOML literal.
+
+        Codex parses the value after ``-c key=`` as TOML. Quoting strings here
+        avoids accidental type changes or line/config injection, while native
+        booleans and numbers retain their intended TOML types.
+        """
+        if isinstance(value, str):
+            return json.dumps(value, ensure_ascii=False)
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, float):
+            if not math.isfinite(value):
+                raise ValueError("Codex config override floats must be finite")
+            return repr(value)
+        if isinstance(value, (list, tuple)):
+            return "[" + ", ".join(cls._toml_literal(item) for item in value) + "]"
+        raise ValueError(
+            "Codex config override values must be str, bool, int, finite float, or list"
+        )
+
+    def _config_args(self) -> list[str]:
+        """Return validated ``-c key=value`` pairs shared by exec and resume."""
+        args: list[str] = []
+        for key, value in self.config_overrides.items():
+            if not isinstance(key, str) or not self._CONFIG_KEY_RE.fullmatch(key):
+                raise ValueError(
+                    "Codex config override keys must be dotted bare TOML keys"
+                )
+            args += ["-c", f"{key}={self._toml_literal(value)}"]
         return args
 
     def _build_args(
@@ -103,11 +153,14 @@ class CodexProvider(BaseProvider):
                 argv += ["--skip-git-repo-check"]
             if self.ephemeral:
                 argv += ["--ephemeral"]
+            if self.ignore_user_config:
+                argv += ["--ignore-user-config"]
+            if self.ignore_rules:
+                argv += ["--ignore-rules"]
             argv += ["-m", model or self.model]
             if self.dangerously_bypass:
                 argv += ["--dangerously-bypass-approvals-and-sandbox"]
-            for k, v in self.config_overrides.items():
-                argv += ["-c", f"{k}={v}"]
+            argv += self._config_args()
             argv += image_args
             if resume_last:
                 argv += ["--last"]

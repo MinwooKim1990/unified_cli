@@ -27,6 +27,7 @@ ErrorKind = Literal[
     "model_not_allowed",
     "not_found",
     "network",
+    "resource_limit",
     "config",
     "internal",
 ]

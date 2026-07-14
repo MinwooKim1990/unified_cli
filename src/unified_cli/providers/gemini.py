@@ -11,9 +11,9 @@ The Antigravity CLI is the binary `agy` (typically at ~/.local/bin/agy).
     stdout. There is NO `--output-format json|stream-json`; we therefore parse
     stdout as plain text instead of JSON events.
   * **Agentic by default** — `agy` runs shell/file/web tools on its own and
-    decides when to web-search (there is no per-call web-search flag). We pass
-    `--dangerously-skip-permissions` so unattended headless calls don't block
-    on tool-approval prompts.
+    decides when to web-search (there is no per-call web-search flag). Tool
+    approvals remain enabled unless the caller explicitly requests the risky
+    `skip_permissions=True` option.
   * **Sessions** — `--continue`/`-c` resumes the most recent conversation;
     `--conversation <UUID>` resumes a specific one. Conversations are stored as
     `~/.gemini/antigravity-cli/conversations/<UUID>.db` (SQLite); the newest by
@@ -38,7 +38,13 @@ import threading
 import time
 from typing import AsyncIterator, Iterator, Optional
 
-from ..base import BaseProvider
+from ..base import (
+    BaseProvider,
+    _StreamReader,
+    _drain_into,
+    _popen_process_group_kwargs,
+    _terminate_process_tree,
+)
 from ..core import Message, Response, Usage
 from ..discovery import find_agy_bin
 from ..errors import UnifiedError, classify
@@ -83,7 +89,8 @@ def _require_gemini_enabled() -> None:
 class GeminiProvider(BaseProvider):
     name = "gemini"
     default_model = "gemini-3.5-flash"
-    api_key_env = "GEMINI_API_KEY"   # agy uses OAuth; kept for base fallback API
+    api_key_env = "GEMINI_API_KEY"   # retained for status/UI compatibility
+    allow_api_key_fallback = False    # agy is OAuth-only; never inject this key
 
     @classmethod
     def login_hint(cls) -> str:
@@ -92,7 +99,7 @@ class GeminiProvider(BaseProvider):
     def __init__(
         self,
         *,
-        skip_permissions: bool = True,   # auto-approve tools (unattended use)
+        skip_permissions: bool = False,  # explicit opt-in only
         sandbox: bool = False,
         add_dirs: Optional[list[str]] = None,
         conversations_dir: Optional[str] = None,
@@ -326,6 +333,7 @@ class GeminiProvider(BaseProvider):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace",
             cwd=self.cwd, env=self._env(), bufsize=1,
+            **_popen_process_group_kwargs(),
         )
         if stdin_data and proc.stdin:
             try:
@@ -336,16 +344,32 @@ class GeminiProvider(BaseProvider):
                 pass
         assert proc.stdout is not None
         # Drain stderr concurrently (pipe-deadlock guard — see base._stream_once).
-        from ..base import _StreamReader, _drain_into
         _stderr_chunks: list[str] = []
+        _stderr_overflow = threading.Event()
         _stderr_thread = threading.Thread(
-            target=_drain_into, args=(proc.stderr, _stderr_chunks), daemon=True)
+            target=_drain_into,
+            kwargs={
+                "pipe": proc.stderr,
+                "sink": _stderr_chunks,
+                "max_bytes": self.max_stderr_bytes,
+                "overflow": _stderr_overflow,
+                "terminate": lambda: _terminate_process_tree(proc),
+            },
+            daemon=True,
+        )
         _stderr_thread.start()
         # Read stdout on a background thread with an output watchdog (kills a
         # child that stays silent past the deadline, without penalizing a slow
         # consumer). first_output_timeout == stream_timeout for agy.
         reader = _StreamReader(
-            proc, first_output=self.first_output_timeout, idle=self.stream_timeout
+            proc,
+            first_output=self.first_output_timeout,
+            idle=self.stream_timeout,
+            max_buffer_bytes=self.max_stream_buffer_bytes,
+            max_output_bytes=self.max_output_bytes,
+            max_events=self.max_stream_events,
+            max_line_bytes=self.max_stream_line_bytes,
+            terminate=lambda: _terminate_process_tree(proc),
         ).start()
         produced = False
         collected: list[str] = []
@@ -363,22 +387,30 @@ class GeminiProvider(BaseProvider):
             # Aborted (Ctrl+C / generator close): agy is agentic and may run for
             # a long time, and stream_timeout is forced to >=600s — so kill
             # rather than wait it out.
-            if not loop_done and proc.poll() is None:
-                proc.kill()
+            if not loop_done:
+                _terminate_process_tree(proc, force_group=True)
             try:
                 proc.wait(timeout=self.stream_timeout)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+                _terminate_process_tree(proc)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
                 raise UnifiedError(
                     kind="network", provider="gemini",
                     message=t("err.gemini.stream_timeout", timeout=self.stream_timeout),
                     hint=t("err.gemini.stream_timeout.hint"),
                 )
+            _terminate_process_tree(proc, force_group=True)
             _stderr_thread.join(timeout=5)
             stderr_text = "".join(_stderr_chunks)
 
         full = "".join(collected)
+        if reader.overflow_reason:
+            raise self._output_limit_error(reader.overflow_reason)
+        if _stderr_overflow.is_set():
+            raise self._output_limit_error("stderr")
         if reader.fired:
             raise self._hang_error(before_output=reader.fired_before_output)
         if proc.returncode not in (0, None):

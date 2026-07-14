@@ -39,6 +39,22 @@ class SessionState:
         return max(0.0, time.time() - self.updated_at) if self.updated_at else 0.0
 
 
+def resolve_cwd(cwd: Optional[str]) -> Optional[str]:
+    """Return one existing canonical directory, or ``None`` when invalid.
+
+    Session state is a convenience record and may outlive a renamed/deleted
+    checkout. Callers use this helper to distinguish an invalid saved directory
+    (safe fallback) from a validated explicit ``--cwd`` (user-facing error).
+    """
+    if not isinstance(cwd, str) or not cwd.strip():
+        return None
+    try:
+        resolved = Path(cwd).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    return str(resolved) if resolved.is_dir() else None
+
+
 def _ensure_dir() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 

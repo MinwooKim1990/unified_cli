@@ -96,6 +96,7 @@ def test_guard_blocks_nonloopback_client_by_default(monkeypatch):
     from fastapi.testclient import TestClient
     from unified_cli import server
     monkeypatch.delenv("UNIFIED_CLI_ALLOW_EXTERNAL_BIND", raising=False)
+    monkeypatch.delenv("UNIFIED_CLI_SERVER_AUTH_TOKEN", raising=False)
     client = TestClient(server.app)
     r = client.get("/healthz")
     assert r.status_code == 403
@@ -108,7 +109,9 @@ def test_guard_allows_when_opted_in(monkeypatch):
     from fastapi.testclient import TestClient
     from unified_cli import server
     monkeypatch.setenv("UNIFIED_CLI_ALLOW_EXTERNAL_BIND", "1")
-    client = TestClient(server.app)
+    token = "test-server-auth-token-at-least-32-bytes"
+    monkeypatch.setenv("UNIFIED_CLI_SERVER_AUTH_TOKEN", token)
+    client = TestClient(server.app, headers={"Authorization": f"Bearer {token}"})
     r = client.get("/healthz")
     assert r.status_code == 200
     assert r.json()["status"] == "ok"

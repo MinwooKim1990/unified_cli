@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-14
+
+### Security
+
+- The OpenAI-compatible server now keeps Codex and `agy` disabled by default,
+  runs Claude with a constrained server profile, and rejects unsafe HTTP image
+  inputs before provider execution.
+- External server binding now requires both an explicit opt-in and a strong
+  Bearer token; malformed or missing authentication fails closed.
+- Provider processes now use bounded output, timeouts, process-group cleanup,
+  temporary-file scopes, and configurable resource limits so a failed or
+  hostile CLI invocation cannot grow without bound.
+
+### Added
+
+- `unified-cli config default-provider [claude|codex|gemini]` and
+  `--reset`, plus `unified-cli --version`.
+- Saved CLI/REPL sessions now restore a valid working directory, while an
+  explicit `--cwd` always takes precedence.
+
+### Changed
+
+- CI now tests every declared Python version through 3.14, validates built
+  distributions, and installs the wheel in a clean environment before release.
+- The PyPI workflow accepts only a matching `vX.Y.Z` tag already on `main`,
+  then runs tests, package metadata checks, and a clean-wheel smoke test.
+- GitHub Actions are pinned to immutable commit SHAs and Dependabot checks for
+  GitHub Actions updates weekly.
+
 ## [0.3.0] - 2026-07-03
 
 Reliability, headless/daemon robustness, and security release — the outcome of a
@@ -217,7 +246,9 @@ Initial public release.
   `gemini-3.5-flash` continue to route to it. Note: `agy` headless output is
   plain text and does **not** report token usage.
 
-[Unreleased]: https://github.com/MinwooKim1990/unified_cli/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/MinwooKim1990/unified_cli/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/MinwooKim1990/unified_cli/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/MinwooKim1990/unified_cli/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/MinwooKim1990/unified_cli/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/MinwooKim1990/unified_cli/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/MinwooKim1990/unified_cli/releases/tag/v0.1.0

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+from dataclasses import dataclass, field
 from typing import Iterator, Optional
 
 from ..base import BaseProvider
@@ -10,6 +12,14 @@ from ..core import Message, Response, Usage
 from ..discovery import find_claude_bin
 from ..errors import UnifiedError
 from ..i18n import t
+
+
+@dataclass
+class _ClaudeStreamState:
+    """Partial Claude content accumulated for one stream invocation only."""
+
+    partial_text_by_block: dict[int, str] = field(default_factory=dict)
+    partial_thinking_by_block: dict[int, str] = field(default_factory=dict)
 
 
 class ClaudeProvider(BaseProvider):
@@ -40,6 +50,9 @@ class ClaudeProvider(BaseProvider):
         disallowed_tools: Optional[list[str]] = None,
         permission_mode: Optional[str] = None,
         add_dirs: Optional[list[str]] = None,
+        safe_mode: bool = False,
+        tools: Optional[list[str]] = None,
+        restrict_image_reads: bool = False,
         terse: bool = False,
         **kw,
     ):
@@ -50,6 +63,33 @@ class ClaudeProvider(BaseProvider):
         self.disallowed_tools = list(disallowed_tools or [])
         self.permission_mode = permission_mode
         self.add_dirs = list(add_dirs or [])
+        self.safe_mode = safe_mode
+        self.tools = None if tools is None else list(tools)
+        self.restrict_image_reads = restrict_image_reads
+
+        # This narrow profile is used by the local HTTP server. It must not be
+        # combined with broad caller-provided capabilities: in dontAsk mode a
+        # scoped Read rule is the only intended noninteractive file access.
+        if self.restrict_image_reads:
+            if not self.safe_mode:
+                raise ValueError("restrict_image_reads requires safe_mode=True")
+            if self.permission_mode != "dontAsk":
+                raise ValueError(
+                    "restrict_image_reads requires permission_mode='dontAsk'"
+                )
+            if self.web_search:
+                raise ValueError("restrict_image_reads requires web_search=False")
+            if self.allowed_tools:
+                raise ValueError("restrict_image_reads does not accept allowed_tools")
+            if self.add_dirs:
+                raise ValueError("restrict_image_reads does not accept add_dirs")
+            if self.tools not in (None, []):
+                raise ValueError(
+                    "restrict_image_reads only permits an empty tools list"
+                )
+            # Text-only server calls expose no Claude tools. Image calls change
+            # this to ["Read"] only after materializing their exact files.
+            self.tools = []
 
         if terse:
             terse_rule = self._terse_rule()
@@ -62,8 +102,6 @@ class ClaudeProvider(BaseProvider):
             for t in ("WebSearch", "WebFetch"):
                 if t not in self.allowed_tools:
                     self.allowed_tools.append(t)
-            if self.permission_mode is None:
-                self.permission_mode = "bypassPermissions"
 
     @classmethod
     def _discover_bin(cls) -> Optional[str]:
@@ -84,17 +122,17 @@ class ClaudeProvider(BaseProvider):
         images: Optional[list] = None,
     ) -> tuple[list[str], Optional[str]]:
         args: list[str] = [self.bin_path, "-p"]
-        args += ["--output-format", "stream-json", "--verbose"] if streaming \
+        args += ["--output-format", "stream-json", "--verbose", "--include-partial-messages"] if streaming \
             else ["--output-format", "json"]
 
         args += ["--model", model or self.model]
+        if self.safe_mode:
+            args += ["--safe-mode"]
 
         if self.system_prompt is not None:
             args += ["--system-prompt", self.system_prompt]
         if self.append_system_prompt is not None:
             args += ["--append-system-prompt", self.append_system_prompt]
-        if self.allowed_tools:
-            args += ["--allowedTools", ",".join(self.allowed_tools)]
         if self.disallowed_tools:
             args += ["--disallowedTools", ",".join(self.disallowed_tools)]
         if self.permission_mode:
@@ -113,27 +151,33 @@ class ClaudeProvider(BaseProvider):
         # the file is on disk somewhere accessible, allow the Read tool, and
         # prepend the path to the prompt so the model picks it up.
         #
-        # Bytes/URL inputs are materialized to a temp file under cwd so that
-        # `--add-dir` (already in args via self.add_dirs) doesn't need to be
-        # extended dynamically — the model only needs Read access to the
-        # absolute path.
+        # Byte inputs are materialized to a temp file. URL inputs are rejected
+        # rather than fetched implicitly; the model receives only an absolute
+        # local path that the caller supplied or this wrapper created.
+        allowed_tools = list(self.allowed_tools)
+        effective_tools = self.tools
         if images:
-            allowed_for_image = list(self.allowed_tools)
-            if "Read" not in allowed_for_image:
-                allowed_for_image.append("Read")
-            # Replace any earlier --allowedTools we already added with the
-            # extended list (last write wins).
-            args = self._strip_existing_allowed_tools(args)
-            args += ["--allowedTools", ",".join(allowed_for_image)]
-            # Bypass permissions for unattended image processing.
-            args = self._strip_existing_permission_mode(args)
-            args += ["--permission-mode", "bypassPermissions"]
-
             paths = [self._materialize_image(att) for att in self._normalize_images(images)]
+            if self.restrict_image_reads:
+                # Claude permission rules use // for an absolute filesystem
+                # path. Do not pass broad Read here: it would allow a remote
+                # prompt to exfiltrate arbitrary local files through the
+                # server's response.
+                allowed_tools = [self._read_rule(path) for path in paths]
+                effective_tools = ["Read"]
+            elif "Read" not in allowed_tools:
+                allowed_tools.append("Read")
             path_lines = "\n".join(t("err.claude.image_label", path=p) for p in paths)
             prompt = (
                 f"{path_lines}\n{t('err.claude.image_instruction')}\n{prompt}"
             )
+
+        if effective_tools is not None:
+            # An empty string is intentional: Claude's --tools "" disables
+            # every built-in tool for a text-only restricted server call.
+            args += ["--tools", ",".join(effective_tools)]
+        if allowed_tools:
+            args += ["--allowedTools", ",".join(allowed_tools)]
 
         # End option parsing so a prompt that happens to start with "-" (e.g.
         # "--version") is passed as the positional prompt, not parsed as a flag.
@@ -161,7 +205,15 @@ class ClaudeProvider(BaseProvider):
             with _os.fdopen(fd, "wb") as f:
                 f.write(att.bytes_)
             self._register_temp_file(tmp)  # cleaned up after the call
-            return tmp
+            # macOS commonly exposes its temporary directory through /var
+            # while the canonical target is /private/var. The restricted
+            # server profile grants Claude a scoped Read rule for the target,
+            # and Claude requires both a symlink path and target to match.
+            # Use the canonical target in the prompt as well as the rule so a
+            # valid byte image is not denied under dontAsk mode. Keep `tmp` in
+            # the scope registration above: unlinking either spelling removes
+            # the same file.
+            return _os.path.realpath(_os.path.abspath(tmp))
         if att.url:
             raise UnifiedError(
                 kind="config", provider="claude",
@@ -173,28 +225,20 @@ class ClaudeProvider(BaseProvider):
         )
 
     @staticmethod
-    def _strip_existing_allowed_tools(args: list[str]) -> list[str]:
-        out: list[str] = []
-        i = 0
-        while i < len(args):
-            if args[i] == "--allowedTools" and i + 1 < len(args):
-                i += 2
-            else:
-                out.append(args[i])
-                i += 1
-        return out
+    def _read_rule(path: str) -> str:
+        """Return a Claude scoped-Read allow rule for one resolved file.
 
-    @staticmethod
-    def _strip_existing_permission_mode(args: list[str]) -> list[str]:
-        out: list[str] = []
-        i = 0
-        while i < len(args):
-            if args[i] == "--permission-mode" and i + 1 < len(args):
-                i += 2
-            else:
-                out.append(args[i])
-                i += 1
-        return out
+        Claude permission patterns use a double slash for filesystem-absolute
+        paths. Resolving symlinks is essential: allow rules require both the
+        link and target to match, and a temp-file profile must not accidentally
+        approve a link whose target lies outside its intended file.
+        """
+        resolved = os.path.realpath(os.path.abspath(path)).replace("\\", "/")
+        if len(resolved) >= 2 and resolved[1] == ":":
+            # Claude normalizes Windows C:\\path to /c/path in permission
+            # rules, so make the path form explicit and platform-independent.
+            resolved = f"/{resolved[0].lower()}{resolved[2:]}"
+        return f"Read(//{resolved.lstrip('/')})"
 
     @staticmethod
     def _aggregate_stream_json(body: str) -> dict:
@@ -246,7 +290,31 @@ class ClaudeProvider(BaseProvider):
             "is_error": is_error,
         }
 
+    def _new_stream_state(self) -> _ClaudeStreamState:
+        return _ClaudeStreamState()
+
+    def _stream_normalize(
+        self, obj: dict, state: object
+    ) -> Iterator[Message]:
+        # BaseProvider supplies a distinct state object to every sync/async
+        # stream invocation. Be defensive for integrations calling this hook
+        # directly, but never keep parser state on the provider instance.
+        if not isinstance(state, _ClaudeStreamState):
+            state = _ClaudeStreamState()
+        yield from self._normalize_with_state(obj, state)
+
     def _normalize(self, obj: dict) -> Iterator[Message]:
+        """Normalize one standalone event (private compatibility helper).
+
+        Public streams call ``_stream_normalize`` with persistent per-stream
+        state. A raw private call has no invocation context, so it is treated
+        as a standalone event rather than leaking state into future calls.
+        """
+        yield from self._normalize_with_state(obj, _ClaudeStreamState())
+
+    def _normalize_with_state(
+        self, obj: dict, state: _ClaudeStreamState
+    ) -> Iterator[Message]:
         t = obj.get("type", "")
         sid = obj.get("session_id")
 
@@ -255,16 +323,47 @@ class ClaudeProvider(BaseProvider):
                 yield Message(kind="session", provider="claude", session_id=sid, raw=obj)
             return
 
+        if t == "stream_event":
+            event = obj.get("event") or {}
+            if event.get("type") != "content_block_delta":
+                return
+            delta = event.get("delta") or {}
+            dtype = delta.get("type")
+            index = event.get("index", 0)
+            if not isinstance(index, int):
+                index = 0
+            if dtype == "text_delta":
+                text = delta.get("text") or ""
+                if text:
+                    state.partial_text_by_block[index] = (
+                        state.partial_text_by_block.get(index, "") + text
+                    )
+                    yield Message(kind="text", provider="claude", text=text, raw=obj)
+            elif dtype == "thinking_delta":
+                text = delta.get("thinking") or ""
+                if text:
+                    state.partial_thinking_by_block[index] = (
+                        state.partial_thinking_by_block.get(index, "") + text
+                    )
+                    yield Message(kind="reasoning", provider="claude", text=text, raw=obj)
+            return
+
         if t in ("assistant", "user"):
             inner = obj.get("message") or {}
-            for block in inner.get("content") or []:
+            for index, block in enumerate(inner.get("content") or []):
                 btype = block.get("type")
                 if btype == "text":
                     text = block.get("text") or ""
+                    seen = state.partial_text_by_block.get(index, "")
+                    if seen and text.startswith(seen):
+                        text = text[len(seen):]
                     if text:
                         yield Message(kind="text", provider="claude", text=text, raw=obj)
                 elif btype == "thinking":
                     text = block.get("thinking") or ""
+                    seen = state.partial_thinking_by_block.get(index, "")
+                    if seen and text.startswith(seen):
+                        text = text[len(seen):]
                     if text:
                         yield Message(kind="reasoning", provider="claude", text=text, raw=obj)
                 elif btype == "tool_use":
@@ -282,6 +381,12 @@ class ClaudeProvider(BaseProvider):
                               "is_error": block.get("is_error", False)},
                         raw=obj,
                     )
+            # Claude can emit another assistant envelope after a tool loop and
+            # restart content-block indices at zero. The partial deltas above
+            # belong only to this envelope, so retaining them would strip a
+            # coincidentally matching prefix from a later complete message.
+            state.partial_text_by_block.clear()
+            state.partial_thinking_by_block.clear()
             return
 
         if t == "result":

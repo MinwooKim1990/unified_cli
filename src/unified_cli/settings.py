@@ -19,12 +19,13 @@ from typing import Any, Optional
 SETTINGS_DIR = Path.home() / ".unified-cli"
 SETTINGS_FILE = SETTINGS_DIR / "settings.json"
 _VERSION = 1
+_PROVIDERS = frozenset(("claude", "codex", "gemini"))
 
 
 @dataclass
 class Settings:
     lang: Optional[str] = None              # None → autodetect/default at use site
-    default_provider: Optional[str] = None  # forward-looking; unused for now
+    default_provider: Optional[str] = None  # None → Claude compatibility default
 
 
 def _ensure_dir() -> None:
@@ -47,10 +48,10 @@ def load_settings() -> Settings:
     inner = data.get("settings")
     if not isinstance(inner, dict):
         return Settings()
-    return Settings(
-        lang=inner.get("lang"),
-        default_provider=inner.get("default_provider"),
-    )
+    default_provider = inner.get("default_provider")
+    if not isinstance(default_provider, str) or default_provider not in _PROVIDERS:
+        default_provider = None
+    return Settings(lang=inner.get("lang"), default_provider=default_provider)
 
 
 def save_settings(s: Settings) -> None:
@@ -88,5 +89,10 @@ def set(key: str, value: Any) -> None:  # noqa: A001 - deliberate get/set pair
     s = load_settings()
     if not hasattr(s, key):
         raise KeyError(key)
+    if (key == "default_provider" and value is not None
+            and (not isinstance(value, str) or value not in _PROVIDERS)):
+        raise ValueError(
+            "default_provider must be one of: " + ", ".join(sorted(_PROVIDERS))
+        )
     setattr(s, key, value)
     save_settings(s)

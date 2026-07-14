@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextvars
 import json
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import AsyncIterator, ClassVar, Iterator, Optional
+from dataclasses import dataclass, field
+from typing import AsyncIterator, Callable, ClassVar, Iterator, Optional, Union
 
 from .core import Message, ModelInfo, ProviderName, Response, Usage
 from .errors import UnifiedError, classify
@@ -23,16 +26,26 @@ from .usage import tracker as _usage_tracker
 # Materialized temp files registered for cleanup on interpreter exit (defense
 # in depth; per-call cleanup happens in chat/stream finally blocks).
 _GLOBAL_TEMP_FILES: set[str] = set()
+_GLOBAL_TEMP_FILES_LOCK = threading.Lock()
+
+
+@dataclass
+class _TempFileScope:
+    """Exact attachment files owned by one public provider invocation."""
+
+    files: list[str] = field(default_factory=list)
 
 
 @atexit.register
 def _cleanup_global_temp_files() -> None:
-    for p in list(_GLOBAL_TEMP_FILES):
+    with _GLOBAL_TEMP_FILES_LOCK:
+        files = list(_GLOBAL_TEMP_FILES)
+        _GLOBAL_TEMP_FILES.clear()
+    for p in files:
         try:
             os.unlink(p)
         except OSError:
             pass
-    _GLOBAL_TEMP_FILES.clear()
 
 
 # Max 2 retries (0.5s, 1.5s) for network errors; 1 retry for auth fallback.
@@ -51,6 +64,68 @@ DEFAULT_STREAM_TIMEOUT = 300      # seconds — streaming may take longer for lo
 # actionable message instead of blocking for the full stream timeout. Providers
 # whose first token is legitimately slow (agy) raise this in their __init__.
 DEFAULT_FIRST_OUTPUT_TIMEOUT = 60
+
+# Hard ceilings prevent a malformed or hostile CLI stream from growing process
+# memory without bound. Public callers can explicitly raise them per provider
+# for a trusted workload; the server has additional request/response limits.
+DEFAULT_MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+DEFAULT_MAX_STDERR_BYTES = 4 * 1024 * 1024
+DEFAULT_MAX_STREAM_BUFFER_BYTES = 4 * 1024 * 1024
+DEFAULT_MAX_STREAM_EVENTS = 50_000
+DEFAULT_MAX_STREAM_LINE_BYTES = 1 * 1024 * 1024
+
+
+class _ProcessTimedOut(Exception):
+    pass
+
+
+class _ProcessOutputLimit(Exception):
+    def __init__(self, source: str):
+        self.source = source
+
+
+def _popen_process_group_kwargs() -> dict:
+    """Spawn headless provider CLIs in their own POSIX process group."""
+    if os.name == "posix":
+        return {"start_new_session": True}
+    # Windows child-tree termination needs taskkill or a Job Object. Keep the
+    # existing direct-child behavior there rather than claiming unsupported
+    # tree semantics.
+    return {}
+
+
+def _process_is_running(proc) -> bool:
+    poll = getattr(proc, "poll", None)
+    if poll is not None:
+        try:
+            return poll() is None
+        except (ProcessLookupError, OSError):
+            return False
+    return getattr(proc, "returncode", None) is None
+
+
+def _terminate_process_tree(proc, *, force_group: bool = False) -> None:
+    """Force-stop a provider child and its dedicated POSIX process group.
+
+    On an abort, the direct CLI leader may already have exited after spawning a
+    descendant that inherited its process group. Force-group cleanup is used
+    only for that short-lived, wrapper-owned subprocess lifecycle so those
+    descendants cannot outlive a cancelled request.
+    """
+    if os.name == "posix":
+        pid = getattr(proc, "pid", None)
+        if pid and (force_group or _process_is_running(proc)):
+            try:
+                os.killpg(pid, signal.SIGKILL)
+                return
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+    if not _process_is_running(proc):
+        return
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
 
 
 def _reject_empty_prompt(prompt: str, provider: str) -> None:
@@ -90,15 +165,80 @@ def _check_session_match(
         )
 
 
-def _drain_into(pipe, sink: list) -> None:
-    """Read `pipe` to EOF into `sink` (used as a daemon-thread target to drain
-    a child's stderr concurrently with the stdout loop — prevents the classic
-    pipe-buffer deadlock where an undrained stderr stalls stdout)."""
+def _bytes_len(value: Union[str, bytes]) -> int:
+    return len(value) if isinstance(value, bytes) else len(value.encode("utf-8", "replace"))
+
+
+def _prefix_within_bytes(value: Union[str, bytes], limit: int) -> Union[str, bytes]:
+    if isinstance(value, bytes):
+        return value[:limit]
+    return value.encode("utf-8", "replace")[:limit].decode("utf-8", "ignore")
+
+
+def _drain_into(
+    pipe,
+    sink: list,
+    *,
+    max_bytes: Optional[int] = None,
+    overflow: Optional[threading.Event] = None,
+    terminate: Optional[Callable[[], None]] = None,
+) -> None:
+    """Drain a text or bytes pipe with an optional bounded diagnostic tail."""
     if pipe is None:
         return
+    total = 0
     try:
-        for chunk in pipe:
+        while True:
+            chunk = pipe.read(64 * 1024)
+            if not chunk:
+                return
+            size = _bytes_len(chunk)
+            if max_bytes is not None and total + size > max_bytes:
+                remaining = max(0, max_bytes - total)
+                if remaining:
+                    # Keep a bounded prefix for error classification; never
+                    # retain the overflowing remainder in process memory.
+                    sink.append(_prefix_within_bytes(chunk, remaining))
+                if overflow is not None:
+                    overflow.set()
+                if terminate is not None:
+                    terminate()
+                return
             sink.append(chunk)
+            total += size
+    except Exception:
+        pass
+
+
+def _drain_binary_into(
+    pipe,
+    sink: list[bytes],
+    *,
+    max_bytes: int,
+    overflow: threading.Event,
+    source: list[str],
+    source_name: str,
+    terminate: Callable[[], None],
+) -> None:
+    """Binary capture used by non-streaming chat with a strict byte ceiling."""
+    if pipe is None:
+        return
+    total = 0
+    try:
+        while True:
+            chunk = pipe.read(64 * 1024)
+            if not chunk:
+                return
+            if total + len(chunk) > max_bytes:
+                remaining = max(0, max_bytes - total)
+                if remaining:
+                    sink.append(chunk[:remaining])
+                source.append(source_name)
+                overflow.set()
+                terminate()
+                return
+            sink.append(chunk)
+            total += len(chunk)
     except Exception:
         pass
 
@@ -123,16 +263,37 @@ class _StreamReader:
 
     _EOF = object()
 
-    def __init__(self, proc, *, first_output: float, idle: float):
+    def __init__(
+        self,
+        proc,
+        *,
+        first_output: float,
+        idle: float,
+        max_buffer_bytes: int,
+        max_output_bytes: int,
+        max_events: int,
+        max_line_bytes: int,
+        terminate: Optional[Callable[[], None]] = None,
+    ):
         self._proc = proc
         self._first = first_output
         self._idle = idle
         self._q: "queue.Queue" = queue.Queue()
+        self._max_buffer_bytes = max_buffer_bytes
+        self._max_output_bytes = max_output_bytes
+        self._max_events = max_events
+        self._max_line_bytes = max_line_bytes
+        self._terminate = terminate or (lambda: _terminate_process_tree(proc))
+        self._counter_lock = threading.Lock()
+        self._buffered_bytes = 0
+        self._total_bytes = 0
+        self._event_count = 0
         self._last = time.monotonic()   # last time the CHILD emitted a line
         self._produced = False
         self._stop = threading.Event()
         self.fired = False
         self.fired_before_output = False
+        self.overflow_reason = ""
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._watch = threading.Thread(target=self._watch_loop, daemon=True)
 
@@ -143,14 +304,44 @@ class _StreamReader:
 
     def _read_loop(self) -> None:
         try:
-            for line in self._proc.stdout:
+            while True:
+                # The size argument stops an unterminated giant JSON line from
+                # allocating unbounded memory before we can reject it.
+                line = self._proc.stdout.readline(self._max_line_bytes + 1)
+                if not line:
+                    break
+                size = _bytes_len(line)
+                over_limit = (
+                    size > self._max_line_bytes
+                    or (len(line) >= self._max_line_bytes and not line.endswith("\n"))
+                )
+                with self._counter_lock:
+                    if not over_limit:
+                        if self._total_bytes + size > self._max_output_bytes:
+                            over_limit = True
+                            self.overflow_reason = "stdout"
+                        elif self._event_count >= self._max_events:
+                            over_limit = True
+                            self.overflow_reason = "event_count"
+                        elif self._buffered_bytes + size > self._max_buffer_bytes:
+                            over_limit = True
+                            self.overflow_reason = "stream_buffer"
+                        else:
+                            self._total_bytes += size
+                            self._event_count += 1
+                            self._buffered_bytes += size
+                    elif not self.overflow_reason:
+                        self.overflow_reason = "line"
+                if over_limit:
+                    self._terminate()
+                    break
                 self._last = time.monotonic()
                 self._produced = True
-                self._q.put(line)
+                self._q.put((line, size))
         except Exception:
             pass
         finally:
-            self._q.put(self._EOF)
+            self._q.put((self._EOF, 0))
 
     def _watch_loop(self) -> None:
         while not self._stop.wait(0.5):
@@ -160,17 +351,16 @@ class _StreamReader:
             if time.monotonic() - self._last > deadline:
                 self.fired = True
                 self.fired_before_output = not self._produced
-                try:
-                    self._proc.kill()
-                except (ProcessLookupError, OSError):
-                    pass
+                self._terminate()
                 return
 
     def __iter__(self):
         while True:
-            item = self._q.get()
+            item, size = self._q.get()
             if item is self._EOF:
                 return
+            with self._counter_lock:
+                self._buffered_bytes = max(0, self._buffered_bytes - size)
             yield item
 
     def close(self) -> None:
@@ -191,6 +381,10 @@ class BaseProvider(ABC):
     name: ClassVar[ProviderName]
     default_model: ClassVar[str]
     api_key_env: ClassVar[str]       # e.g., "ANTHROPIC_API_KEY"
+    # Some subscription CLIs are OAuth-only. Such providers still expose an
+    # API-key environment variable for UI/status compatibility, but must never
+    # retry an OAuth failure by injecting that key into a different CLI.
+    allow_api_key_fallback: ClassVar[bool] = True
 
     @classmethod
     def login_hint(cls) -> str:
@@ -210,6 +404,11 @@ class BaseProvider(ABC):
         timeout: Optional[float] = None,
         first_output_timeout: Optional[float] = None,
         web_search: bool = True,
+        max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
+        max_stderr_bytes: int = DEFAULT_MAX_STDERR_BYTES,
+        max_stream_buffer_bytes: int = DEFAULT_MAX_STREAM_BUFFER_BYTES,
+        max_stream_events: int = DEFAULT_MAX_STREAM_EVENTS,
+        max_stream_line_bytes: int = DEFAULT_MAX_STREAM_LINE_BYTES,
     ):
         self.model = model or self.default_model
         self.cwd = cwd
@@ -226,10 +425,26 @@ class BaseProvider(ABC):
             self.stream_timeout,
         )
         self.web_search = web_search
-        # Per-call temp files (e.g. image bytes materialized to disk). Tracked
-        # thread-locally and unlinked after each call so the long-running server
-        # doesn't leak files. See _register_temp_file / _cleanup_temp_files.
-        self._tmp = threading.local()
+        for name, value in (
+            ("max_output_bytes", max_output_bytes),
+            ("max_stderr_bytes", max_stderr_bytes),
+            ("max_stream_buffer_bytes", max_stream_buffer_bytes),
+            ("max_stream_events", max_stream_events),
+            ("max_stream_line_bytes", max_stream_line_bytes),
+        ):
+            if not isinstance(value, int) or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        self.max_output_bytes = max_output_bytes
+        self.max_stderr_bytes = max_stderr_bytes
+        self.max_stream_buffer_bytes = max_stream_buffer_bytes
+        self.max_stream_events = max_stream_events
+        self.max_stream_line_bytes = max_stream_line_bytes
+        # Materialized attachment files are tied to an explicit invocation
+        # scope, not a thread. Async streams can interleave on one event-loop
+        # thread, so thread-local tracking could delete another task's image.
+        self._temp_scope: "contextvars.ContextVar[Optional[_TempFileScope]]" = (
+            contextvars.ContextVar(f"unified_cli_temp_scope_{id(self)}", default=None)
+        )
 
         resolved = bin_path or self._discover_bin()
         if not resolved:
@@ -273,31 +488,82 @@ class BaseProvider(ABC):
     @abstractmethod
     def _normalize(self, obj: dict) -> Iterator[Message]: ...
 
+    def _new_stream_state(self) -> object:
+        """Return parser state owned by one public stream invocation.
+
+        Most providers are stateless while normalizing NDJSON, so the default
+        is deliberately opaque. Providers whose wire format emits partial and
+        final versions of the same content can override this together with
+        ``_stream_normalize``. Keeping it invocation-local avoids sharing
+        parser state when callers interleave generators from one provider
+        instance.
+        """
+        return object()
+
+    def _stream_normalize(self, obj: dict, state: object) -> Iterator[Message]:
+        """Normalize one streaming event using invocation-local parser state."""
+        del state
+        yield from self._normalize(obj)
+
     @abstractmethod
     def _parse_json_response(self, text: str, model: str) -> Response: ...
 
     # ----- temp file lifecycle -----
 
+    def _new_temp_scope(self) -> _TempFileScope:
+        return _TempFileScope()
+
+    def _build_args_in_temp_scope(
+        self,
+        scope: _TempFileScope,
+        prompt: str,
+        *,
+        session_id: Optional[str],
+        resume_last: bool,
+        model: Optional[str],
+        streaming: bool,
+        images: Optional[list],
+    ) -> tuple[list[str], Optional[str]]:
+        token = self._temp_scope.set(scope)
+        try:
+            return self._build_args(
+                prompt, session_id=session_id, resume_last=resume_last,
+                model=model, streaming=streaming, images=images,
+            )
+        finally:
+            # Keep the scope object locally for deterministic cleanup, rather
+            # than looking up mutable task/thread ambient state later.
+            self._temp_scope.reset(token)
+
     def _reset_temp_files(self) -> None:
-        self._tmp.files = []
+        """Compatibility helper for subclasses that invoke build methods directly."""
+        self._temp_scope.set(self._new_temp_scope())
 
     def _register_temp_file(self, path: str) -> None:
         """Providers call this when they materialize image bytes/URLs to disk,
         so the file is unlinked after the call completes."""
-        files = getattr(self._tmp, "files", None)
-        if files is None:
-            files = self._tmp.files = []
-        files.append(path)
-        _GLOBAL_TEMP_FILES.add(path)  # atexit safety net
+        scope = self._temp_scope.get()
+        if scope is None:
+            # Preserve direct private build-args use for integrations/tests.
+            # Public chat/stream paths always install an explicit scope.
+            scope = self._new_temp_scope()
+            self._temp_scope.set(scope)
+        scope.files.append(path)
+        with _GLOBAL_TEMP_FILES_LOCK:
+            _GLOBAL_TEMP_FILES.add(path)  # atexit safety net
 
-    def _cleanup_temp_files(self) -> None:
-        for p in getattr(self._tmp, "files", None) or []:
+    def _cleanup_temp_files(self, scope: Optional[_TempFileScope] = None) -> None:
+        target = scope or self._temp_scope.get()
+        if target is None:
+            return
+        for p in target.files:
             try:
                 os.unlink(p)
             except OSError:
                 pass
-            _GLOBAL_TEMP_FILES.discard(p)
-        self._tmp.files = []
+            with _GLOBAL_TEMP_FILES_LOCK:
+                _GLOBAL_TEMP_FILES.discard(p)
+        target.files.clear()
 
     # ----- env + subprocess -----
 
@@ -313,7 +579,7 @@ class BaseProvider(ABC):
         `extra_env` always wins (applied after the pop).
         """
         env = os.environ.copy()
-        if not fallback_api_key:
+        if not (fallback_api_key and self.allow_api_key_fallback):
             env.pop(self.api_key_env, None)
         env.update(self.extra_env)
         return env
@@ -355,6 +621,111 @@ class BaseProvider(ABC):
             hint=hint,
         )
 
+    def _run_once(
+        self,
+        args: list[str],
+        stdin_data: Optional[str],
+        *,
+        fallback_api_key: bool,
+    ) -> tuple[str, str, int]:
+        """Run one bounded non-streaming child and capture its output safely."""
+        proc = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE if stdin_data else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=self.cwd,
+            env=self._env(fallback_api_key=fallback_api_key),
+            **_popen_process_group_kwargs(),
+        )
+        overflow = threading.Event()
+        overflow_sources: list[str] = []
+        terminate = lambda: _terminate_process_tree(proc)
+        stdout_chunks: list[bytes] = []
+        stderr_chunks: list[bytes] = []
+        stdout_thread = threading.Thread(
+            target=_drain_binary_into,
+            kwargs={
+                "pipe": proc.stdout, "sink": stdout_chunks,
+                "max_bytes": self.max_output_bytes, "overflow": overflow,
+                "source": overflow_sources, "source_name": "stdout",
+                "terminate": terminate,
+            },
+            daemon=True,
+        )
+        stderr_thread = threading.Thread(
+            target=_drain_binary_into,
+            kwargs={
+                "pipe": proc.stderr, "sink": stderr_chunks,
+                "max_bytes": self.max_stderr_bytes, "overflow": overflow,
+                "source": overflow_sources, "source_name": "stderr",
+                "terminate": terminate,
+            },
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+
+        stdin_thread: Optional[threading.Thread] = None
+        if stdin_data and proc.stdin is not None:
+            def write_stdin() -> None:
+                try:
+                    proc.stdin.write(stdin_data.encode("utf-8"))
+                    proc.stdin.flush()
+                except (BrokenPipeError, OSError):
+                    pass
+                finally:
+                    try:
+                        proc.stdin.close()
+                    except OSError:
+                        pass
+            stdin_thread = threading.Thread(target=write_stdin, daemon=True)
+            stdin_thread.start()
+
+        timed_out = False
+        deadline = time.monotonic() + self.timeout
+        while proc.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                terminate()
+                break
+            try:
+                proc.wait(timeout=min(remaining, 0.1))
+            except subprocess.TimeoutExpired:
+                continue
+
+        if proc.poll() is None:
+            terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        # A completed headless provider call must not leave a background
+        # descendant in its dedicated process group.
+        _terminate_process_tree(proc, force_group=True)
+        for thread in (stdout_thread, stderr_thread, stdin_thread):
+            if thread is not None:
+                thread.join(timeout=5)
+
+        if timed_out:
+            raise _ProcessTimedOut()
+        if overflow.is_set():
+            raise _ProcessOutputLimit(overflow_sources[0] if overflow_sources else "output")
+        return (
+            b"".join(stdout_chunks).decode("utf-8", "replace"),
+            b"".join(stderr_chunks).decode("utf-8", "replace"),
+            proc.returncode if proc.returncode is not None else -1,
+        )
+
+    def _output_limit_error(self, source: str) -> UnifiedError:
+        return UnifiedError(
+            kind="resource_limit", provider=self.name,
+            message=t("err.base.output_limit", provider=self.name),
+            hint=t("err.base.output_limit.hint"),
+            cause=f"{source} exceeded configured output limit",
+        )
+
     def _run(self, args: list[str], stdin_data: Optional[str] = None) -> str:
         """Run subprocess with non-streaming output. Returns stdout on success.
 
@@ -369,17 +740,9 @@ class BaseProvider(ABC):
 
         for attempt in range(len(_NETWORK_BACKOFF) + 1):
             try:
-                # When no stdin is supplied we still pass empty input ("")
-                # rather than letting the child inherit our stdin — Gemini
-                # CLI in particular blocks waiting for stdin input even
-                # though `-p` is supplied, which causes the wrapper to hang.
-                result = subprocess.run(
-                    args, capture_output=True, text=True,
-                    encoding="utf-8", errors="replace",
-                    input=stdin_data if stdin_data is not None else "",
-                    cwd=self.cwd, env=self._env(), timeout=self.timeout,
-                )
-            except subprocess.TimeoutExpired:
+                stdout, stderr, returncode = self._run_once(
+                    args, stdin_data, fallback_api_key=False)
+            except _ProcessTimedOut:
                 raise UnifiedError(
                     kind="network", provider=self.name,
                     message=t("err.base.timeout", provider=self.name, timeout=self.timeout),
@@ -387,33 +750,33 @@ class BaseProvider(ABC):
                           if self._keychain_block_suspected()
                           else t("err.base.timeout.hint")),
                 )
-            if result.returncode == 0:
-                return result.stdout
+            except _ProcessOutputLimit as exc:
+                raise self._output_limit_error(exc.source)
+            if returncode == 0:
+                return stdout
 
-            err = classify(self.name, result.stderr, result.stdout, result.returncode)
+            err = classify(self.name, stderr, stdout, returncode)
             last_err = err
 
             if err.kind == "auth_expired" and not tried_api_fallback:
-                if self.api_key_env in os.environ:
+                if (self.allow_api_key_fallback
+                        and self.api_key_env in os.environ):
                     tried_api_fallback = True
-                    args_retry = args
                     try:
-                        result = subprocess.run(
-                            args_retry, capture_output=True, text=True,
-                            encoding="utf-8", errors="replace",
-                            input=stdin_data if stdin_data is not None else "",
-                            cwd=self.cwd, env=self._env(fallback_api_key=True),
-                            timeout=self.timeout,
+                        stdout, stderr, returncode = self._run_once(
+                            args, stdin_data, fallback_api_key=True,
                         )
-                    except subprocess.TimeoutExpired:
+                    except _ProcessTimedOut:
                         raise UnifiedError(
                             kind="network", provider=self.name,
                             message=t("err.base.timeout_fallback", provider=self.name),
                             hint=t("err.base.timeout_fallback.hint"),
                         )
-                    if result.returncode == 0:
-                        return result.stdout
-                    err = classify(self.name, result.stderr, result.stdout, result.returncode)
+                    except _ProcessOutputLimit as exc:
+                        raise self._output_limit_error(exc.source)
+                    if returncode == 0:
+                        return stdout
+                    err = classify(self.name, stderr, stdout, returncode)
                     last_err = err
                 raise err  # no key available or fallback also failed
 
@@ -438,13 +801,13 @@ class BaseProvider(ABC):
         images: Optional[list] = None,
     ) -> Response:
         _reject_empty_prompt(prompt, self.name)
-        self._reset_temp_files()
-        args, stdin_data = self._build_args(
-            prompt, session_id=session_id, resume_last=resume_last,
-            model=model, streaming=False, images=images,
-        )
-        t0 = time.time()
+        scope = self._new_temp_scope()
         try:
+            args, stdin_data = self._build_args_in_temp_scope(
+                scope, prompt, session_id=session_id, resume_last=resume_last,
+                model=model, streaming=False, images=images,
+            )
+            t0 = time.time()
             try:
                 stdout = self._run(args, stdin_data=stdin_data)
                 resp = self._parse_json_response(stdout, model or self.model)
@@ -467,7 +830,7 @@ class BaseProvider(ABC):
             )
             return resp
         finally:
-            self._cleanup_temp_files()
+            self._cleanup_temp_files(scope)
 
     def stream(
         self,
@@ -479,16 +842,16 @@ class BaseProvider(ABC):
         images: Optional[list] = None,
     ) -> Iterator[Message]:
         _reject_empty_prompt(prompt, self.name)
-        self._reset_temp_files()
-        args, stdin_data = self._build_args(
-            prompt, session_id=session_id, resume_last=resume_last,
-            model=model, streaming=True, images=images,
-        )
-        t0 = time.time()
-        final_usage = Usage()
-        final_session = ""
-        session_checked = False
+        scope = self._new_temp_scope()
         try:
+            args, stdin_data = self._build_args_in_temp_scope(
+                scope, prompt, session_id=session_id, resume_last=resume_last,
+                model=model, streaming=True, images=images,
+            )
+            t0 = time.time()
+            final_usage = Usage()
+            final_session = ""
+            session_checked = False
             try:
                 for msg in self._stream_run(args, stdin_data=stdin_data):
                     if msg.kind == "usage" and msg.usage:
@@ -516,7 +879,7 @@ class BaseProvider(ABC):
                 prompt_preview=prompt,
             )
         finally:
-            self._cleanup_temp_files()
+            self._cleanup_temp_files(scope)
 
     async def achat(self, prompt: str, **kw) -> Response:
         loop = asyncio.get_event_loop()
@@ -532,38 +895,75 @@ class BaseProvider(ABC):
         images: Optional[list] = None,
     ) -> AsyncIterator[Message]:
         _reject_empty_prompt(prompt, self.name)
-        self._reset_temp_files()
-        args, stdin_data = self._build_args(
-            prompt, session_id=session_id, resume_last=resume_last,
-            model=model, streaming=True, images=images,
-        )
+        scope = self._new_temp_scope()
+        stream_state = self._new_stream_state()
+        token = self._temp_scope.set(scope)
+        try:
+            args, stdin_data = self._build_args(
+                prompt, session_id=session_id, resume_last=resume_last,
+                model=model, streaming=True, images=images,
+            )
+        except BaseException:
+            self._cleanup_temp_files(scope)
+            raise
+        finally:
+            self._temp_scope.reset(token)
         t0 = time.time()
         final_usage = Usage()
         final_session = ""
         session_checked = False
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdin=asyncio.subprocess.PIPE if stdin_data else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=self.cwd, env=self._env(),
-            limit=8 * 1024 * 1024,  # allow long JSON lines (asyncio default is 64 KiB)
-        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdin=asyncio.subprocess.PIPE if stdin_data else asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self.cwd, env=self._env(),
+                limit=self.max_stream_line_bytes,
+                **_popen_process_group_kwargs(),
+            )
+        except BaseException:
+            self._cleanup_temp_files(scope)
+            raise
         if stdin_data and proc.stdin:
-            proc.stdin.write(stdin_data.encode())
-            await proc.stdin.drain()
-            proc.stdin.close()
+            try:
+                proc.stdin.write(stdin_data.encode())
+                await asyncio.wait_for(proc.stdin.drain(), timeout=self.timeout)
+            except BaseException:
+                _terminate_process_tree(proc)
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=5)
+                except Exception:
+                    pass
+                self._cleanup_temp_files(scope)
+                raise
+            finally:
+                proc.stdin.close()
         assert proc.stdout is not None
-        # Drain stderr concurrently so a chatty child can't fill the stderr pipe
-        # and stall the stdout reader (pipe-buffer deadlock).
+        # Drain stderr concurrently so a chatty child cannot fill the stderr
+        # pipe. Retain only a bounded diagnostic capture.
         _stderr_chunks: list[bytes] = []
+        _stderr_size = 0
+        _stderr_overflow = False
 
         async def _drain_stderr():
+            nonlocal _stderr_size, _stderr_overflow
             if proc.stderr is None:
                 return
             try:
-                async for chunk in proc.stderr:
+                while True:
+                    chunk = await proc.stderr.read(64 * 1024)
+                    if not chunk:
+                        return
+                    if _stderr_size + len(chunk) > self.max_stderr_bytes:
+                        remaining = max(0, self.max_stderr_bytes - _stderr_size)
+                        if remaining:
+                            _stderr_chunks.append(chunk[:remaining])
+                        _stderr_overflow = True
+                        _terminate_process_tree(proc)
+                        return
                     _stderr_chunks.append(chunk)
+                    _stderr_size += len(chunk)
             except Exception:
                 pass
 
@@ -576,7 +976,13 @@ class BaseProvider(ABC):
         # short first-output deadline applies only before any output.
         _EOF = object()
         _line_q: "asyncio.Queue" = asyncio.Queue()
-        state = {"produced": False}
+        state = {
+            "produced": False,
+            "buffered": 0,
+            "total": 0,
+            "events": 0,
+            "overflow": "",
+        }
 
         async def _read_stdout():
             while True:
@@ -588,7 +994,25 @@ class BaseProvider(ABC):
                 if not raw:
                     await _line_q.put((_EOF, None))
                     return
+                if state["total"] + len(raw) > self.max_output_bytes:
+                    state["overflow"] = "stdout"
+                    _terminate_process_tree(proc)
+                    await _line_q.put(("limit", None))
+                    return
+                if state["events"] >= self.max_stream_events:
+                    state["overflow"] = "event_count"
+                    _terminate_process_tree(proc)
+                    await _line_q.put(("limit", None))
+                    return
+                if state["buffered"] + len(raw) > self.max_stream_buffer_bytes:
+                    state["overflow"] = "stream_buffer"
+                    _terminate_process_tree(proc)
+                    await _line_q.put(("limit", None))
+                    return
                 state["produced"] = True
+                state["total"] += len(raw)
+                state["events"] += 1
+                state["buffered"] += len(raw)
                 await _line_q.put(("line", raw))
 
         _read_task = asyncio.ensure_future(_read_stdout())
@@ -603,10 +1027,7 @@ class BaseProvider(ABC):
                     # is silent (the consumer only ever fills the queue, never
                     # drains it) — a wedged process, e.g. claude blocked on the
                     # Keychain under launchd. Kill it and surface a hang error.
-                    try:
-                        proc.kill()
-                    except ProcessLookupError:
-                        pass
+                    _terminate_process_tree(proc)
                     err = self._hang_error(before_output=not state["produced"])
                     _usage_tracker.record(
                         self.name, model or self.model,
@@ -616,16 +1037,16 @@ class BaseProvider(ABC):
                     raise err
                 if kind is _EOF:
                     break
+                if kind == "limit":
+                    raise self._output_limit_error(state["overflow"] or "output")
                 if kind == "err":
-                    try:
-                        proc.kill()
-                    except ProcessLookupError:
-                        pass
+                    _terminate_process_tree(proc)
                     raise UnifiedError(
                         kind="internal", provider=self.name,
                         message=t("err.base.line_too_long", provider=self.name),
                         hint=t("err.base.line_too_long.hint"),
                     )
+                state["buffered"] = max(0, state["buffered"] - len(raw))
                 line = raw.decode("utf-8", "replace").strip()
                 if not line or not line.startswith("{"):
                     continue
@@ -633,7 +1054,7 @@ class BaseProvider(ABC):
                     obj = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                for msg in self._normalize(obj):
+                for msg in self._stream_normalize(obj, stream_state):
                     if msg.kind == "usage" and msg.usage:
                         final_usage = msg.usage
                     if (msg.kind == "session" and msg.session_id
@@ -642,12 +1063,18 @@ class BaseProvider(ABC):
                         _check_session_match(self.name, session_id, msg.session_id)
                         session_checked = True
                     yield msg
-            await proc.wait()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=self.stream_timeout)
+            except asyncio.TimeoutError:
+                _terminate_process_tree(proc)
+                raise self._hang_error(before_output=False)
+            try:
+                await asyncio.wait_for(_drain_task, timeout=5)
+            except Exception:
+                pass
+            if _stderr_overflow:
+                raise self._output_limit_error("stderr")
             if proc.returncode != 0:
-                try:
-                    await asyncio.wait_for(_drain_task, timeout=5)
-                except Exception:
-                    pass
                 err_bytes = b"".join(_stderr_chunks)
                 err = classify(self.name, err_bytes.decode(), "", proc.returncode)
                 # Mirror sync stream(): record the error turn before raising.
@@ -668,15 +1095,13 @@ class BaseProvider(ABC):
                 prompt_preview=prompt,
             )
         finally:
-            # Abort/error mid-stream: kill a still-running child rather than
-            # awaiting it (an agentic child may never exit on its own).
+            # Abort/error mid-stream may leave a descendant after the direct
+            # leader exits. Always retire the short-lived, dedicated process
+            # group before tearing down reader tasks.
+            _terminate_process_tree(proc, force_group=True)
             if proc.returncode is None:
                 try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                try:
-                    await proc.wait()
+                    await asyncio.wait_for(proc.wait(), timeout=5)
                 except Exception:
                     pass
             for _task in (_read_task, _drain_task):
@@ -686,13 +1111,14 @@ class BaseProvider(ABC):
                     await _task
                 except (asyncio.CancelledError, Exception):
                     pass
-            self._cleanup_temp_files()
+            self._cleanup_temp_files(scope)
 
     def _stream_once(
         self,
         args: list[str],
         *,
         fallback: bool,
+        stream_state: object,
         stdin_data: Optional[str] = None,
     ) -> Iterator[Message]:
         """Run subprocess once, yield normalized messages, raise on failure."""
@@ -702,6 +1128,7 @@ class BaseProvider(ABC):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", cwd=self.cwd,
             env=self._env(fallback_api_key=fallback), bufsize=1,
+            **_popen_process_group_kwargs(),
         )
         if stdin_data and proc.stdin:
             try:
@@ -715,15 +1142,32 @@ class BaseProvider(ABC):
         # buffer (~64 KB) to stderr while still streaming stdout, an undrained
         # stderr pipe blocks the child, which stalls our stdout loop forever.
         _stderr_chunks: list[str] = []
+        _stderr_overflow = threading.Event()
         _stderr_thread = threading.Thread(
-            target=_drain_into, args=(proc.stderr, _stderr_chunks), daemon=True)
+            target=_drain_into,
+            kwargs={
+                "pipe": proc.stderr,
+                "sink": _stderr_chunks,
+                "max_bytes": self.max_stderr_bytes,
+                "overflow": _stderr_overflow,
+                "terminate": lambda: _terminate_process_tree(proc),
+            },
+            daemon=True,
+        )
         _stderr_thread.start()
         # Read stdout on a background thread with an output watchdog. This kills
         # a child that produces no first line within first_output_timeout, or
         # goes idle past stream_timeout — WITHOUT killing a healthy child just
         # because the consumer below is slow to pull (see _StreamReader).
         reader = _StreamReader(
-            proc, first_output=self.first_output_timeout, idle=self.stream_timeout
+            proc,
+            first_output=self.first_output_timeout,
+            idle=self.stream_timeout,
+            max_buffer_bytes=self.max_stream_buffer_bytes,
+            max_output_bytes=self.max_output_bytes,
+            max_events=self.max_stream_events,
+            max_line_bytes=self.max_stream_line_bytes,
+            terminate=lambda: _terminate_process_tree(proc),
         ).start()
         produced_any = False
         loop_done = False
@@ -736,7 +1180,7 @@ class BaseProvider(ABC):
                     obj = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                for msg in self._normalize(obj):
+                for msg in self._stream_normalize(obj, stream_state):
                     produced_any = True
                     yield msg
             loop_done = True
@@ -744,17 +1188,27 @@ class BaseProvider(ABC):
             reader.close()
             # Aborted mid-stream (generator .close()/error): don't wait on a
             # possibly long-running child — kill it.
-            if not loop_done and proc.poll() is None:
-                proc.kill()
+            if not loop_done:
+                _terminate_process_tree(proc, force_group=True)
             try:
                 proc.wait(timeout=self.stream_timeout)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+                _terminate_process_tree(proc)
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
                 raise self._hang_error(before_output=False)
+            # The leader may have exited before an inherited-child process.
+            # Clean the wrapper-owned group after every completed invocation.
+            _terminate_process_tree(proc, force_group=True)
             _stderr_thread.join(timeout=5)
             stderr_text = "".join(_stderr_chunks)
 
+        if reader.overflow_reason:
+            raise self._output_limit_error(reader.overflow_reason)
+        if _stderr_overflow.is_set():
+            raise self._output_limit_error("stderr")
         if reader.fired:
             # The watchdog killed a wedged child — report the hang, not the
             # SIGKILL exit code (which classify() would mislabel as internal).
@@ -771,13 +1225,24 @@ class BaseProvider(ABC):
     ) -> Iterator[Message]:
         """Sync streaming with one auth-fallback retry on pre-stream failure."""
         try:
-            yield from self._stream_once(args, fallback=False, stdin_data=stdin_data)
+            yield from self._stream_once(
+                args,
+                fallback=False,
+                stream_state=self._new_stream_state(),
+                stdin_data=stdin_data,
+            )
             return
         except UnifiedError as err:
             produced = getattr(err, "_produced_any", False)
             if (err.kind == "auth_expired"
                     and not produced
+                    and self.allow_api_key_fallback
                     and self.api_key_env in os.environ):
-                yield from self._stream_once(args, fallback=True, stdin_data=stdin_data)
+                yield from self._stream_once(
+                    args,
+                    fallback=True,
+                    stream_state=self._new_stream_state(),
+                    stdin_data=stdin_data,
+                )
                 return
             raise

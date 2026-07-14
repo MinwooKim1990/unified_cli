@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from dataclasses import asdict
@@ -14,7 +15,7 @@ from rich.live import Live
 from rich.markup import escape
 from rich.table import Table
 
-from . import i18n
+from . import i18n, settings
 from .core import ProviderName
 from .errors import UnifiedError
 from .factory import create, route
@@ -24,7 +25,7 @@ from .models import DEFAULT_MODELS, list_models
 # are imported lazily inside _cmd_repl / _cmd_setup so that fast paths like
 # `--version`, `--help`, `doctor`, `chat` don't pay their import cost.
 from .state import (
-    clear_last_session, load_last_session, save_last_session,
+    clear_last_session, load_last_session, resolve_cwd, save_last_session,
 )
 from .ui import banner, collect_states, health_cell, status_table
 from .usage import tracker
@@ -208,8 +209,8 @@ def _resolve_session_flags(
     args: argparse.Namespace,
     routed_provider: Optional[ProviderName],
     routed_model: Optional[str],
-) -> tuple[Optional[ProviderName], Optional[str], Optional[str]]:
-    """Inspect --resume/--continue/--new and return (provider, model, session_id).
+) -> tuple[Optional[ProviderName], Optional[str], Optional[str], Optional[str]]:
+    """Resolve session flags to (provider, model, session_id, saved_cwd).
 
     Rules:
       --resume <id>  → use as-is. provider/model from -m (or default).
@@ -220,16 +221,16 @@ def _resolve_session_flags(
       (none)         → start fresh (no state read/clear).
     """
     if args.resume:
-        return routed_provider, routed_model, args.resume
+        return routed_provider, routed_model, args.resume, None
 
     if getattr(args, "continue_", False):
         saved = load_last_session()
         if saved is None:
             console.print(f"[yellow]{t('cli.chat.no_saved_session')}[/yellow]")
-            return routed_provider, routed_model, None
+            return routed_provider, routed_model, None, None
         # If user didn't override -m, reuse saved (provider, model).
         if routed_provider is None and routed_model is None:
-            return saved.provider, saved.model, saved.session_id
+            return saved.provider, saved.model, saved.session_id, saved.cwd
         # If user overrode to a different provider, the saved session_id is invalid.
         if routed_provider and routed_provider != saved.provider:
             console.print(
@@ -238,15 +239,41 @@ def _resolve_session_flags(
                     saved=saved.provider, routed=routed_provider)
                 + "[/yellow]"
             )
-            return routed_provider, routed_model, None
+            return routed_provider, routed_model, None, None
         # Same provider, different model override: keep session_id.
-        return saved.provider, routed_model or saved.model, saved.session_id
+        return saved.provider, routed_model or saved.model, saved.session_id, saved.cwd
 
     if args.new:
         clear_last_session()
-        return routed_provider, routed_model, None
+        return routed_provider, routed_model, None, None
 
-    return routed_provider, routed_model, None
+    return routed_provider, routed_model, None, None
+
+
+def _configured_default_provider() -> ProviderName:
+    """Read the validated user preference, retaining Claude compatibility."""
+    provider = settings.get("default_provider")
+    return (provider if isinstance(provider, str)
+            and provider in {"claude", "codex", "gemini"} else "claude")
+
+
+def _effective_cwd(explicit_cwd: Optional[str], saved_cwd: Optional[str]) -> str:
+    """Resolve the documented CWD precedence for a CLI chat invocation."""
+    if explicit_cwd is not None:
+        resolved = resolve_cwd(explicit_cwd)
+        if resolved is None:
+            raise ValueError(t("cli.chat.invalid_cwd", cwd=explicit_cwd))
+        return resolved
+    if saved_cwd:
+        resolved = resolve_cwd(saved_cwd)
+        if resolved is not None:
+            return resolved
+        err_console.print(
+            f"[yellow]{t('cli.chat.saved_cwd_missing', cwd=escape(saved_cwd))}[/yellow]"
+        )
+    # Passing the effective cwd explicitly keeps the persisted state truthful
+    # and has the same subprocess semantics as BaseProvider's inherited cwd.
+    return resolve_cwd(os.getcwd()) or os.getcwd()
 
 
 def _print_session_panel(
@@ -285,22 +312,32 @@ def _cmd_chat(args: argparse.Namespace) -> int:
 
     # Resolve session flags (may override provider/model from state file).
     try:
-        provider, model, session_id = _resolve_session_flags(args, provider, model)
+        provider, model, session_id, saved_cwd = _resolve_session_flags(
+            args, provider, model
+        )
     except UnifiedError as e:
         err_console.print(f"[red]{escape(str(e))}[/red]")
         return 2
 
+    try:
+        effective_cwd = _effective_cwd(args.cwd, saved_cwd)
+    except ValueError as e:
+        err_console.print(f"[red]{escape(str(e))}[/red]")
+        return 2
+
+    provider = provider or _configured_default_provider()
+
     create_kwargs: dict = {
         "model": model,
         "web_search": args.web_search,
-        "cwd": args.cwd,
+        "cwd": effective_cwd,
     }
     # --terse is Claude-specific (others already default to concise replies).
-    if args.terse and (provider or "claude") == "claude":
+    if args.terse and provider == "claude":
         create_kwargs["terse"] = True
 
     try:
-        client = create(provider or "claude", **create_kwargs)
+        client = create(provider, **create_kwargs)
     except UnifiedError as e:
         err_console.print(f"[red]{escape(str(e))}[/red]")
         return 3
@@ -353,6 +390,7 @@ def _cmd_chat(args: argparse.Namespace) -> int:
                 provider=resp.provider,  # type: ignore[arg-type]
                 model=resp.model or client.model,
                 session_id=resp.session_id,
+                cwd=effective_cwd,
             )
         except OSError:
             pass  # state save is best-effort
@@ -420,13 +458,40 @@ def _run_stream_with_spinner(
 def _cmd_repl(args: argparse.Namespace) -> int:
     from .repl import run_repl  # lazy (prompt_toolkit)
     return run_repl(
-        provider=args.provider,
+        provider=args.provider or _configured_default_provider(),
         model=args.model,
         web_search=args.web_search,
         terse=args.terse,
         cwd=args.cwd,
         continue_session=getattr(args, "continue_", False),
     )
+
+
+# ----- config -----
+
+def _cmd_config(args: argparse.Namespace) -> int:
+    """Read or update durable, non-secret CLI preferences."""
+    if args.config_cmd != "default-provider":  # pragma: no cover - parser owns this
+        return 2
+    if args.reset and args.provider:
+        err_console.print(f"[red]{t('cli.config.default_provider.conflict')}[/red]")
+        return 2
+    try:
+        if args.reset:
+            settings.set("default_provider", None)
+            console.print(t("cli.config.default_provider.reset"))
+        elif args.provider:
+            settings.set("default_provider", args.provider)
+            console.print(t("cli.config.default_provider.set", provider=args.provider))
+        else:
+            provider = settings.get("default_provider")
+            console.print(
+                t("cli.config.default_provider.current", provider=provider or "claude")
+            )
+    except (OSError, ValueError) as e:
+        err_console.print(f"[red]{escape(str(e))}[/red]")
+        return 2
+    return 0
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
@@ -496,6 +561,13 @@ def _prescan_lang(raw: list[str]) -> None:
 def main(argv: list[str] | None = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
 
+    # Keep version probing automation-friendly: no parser construction, Rich
+    # rendering, localization output, or provider discovery on this fast path.
+    if raw in (["--version"], ["-V"]):
+        from . import __version__
+        print(__version__)
+        return 0
+
     # Resolve language early so all localized help/description text is correct.
     _prescan_lang(raw)
 
@@ -554,6 +626,22 @@ def main(argv: list[str] | None = None) -> int:
     p_mod.add_argument("--json", action="store_true", help=t("cli.help.models.json"))
     p_mod.set_defaults(func=_cmd_models)
 
+    p_config = _add("config", help=t("cli.help.config"))
+    config_sub = p_config.add_subparsers(dest="config_cmd", required=True)
+    p_default_provider = config_sub.add_parser(
+        "default-provider", parents=[lang_parent],
+        help=t("cli.help.config.default_provider"),
+    )
+    p_default_provider.add_argument(
+        "provider", nargs="?", choices=["claude", "codex", "gemini"],
+        help=t("cli.help.config.default_provider.provider"),
+    )
+    p_default_provider.add_argument(
+        "--reset", action="store_true",
+        help=t("cli.help.config.default_provider.reset"),
+    )
+    p_default_provider.set_defaults(func=_cmd_config)
+
     p_chat = _add("chat", help=t("cli.help.chat"))
     p_chat.add_argument("prompt", nargs="?",
                         help=t("cli.help.chat.prompt"))
@@ -586,7 +674,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_repl = _add("repl", help=t("cli.help.repl"))
     p_repl.add_argument("--provider", choices=["claude", "codex", "gemini"],
-                        default="claude", help=t("cli.help.repl.provider"))
+                        default=None, help=t("cli.help.repl.provider"))
     p_repl.add_argument("-m", "--model",
                         help=t("cli.help.repl.model"))
     p_repl.add_argument("--no-web-search", dest="web_search",

@@ -12,6 +12,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from unified_cli import UnifiedError
@@ -175,8 +177,7 @@ def test_codex_build_args_no_image_uses_argv():
 
 
 def test_claude_build_args_with_image_uses_read_tool():
-    """Claude routes image input through the Read tool: --allowedTools Read +
-    bypassPermissions + path prepended to the prompt."""
+    """Claude routes image input through Read without elevating permissions."""
     from unified_cli import create
     p = _make_dummy_png()
     try:
@@ -190,8 +191,7 @@ def test_claude_build_args_with_image_uses_read_tool():
         # Read tool must appear in the allowed list
         idx = argv.index("--allowedTools")
         assert "Read" in argv[idx + 1]
-        assert "--permission-mode" in joined
-        assert "bypassPermissions" in joined
+        assert "--permission-mode" not in argv
         # Image absolute path must be in the (last) prompt argument
         assert p in argv[-1]
         assert stdin is None
@@ -243,7 +243,8 @@ def test_server_multicontent_parses_text_blocks():
 
 def test_server_multicontent_parses_data_url_image():
     from unified_cli.server import ChatMessage, _extract_user_message
-    fake_b64 = base64.b64encode(b"png-bytes").decode()
+    png = b"\x89PNG\r\n\x1a\nminimal-payload"
+    fake_b64 = base64.b64encode(png).decode()
     msgs = [ChatMessage(role="user", content=[
         {"type": "text", "text": "what is this?"},
         {"type": "image_url",
@@ -254,20 +255,53 @@ def test_server_multicontent_parses_data_url_image():
     assert len(images) == 1
     att = images[0]
     assert isinstance(att, Attachment)
-    assert att.bytes_ == b"png-bytes"
+    assert att.bytes_ == png
     assert att.media_type == "image/png"
 
 
-def test_server_multicontent_parses_http_url():
+@pytest.mark.parametrize("url", [
+    "https://example.com/x.png",
+    "/etc/hosts",
+    "file:///etc/hosts",
+    "../secret.png",
+    "data:text/plain;base64,aGVsbG8=",
+    "data:image/png;base64,not-valid!!!",
+    "data:image/png;base64,",
+])
+def test_server_multicontent_rejects_noncanonical_or_untrusted_image_url(url):
     from unified_cli.server import ChatMessage, _extract_user_message
     msgs = [ChatMessage(role="user", content=[
         {"type": "text", "text": "describe"},
-        {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}},
+        {"type": "image_url", "image_url": {"url": url}},
     ])]
-    text, images = _extract_user_message(msgs)
-    assert text == "describe"
-    assert len(images) == 1
-    assert images[0] == "https://example.com/x.png"
+    with pytest.raises(Exception) as exc_info:
+        _extract_user_message(msgs)
+    assert getattr(exc_info.value, "status_code", None) == 400
+
+
+def test_server_multicontent_rejects_mime_signature_mismatch():
+    from unified_cli.server import ChatMessage, _extract_user_message
+    jpeg = base64.b64encode(b"\xff\xd8\xffnot-a-png").decode()
+    msgs = [ChatMessage(role="user", content=[
+        {"type": "image_url",
+         "image_url": {"url": f"data:image/png;base64,{jpeg}"}},
+    ])]
+    with pytest.raises(Exception) as exc_info:
+        _extract_user_message(msgs)
+    assert getattr(exc_info.value, "status_code", None) == 400
+
+
+def test_server_multicontent_rejects_image_over_limit(monkeypatch):
+    from unified_cli import server
+    monkeypatch.setattr(server, "_MAX_IMAGE_BYTES", 8)
+    payload = base64.b64encode(b"\x89PNG\r\n\x1a\nmore").decode()
+    msgs = [server.ChatMessage(role="user", content=[
+        {"type": "image_url",
+         "image_url": {"url": f"data:image/png;base64,{payload}"}},
+    ])]
+    with pytest.raises(Exception) as exc_info:
+        server._extract_user_message(msgs)
+    assert getattr(exc_info.value, "status_code", None) == 413
 
 
 if __name__ == "__main__":

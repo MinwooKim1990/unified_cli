@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -40,6 +41,28 @@ def test_set_get_convenience():
 def test_set_unknown_key_raises():
     with pytest.raises(KeyError):
         st.set("not_a_field", "x")
+
+
+def test_default_provider_roundtrip_and_reset():
+    st.set("default_provider", "codex")
+    assert st.load_settings().default_provider == "codex"
+    st.set("default_provider", None)
+    assert st.load_settings().default_provider is None
+
+
+@pytest.mark.parametrize("value", ["unknown", "CLAUDE", ["claude"], {"provider": "claude"}])
+def test_default_provider_rejects_invalid_values(value):
+    with pytest.raises(ValueError):
+        st.set("default_provider", value)
+
+
+def test_invalid_persisted_default_provider_is_ignored():
+    st.SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    st.SETTINGS_FILE.write_text(json.dumps({
+        "version": 1,
+        "settings": {"lang": "en", "default_provider": ["not", "a", "provider"]},
+    }), encoding="utf-8")
+    assert st.load_settings().default_provider is None
 
 
 def test_corrupt_json_falls_back(monkeypatch):

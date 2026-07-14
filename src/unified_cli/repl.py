@@ -38,7 +38,7 @@ from .repl_completion import (
     SLASH_COMMANDS, arg_candidates, build_session, has_prompt_toolkit,
     pick_model, pick_provider, warm_models_async,
 )
-from .state import save_last_session
+from .state import resolve_cwd, save_last_session
 from .ui import status_layout
 from .usage import tracker
 
@@ -123,7 +123,17 @@ def run_repl(
         provider = "claude"
         model = None
 
-    provider_opts: dict = {"web_search": web_search, "cwd": cwd}
+    explicit_cwd: Optional[str] = None
+    if cwd is not None:
+        explicit_cwd = resolve_cwd(cwd)
+        if explicit_cwd is None:
+            console.print(f"[red]{t('cli.chat.invalid_cwd', cwd=escape(cwd))}[/red]")
+            return 2
+    # Always retain the effective directory so state.json can restore the exact
+    # tool workspace on --continue or /resume. This is equivalent to inherited
+    # subprocess cwd when the caller did not provide --cwd.
+    effective_cwd = explicit_cwd or resolve_cwd(os.getcwd()) or os.getcwd()
+    provider_opts: dict = {"web_search": web_search, "cwd": effective_cwd}
     if terse:
         provider_opts["terse"] = True
 
@@ -138,7 +148,9 @@ def run_repl(
     pending_images: list[str] = []
 
     if continue_session:
-        _apply_resume(conv, current)
+        _apply_resume(
+            conv, current, provider_opts, preserve_cwd=explicit_cwd is not None
+        )
 
     # Input driver: prompt_toolkit (live menu) when interactive, else readline.
     use_ptk = has_prompt_toolkit() and _interactive()
@@ -158,7 +170,7 @@ def run_repl(
             line = session.prompt(prompt_str) if session else input(prompt_str)
         except EOFError:
             console.print()
-            _on_exit(conv, current)
+            _on_exit(conv, current, provider_opts)
             return 0
         except KeyboardInterrupt:
             console.print(f"\n[dim]{t('repl.interrupt_hint')}[/dim]")
@@ -173,7 +185,8 @@ def run_repl(
             # the whole REPL (losing in-memory session state).
             try:
                 stop = _handle_slash(line, conv, current, provider_opts,
-                                     pending_images, use_ptk)
+                                     pending_images, use_ptk,
+                                     preserve_cwd=explicit_cwd is not None)
             except KeyboardInterrupt:
                 console.print()
                 continue
@@ -183,7 +196,7 @@ def run_repl(
                 console.print(f"[red]{escape(t('repl.slash_error', err=e))}[/red]")
                 continue
             if stop:
-                _on_exit(conv, current)
+                _on_exit(conv, current, provider_opts)
                 return 0
             continue
 
@@ -200,7 +213,13 @@ def run_repl(
 
 # ---------- slash commands ----------
 
-def _apply_resume(conv: UnifiedConversation, current: dict) -> bool:
+def _apply_resume(
+    conv: UnifiedConversation,
+    current: dict,
+    provider_opts: Optional[dict] = None,
+    *,
+    preserve_cwd: bool = False,
+) -> bool:
     """Load the last saved session and seed the conversation so the NEXT turn
     resumes it natively. Returns True on success.
 
@@ -223,6 +242,18 @@ def _apply_resume(conv: UnifiedConversation, current: dict) -> bool:
     current["model"] = saved.model
     conv.sessions[saved.provider] = saved.session_id
     conv.turns.append(Turn(provider=saved.provider, prompt="", text=""))
+    if provider_opts is not None and not preserve_cwd and saved.cwd:
+        restored_cwd = resolve_cwd(saved.cwd)
+        if restored_cwd is not None:
+            provider_opts["cwd"] = restored_cwd
+            # `/resume` can happen after an earlier provider call. Recreate
+            # cached clients so the resumed session cannot retain that old
+            # call's workspace.
+            conv._clients.clear()
+        else:
+            console.print(
+                f"[yellow]{t('cli.chat.saved_cwd_missing', cwd=escape(saved.cwd))}[/yellow]"
+            )
     age_min = int(saved.age_seconds // 60)
     console.print(f"[green]{t('repl.resume.done', provider=saved.provider, model=escape(_short(saved.model)), sid=escape(saved.session_id[:12]), age=age_min)}[/green]")
     return True
@@ -252,6 +283,8 @@ def _handle_slash(
     provider_opts: dict,
     pending_images: list[str],
     use_ptk: bool,
+    *,
+    preserve_cwd: bool = False,
 ) -> bool:
     """Return True if the REPL should exit."""
     parts = line.split()
@@ -358,7 +391,7 @@ def _handle_slash(
         return False
 
     if cmd == "/resume":
-        _apply_resume(conv, current)
+        _apply_resume(conv, current, provider_opts, preserve_cwd=preserve_cwd)
         return False
 
     if cmd == "/save":
@@ -537,7 +570,9 @@ def _banner(current: dict, use_ptk: bool) -> None:
     ))
 
 
-def _on_exit(conv: UnifiedConversation, current: dict) -> None:
+def _on_exit(
+    conv: UnifiedConversation, current: dict, provider_opts: Optional[dict] = None
+) -> None:
     sid = conv.sessions.get(current["provider"])
     if sid:
         try:
@@ -545,6 +580,7 @@ def _on_exit(conv: UnifiedConversation, current: dict) -> None:
                 provider=current["provider"],
                 model=current["model"],
                 session_id=sid,
+                cwd=(provider_opts or {}).get("cwd"),
             )
             console.print(f"[dim]{t('repl.exit.saved')}[/dim]")
         except OSError:

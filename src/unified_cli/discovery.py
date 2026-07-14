@@ -82,19 +82,19 @@ def find_codex_bin() -> Optional[str]:
     return _first_executable(_CODEX_FALLBACK_BINS)
 
 
-def find_gemini_bin() -> Optional[str]:
-    """Locate the Antigravity `agy` CLI (the successor to the now-blocked
-    `gemini` CLI for individual accounts — see migration notes in
-    providers/gemini.py).
+def find_agy_bin() -> Optional[str]:
+    """Locate the Antigravity ``agy`` CLI.
 
-    Search order: $AGY_CLI_PATH → $GEMINI_CLI_PATH (legacy) → `agy` on PATH →
-    ~/.local/bin/agy. As a last resort, falls back to a `gemini` binary on
-    PATH for users who still have a working paid-API-key gemini CLI.
+    The provider named ``gemini`` wraps Antigravity, not the retired Gemini
+    CLI. Its command-line flags, session format, and plain-text output parser
+    are agy-specific, so selecting a legacy ``gemini`` executable would fail
+    unpredictably rather than provide a usable fallback.
+
+    Search order: $AGY_CLI_PATH → ``agy`` on PATH → ~/.local/bin/agy.
     """
-    for var in ("AGY_CLI_PATH", "GEMINI_CLI_PATH"):
-        env = os.environ.get(var)
-        if env and os.path.isfile(env) and os.access(env, os.X_OK):
-            return env
+    env = os.environ.get("AGY_CLI_PATH")
+    if env and os.path.isfile(env) and os.access(env, os.X_OK):
+        return env
 
     on_path = shutil.which("agy")
     if on_path:
@@ -104,12 +104,13 @@ def find_gemini_bin() -> Optional[str]:
     if os.path.isfile(local) and os.access(local, os.X_OK):
         return local
 
-    # Legacy fallback (likely blocked by IneligibleTierError for individuals).
-    return shutil.which("gemini")
+    return None
 
 
-# Backwards/forwards-compatible alias.
-find_agy_bin = find_gemini_bin
+# The public provider key remains "gemini" for compatibility. Keep this
+# function name as an import compatibility alias, but never probe the legacy
+# Gemini CLI or its GEMINI_CLI_PATH variable from the agy-only provider.
+find_gemini_bin = find_agy_bin
 
 
 FINDERS = {

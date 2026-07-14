@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -27,7 +28,7 @@ from unified_cli.errors import UnifiedError
 # A minimal fake CLI. Behaviour selected by argv[1]. Emits newline-delimited
 # JSON on stdout (the shape FakeProvider._normalize understands).
 _FAKE_CLI = r'''
-import sys, json, time, os
+import sys, json, time, os, subprocess
 mode = sys.argv[1] if len(sys.argv) > 1 else "ok"
 def emit(o):
     sys.stdout.write(json.dumps(o) + "\n"); sys.stdout.flush()
@@ -68,6 +69,25 @@ elif mode == "drip":
 elif mode == "echo_key":
     emit({"type": "text", "text": "KEY=" + os.environ.get("ANTHROPIC_API_KEY", "<none>")})
     emit({"type": "done"})
+elif mode == "output_flood":
+    for i in range(100):
+        emit({"type": "text", "text": "x" * 2048})
+elif mode == "spawn_descendant":
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    pid_file = os.environ.get("FAKE_CHILD_PID_FILE")
+    if pid_file:
+        with open(pid_file, "w") as f:
+            f.write(str(child.pid))
+    emit({"type": "text", "text": "CHILD=" + str(child.pid)})
+    time.sleep(60)
+elif mode == "spawn_then_exit":
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    pid_file = os.environ.get("FAKE_CHILD_PID_FILE")
+    if pid_file:
+        with open(pid_file, "w") as f:
+            f.write(str(child.pid))
+    emit({"type": "text", "text": "CHILD=" + str(child.pid)})
+    sys.exit(0)
 '''
 
 
@@ -115,6 +135,32 @@ class FakeProvider(BaseProvider):
                         model=model, usage=Usage(), messages=[], raw=[])
 
 
+class FakeOAuthOnlyProvider(FakeProvider):
+    """Provider shape that exposes a key name but never permits fallback."""
+
+    allow_api_key_fallback = False
+
+
+class StatefulNormalizeProvider(FakeProvider):
+    """Makes BaseProvider's per-invocation parser-state plumbing observable."""
+
+    def _new_stream_state(self):
+        return {"text_count": 0}
+
+    def _stream_normalize(self, obj, state):
+        for message in super()._stream_normalize(obj, state):
+            if message.kind == "text":
+                state["text_count"] += 1
+                yield Message(
+                    kind="text",
+                    provider=self.name,
+                    text=f"{state['text_count']}:{message.text}",
+                    raw=message.raw,
+                )
+            else:
+                yield message
+
+
 # ---- happy path ----
 
 def test_stream_ok_yields_all_events():
@@ -127,6 +173,20 @@ def test_stream_unicode_roundtrips():
     fp = FakeProvider("unicode")
     texts = [m.text for m in fp.stream("hi") if m.kind == "text"]
     assert texts == ["안녕 🌟 café"]
+
+
+def test_sync_interleaved_streams_receive_distinct_parser_state():
+    fp = StatefulNormalizeProvider("ok")
+    first = fp.stream("first")
+    second = fp.stream("second")
+    try:
+        first_text = next(message.text for message in first if message.kind == "text")
+        second_text = next(message.text for message in second if message.kind == "text")
+    finally:
+        first.close()
+        second.close()
+    assert first_text == "1:hello"
+    assert second_text == "1:hello"
 
 
 def test_stream_stderr_flood_no_deadlock():
@@ -237,6 +297,15 @@ def test_stream_auth_no_key_no_fallback(monkeypatch):
     assert ei.value.kind == "auth_expired"
 
 
+def test_oauth_only_provider_never_retries_with_inherited_key(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    fp = FakeOAuthOnlyProvider("auth")
+    assert "ANTHROPIC_API_KEY" not in fp._env(fallback_api_key=True)
+    with pytest.raises(UnifiedError) as ei:
+        list(fp.stream("hi"))
+    assert ei.value.kind == "auth_expired"
+
+
 # ---- async streaming (astream) ----
 
 def test_astream_ok():
@@ -247,6 +316,22 @@ def test_astream_ok():
         return [m.kind async for m in fp.astream("hi")]
 
     assert asyncio.run(run()) == ["session", "text", "usage", "done"]
+
+
+def test_concurrent_astreams_receive_distinct_parser_state():
+    import asyncio
+    fp = StatefulNormalizeProvider("ok")
+
+    async def consume():
+        return [message.text async for message in fp.astream("hi")
+                if message.kind == "text"]
+
+    async def run():
+        return await asyncio.gather(consume(), consume())
+
+    assert asyncio.run(run()) == [
+        ["1:hello"], ["1:hello"],
+    ]
 
 
 def test_astream_hang_before_output_fails_fast():
@@ -261,6 +346,183 @@ def test_astream_hang_before_output_fails_fast():
         asyncio.run(run())
     assert ei.value.kind == "network"
     assert time.time() - t0 < 4
+
+
+# ---- bounded output / exact temp-file ownership ----
+
+def test_stream_output_limit_terminates_child_promptly():
+    fp = FakeProvider(
+        "output_flood",
+        timeout=10,
+        max_output_bytes=1024,
+        max_stream_buffer_bytes=1024,
+    )
+    t0 = time.time()
+    with pytest.raises(UnifiedError) as ei:
+        list(fp.stream("hi"))
+    assert ei.value.kind == "resource_limit"
+    assert time.time() - t0 < 5
+
+
+def test_chat_output_limit_is_bounded():
+    fp = FakeProvider("output_flood", timeout=10, max_output_bytes=1024)
+    with pytest.raises(UnifiedError) as ei:
+        fp.chat("hi")
+    assert ei.value.kind == "resource_limit"
+
+
+class _ScopedTempProvider(FakeProvider):
+    def __init__(self):
+        super().__init__("drip", timeout=5)
+        self.materialized: list[str] = []
+
+    def _build_args(self, prompt, *, session_id, resume_last, model,
+                    streaming, images=None):
+        fd, path = tempfile.mkstemp(prefix="unified-cli-scope-", suffix=".img")
+        os.write(fd, b"image")
+        os.close(fd)
+        self._register_temp_file(path)
+        self.materialized.append(path)
+        return [sys.executable, "-c", _FAKE_CLI, self._mode], None
+
+
+class _FailingTempProvider(_ScopedTempProvider):
+    def _build_args(self, *args, **kwargs):
+        super()._build_args(*args, **kwargs)
+        raise RuntimeError("build failed after materialization")
+
+
+def test_overlapping_astream_temp_scopes_do_not_cross_cleanup():
+    import asyncio
+    fp = _ScopedTempProvider()
+
+    async def run():
+        first = fp.astream("first", images=[b"one"])
+        second = fp.astream("second", images=[b"two"])
+        await first.__anext__()
+        await second.__anext__()
+        first_path, second_path = fp.materialized
+        assert os.path.exists(first_path)
+        assert os.path.exists(second_path)
+
+        async for _ in first:
+            pass
+        after_first = (os.path.exists(first_path), os.path.exists(second_path))
+        await second.aclose()
+        after_second = os.path.exists(second_path)
+        return after_first, after_second
+
+    after_first, after_second = asyncio.run(run())
+    assert after_first == (False, True)
+    assert after_second is False
+
+
+def test_astream_build_error_cleans_its_temp_scope():
+    import asyncio
+    fp = _FailingTempProvider()
+
+    async def run():
+        gen = fp.astream("broken", images=[b"image"])
+        with pytest.raises(RuntimeError, match="build failed"):
+            await gen.__anext__()
+
+    asyncio.run(run())
+    assert len(fp.materialized) == 1
+    assert not os.path.exists(fp.materialized[0])
+
+
+# ---- POSIX process-group cancellation ----
+
+def _wait_for_pid_exit(pid: int, timeout: float = 4) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        time.sleep(0.05)
+    return False
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
+def test_stream_abort_kills_descendant_process():
+    fp = FakeProvider("spawn_descendant", timeout=30)
+    gen = fp.stream("hi")
+    first = next(gen)
+    pid = int(first.text.split("=", 1)[1])
+    gen.close()
+    assert _wait_for_pid_exit(pid)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
+def test_stream_abort_kills_descendant_after_parent_exits():
+    fp = FakeProvider("spawn_then_exit", timeout=30)
+    gen = fp.stream("hi")
+    first = next(gen)
+    pid = int(first.text.split("=", 1)[1])
+    # Let the direct fake CLI exit while the descendant still owns the pipe.
+    time.sleep(0.1)
+    gen.close()
+    assert _wait_for_pid_exit(pid)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
+def test_astream_abort_kills_descendant_process():
+    import asyncio
+    fp = FakeProvider("spawn_descendant", timeout=30)
+
+    async def run():
+        gen = fp.astream("hi")
+        first = await gen.__anext__()
+        await gen.aclose()
+        return int(first.text.split("=", 1)[1])
+
+    assert _wait_for_pid_exit(asyncio.run(run()))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
+def test_astream_abort_kills_descendant_after_parent_exits():
+    import asyncio
+    fp = FakeProvider("spawn_then_exit", timeout=30)
+
+    async def run():
+        gen = fp.astream("hi")
+        first = await gen.__anext__()
+        await asyncio.sleep(0.1)
+        await gen.aclose()
+        return int(first.text.split("=", 1)[1])
+
+    assert _wait_for_pid_exit(asyncio.run(run()))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
+def test_chat_timeout_kills_descendant_process(tmp_path):
+    pid_file = tmp_path / "child.pid"
+    fp = FakeProvider(
+        "spawn_descendant",
+        timeout=1,
+        extra_env={"FAKE_CHILD_PID_FILE": str(pid_file)},
+    )
+    with pytest.raises(UnifiedError) as ei:
+        fp.chat("hi")
+    assert ei.value.kind == "network"
+    assert pid_file.exists()
+    assert _wait_for_pid_exit(int(pid_file.read_text()))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
+def test_chat_completion_retires_descendant_after_parent_exits(tmp_path):
+    pid_file = tmp_path / "child.pid"
+    fp = FakeProvider(
+        "spawn_then_exit",
+        timeout=10,
+        extra_env={"FAKE_CHILD_PID_FILE": str(pid_file)},
+    )
+    fp.chat("hi")
+    assert pid_file.exists()
+    assert _wait_for_pid_exit(int(pid_file.read_text()))
 
 
 # ---- hang-error diagnosis helper ----

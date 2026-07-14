@@ -32,11 +32,11 @@ Error handling:
         create("claude").chat("")
     except UnifiedError as e:
         e.kind  # auth_expired | rate_limit | model_not_allowed | not_found
-                # | network | config | internal
+                # | network | resource_limit | config | internal
         e.hint  # 사용자용 복구 힌트
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 from .base import BaseProvider
 from .conversation import UnifiedConversation
