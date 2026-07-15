@@ -249,11 +249,36 @@ def test_claude_dash_prompt_gets_sentinel():
 
 
 def test_claude_normal_prompt_no_sentinel():
+    # web_search=False so no --allowedTools is emitted; only then is the
+    # sentinel unnecessary (the default web_search=True adds WebSearch/WebFetch
+    # to --allowedTools, which is variadic and requires the sentinel).
     from unified_cli.providers.claude import ClaudeProvider
-    p = ClaudeProvider(bin_path="claude")
+    p = ClaudeProvider(bin_path="claude", web_search=False)
     args, _ = p._build_args("hello there", session_id=None, resume_last=False,
                             model=None, streaming=False)
     assert "--" not in args
+
+
+def test_claude_web_search_gets_sentinel():
+    # --allowedTools is variadic (<tools...>): without a "--" sentinel it
+    # swallows the positional prompt and the CLI exits 1 with "Input must be
+    # provided either through stdin or as a prompt argument".
+    from unified_cli.providers.claude import ClaudeProvider
+    p = ClaudeProvider(bin_path="claude", web_search=True)
+    args, _ = p._build_args("hello there", session_id=None, resume_last=False,
+                            model=None, streaming=True)
+    assert args[-1] == "hello there"
+    assert args[-2] == "--"
+    assert args.index("--allowedTools") < args.index("--")
+
+
+def test_claude_disallowed_tools_get_sentinel():
+    from unified_cli.providers.claude import ClaudeProvider
+    p = ClaudeProvider(bin_path="claude", disallowed_tools=["Bash"])
+    args, _ = p._build_args("hello there", session_id=None, resume_last=False,
+                            model=None, streaming=False)
+    assert args[-1] == "hello there"
+    assert args[-2] == "--"
 
 
 def test_codex_dash_prompt_gets_sentinel():

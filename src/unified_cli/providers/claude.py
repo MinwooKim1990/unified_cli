@@ -179,10 +179,20 @@ class ClaudeProvider(BaseProvider):
         if allowed_tools:
             args += ["--allowedTools", ",".join(allowed_tools)]
 
-        # End option parsing so a prompt that happens to start with "-" (e.g.
-        # "--version") is passed as the positional prompt, not parsed as a flag.
-        # Guarded on the leading dash so normal prompts are byte-identical.
-        if prompt.startswith("-"):
+        # End option parsing so the positional prompt is never mis-parsed:
+        # - a prompt starting with "-" (e.g. "--version") would be read as a flag;
+        # - --tools/--allowedTools/--disallowedTools are VARIADIC (<tools...>) in
+        #   the claude CLI, so when one of them is the last option it swallows the
+        #   positional prompt ("Input must be provided either through stdin or as
+        #   a prompt argument"). web_search=True hits this via --allowedTools.
+        # Guarded so plain prompts without tool flags stay byte-identical.
+        needs_sentinel = (
+            prompt.startswith("-")
+            or bool(allowed_tools)
+            or effective_tools is not None
+            or bool(self.disallowed_tools)
+        )
+        if needs_sentinel:
             args.append("--")
         args.append(prompt)
         return args, None
@@ -293,6 +303,26 @@ class ClaudeProvider(BaseProvider):
     def _new_stream_state(self) -> _ClaudeStreamState:
         return _ClaudeStreamState()
 
+    @staticmethod
+    def _seen_partial(partials: dict[int, str], index: int, text: str) -> str:
+        """Return the already-streamed prefix of a complete content block.
+
+        The claude CLI emits one assistant envelope per content block and
+        re-indexes each envelope's content from 0, so the envelope index can
+        disagree with the stream_event block index (e.g. text streamed as
+        block 1 after a thinking block arrives in an envelope where it is
+        block 0). Try the direct index first, then fall back to the
+        concatenation of every streamed partial of this kind — without the
+        fallback the complete text is yielded a second time (duplication).
+        """
+        seen = partials.get(index, "")
+        if seen and text.startswith(seen):
+            return seen
+        joined = "".join(partials[k] for k in sorted(partials))
+        if joined and text.startswith(joined):
+            return joined
+        return ""
+
     def _stream_normalize(
         self, obj: dict, state: object
     ) -> Iterator[Message]:
@@ -354,15 +384,15 @@ class ClaudeProvider(BaseProvider):
                 btype = block.get("type")
                 if btype == "text":
                     text = block.get("text") or ""
-                    seen = state.partial_text_by_block.get(index, "")
-                    if seen and text.startswith(seen):
+                    seen = self._seen_partial(state.partial_text_by_block, index, text)
+                    if seen:
                         text = text[len(seen):]
                     if text:
                         yield Message(kind="text", provider="claude", text=text, raw=obj)
                 elif btype == "thinking":
                     text = block.get("thinking") or ""
-                    seen = state.partial_thinking_by_block.get(index, "")
-                    if seen and text.startswith(seen):
+                    seen = self._seen_partial(state.partial_thinking_by_block, index, text)
+                    if seen:
                         text = text[len(seen):]
                     if text:
                         yield Message(kind="reasoning", provider="claude", text=text, raw=obj)

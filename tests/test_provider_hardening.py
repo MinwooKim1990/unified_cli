@@ -375,6 +375,42 @@ def test_claude_streaming_requests_partials_and_deduplicates_final_text():
     assert [message.tool["name"] for message in messages if message.kind == "tool_use"] == ["Read"]
 
 
+def test_claude_streaming_dedups_reindexed_per_block_envelopes():
+    # Real CLI shape (claude -p --include-partial-messages): one assistant
+    # envelope per content block, each envelope's content re-indexed from 0.
+    # Text streamed as block 1 (after a thinking block at 0) then arrives in
+    # its own envelope at index 0 — it must still be recognized as already
+    # streamed. Previously the index-only lookup missed and the complete text
+    # was yielded a second time (visible duplication in consumers).
+    from unified_cli.providers.claude import ClaudeProvider
+
+    provider = ClaudeProvider(bin_path="claude", web_search=False)
+    state = provider._new_stream_state()
+    events = [
+        {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "plan"},
+        }},
+        {"type": "assistant", "message": {"content": [
+            {"type": "thinking", "thinking": "plan"},
+        ]}},
+        {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 1,
+            "delta": {"type": "text_delta", "text": "PONG"},
+        }},
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "PONG"},
+        ]}},
+    ]
+    messages = [
+        message
+        for event in events
+        for message in provider._stream_normalize(event, state)
+    ]
+    assert [m.text for m in messages if m.kind == "text"] == ["PONG"]
+    assert [m.text for m in messages if m.kind == "reasoning"] == ["plan"]
+
+
 def test_claude_streaming_reconciles_reasoning_and_legacy_final_messages():
     from unified_cli.providers.claude import ClaudeProvider
 
