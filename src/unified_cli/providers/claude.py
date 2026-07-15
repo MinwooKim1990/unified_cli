@@ -181,7 +181,8 @@ class ClaudeProvider(BaseProvider):
 
         # End option parsing so the positional prompt is never mis-parsed:
         # - a prompt starting with "-" (e.g. "--version") would be read as a flag;
-        # - --tools/--allowedTools/--disallowedTools are VARIADIC (<tools...>) in
+        # - --add-dir (<directories...>) and --tools/--allowedTools/
+        #   --disallowedTools (<tools...>) are VARIADIC in
         #   the claude CLI, so when one of them is the last option it swallows the
         #   positional prompt ("Input must be provided either through stdin or as
         #   a prompt argument"). web_search=True hits this via --allowedTools.
@@ -191,6 +192,7 @@ class ClaudeProvider(BaseProvider):
             or bool(allowed_tools)
             or effective_tools is not None
             or bool(self.disallowed_tools)
+            or bool(self.add_dirs)
         )
         if needs_sentinel:
             args.append("--")

@@ -281,6 +281,14 @@ def test_claude_disallowed_tools_get_sentinel():
     assert args[-2] == "--"
 
 
+def test_claude_add_dirs_get_sentinel():
+    from unified_cli.providers.claude import ClaudeProvider
+    p = ClaudeProvider(bin_path="claude", web_search=False, add_dirs=["/workspace"])
+    args, _ = p._build_args("hello there", session_id=None, resume_last=False,
+                            model=None, streaming=False)
+    assert args[-4:] == ["--add-dir", "/workspace", "--", "hello there"]
+
+
 def test_codex_dash_prompt_gets_sentinel():
     from unified_cli.providers.codex import CodexProvider
     p = CodexProvider(bin_path="codex")
