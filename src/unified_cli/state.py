@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
-from .core import ProviderName
+from .core import ProviderId
 
 
 STATE_DIR = Path.home() / ".unified-cli"
@@ -28,7 +28,7 @@ _VERSION = 1
 
 @dataclass
 class SessionState:
-    provider: ProviderName
+    provider: ProviderId
     model: str
     session_id: str
     cwd: str = ""
@@ -60,7 +60,7 @@ def _ensure_dir() -> None:
 
 
 def save_last_session(
-    provider: ProviderName,
+    provider: ProviderId,
     model: str,
     session_id: str,
     cwd: Optional[str] = None,

@@ -60,7 +60,7 @@ except ImportError as e:  # pragma: no cover
 from .conversation import UnifiedConversation
 from .dashboard_tpl import DASHBOARD_HTML
 from .errors import ErrorKind, UnifiedError
-from .factory import route
+from .factory import _cannot_route_error, _route_builtin
 from .i18n import t
 from .models import list_models
 from .ui import collect_states
@@ -758,8 +758,14 @@ def _acquire_conversation(user: Optional[str]) -> _ConversationLease:
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatRequest):
     _validate_chat_request(req)
+    # The /v1 boundary accepts only Core routing. This pure lookup preserves
+    # historical Core inference (including slash-containing vendor model ids)
+    # while ensuring extension metadata is never discovered or loaded here.
     try:
-        provider, model = route(req.model)
+        routed = _route_builtin(req.model)
+        if routed is None:
+            raise _cannot_route_error(req.model)
+        provider, model = routed
     except UnifiedError as e:
         _raise_http(e)
     if (provider in ("codex", "gemini")

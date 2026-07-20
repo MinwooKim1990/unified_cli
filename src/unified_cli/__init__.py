@@ -40,11 +40,27 @@ __version__ = "0.4.0"
 
 from .base import BaseProvider
 from .conversation import UnifiedConversation
-from .core import Message, ModelInfo, ProviderName, Response, Usage
+from .core import Message, ModelInfo, ProviderId, ProviderName, Response, Usage
 from .errors import ErrorKind, UnifiedError, classify
 from .factory import PROVIDERS, create, route
 from .models import DEFAULT_MODELS, list_models
+from .plugin import (
+    PROVIDER_PLUGIN_ABI_V1,
+    ProviderDoctorV1,
+    ProviderFactoryV1,
+    ProviderModelListerV1,
+    ProviderPluginV1,
+    ProviderServerPolicyV1,
+)
 from .providers import ClaudeProvider, CodexProvider, GeminiProvider
+from .registry import (
+    ENTRY_POINT_GROUP,
+    ProviderDescriptor,
+    ProviderDescriptorV1,
+    doctor_provider,
+    list_providers,
+    load_provider_plugin,
+)
 from .state import SessionState, load_last_session, save_last_session
 from .usage import UsageTracker, tracker
 
@@ -61,14 +77,27 @@ __all__ = [
     "ErrorKind",
     "Message",
     "ModelInfo",
+    "PROVIDER_PLUGIN_ABI_V1",
+    "ENTRY_POINT_GROUP",
+    "ProviderDescriptor",
+    "ProviderDescriptorV1",
+    "ProviderDoctorV1",
+    "ProviderFactoryV1",
+    "ProviderId",
     "ProviderName",
+    "ProviderModelListerV1",
+    "ProviderPluginV1",
+    "ProviderServerPolicyV1",
     "Response",
     "Usage",
     "DEFAULT_MODELS",
     "PROVIDERS",
     "classify",
     "create",
+    "doctor_provider",
     "list_models",
+    "list_providers",
+    "load_provider_plugin",
     "load_last_session",
     "route",
     "save_last_session",

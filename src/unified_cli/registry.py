@@ -1,0 +1,703 @@
+"""Lazy registry for built-in and entry-point provider implementations."""
+
+from __future__ import annotations
+
+import asyncio
+import itertools
+import os
+import threading
+import unicodedata
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, Literal, Optional, Tuple
+
+try:  # Python 3.9+ (kept isolated so importing unified_cli never enumerates it)
+    from importlib import metadata as importlib_metadata
+except ImportError:  # pragma: no cover - defensive for unusual runtimes
+    import importlib_metadata  # type: ignore[no-redef]
+
+from .base import BaseProvider
+from .core import ModelInfo, ProviderId, ProviderName
+from .errors import UnifiedError
+from .plugin import (
+    PROVIDER_PLUGIN_ABI_V1,
+    ProviderPluginV1,
+    ProviderServerPolicyV1,
+    _valid_provider_id,
+)
+
+
+ENTRY_POINT_GROUP = "unified_cli.providers.v1"
+DISABLE_PLUGINS_ENV = "UNIFIED_CLI_DISABLE_PLUGINS"
+BUILTIN_PROVIDER_IDS: Tuple[ProviderName, ...] = ("claude", "codex", "gemini")
+RESERVED_PROVIDER_IDS = frozenset((*BUILTIN_PROVIDER_IDS, "agy"))
+
+
+@dataclass(frozen=True)
+class ProviderDescriptorV1:
+    """Safe registry metadata; extension code is never stored in descriptors."""
+
+    id: ProviderId
+    source: Literal["builtin", "extension"]
+    status: Literal["builtin", "available", "loaded", "invalid", "failed"]
+    default_model: Optional[str] = None
+    capabilities: frozenset[str] = frozenset()
+    route_prefixes: Tuple[str, ...] = ()
+    server_policy: Optional[ProviderServerPolicyV1] = None
+    error: Optional[str] = None
+
+
+# Unversioned convenience name.  The concrete shape remains explicitly v1 so
+# a future registry can add another descriptor without mutating this contract.
+ProviderDescriptor = ProviderDescriptorV1
+
+
+@dataclass
+class _LoadRecord:
+    ready: threading.Event
+    plugin: Optional[ProviderPluginV1] = None
+    error: Optional[UnifiedError] = None
+
+
+_LOCK = threading.RLock()
+_ENTRY_POINTS: Optional[Tuple[Any, ...]] = None
+_DISCOVERY_FAILED = False
+_LOADS: Dict[ProviderId, _LoadRecord] = {}
+_LOAD_CONTEXT = threading.local()
+_CANCELLATION_EXCEPTIONS = (
+    KeyboardInterrupt,
+    GeneratorExit,
+    asyncio.CancelledError,
+)
+_MAX_EXTENSION_MODELS = 1_000
+_MAX_MODEL_ID_CHARS = 512
+_MAX_MODEL_DISPLAY_CHARS = 512
+_PLUGIN_LOAD_WAIT_SECONDS = 30.0
+
+
+def _valid_plugin_text(
+    value: object,
+    *,
+    max_chars: int,
+    allow_empty: bool,
+    require_trimmed: bool,
+) -> bool:
+    if type(value) is not str:
+        return False
+    if (not allow_empty and not value) or len(value) > max_chars:
+        return False
+    if require_trimmed and value != value.strip():
+        return False
+    try:
+        value.encode("utf-8", "strict")
+    except UnicodeEncodeError:
+        return False
+    return not any(
+        unicodedata.category(char).startswith("C")
+        or unicodedata.category(char) in {"Zl", "Zp"}
+        for char in value
+    )
+
+
+def plugins_disabled() -> bool:
+    return os.environ.get(DISABLE_PLUGINS_ENV, "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _plugin_error(provider_id: ProviderId, code: str) -> UnifiedError:
+    messages = {
+        "disabled": "Provider extensions are disabled in this process.",
+        "discovery": f"Provider extension '{provider_id}' is unavailable.",
+        "unknown": f"Unknown provider: {provider_id}",
+        "invalid_id": "The requested provider id is invalid.",
+        "reserved": f"Provider id '{provider_id}' is reserved by unified-cli.",
+        "duplicate": f"Provider extension '{provider_id}' is ambiguous.",
+        "load": f"Provider extension '{provider_id}' could not be loaded.",
+        "abi": f"Provider extension '{provider_id}' uses an unsupported ABI.",
+        "metadata": f"Provider extension '{provider_id}' has invalid metadata.",
+        "factory": f"Provider extension '{provider_id}' could not be created.",
+        "reentrant": f"Provider extension '{provider_id}' re-entered its own loader.",
+        "models": f"Provider extension '{provider_id}' could not list models.",
+        "doctor": f"Provider extension '{provider_id}' doctor failed.",
+        "runtime": f"Provider extension '{provider_id}' failed while running.",
+    }
+    hints = {
+        "disabled": f"Unset {DISABLE_PLUGINS_ENV} to enable provider extensions.",
+        "unknown": "Install a matching provider extension or use claude / codex / gemini.",
+        "duplicate": "Remove the duplicate provider distribution and retry.",
+        "reserved": "Use the built-in public provider id; agy is only an executable alias.",
+    }
+    causes = {
+        "discovery": "provider entry-point metadata unavailable",
+        "load": "provider entry-point import failed",
+        "abi": "provider plugin ABI rejected",
+        "metadata": "provider plugin metadata rejected",
+        "factory": "provider factory failed",
+        "reentrant": "provider entry-point load was re-entrant",
+        "models": "provider model listing failed",
+        "doctor": "provider doctor failed",
+        "runtime": "extension provider runtime failed",
+    }
+    return UnifiedError(
+        kind="internal" if code == "runtime" else "config",
+        provider=provider_id,
+        message=messages[code],
+        hint=hints.get(code, "Check the provider extension installation."),
+        cause=causes.get(code, ""),
+    )
+
+
+class _ExtensionProviderProxy(BaseProvider):
+    """Core-owned error boundary around an explicitly loaded provider."""
+
+    name = "extension"
+    default_model = ""
+    api_key_env = ""
+
+    def __init__(self, provider_id: ProviderId, inner: BaseProvider):
+        self.name = provider_id
+        self.default_model = inner.default_model
+        self.api_key_env = inner.api_key_env
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    @classmethod
+    def _discover_bin(cls) -> Optional[str]:  # pragma: no cover - never called
+        return None
+
+    @classmethod
+    def _install_hint(cls) -> str:  # pragma: no cover - never called
+        return ""
+
+    def _build_args(self, *args: Any, **kwargs: Any) -> Any:  # pragma: no cover
+        raise NotImplementedError
+
+    def _normalize(self, obj: dict) -> Any:  # pragma: no cover - never called
+        raise NotImplementedError
+
+    def _parse_json_response(
+        self, text: str, model: str,
+    ) -> Any:  # pragma: no cover - never called
+        raise NotImplementedError
+
+    def chat(self, prompt: str, **kwargs: Any) -> Any:
+        failed = False
+        try:
+            response = self._inner.chat(prompt, **kwargs)
+        except _CANCELLATION_EXCEPTIONS:
+            raise
+        except BaseException:
+            failed = True
+            response = None
+        if failed:
+            raise _plugin_error(self.name, "runtime") from None
+        return response
+
+    def stream(self, prompt: str, **kwargs: Any) -> Any:
+        failed = False
+        try:
+            yield from self._inner.stream(prompt, **kwargs)
+        except _CANCELLATION_EXCEPTIONS:
+            raise
+        except BaseException:
+            failed = True
+        if failed:
+            raise _plugin_error(self.name, "runtime") from None
+
+    async def achat(self, prompt: str, **kwargs: Any) -> Any:
+        failed = False
+        try:
+            response = await self._inner.achat(prompt, **kwargs)
+        except _CANCELLATION_EXCEPTIONS:
+            raise
+        except BaseException:
+            failed = True
+            response = None
+        if failed:
+            raise _plugin_error(self.name, "runtime") from None
+        return response
+
+    async def astream(self, prompt: str, **kwargs: Any) -> Any:
+        failed = False
+        cancelled = False
+        inner_iterator: Any = None
+        try:
+            stream = self._inner.astream(prompt, **kwargs)
+            inner_iterator = stream.__aiter__()
+            async for message in inner_iterator:
+                yield message
+        except _CANCELLATION_EXCEPTIONS:
+            cancelled = True
+            raise
+        except BaseException:
+            failed = True
+        finally:
+            if inner_iterator is not None:
+                try:
+                    close = getattr(inner_iterator, "aclose", None)
+                    if callable(close):
+                        await close()
+                except _CANCELLATION_EXCEPTIONS:
+                    raise
+                except BaseException:
+                    if not cancelled:
+                        failed = True
+        if failed:
+            raise _plugin_error(self.name, "runtime") from None
+
+
+def _entry_points_for_group(raw: Any) -> Iterable[Any]:
+    """Normalize importlib.metadata's Python 3.9 and 3.10+ return shapes."""
+    select = getattr(raw, "select", None)
+    if callable(select):
+        return select(group=ENTRY_POINT_GROUP)
+    if isinstance(raw, dict):
+        return raw.get(ENTRY_POINT_GROUP, ())
+    return (
+        entry_point for entry_point in raw
+        if _entry_point_is_in_group(entry_point)
+    )
+
+
+def _entry_point_is_in_group(entry_point: Any) -> bool:
+    try:
+        group = getattr(entry_point, "group", None)
+    except _CANCELLATION_EXCEPTIONS:
+        raise
+    except BaseException:
+        return False
+    return type(group) is str and group == ENTRY_POINT_GROUP
+
+
+def _discover_entry_points() -> Tuple[Any, ...]:
+    global _ENTRY_POINTS, _DISCOVERY_FAILED
+    if plugins_disabled():
+        return ()
+    with _LOCK:
+        if _ENTRY_POINTS is not None:
+            return _ENTRY_POINTS
+        if _DISCOVERY_FAILED:
+            raise _plugin_error("extension", "discovery") from None
+        discovery_failed = False
+        try:
+            raw = importlib_metadata.entry_points()
+            _ENTRY_POINTS = tuple(_entry_points_for_group(raw))
+        except _CANCELLATION_EXCEPTIONS:
+            raise
+        except BaseException:
+            discovery_failed = True
+        if discovery_failed:
+            # Cache only a boolean.  A plugin/distribution exception may carry
+            # credentials, paths, or hostile text and must not remain attached
+            # to the safe public error or appear in a traceback.
+            _DISCOVERY_FAILED = True
+            raise _plugin_error("extension", "discovery") from None
+        return _ENTRY_POINTS
+
+
+def _safe_entry_point_name(entry_point: Any) -> Optional[str]:
+    """Return one canonical metadata name, skipping malformed entries."""
+    try:
+        name = getattr(entry_point, "name", None)
+    except _CANCELLATION_EXCEPTIONS:
+        raise
+    except BaseException:
+        return None
+    return name if _valid_provider_id(name) else None
+
+
+def _matching_entry_points(provider_id: ProviderId) -> Tuple[Any, ...]:
+    matches = []
+    for entry_point in _discover_entry_points():
+        if _safe_entry_point_name(entry_point) == provider_id:
+            matches.append(entry_point)
+    return tuple(matches)
+
+
+def _matching_entry_points_safely(provider_id: ProviderId) -> Tuple[Any, ...]:
+    failed = False
+    try:
+        matches = _matching_entry_points(provider_id)
+    except _CANCELLATION_EXCEPTIONS:
+        raise
+    except UnifiedError:
+        raise
+    except BaseException:
+        failed = True
+        matches = ()
+    if failed:
+        raise _plugin_error(provider_id, "discovery") from None
+    return matches
+
+
+def extension_provider_exists(provider_id: ProviderId) -> bool:
+    """Metadata-only check used for an explicit ``provider/model`` prefix."""
+    if plugins_disabled():
+        raise _plugin_error(provider_id, "disabled")
+    if not _valid_provider_id(provider_id):
+        raise _plugin_error(provider_id, "invalid_id")
+    matches = _matching_entry_points_safely(provider_id)
+    if provider_id in RESERVED_PROVIDER_IDS and matches:
+        raise _plugin_error(provider_id, "reserved")
+    if len(matches) > 1:
+        raise _plugin_error(provider_id, "duplicate")
+    return len(matches) == 1
+
+
+def _validate_loaded_plugin(
+    provider_id: ProviderId, loaded: object,
+) -> ProviderPluginV1:
+    if not isinstance(loaded, ProviderPluginV1):
+        if getattr(loaded, "abi_version", PROVIDER_PLUGIN_ABI_V1) != PROVIDER_PLUGIN_ABI_V1:
+            raise _plugin_error(provider_id, "abi")
+        raise _plugin_error(provider_id, "metadata")
+    if loaded.abi_version != PROVIDER_PLUGIN_ABI_V1:
+        raise _plugin_error(provider_id, "abi")
+    if loaded.id != provider_id:
+        raise _plugin_error(provider_id, "metadata")
+    if loaded.id in RESERVED_PROVIDER_IDS:
+        raise _plugin_error(provider_id, "reserved")
+    if any(prefix in RESERVED_PROVIDER_IDS for prefix in loaded.route_prefixes):
+        raise _plugin_error(provider_id, "metadata")
+    # Reconstruct the frozen value to re-run validation even if a hostile
+    # loader fabricated or mutated an instance with object.__setattr__.
+    return ProviderPluginV1(
+        id=loaded.id,
+        factory=loaded.factory,
+        default_model=loaded.default_model,
+        model_lister=loaded.model_lister,
+        doctor=loaded.doctor,
+        capabilities=loaded.capabilities,
+        route_prefixes=loaded.route_prefixes,
+        server_policy=loaded.server_policy,
+        abi_version=loaded.abi_version,
+    )
+
+
+def _load_entry_point_safely(provider_id: ProviderId, entry_point: Any) -> object:
+    failed = False
+    try:
+        loaded = entry_point.load()
+    except _CANCELLATION_EXCEPTIONS:
+        raise
+    except BaseException:
+        failed = True
+        loaded = None
+    if failed:
+        raise _plugin_error(provider_id, "load") from None
+    return loaded
+
+
+def _validate_loaded_plugin_safely(
+    provider_id: ProviderId, loaded: object,
+) -> ProviderPluginV1:
+    failed = False
+    try:
+        plugin = _validate_loaded_plugin(provider_id, loaded)
+    except _CANCELLATION_EXCEPTIONS:
+        raise
+    except UnifiedError:
+        raise
+    except BaseException:
+        failed = True
+        plugin = None
+    if failed:
+        raise _plugin_error(provider_id, "metadata") from None
+    assert plugin is not None
+    return plugin
+
+
+def load_provider_plugin(provider_id: ProviderId) -> ProviderPluginV1:
+    """Load exactly one explicitly requested extension provider, once."""
+    if plugins_disabled():
+        raise _plugin_error(provider_id, "disabled")
+    if not _valid_provider_id(provider_id):
+        raise _plugin_error(provider_id, "invalid_id")
+    if provider_id in RESERVED_PROVIDER_IDS:
+        # Built-ins are resolved by factory.create before reaching this API;
+        # this loader is intentionally extensions-only.
+        raise _plugin_error(provider_id, "reserved")
+    if getattr(_LOAD_CONTEXT, "active", False):
+        # Entry-point initializers must not recursively load providers. This
+        # also breaks cross-provider wait cycles when two imports start on
+        # different threads and then request one another.
+        raise _plugin_error(provider_id, "reentrant") from None
+
+    with _LOCK:
+        record = _LOADS.get(provider_id)
+        if record is None:
+            record = _LoadRecord(ready=threading.Event())
+            _LOADS[provider_id] = record
+            owns_load = True
+        else:
+            owns_load = False
+
+    if not owns_load:
+        if not record.ready.wait(timeout=_PLUGIN_LOAD_WAIT_SECONDS):
+            raise _plugin_error(provider_id, "load") from None
+        if record.plugin is not None:
+            return record.plugin
+        assert record.error is not None
+        raise record.error
+
+    _LOAD_CONTEXT.active = True
+    try:
+        unexpected_failure = False
+        try:
+            matches = _matching_entry_points_safely(provider_id)
+            if not matches:
+                raise _plugin_error(provider_id, "unknown")
+            if len(matches) > 1:
+                raise _plugin_error(provider_id, "duplicate")
+            loaded = _load_entry_point_safely(provider_id, matches[0])
+            plugin = _validate_loaded_plugin_safely(provider_id, loaded)
+        except _CANCELLATION_EXCEPTIONS:
+            # The initiating caller may cancel, but concurrent waiters still
+            # need a deterministic terminal record rather than a permanently
+            # unset Event.
+            record.error = _plugin_error(provider_id, "load")
+            record.ready.set()
+            raise
+        except UnifiedError as exc:
+            record.error = exc
+            record.ready.set()
+            raise
+        except BaseException:
+            unexpected_failure = True
+
+        if unexpected_failure:
+            error = _plugin_error(provider_id, "load")
+            record.error = error
+            record.ready.set()
+            raise error from None
+
+        record.plugin = plugin
+        record.ready.set()
+        return plugin
+    finally:
+        _LOAD_CONTEXT.active = False
+
+
+def instantiate_extension_provider(
+    provider_id: ProviderId,
+    *,
+    model: Optional[str] = None,
+    **opts: Any,
+) -> BaseProvider:
+    plugin = load_provider_plugin(provider_id)
+    failed = False
+    try:
+        provider = plugin.factory(model=model or plugin.default_model, **opts)
+        if not isinstance(provider, BaseProvider) or provider.name != provider_id:
+            raise TypeError("provider factory returned an incompatible object")
+        wrapped = _ExtensionProviderProxy(provider_id, provider)
+    except _CANCELLATION_EXCEPTIONS:
+        raise
+    except BaseException:
+        failed = True
+        provider = None
+        wrapped = None
+    if failed:
+        raise _plugin_error(provider_id, "factory") from None
+    assert wrapped is not None
+    return wrapped
+
+
+def list_extension_models(provider_id: ProviderId) -> list[ModelInfo]:
+    """Run one explicitly requested extension's model lister safely."""
+    plugin = load_provider_plugin(provider_id)
+    failed = False
+    try:
+        # Materialize at most one item past the public limit so a buggy
+        # infinite generator cannot grow memory without bound.
+        supplied = list(itertools.islice(
+            iter(plugin.model_lister()), _MAX_EXTENSION_MODELS + 1,
+        ))
+        if len(supplied) > _MAX_EXTENSION_MODELS:
+            raise ValueError("provider model_lister returned too many models")
+
+        models: list[ModelInfo] = []
+        seen_ids: set[str] = set()
+        default_count = 0
+        for model in supplied:
+            if type(model) is not ModelInfo:
+                raise TypeError("provider model_lister returned invalid metadata")
+            if not _valid_plugin_text(
+                model.id,
+                max_chars=_MAX_MODEL_ID_CHARS,
+                allow_empty=False,
+                require_trimmed=True,
+            ):
+                raise ValueError("provider model id is invalid")
+            if type(model.provider) is not str or model.provider != provider_id:
+                raise ValueError("provider model id namespace is invalid")
+            if not _valid_plugin_text(
+                model.display_name,
+                max_chars=_MAX_MODEL_DISPLAY_CHARS,
+                allow_empty=True,
+                require_trimmed=False,
+            ):
+                raise ValueError("provider model display name is invalid")
+            if type(model.default) is not bool or type(model.deprecated) is not bool:
+                raise TypeError("provider model flags must be bool")
+            if type(model.source) is not str or model.source != "plugin":
+                raise ValueError("extension model source must be plugin")
+            if model.id in seen_ids:
+                raise ValueError("provider model ids must be unique")
+            seen_ids.add(model.id)
+            default_count += int(model.default)
+            if default_count > 1:
+                raise ValueError("provider model list has multiple defaults")
+
+            # Return core-owned copies so a plugin cannot mutate already
+            # validated metadata through retained references.
+            models.append(ModelInfo(
+                id=model.id,
+                provider=provider_id,
+                display_name=model.display_name,
+                default=model.default,
+                deprecated=model.deprecated,
+                source="plugin",
+            ))
+    except _CANCELLATION_EXCEPTIONS:
+        raise
+    except BaseException:
+        failed = True
+        models = []
+    if failed:
+        raise _plugin_error(provider_id, "models") from None
+    return models
+
+
+def doctor_provider(provider_id: ProviderId) -> Any:
+    """Run a built-in or explicitly requested extension provider doctor."""
+    if provider_id in BUILTIN_PROVIDER_IDS:
+        from .ui import collect_states
+
+        return next(state for state in collect_states() if state.name == provider_id)
+
+    plugin = load_provider_plugin(provider_id)
+    failed = False
+    try:
+        result = plugin.doctor()
+    except _CANCELLATION_EXCEPTIONS:
+        raise
+    except BaseException:
+        failed = True
+        result = None
+    if failed:
+        raise _plugin_error(provider_id, "doctor") from None
+    return result
+
+
+def _builtin_descriptors() -> list[ProviderDescriptorV1]:
+    # Imported only for an explicit registry listing, never for create/route.
+    from .models import DEFAULT_MODELS
+
+    return [
+        ProviderDescriptorV1(
+            id=provider_id,
+            source="builtin",
+            status="builtin",
+            default_model=DEFAULT_MODELS[provider_id],
+            route_prefixes=(provider_id,),
+            server_policy=ProviderServerPolicyV1(
+                enabled=(provider_id == "claude"),
+                requires_external_isolation=(provider_id != "claude"),
+            ),
+        )
+        for provider_id in BUILTIN_PROVIDER_IDS
+    ]
+
+
+def list_providers(*, include_ext: bool = False) -> list[ProviderDescriptorV1]:
+    """Return immutable descriptors; extensions are metadata-only by default.
+
+    Even with ``include_ext=True``, entry points are enumerated but their
+    modules are not imported.  Plugins explicitly loaded earlier may expose
+    their already-validated metadata in the returned descriptor.
+    """
+    descriptors = _builtin_descriptors()
+    if not include_ext or plugins_disabled():
+        return descriptors
+
+    entry_points = _discover_entry_points()
+    by_name: Dict[str, list[Any]] = {}
+    invalid_names: list[str] = []
+    for entry_point in entry_points:
+        name = _safe_entry_point_name(entry_point)
+        if name is not None:
+            by_name.setdefault(name, []).append(entry_point)
+        else:
+            invalid_names.append("<invalid>")
+
+    for provider_id in sorted(by_name):
+        entries = by_name[provider_id]
+        error: Optional[str] = None
+        status: Literal["available", "loaded", "invalid", "failed"] = "available"
+        if provider_id in RESERVED_PROVIDER_IDS:
+            status, error = "invalid", "reserved_id"
+        elif len(entries) > 1:
+            status, error = "invalid", "duplicate_entry_point"
+
+        with _LOCK:
+            record = _LOADS.get(provider_id)
+            loaded = record.plugin if record and record.ready.is_set() else None
+            failed = record.error if record and record.ready.is_set() else None
+        if loaded is not None:
+            status = "loaded"
+            descriptors.append(ProviderDescriptorV1(
+                id=provider_id,
+                source="extension",
+                status=status,
+                default_model=loaded.default_model,
+                capabilities=loaded.capabilities,
+                route_prefixes=loaded.route_prefixes,
+                server_policy=loaded.server_policy,
+            ))
+        else:
+            if failed is not None and status == "available":
+                status, error = "failed", "load_failed"
+            descriptors.append(ProviderDescriptorV1(
+                id=provider_id,
+                source="extension",
+                status=status,
+                error=error,
+            ))
+
+    for invalid_name in invalid_names:
+        descriptors.append(ProviderDescriptorV1(
+            id=invalid_name,
+            source="extension",
+            status="invalid",
+            error="invalid_entry_point_name",
+        ))
+    return descriptors
+
+
+def _reset_provider_registry_for_tests() -> None:
+    """Clear discovery/load caches.  Test suites must not call during a load."""
+    global _ENTRY_POINTS, _DISCOVERY_FAILED
+    with _LOCK:
+        _ENTRY_POINTS = None
+        _DISCOVERY_FAILED = False
+        _LOADS.clear()
+
+
+__all__ = [
+    "BUILTIN_PROVIDER_IDS",
+    "DISABLE_PLUGINS_ENV",
+    "ENTRY_POINT_GROUP",
+    "ProviderDescriptorV1",
+    "ProviderDescriptor",
+    "RESERVED_PROVIDER_IDS",
+    "extension_provider_exists",
+    "doctor_provider",
+    "instantiate_extension_provider",
+    "list_extension_models",
+    "list_providers",
+    "load_provider_plugin",
+    "plugins_disabled",
+]

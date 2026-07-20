@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from typing import AsyncIterator, Iterator, Optional
 
 from .base import BaseProvider
-from .core import Message, ProviderName, Response
+from .core import Message, ProviderId, Response
 from .errors import UnifiedError
 from .factory import create
 from .i18n import t
@@ -25,7 +25,7 @@ from .i18n import t
 
 @dataclass
 class Turn:
-    provider: ProviderName
+    provider: ProviderId
     prompt: str
     text: str
     timestamp: float = field(default_factory=time.time)
@@ -43,12 +43,12 @@ class UnifiedConversation:
     def __init__(
         self,
         *,
-        default_provider: ProviderName = "claude",
+        default_provider: ProviderId = "claude",
         default_model: Optional[str] = None,
         sticky: bool = False,
         context_window: int = 8,
         provider_opts: Optional[dict] = None,
-        provider_opts_by_provider: Optional[dict[ProviderName, dict]] = None,
+        provider_opts_by_provider: Optional[dict[ProviderId, dict]] = None,
         max_turns: Optional[int] = None,
         max_turn_chars: Optional[int] = None,
         max_clients: Optional[int] = None,
@@ -81,14 +81,14 @@ class UnifiedConversation:
         self.max_turn_chars = max_turn_chars
         self.max_clients = max_clients
 
-        self.sessions: dict[ProviderName, str] = {}
+        self.sessions: dict[ProviderId, str] = {}
         self.turns: list[Turn] = []
-        self._clients: "OrderedDict[tuple[ProviderName, Optional[str]], BaseProvider]" = OrderedDict()
-        self._locked_provider: Optional[ProviderName] = None
+        self._clients: "OrderedDict[tuple[ProviderId, Optional[str]], BaseProvider]" = OrderedDict()
+        self._locked_provider: Optional[ProviderId] = None
 
     # ----- helpers -----
 
-    def _get_client(self, provider: ProviderName, model: Optional[str]) -> BaseProvider:
+    def _get_client(self, provider: ProviderId, model: Optional[str]) -> BaseProvider:
         key = (provider, model)
         if key not in self._clients:
             if self.max_clients is not None and len(self._clients) >= self.max_clients:
@@ -111,9 +111,9 @@ class UnifiedConversation:
 
     def _resolve(
         self,
-        provider: Optional[ProviderName],
+        provider: Optional[ProviderId],
         model: Optional[str],
-    ) -> tuple[ProviderName, Optional[str]]:
+    ) -> tuple[ProviderId, Optional[str]]:
         prov = provider or self._locked_provider or self.default_provider
         if self.sticky:
             if self._locked_provider is None:
@@ -127,7 +127,7 @@ class UnifiedConversation:
         mdl = model or self.default_model
         return prov, mdl
 
-    def _context_prefix_if_switch(self, provider: ProviderName) -> str:
+    def _context_prefix_if_switch(self, provider: ProviderId) -> str:
         """Build a short '<prior-context>' prefix when switching providers."""
         if not self.turns:
             return ""
@@ -152,7 +152,7 @@ class UnifiedConversation:
         lines.append("---")
         return "\n".join(lines) + "\n"
 
-    def _use_native_session(self, provider: ProviderName) -> Optional[str]:
+    def _use_native_session(self, provider: ProviderId) -> Optional[str]:
         """Return the stored session_id iff the previous turn was this provider."""
         if not self.turns or self.turns[-1].provider != provider:
             return None
@@ -164,7 +164,7 @@ class UnifiedConversation:
         self,
         prompt: str,
         *,
-        provider: Optional[ProviderName] = None,
+        provider: Optional[ProviderId] = None,
         model: Optional[str] = None,
         images: Optional[list] = None,
     ) -> Response:
@@ -186,7 +186,7 @@ class UnifiedConversation:
         self,
         prompt: str,
         *,
-        provider: Optional[ProviderName] = None,
+        provider: Optional[ProviderId] = None,
         model: Optional[str] = None,
         images: Optional[list] = None,
     ) -> Iterator[Message]:
@@ -224,7 +224,7 @@ class UnifiedConversation:
         self,
         prompt: str,
         *,
-        provider: Optional[ProviderName] = None,
+        provider: Optional[ProviderId] = None,
         model: Optional[str] = None,
         images: Optional[list] = None,
     ) -> Response:
@@ -246,7 +246,7 @@ class UnifiedConversation:
         self,
         prompt: str,
         *,
-        provider: Optional[ProviderName] = None,
+        provider: Optional[ProviderId] = None,
         model: Optional[str] = None,
         images: Optional[list] = None,
     ) -> AsyncIterator[Message]:
@@ -280,7 +280,7 @@ class UnifiedConversation:
 
     def _record(
         self,
-        provider: ProviderName,
+        provider: ProviderId,
         prompt: str,
         text: str,
         session_id: Optional[str],

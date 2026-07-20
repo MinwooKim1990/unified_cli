@@ -409,7 +409,7 @@ def test_chunked_body_overflow_rejected_before_routing(monkeypatch):
     monkeypatch.setattr(server, "_MAX_REQUEST_BODY_BYTES", 16)
     routed = {"count": 0}
     monkeypatch.setattr(
-        server, "route",
+        server, "_route_builtin",
         lambda model: routed.__setitem__("count", routed["count"] + 1),
     )
     sent = asyncio.run(_raw_asgi_chat(
