@@ -12,6 +12,7 @@ Inside a single provider, resumption uses that provider's native session.
 from __future__ import annotations
 
 import time
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Iterator, Optional
@@ -209,6 +210,7 @@ class UnifiedConversation:
         provider: Optional[ProviderId] = None,
         model: Optional[str] = None,
         images: Optional[list] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Response:
         prov, mdl = self._resolve(provider, model)
         client = self._get_client(prov, mdl)
@@ -216,11 +218,13 @@ class UnifiedConversation:
         prefix = self._context_prefix_if_switch(prov)
         native_session = self._use_native_session(prov)
 
-        resp = client.chat(
-            prefix + prompt if prefix else prompt,
-            session_id=native_session,
-            images=images,
-        )
+        call_kwargs = {"session_id": native_session, "images": images}
+        # Third-party/test provider doubles may implement the historical
+        # method shape without **kwargs. Preserve that boundary unless a
+        # caller explicitly opts into cancellation.
+        if cancel_event is not None:
+            call_kwargs["cancel_event"] = cancel_event
+        resp = client.chat(prefix + prompt if prefix else prompt, **call_kwargs)
         self._record(prov, prompt, resp.text, resp.session_id)
         return resp
 
@@ -231,6 +235,7 @@ class UnifiedConversation:
         provider: Optional[ProviderId] = None,
         model: Optional[str] = None,
         images: Optional[list] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Iterator[Message]:
         prov, mdl = self._resolve(provider, model)
         client = self._get_client(prov, mdl)
@@ -241,10 +246,11 @@ class UnifiedConversation:
         chunks: list[str] = []
         session_id: Optional[str] = None
         try:
+            call_kwargs = {"session_id": native_session, "images": images}
+            if cancel_event is not None:
+                call_kwargs["cancel_event"] = cancel_event
             for msg in client.stream(
-                prefix + prompt if prefix else prompt,
-                session_id=native_session,
-                images=images,
+                prefix + prompt if prefix else prompt, **call_kwargs
             ):
                 if msg.kind == "text":
                     _append_novel_stream_text(chunks, msg)
@@ -269,6 +275,7 @@ class UnifiedConversation:
         provider: Optional[ProviderId] = None,
         model: Optional[str] = None,
         images: Optional[list] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Response:
         prov, mdl = self._resolve(provider, model)
         client = self._get_client(prov, mdl)
@@ -276,11 +283,11 @@ class UnifiedConversation:
         prefix = self._context_prefix_if_switch(prov)
         native_session = self._use_native_session(prov)
 
+        call_kwargs = {"session_id": native_session, "images": images}
+        if cancel_event is not None:
+            call_kwargs["cancel_event"] = cancel_event
         resp = await client.achat(
-            prefix + prompt if prefix else prompt,
-            session_id=native_session,
-            images=images,
-        )
+            prefix + prompt if prefix else prompt, **call_kwargs)
         self._record(prov, prompt, resp.text, resp.session_id)
         return resp
 
@@ -291,6 +298,7 @@ class UnifiedConversation:
         provider: Optional[ProviderId] = None,
         model: Optional[str] = None,
         images: Optional[list] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> AsyncIterator[Message]:
         prov, mdl = self._resolve(provider, model)
         client = self._get_client(prov, mdl)
@@ -301,10 +309,11 @@ class UnifiedConversation:
         chunks: list[str] = []
         session_id: Optional[str] = None
         try:
+            call_kwargs = {"session_id": native_session, "images": images}
+            if cancel_event is not None:
+                call_kwargs["cancel_event"] = cancel_event
             async for msg in client.astream(
-                prefix + prompt if prefix else prompt,
-                session_id=native_session,
-                images=images,
+                prefix + prompt if prefix else prompt, **call_kwargs
             ):
                 if msg.kind == "text":
                     _append_novel_stream_text(chunks, msg)

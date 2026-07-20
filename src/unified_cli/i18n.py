@@ -443,9 +443,14 @@ _EN = {
     "cli.help.serve": "Launch the localhost dashboard + OpenAI-compatible API",
     "cli.help.serve.port": "Port to bind (default 8000)",
     "cli.help.serve.open": "Open the dashboard in your browser",
+    "cli.help.serve.manage": "Enable the local management dashboard",
+    "cli.help.serve.workspace": "Allow a workspace path in management mode (repeatable)",
     "cli.serve.starting": "Serving on [cyan]{url}[/cyan]  (Ctrl+C to stop)",
     "cli.serve.missing_deps": "The server needs extra dependencies (fastapi, uvicorn).",
     "cli.serve.install_hint": "Install them with: pip install \"unified-cli[server]\"",
+    "cli.serve.workspace_requires_manage": "--workspace requires --manage.",
+    "cli.serve.invalid_workspace": "Management mode could not use the requested workspace.",
+    "cli.serve.server_start_failed": "The local server could not start or bind to its port.",
 
     # ===== onboarding (onboarding.py) =====
     "setup.banner": "unified-cli setup — onboarding 3 providers",
@@ -977,9 +982,14 @@ _KO = {
     "cli.help.serve": "localhost 대시보드 + OpenAI 호환 API 실행",
     "cli.help.serve.port": "바인드 포트 (기본 8000)",
     "cli.help.serve.open": "브라우저에서 대시보드 열기",
+    "cli.help.serve.manage": "로컬 관리 대시보드 활성화",
+    "cli.help.serve.workspace": "관리 모드에서 허용할 작업공간 경로 (반복 가능)",
     "cli.serve.starting": "[cyan]{url}[/cyan] 에서 서비스 중  (Ctrl+C 로 중지)",
     "cli.serve.missing_deps": "서버에는 추가 의존성(fastapi, uvicorn)이 필요합니다.",
     "cli.serve.install_hint": "설치: pip install \"unified-cli[server]\"",
+    "cli.serve.workspace_requires_manage": "--workspace 는 --manage 와 함께 사용해야 합니다.",
+    "cli.serve.invalid_workspace": "관리 모드에서 요청한 작업공간을 사용할 수 없습니다.",
+    "cli.serve.server_start_failed": "로컬 서버를 시작하거나 포트에 바인드할 수 없습니다.",
 
     # ===== onboarding (onboarding.py) =====
     "setup.banner": "unified-cli setup — 3개 provider 온보딩",

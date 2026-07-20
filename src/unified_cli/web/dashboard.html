@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en" data-theme="auto">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Unified CLI Manager</title>
+  <link rel="stylesheet" href="/dashboard/assets/app.css">
+  <script type="module" src="/dashboard/assets/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content" data-i18n="skip">Skip to main content</a>
+
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Primary" data-i18n-aria-label="primaryLandmark">
+      <div class="brand" aria-label="Unified CLI">
+        <span class="brand-mark" aria-hidden="true">U</span>
+        <span>
+          <strong>Unified CLI</strong>
+          <small data-i18n="manager">Manager</small>
+        </span>
+      </div>
+      <nav class="primary-nav" aria-label="Management views" data-i18n-aria-label="managementViews">
+        <button class="nav-item is-active" type="button" data-view="overview" aria-current="page">
+          <span aria-hidden="true">⌂</span><span data-i18n="navOverview">Overview</span>
+        </button>
+        <button class="nav-item" type="button" data-view="providers">
+          <span aria-hidden="true">◇</span><span data-i18n="navProviders">Providers</span>
+        </button>
+        <button class="nav-item" type="button" data-view="chat">
+          <span aria-hidden="true">✦</span><span data-i18n="navChat">Chat</span>
+        </button>
+        <button class="nav-item" type="button" data-view="models">
+          <span aria-hidden="true">▦</span><span data-i18n="navModels">Models</span>
+        </button>
+        <button class="nav-item" type="button" data-view="sessions">
+          <span aria-hidden="true">◫</span><span data-i18n="navSessions">Sessions</span>
+        </button>
+        <button class="nav-item" type="button" data-view="usage">
+          <span aria-hidden="true">↗</span><span data-i18n="navUsage">Usage</span>
+        </button>
+        <button class="nav-item" type="button" data-view="settings">
+          <span aria-hidden="true">⚙</span><span data-i18n="navSettings">Settings &amp; Security</span>
+        </button>
+      </nav>
+      <div class="sidebar-footer">
+        <p class="connection-line"><span id="connection-indicator" class="status-mark" aria-hidden="true">●</span><span id="connection-label" data-i18n="connecting">Connecting…</span></p>
+        <p id="version-label" class="muted">Unified CLI</p>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div>
+          <p id="view-eyebrow" class="eyebrow" data-i18n="manager">Manager</p>
+          <h1 id="view-title" data-i18n="navOverview">Overview</h1>
+        </div>
+        <div class="topbar-actions">
+          <label class="compact-field" for="language-select"><span data-i18n="language">Language</span>
+            <select id="language-select">
+              <option value="en">English</option>
+              <option value="ko">한국어</option>
+            </select>
+          </label>
+          <label class="compact-field" for="theme-select"><span data-i18n="theme">Theme</span>
+            <select id="theme-select">
+              <option value="auto" data-i18n="themeAuto">Auto</option>
+              <option value="light" data-i18n="themeLight">Light</option>
+              <option value="dark" data-i18n="themeDark">Dark</option>
+            </select>
+          </label>
+          <span id="mode-badge" class="badge badge-neutral" data-i18n="checkingMode">Checking mode</span>
+        </div>
+      </header>
+
+      <nav class="mobile-nav" aria-label="Management views" data-i18n-aria-label="managementViews">
+        <button class="nav-item is-active" type="button" data-view="overview" aria-current="page" data-i18n="navOverview">Overview</button>
+        <button class="nav-item" type="button" data-view="providers" data-i18n="navProviders">Providers</button>
+        <button class="nav-item" type="button" data-view="chat" data-i18n="navChat">Chat</button>
+        <button class="nav-item" type="button" data-view="models" data-i18n="navModels">Models</button>
+        <button class="nav-item" type="button" data-view="sessions" data-i18n="navSessions">Sessions</button>
+        <button class="nav-item" type="button" data-view="usage" data-i18n="navUsage">Usage</button>
+        <button class="nav-item" type="button" data-view="settings" data-i18n="navSettings">Settings &amp; Security</button>
+      </nav>
+
+      <main id="main-content" tabindex="-1">
+        <div id="read-only-banner" class="notice notice-warning" role="status" hidden>
+          <strong data-i18n="readOnlyTitle">Safe read-only mode</strong>
+          <span data-i18n="readOnlyBody">Management API was not found. No provider checks or model probes will run automatically.</span>
+        </div>
+
+        <section id="view-overview" class="view" data-view-panel="overview" aria-labelledby="overview-heading">
+          <div class="section-heading">
+            <div><p class="eyebrow" data-i18n="atGlance">At a glance</p><h2 id="overview-heading" data-i18n="overviewHeading">Local management status</h2></div>
+            <button id="refresh-overview" class="button secondary" type="button" data-i18n="refresh">Refresh</button>
+          </div>
+          <div class="stat-grid" aria-label="Summary" data-i18n-aria-label="summary">
+            <article class="stat-card"><span data-i18n="providersReady">Providers ready</span><strong id="overview-providers">—</strong><small id="overview-providers-note" data-i18n="awaitingData">Awaiting data</small></article>
+            <article class="stat-card"><span data-i18n="activeSessions">Active sessions</span><strong id="overview-sessions">—</strong><small data-i18n="coreAndExt">Core and Ext</small></article>
+            <article class="stat-card"><span data-i18n="recentTokens">Recent tokens</span><strong id="overview-tokens">—</strong><small data-i18n="noPromptPreview">Prompt previews hidden</small></article>
+            <article class="stat-card"><span data-i18n="serverMode">Server mode</span><strong id="overview-mode">—</strong><small id="overview-mode-note" data-i18n="leastPrivilege">Least privilege</small></article>
+          </div>
+          <div class="two-column">
+            <article class="panel">
+              <div class="panel-heading"><div><p class="eyebrow" data-i18n="providerHealth">Provider health</p><h3 data-i18n="providerSummary">Provider summary</h3></div><button class="text-button" type="button" data-open-view="providers" data-i18n="viewAll">View all</button></div>
+              <div id="overview-provider-list" class="stack-list" aria-live="polite"><p class="empty-state" data-i18n="awaitingBootstrap">Waiting for secure bootstrap…</p></div>
+            </article>
+            <article class="panel">
+              <div class="panel-heading"><div><p class="eyebrow" data-i18n="security">Security</p><h3 data-i18n="guardrails">Active guardrails</h3></div></div>
+              <dl id="overview-security" class="summary-list"><div><dt data-i18n="browserPermission">Browser permission</dt><dd>read_only</dd></div><div><dt data-i18n="credentials">Credentials</dt><dd data-i18n="sameOriginOnly">Same origin only</dd></div><div><dt data-i18n="promptStorage">Prompt storage</dt><dd data-i18n="disabled">Disabled</dd></div></dl>
+            </article>
+          </div>
+        </section>
+
+        <section id="view-providers" class="view" data-view-panel="providers" aria-labelledby="providers-heading" hidden>
+          <div class="section-heading"><div><p class="eyebrow" data-i18n="providerSetup">Provider setup</p><h2 id="providers-heading" data-i18n="providersHeading">Capabilities and compatibility</h2></div></div>
+          <p class="section-intro" data-i18n="providerIntro">Commands are copy-only. Verification runs only when you request it.</p>
+          <div id="provider-grid" class="card-grid" aria-live="polite"><p class="empty-state" data-i18n="awaitingBootstrap">Waiting for secure bootstrap…</p></div>
+        </section>
+
+        <section id="view-chat" class="view" data-view-panel="chat" aria-labelledby="chat-heading" hidden>
+          <div class="section-heading"><div><p class="eyebrow" data-i18n="boundedWorkspace">Bounded workspace</p><h2 id="chat-heading" data-i18n="chatHeading">Read-only chat</h2></div><span class="badge badge-lock" data-i18n="permissionReadOnly">Permission: read_only</span></div>
+          <div class="chat-layout">
+            <form id="chat-form" class="panel chat-composer">
+              <div class="field-grid">
+                <label for="chat-provider"><span data-i18n="provider">Provider</span><select id="chat-provider" name="provider" required><option value="" data-i18n="selectProvider">Select provider</option></select></label>
+                <label for="chat-model"><span data-i18n="model">Model</span><select id="chat-model" name="model"><option value="" data-i18n="defaultModel">Provider default</option></select></label>
+                <label for="chat-workspace"><span data-i18n="workspace">Workspace</span><select id="chat-workspace" name="workspace" required><option value="" data-i18n="selectWorkspace">Select workspace</option></select></label>
+                <label for="chat-permission"><span data-i18n="permission">Permission</span><input id="chat-permission" value="read_only" readonly aria-readonly="true"></label>
+              </div>
+              <label for="chat-prompt"><span data-i18n="prompt">Prompt</span><textarea id="chat-prompt" name="prompt" rows="6" maxlength="20000" required data-i18n-placeholder="promptPlaceholder" placeholder="Ask about the selected workspace…"></textarea></label>
+              <div class="attachment-row">
+                <label class="button secondary file-button" for="image-picker"><span data-i18n="addImages">Add images</span><input id="image-picker" type="file" accept="image/png,image/jpeg,image/webp" multiple></label>
+                <span id="image-limit" class="field-help" data-i18n="imageLimit">PNG, JPEG, or WebP · up to 4 files · 12 MB total</span>
+              </div>
+              <div id="image-preview" class="image-preview" aria-live="polite"></div>
+              <div class="form-actions"><button id="send-chat" class="button primary" type="submit" data-i18n="send">Send</button><button id="cancel-chat" class="button danger" type="button" disabled data-i18n="cancel">Cancel</button><span id="chat-status" class="inline-status" role="status" aria-live="polite"></span></div>
+            </form>
+            <div class="chat-results">
+              <article class="panel"><div class="panel-heading"><h3 data-i18n="response">Response</h3><span id="chat-session-label" class="muted"></span></div><div id="chat-output" class="chat-output" role="log" aria-live="polite" aria-relevant="additions text" tabindex="0"><p class="empty-state" data-i18n="responseEmpty">Streaming text will appear here.</p></div></article>
+              <article class="panel"><div class="panel-heading"><h3 data-i18n="toolTimeline">Tool timeline</h3><span class="muted" data-i18n="boundedLog">Bounded log</span></div><ol id="tool-timeline" class="timeline" aria-live="polite"><li class="empty-state" data-i18n="toolsEmpty">Correlated tool events will appear here.</li></ol></article>
+            </div>
+          </div>
+        </section>
+
+        <section id="view-models" class="view" data-view-panel="models" aria-labelledby="models-heading" hidden>
+          <div class="section-heading"><div><p class="eyebrow" data-i18n="lazyDiscovery">On-demand discovery</p><h2 id="models-heading" data-i18n="modelsHeading">Provider models</h2></div></div>
+          <div class="panel filter-bar"><label for="models-provider"><span data-i18n="provider">Provider</span><select id="models-provider"><option value="" data-i18n="selectProvider">Select provider</option></select></label><button id="refresh-models" class="button secondary" type="button" disabled data-i18n="refreshModels">Load models</button><span id="models-status" role="status" aria-live="polite"></span></div>
+          <div class="panel table-wrap"><table><caption data-i18n="modelsCaption">Models returned by the selected provider</caption><thead><tr><th scope="col" data-i18n="model">Model</th><th scope="col" data-i18n="source">Source</th><th scope="col" data-i18n="context">Context</th><th scope="col" data-i18n="capabilities">Capabilities</th></tr></thead><tbody id="models-table-body"><tr><td colspan="4" class="empty-state" data-i18n="modelsLazyEmpty">Select a provider to load models. Nothing is probed automatically.</td></tr></tbody></table></div>
+        </section>
+
+        <section id="view-sessions" class="view" data-view-panel="sessions" aria-labelledby="sessions-heading" hidden>
+          <div class="section-heading"><div><p class="eyebrow" data-i18n="sessionIndex">Session index</p><h2 id="sessions-heading" data-i18n="sessionsHeading">Core and Ext sessions</h2></div><button id="refresh-sessions" class="button secondary" type="button" data-i18n="refreshSessions">Refresh sessions</button></div>
+          <div class="panel table-wrap"><table><caption data-i18n="sessionsCaption">Indexed sessions. Core is managed locally; Ext belongs to a provider.</caption><thead><tr><th scope="col" data-i18n="kind">Kind</th><th scope="col" data-i18n="name">Name</th><th scope="col" data-i18n="provider">Provider</th><th scope="col" data-i18n="updated">Updated</th><th scope="col" data-i18n="actions">Actions</th></tr></thead><tbody id="sessions-table-body"><tr><td colspan="5" class="empty-state" data-i18n="sessionsEmpty">Refresh to load sessions.</td></tr></tbody></table></div>
+        </section>
+
+        <section id="view-usage" class="view" data-view-panel="usage" aria-labelledby="usage-heading" hidden>
+          <div class="section-heading"><div><p class="eyebrow" data-i18n="privacyAware">Privacy-aware telemetry</p><h2 id="usage-heading" data-i18n="usageHeading">Usage and performance</h2></div><div class="button-group"><button id="refresh-usage" class="button secondary" type="button" data-i18n="refreshUsage">Refresh usage</button><button id="export-usage" class="button secondary" type="button" disabled data-i18n="exportJson">Export JSON</button></div></div>
+          <form id="usage-filters" class="panel filter-bar"><label for="usage-provider"><span data-i18n="provider">Provider</span><select id="usage-provider"><option value="" data-i18n="allProviders">All providers</option></select></label><label for="usage-errors"><span data-i18n="result">Result</span><select id="usage-errors"><option value="all" data-i18n="allResults">All results</option><option value="errors" data-i18n="errorsOnly">Errors only</option><option value="success" data-i18n="successOnly">Success only</option></select></label><label for="usage-window"><span data-i18n="window">Window</span><select id="usage-window"><option value="all" data-i18n="allTime">All available</option><option value="hour" data-i18n="lastHour">Last hour</option><option value="day" data-i18n="lastDay">Last 24 hours</option></select></label></form>
+          <div class="stat-grid usage-stats"><article class="stat-card"><span data-i18n="inputTokens">Input tokens</span><strong id="usage-input">—</strong><small data-i18n="promptHidden">Prompt content hidden</small></article><article class="stat-card"><span data-i18n="outputTokens">Output tokens</span><strong id="usage-output">—</strong><small data-i18n="aggregateOnly">Aggregate only</small></article><article class="stat-card"><span data-i18n="cachedTokens">Cached tokens</span><strong id="usage-cached">—</strong><small data-i18n="aggregateOnly">Aggregate only</small></article><article class="stat-card"><span data-i18n="errorRate">Error rate</span><strong id="usage-errors-rate">—</strong><small id="usage-error-note">—</small></article></div>
+          <div class="panel table-wrap"><table><caption data-i18n="usageCaption">Recent calls without prompt previews</caption><thead><tr><th scope="col" data-i18n="time">Time</th><th scope="col" data-i18n="providerModel">Provider / model</th><th scope="col" data-i18n="tokensCached">Tokens / cached</th><th scope="col">TTFT</th><th scope="col" data-i18n="latency">Latency</th><th scope="col" data-i18n="result">Result</th></tr></thead><tbody id="usage-table-body"><tr><td colspan="6" class="empty-state" data-i18n="usageEmpty">Refresh to load usage.</td></tr></tbody></table></div>
+        </section>
+
+        <section id="view-settings" class="view" data-view-panel="settings" aria-labelledby="settings-heading" hidden>
+          <div class="section-heading"><div><p class="eyebrow" data-i18n="configuration">Configuration</p><h2 id="settings-heading" data-i18n="settingsHeading">Settings &amp; Security</h2></div></div>
+          <div class="settings-grid">
+            <article class="panel"><h3 data-i18n="appearance">Appearance</h3><dl id="settings-appearance" class="summary-list"><div><dt data-i18n="language">Language</dt><dd id="settings-language">English</dd></div><div><dt data-i18n="theme">Theme</dt><dd id="settings-theme">Auto</dd></div></dl></article>
+            <article class="panel"><h3 data-i18n="defaults">Defaults</h3><dl id="settings-defaults" class="summary-list"><div><dt data-i18n="provider">Provider</dt><dd id="default-provider">—</dd></div><div><dt data-i18n="model">Model</dt><dd id="default-model">—</dd></div><div><dt data-i18n="workspace">Workspace</dt><dd id="default-workspace">—</dd></div></dl></article>
+            <article class="panel"><h3 data-i18n="permissions">Permissions</h3><dl id="settings-permissions" class="summary-list"><div><dt data-i18n="browserPermission">Browser permission</dt><dd>read_only</dd></div><div><dt data-i18n="webAccess">Web access</dt><dd id="security-web">—</dd></div><div><dt>MCP</dt><dd id="security-mcp">—</dd></div></dl></article>
+            <article class="panel"><h3 data-i18n="boundaries">Boundaries</h3><dl class="summary-list"><div><dt data-i18n="workspaces">Workspaces</dt><dd id="security-workspaces">—</dd></div><div><dt data-i18n="serverAllowlist">Server allowlist</dt><dd id="security-allowlist">—</dd></div><div><dt>CSRF</dt><dd id="security-csrf" data-i18n="memoryOnly">Memory only</dd></div></dl></article>
+          </div>
+          <form id="settings-form" class="panel settings-editor">
+            <div class="panel-heading"><div><p class="eyebrow" data-i18n="editableDefaults">Editable defaults</p><h3 data-i18n="savePreferences">Save browser management preferences</h3></div><span id="settings-status" role="status" aria-live="polite"></span></div>
+            <div class="field-grid settings-fields">
+              <label for="setting-theme"><span data-i18n="theme">Theme</span><select id="setting-theme" name="theme"><option value="auto" data-i18n="themeAuto">Auto</option><option value="light" data-i18n="themeLight">Light</option><option value="dark" data-i18n="themeDark">Dark</option></select></label>
+              <label for="setting-default-provider"><span data-i18n="provider">Provider</span><select id="setting-default-provider" name="default_provider"><option value="" data-i18n="selectProvider">Select provider</option></select></label>
+              <label for="setting-workspace"><span data-i18n="workspace">Workspace</span><select id="setting-workspace" name="workspace_id"><option value="" data-i18n="noDefaultWorkspace">No default workspace</option></select></label>
+              <label for="setting-permission"><span data-i18n="browserPermission">Browser permission</span><input id="setting-permission" name="browser_permission" value="read_only" readonly aria-readonly="true"></label>
+              <label class="checkbox-field" for="setting-web"><input id="setting-web" name="web" type="checkbox"><span data-i18n="allowWeb">Allow read-only web tools</span></label>
+              <label class="checkbox-field" for="setting-prompt-preview"><input id="setting-prompt-preview" name="browser_prompt_preview" type="checkbox"><span data-i18n="allowPromptPreview">Allow short prompt previews in usage</span></label>
+            </div>
+            <p class="field-help" data-i18n="languageLocalNote">Language changes apply to this open page only and are not sent to the server.</p>
+            <div class="form-actions"><button id="save-settings" class="button primary" type="submit" data-i18n="saveSettings">Save settings</button></div>
+          </form>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <dialog id="confirm-dialog" aria-labelledby="confirm-title" aria-describedby="confirm-message">
+    <form method="dialog">
+      <h2 id="confirm-title" data-i18n="confirmAction">Confirm action</h2>
+      <p id="confirm-message"></p>
+      <div class="form-actions"><button id="confirm-cancel" class="button secondary" value="cancel" data-i18n="cancel">Cancel</button><button id="confirm-accept" class="button danger" value="confirm" data-i18n="confirm">Confirm</button></div>
+    </form>
+  </dialog>
+
+  <div id="global-status" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
+</body>
+</html>
