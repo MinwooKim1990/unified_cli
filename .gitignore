@@ -25,6 +25,9 @@ build/
 .pytest_cache/
 .coverage
 htmlcov/
+tests/browser/node_modules/
+tests/browser/test-results/
+tests/browser/playwright-report/
 
 # Local overrides — anything under .local/ is ignored
 .local/

@@ -28,6 +28,7 @@ Conversation persistence:
 from __future__ import annotations
 
 import base64
+import asyncio
 import binascii
 import hmac
 import ipaddress
@@ -42,12 +43,12 @@ import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Optional, Sequence, Union
 
 try:
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import (
-        HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse,
+        HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse,
     )
     from pydantic import BaseModel
     from starlette.background import BackgroundTask
@@ -62,6 +63,15 @@ from .dashboard_tpl import DASHBOARD_HTML
 from .errors import ErrorKind, UnifiedError
 from .factory import _cannot_route_error, _route_builtin
 from .i18n import t
+from .manage import (
+    COOKIE_NAME as _MANAGE_COOKIE_NAME,
+    MAX_UI_BODY_BYTES as _MAX_UI_BODY_BYTES,
+    ManageError,
+    disable_manage,
+    ensure_manage,
+    get_manage_runtime,
+    prepare_manage,
+)
 from .models import list_models
 from .ui import collect_states
 from .usage import tracker
@@ -265,13 +275,19 @@ class _ChatBodyLimitMiddleware:
         self.max_body_bytes = max_body_bytes
 
     async def __call__(self, scope, receive, send):
-        if (scope.get("type") != "http"
-                or scope.get("method") != "POST"
-                or scope.get("path") != "/v1/chat/completions"):
+        path = scope.get("path", "")
+        method = scope.get("method", "")
+        is_legacy_chat = method == "POST" and path == "/v1/chat/completions"
+        is_manage_mutation = (
+            path.startswith("/api/ui/v1/")
+            and method in {"POST", "PATCH", "DELETE"}
+        )
+        if scope.get("type") != "http" or not (is_legacy_chat or is_manage_mutation):
             await self.app(scope, receive, send)
             return
 
-        limit = self.max_body_bytes or _MAX_REQUEST_BODY_BYTES
+        limit = self.max_body_bytes or (
+            _MAX_UI_BODY_BYTES if is_manage_mutation else _MAX_REQUEST_BODY_BYTES)
         for name, value in scope.get("headers", []):
             if name.lower() != b"content-length":
                 continue
@@ -349,6 +365,14 @@ app = FastAPI(title="unified-cli OpenAI-compat", lifespan=_lifespan)
 app.add_middleware(_ChatBodyLimitMiddleware)
 
 
+@app.exception_handler(ManageError)
+async def _manage_error_handler(_request: "Request", error: ManageError):
+    return JSONResponse(
+        status_code=error.status_code,
+        content={"error": {"message": error.message, "code": error.code}},
+    )
+
+
 def _is_loopback_host(host: str) -> bool:
     """True only for a genuine loopback host: the literal name "localhost", or
     an IP address that parses as loopback (127.0.0.0/8, ::1).
@@ -375,6 +399,88 @@ def _host_header_name(host_header: str) -> str:
     return h.rsplit(":", 1)[0] if ":" in h else h
 
 
+def _valid_manage_host_header(host_header: str) -> bool:
+    """Validate loopback Host syntax as well as its parsed hostname."""
+    value = (host_header or "").strip()
+    if not value or any(char in value for char in ("@", "/", "\\", "\x00")):
+        return False
+    if value.startswith("["):
+        closing = value.find("]")
+        if closing < 0:
+            return False
+        name = value[1:closing]
+        suffix = value[closing + 1:]
+        if suffix and (not suffix.startswith(":") or not suffix[1:].isdigit()):
+            return False
+        port = suffix[1:] if suffix else ""
+    else:
+        if value.count(":") > 1:
+            return False
+        name, separator, port = value.partition(":")
+        if separator and not port.isdigit():
+            return False
+    if port and not 1 <= int(port) <= 65_535:
+        return False
+    return _is_loopback_host(name)
+
+
+def _is_manage_surface(path: str) -> bool:
+    if path == "/api/ui/v1" or path.startswith("/api/ui/v1/"):
+        return True
+    # The dashboard predates manage mode and remains a useful read-only view
+    # of the legacy /v1 diagnostics.  It becomes a manage trust surface only
+    # while the opt-in runtime exists; otherwise its original bearer/bind
+    # contract is preserved.
+    return get_manage_runtime() is not None and (
+        path == "/dashboard" or path.startswith("/dashboard/assets/")
+    )
+
+
+def _needs_browser_security_headers(path: str) -> bool:
+    return (
+        path == "/dashboard"
+        or path.startswith("/dashboard/assets/")
+        or path == "/api/ui/v1"
+        or path.startswith("/api/ui/v1/")
+    )
+
+
+_MANAGE_SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self'; style-src 'self'; "
+        "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
+        "base-uri 'none'; frame-src 'none'; form-action 'self'; "
+        "frame-ancestors 'none'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Cache-Control": "no-store",
+    "Pragma": "no-cache",
+    "X-Frame-Options": "DENY",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+}
+
+
+def _manage_loopback_error() -> "JSONResponse":
+    return JSONResponse(
+        status_code=403,
+        content={"error": {
+            "message": "The browser management surface is loopback-only.",
+            "code": "manage_loopback_required",
+        }},
+    )
+
+
+def _apply_manage_security_headers(response: "Response") -> "Response":
+    for name, value in _MANAGE_SECURITY_HEADERS.items():
+        response.headers[name] = value
+    # CORS is intentionally absent: a browser must be same-origin and present
+    # the host-only session cookie plus the in-memory CSRF token.
+    if "Access-Control-Allow-Origin" in response.headers:
+        del response.headers["Access-Control-Allow-Origin"]
+    return response
+
+
 @app.middleware("http")
 async def _localhost_guard(request: "Request", call_next):
     """Enforce localhost-only at the ASGI layer, so the invariant holds even
@@ -382,7 +488,22 @@ async def _localhost_guard(request: "Request", call_next):
     bypasses run()'s bind guard. Rejects a non-loopback peer OR a non-loopback
     Host header (DNS-rebinding defense). External opt-in is bearer-protected;
     setting a bearer token intentionally protects loopback requests too."""
-    if not _external_bind_allowed():
+    manage_surface = _is_manage_surface(request.url.path)
+    if manage_surface:
+        client_host = request.client.host if request.client else ""
+        hosts = request.headers.getlist("host")
+        server_info = request.scope.get("server") or ("", 0)
+        bound_host = server_info[0] if server_info else ""
+        if (
+            len(hosts) != 1
+            or not client_host
+            or not bound_host
+            or not _is_loopback_host(client_host)
+            or not _valid_manage_host_header(hosts[0])
+            or not _is_loopback_host(bound_host)
+        ):
+            return _apply_manage_security_headers(_manage_loopback_error())
+    elif not _external_bind_allowed():
         client_host = request.client.host if request.client else ""
         host_name = _host_header_name(request.headers.get("host", ""))
         server_info = request.scope.get("server") or ("", 0)
@@ -390,7 +511,7 @@ async def _localhost_guard(request: "Request", call_next):
         if (bound_host and not _is_loopback_host(bound_host)) or \
            (client_host and not _is_loopback_host(client_host)) or \
            (host_name and not _is_loopback_host(host_name)):
-            return JSONResponse(
+            response = JSONResponse(
                 status_code=403,
                 content={"error": {
                     "message": ("This server is localhost-only. Set "
@@ -401,13 +522,29 @@ async def _localhost_guard(request: "Request", call_next):
                     "code": "config",
                 }},
             )
+            return (
+                _apply_manage_security_headers(response)
+                if _needs_browser_security_headers(request.url.path) else response
+            )
 
-    if _server_auth_required():
+    if not manage_surface and _server_auth_required():
         if _configured_server_auth_token() is None:
-            return _server_auth_config_error()
+            response = _server_auth_config_error()
+            return (
+                _apply_manage_security_headers(response)
+                if _needs_browser_security_headers(request.url.path) else response
+            )
         if not _valid_bearer_authorization(request.headers.get("authorization")):
-            return _server_auth_required_error()
-    return await call_next(request)
+            response = _server_auth_required_error()
+            return (
+                _apply_manage_security_headers(response)
+                if _needs_browser_security_headers(request.url.path) else response
+            )
+    response = await call_next(request)
+    return (
+        _apply_manage_security_headers(response)
+        if _needs_browser_security_headers(request.url.path) else response
+    )
 
 
 # Conversation ids map to slots rather than bare conversations so the LRU can
@@ -755,6 +892,216 @@ def _acquire_conversation(user: Optional[str]) -> _ConversationLease:
 
 # ---- endpoints ----
 
+def _manage_runtime_required():
+    runtime = get_manage_runtime()
+    if runtime is None:
+        raise ManageError(404, "manage_disabled", "Browser management is disabled.")
+    return runtime
+
+
+def _require_exact_manage_origin(request: "Request") -> None:
+    origins = request.headers.getlist("origin")
+    hosts = request.headers.getlist("host")
+    if len(origins) != 1 or len(hosts) != 1:
+        raise ManageError(403, "origin_required", "An exact same-origin request is required.")
+    expected = f"{request.url.scheme}://{hosts[0]}"
+    if not hmac.compare_digest(origins[0].encode("utf-8"), expected.encode("utf-8")):
+        raise ManageError(403, "origin_required", "An exact same-origin request is required.")
+
+
+def _require_safe_bootstrap_source(request: "Request") -> None:
+    """Reject browser cross-site bootstrap while supporting normal GET fetch.
+
+    Browsers may omit Origin on same-origin GET.  When it is present we demand
+    an exact match; otherwise Sec-Fetch-Site must be same-origin/none.  Header-
+    less loopback CLI clients remain usable and still need the one-time secret.
+    """
+    origins = request.headers.getlist("origin")
+    if origins:
+        _require_exact_manage_origin(request)
+        return
+    fetch_sites = request.headers.getlist("sec-fetch-site")
+    if len(fetch_sites) > 1 or (
+        fetch_sites and fetch_sites[0] not in {"same-origin", "none"}
+    ):
+        raise ManageError(403, "origin_required", "A same-origin bootstrap is required.")
+
+
+def _manage_session(request: "Request", *, mutation: bool = False):
+    runtime = _manage_runtime_required()
+    if mutation:
+        _require_exact_manage_origin(request)
+    session = runtime.authenticate(
+        request.cookies.get(_MANAGE_COOKIE_NAME), mutation=mutation)
+    # A host-only cookie is still shared by every localhost port.  The CSRF
+    # value is kept by the dashboard's origin-scoped history entry and sent as
+    # an explicit proof on every request, so the cookie alone is never enough.
+    runtime.check_csrf(session, request.headers.get("x-csrf-token"))
+    return runtime, session
+
+
+async def _manage_json_body(request: "Request") -> dict:
+    try:
+        payload = await request.json()
+    except (UnicodeError, ValueError, json.JSONDecodeError):
+        raise ManageError(400, "invalid_json", "Request body must be valid JSON.") from None
+    if type(payload) is not dict:
+        raise ManageError(400, "invalid_json", "Request body must be a JSON object.")
+    return payload
+
+
+def _next_manage_chunk(iterator):
+    try:
+        return True, next(iterator)
+    except StopIteration:
+        return False, None
+
+
+async def _async_manage_chat_stream(runtime, chat):
+    """Relay a blocking provider generator with one-item backpressure.
+
+    Starlette can cancel this async iterator immediately on disconnect.  The
+    relay then signals the provider event, waits for the blocked ``next`` call
+    to unwind after process-tree termination, and closes the upstream cleanly.
+    """
+    upstream = runtime.stream_chat(chat)
+    in_flight = None
+    try:
+        while True:
+            in_flight = asyncio.create_task(
+                asyncio.to_thread(_next_manage_chunk, upstream))
+            has_item, item = await asyncio.shield(in_flight)
+            in_flight = None
+            if not has_item:
+                return
+            yield item
+    finally:
+        chat.cancel_event.set()
+        if in_flight is not None and not in_flight.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(in_flight), timeout=5)
+            except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                pass
+        close = getattr(upstream, "close", None)
+        if close is not None:
+            try:
+                close()
+            except (RuntimeError, ValueError):
+                pass
+        runtime.finish_chat(chat.id)
+
+
+@app.get("/api/ui/v1/bootstrap")
+def manage_bootstrap(request: "Request"):
+    runtime = _manage_runtime_required()
+    _require_safe_bootstrap_source(request)
+    peer = request.client.host if request.client else "loopback"
+    payload, new_cookie = runtime.bootstrap(
+        supplied_token=request.headers.get("x-unified-bootstrap"),
+        supplied_csrf=request.headers.get("x-csrf-token"),
+        cookie=request.cookies.get(_MANAGE_COOKIE_NAME),
+        peer_key=peer,
+    )
+    response = JSONResponse(payload)
+    if new_cookie is not None:
+        response.set_cookie(
+            key=_MANAGE_COOKIE_NAME,
+            value=new_cookie,
+            path="/api/ui/v1",
+            httponly=True,
+            samesite="strict",
+            secure=request.url.scheme == "https",
+        )
+    return response
+
+
+@app.get("/api/ui/v1/providers")
+def manage_providers(request: "Request"):
+    runtime, _session = _manage_session(request)
+    return runtime.provider_metadata()
+
+
+@app.post("/api/ui/v1/providers/{provider_id}/verify")
+def manage_verify_provider(provider_id: str, request: "Request"):
+    runtime, _session = _manage_session(request, mutation=True)
+    return runtime.verify_provider(provider_id)
+
+
+@app.post("/api/ui/v1/providers/{provider_id}/models")
+def manage_provider_models(provider_id: str, request: "Request"):
+    # Model discovery may invoke a provider-specific probe, so it is an
+    # explicit mutation-style action even though it only returns metadata.
+    runtime, _session = _manage_session(request, mutation=True)
+    return runtime.provider_models(provider_id)
+
+
+@app.get("/api/ui/v1/sessions")
+def manage_sessions(request: "Request"):
+    runtime, _session = _manage_session(request)
+    return runtime.list_sessions()
+
+
+@app.patch("/api/ui/v1/sessions/{session_id}")
+async def manage_patch_session(session_id: str, request: "Request"):
+    runtime, _session = _manage_session(request, mutation=True)
+    return runtime.patch_session(session_id, await _manage_json_body(request))
+
+
+@app.delete("/api/ui/v1/sessions/{session_id}")
+def manage_delete_session(session_id: str, request: "Request"):
+    runtime, _session = _manage_session(request, mutation=True)
+    return runtime.delete_session(session_id)
+
+
+@app.get("/api/ui/v1/usage")
+def manage_usage(request: "Request"):
+    runtime, _session = _manage_session(request)
+    return runtime.usage_snapshot()
+
+
+@app.patch("/api/ui/v1/settings")
+async def manage_settings(request: "Request"):
+    runtime, _session = _manage_session(request, mutation=True)
+    return runtime.patch_settings(await _manage_json_body(request))
+
+
+@app.post("/api/ui/v1/chat")
+async def manage_chat(request: "Request"):
+    runtime, session = _manage_session(request, mutation=True)
+    chat = runtime.start_chat(await _manage_json_body(request), session.key)
+    return StreamingResponse(
+        _async_manage_chat_stream(runtime, chat),
+        media_type="application/x-ndjson",
+        headers={"X-Unified-Chat-Id": chat.id},
+        background=BackgroundTask(runtime.finish_chat, chat.id),
+    )
+
+
+@app.post("/api/ui/v1/chat/{chat_id}/cancel")
+def manage_cancel_chat(chat_id: str, request: "Request"):
+    runtime, session = _manage_session(request, mutation=True)
+    return runtime.cancel_chat(chat_id, session.key)
+
+
+@app.get("/api/ui/v1/events")
+def manage_events(request: "Request"):
+    runtime, _session = _manage_session(request)
+
+    async def events():
+        state = runtime.state_event()
+        yield "retry: 15000\nevent: state\ndata: " + json.dumps(
+            state, ensure_ascii=False, separators=(",", ":")) + "\n\n"
+        while get_manage_runtime() is runtime:
+            # Poll disconnect in short bounded intervals so closing a tab or
+            # disabling manage mode does not leave an orphan stream.
+            for _ in range(30):
+                if await request.is_disconnected() or get_manage_runtime() is not runtime:
+                    return
+                await asyncio.sleep(0.5)
+            yield "event: heartbeat\ndata: {\"type\":\"heartbeat\"}\n\n"
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatRequest):
     _validate_chat_request(req)
@@ -993,8 +1340,19 @@ def root():
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    """Browser dashboard (loopback by default; bearer-guarded when configured)."""
+    """Browser dashboard; manage APIs remain opt-in and independently gated."""
     return HTMLResponse(DASHBOARD_HTML)
+
+
+@app.get("/dashboard/assets/{asset_name}")
+def dashboard_asset(asset_name: str):
+    """Serve only package-owned dashboard assets through a strict allowlist."""
+    try:
+        from .dashboard_tpl import load_dashboard_asset
+        content, media_type = load_dashboard_asset(asset_name)
+    except (KeyError, FileNotFoundError, ValueError):
+        raise ManageError(404, "asset_not_found", "Dashboard asset was not found.") from None
+    return Response(content=content, media_type=media_type)
 
 
 # ---- launcher with a localhost guard ----
@@ -1005,7 +1363,14 @@ def _external_bind_allowed() -> bool:
     }
 
 
-def run(host: str = "127.0.0.1", port: int = 8000, **uvicorn_kwargs) -> None:
+def run(
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    *,
+    manage: bool = False,
+    workspaces: Sequence[str] = (),
+    **uvicorn_kwargs,
+) -> None:
     """Launch the OpenAI-compatible server.
 
     Binds to loopback (127.0.0.1) by default. Binding to a non-loopback host
@@ -1019,6 +1384,19 @@ def run(host: str = "127.0.0.1", port: int = 8000, **uvicorn_kwargs) -> None:
     A configured bearer token is also enforced on loopback, so users can opt
     into local process-to-process authentication without a separate mode.
     """
+    if type(manage) is not bool:
+        raise ValueError("manage must be a boolean")
+    if manage and not _is_loopback_host(host):
+        raise UnifiedError(
+            kind="config", provider="claude",
+            message="Browser management can only bind to a loopback host.",
+            hint="Use 127.0.0.1, localhost, or ::1.",
+        )
+    if manage:
+        # If prepare_manage() already issued a bootstrap credential (the CLI
+        # normally does this so it can display it), run() must not rotate it.
+        ensure_manage(workspaces)
+
     if not _is_loopback_host(host):
         warning = t("server.external_bind.warning", host=host)
         if not _external_bind_allowed():
@@ -1032,13 +1410,15 @@ def run(host: str = "127.0.0.1", port: int = 8000, **uvicorn_kwargs) -> None:
         print(warning + t("server.external_bind.proceeding", env=_ALLOW_EXTERNAL_ENV),
               file=sys.stderr)
 
-    # Validate before importing/running uvicorn so both the explicit launcher
-    # and raw-ASGI lifespan path fail closed for a missing or weak secret.
-    _require_server_auth_configuration()
-
-    import uvicorn
-
-    uvicorn.run(app, host=host, port=port, **uvicorn_kwargs)
+    try:
+        # Validate before importing/running uvicorn so both the explicit
+        # launcher and raw-ASGI lifespan path fail closed for a weak secret.
+        _require_server_auth_configuration()
+        import uvicorn
+        uvicorn.run(app, host=host, port=port, **uvicorn_kwargs)
+    finally:
+        if manage:
+            disable_manage()
 
 
 if __name__ == "__main__":

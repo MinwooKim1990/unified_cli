@@ -41,7 +41,10 @@ from typing import AsyncIterator, Iterator, Optional
 from ..base import (
     BaseProvider,
     _StreamReader,
-    _drain_into,
+    _cancel_requested,
+    _cancelled_error,
+    _close_popen_pipes,
+    _drain_binary_into,
     _popen_process_group_kwargs,
     _terminate_process_tree,
 )
@@ -325,35 +328,48 @@ class GeminiProvider(BaseProvider):
     # ----- streaming (plain text, line-buffered) -----
 
     def _stream_run(
-        self, args: list[str], stdin_data: Optional[str] = None
+        self,
+        args: list[str],
+        stdin_data: Optional[str] = None,
+        *,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Iterator[Message]:
+        if _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
         proc = subprocess.Popen(
             args,
             stdin=subprocess.PIPE if stdin_data else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace",
-            cwd=self.cwd, env=self._env(), bufsize=1,
+            cwd=self.cwd, env=self._env(),
             **_popen_process_group_kwargs(),
         )
         if stdin_data and proc.stdin:
             try:
-                proc.stdin.write(stdin_data)
+                proc.stdin.write(stdin_data.encode("utf-8"))
                 proc.stdin.flush()
                 proc.stdin.close()
-            except BrokenPipeError:
+            except (BrokenPipeError, OSError, ValueError):
                 pass
         assert proc.stdout is not None
         # Drain stderr concurrently (pipe-deadlock guard — see base._stream_once).
-        _stderr_chunks: list[str] = []
+        _stderr_chunks: list[bytes] = []
         _stderr_overflow = threading.Event()
+        _stderr_sources: list[str] = []
+        _stderr_failures: list[BaseException] = []
+        _stderr_stop = threading.Event()
         _stderr_thread = threading.Thread(
-            target=_drain_into,
+            target=_drain_binary_into,
             kwargs={
                 "pipe": proc.stderr,
                 "sink": _stderr_chunks,
                 "max_bytes": self.max_stderr_bytes,
                 "overflow": _stderr_overflow,
+                "source": _stderr_sources,
+                "source_name": "stderr",
                 "terminate": lambda: _terminate_process_tree(proc),
+                "stop": _stderr_stop,
+                "process_exited": lambda: proc.poll() is not None,
+                "failure": _stderr_failures,
             },
             daemon=True,
         )
@@ -370,6 +386,7 @@ class GeminiProvider(BaseProvider):
             max_events=self.max_stream_events,
             max_line_bytes=self.max_stream_line_bytes,
             terminate=lambda: _terminate_process_tree(proc),
+            cancel_event=cancel_event,
         ).start()
         produced = False
         collected: list[str] = []
@@ -389,6 +406,7 @@ class GeminiProvider(BaseProvider):
             # rather than wait it out.
             if not loop_done:
                 _terminate_process_tree(proc, force_group=True)
+            wait_error = None
             try:
                 proc.wait(timeout=self.stream_timeout)
             except subprocess.TimeoutExpired:
@@ -397,18 +415,37 @@ class GeminiProvider(BaseProvider):
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
-                raise UnifiedError(
+                wait_error = UnifiedError(
                     kind="network", provider="gemini",
                     message=t("err.gemini.stream_timeout", timeout=self.stream_timeout),
                     hint=t("err.gemini.stream_timeout.hint"),
                 )
             _terminate_process_tree(proc, force_group=True)
-            _stderr_thread.join(timeout=5)
-            stderr_text = "".join(_stderr_chunks)
+            reader.wait_closed(timeout=0.2)
+            _stderr_thread.join(timeout=0.2)
+            _stderr_stop.set()
+            reader.wait_closed(timeout=1)
+            if _stderr_thread.is_alive():
+                _stderr_thread.join(timeout=1)
+            live_pipes = []
+            if not reader.is_closed():
+                live_pipes.append(proc.stdout)
+            if _stderr_thread.is_alive():
+                live_pipes.append(proc.stderr)
+            _close_popen_pipes(proc, skip=tuple(live_pipes))
+            stderr_text = b"".join(_stderr_chunks).decode("utf-8", "replace")
+            if wait_error is not None:
+                raise wait_error
 
         full = "".join(collected)
         if reader.overflow_reason:
             raise self._output_limit_error(reader.overflow_reason)
+        if reader.cancelled or _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
+        if reader.read_error is not None:
+            raise self._pipe_reader_error("stdout", reader.read_error)
+        if _stderr_failures:
+            raise self._pipe_reader_error("stderr", _stderr_failures[0])
         if _stderr_overflow.is_set():
             raise self._output_limit_error("stderr")
         if reader.fired:
@@ -439,6 +476,7 @@ class GeminiProvider(BaseProvider):
         resume_last: bool = False,
         model: Optional[str] = None,
         images: Optional[list] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> AsyncIterator[Message]:
         # agy has no async event stream; run the blocking call in an executor
         # and surface the result as text → session → done.
@@ -447,7 +485,7 @@ class GeminiProvider(BaseProvider):
             None,
             lambda: self.chat(
                 prompt, session_id=session_id, resume_last=resume_last,
-                model=model, images=images,
+                model=model, images=images, cancel_event=cancel_event,
             ),
         )
         if resp.text:

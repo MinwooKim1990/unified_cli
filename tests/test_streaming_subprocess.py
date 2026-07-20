@@ -9,6 +9,7 @@ regresses here.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -39,6 +40,14 @@ if mode == "ok":
     emit({"type": "done"})
 elif mode == "unicode":
     emit({"type": "text", "text": "안녕 \U0001f31f café"})
+    emit({"type": "done"})
+elif mode == "unicode_split":
+    raw = (json.dumps(
+        {"type": "text", "text": "안녕 \U0001f31f café"},
+        ensure_ascii=False,
+    ) + "\n").encode("utf-8")
+    for byte in raw:
+        os.write(1, bytes([byte]))
     emit({"type": "done"})
 elif mode == "hang":
     time.sleep(60)
@@ -72,6 +81,8 @@ elif mode == "echo_key":
 elif mode == "output_flood":
     for i in range(100):
         emit({"type": "text", "text": "x" * 2048})
+elif mode == "oversized_line":
+    os.write(1, b'{"type":"text","text":"' + b"x" * 4096)
 elif mode == "spawn_descendant":
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
     pid_file = os.environ.get("FAKE_CHILD_PID_FILE")
@@ -87,6 +98,43 @@ elif mode == "spawn_then_exit":
         with open(pid_file, "w") as f:
             f.write(str(child.pid))
     emit({"type": "text", "text": "CHILD=" + str(child.pid)})
+    sys.exit(0)
+elif mode == "detached_pipe_holder":
+    # A new-session child is outside the provider leader's process group but
+    # inherits both output pipes. The wrapper must finish when the leader exits
+    # instead of waiting for this unrelated descriptor holder.
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(5)"],
+        start_new_session=True,
+    )
+    pid_file = os.environ.get("FAKE_CHILD_PID_FILE")
+    if pid_file:
+        with open(pid_file, "w") as f:
+            f.write(str(child.pid))
+    emit({"type": "text", "text": "detached-holder"})
+    emit({"type": "done"})
+    sys.exit(0)
+elif mode == "detached_continuous_writer":
+    code = r"""
+import json, os, time
+leader = os.getppid()
+while os.getppid() == leader:
+    time.sleep(0.001)
+for i in range(400):
+    try:
+        raw = (json.dumps({"type": "text", "text": "detached%d" % i}) + "\n").encode()
+        os.write(1, raw)
+    except BrokenPipeError:
+        break
+    time.sleep(0.005)
+"""
+    child = subprocess.Popen([sys.executable, "-c", code], start_new_session=True)
+    pid_file = os.environ.get("FAKE_CHILD_PID_FILE")
+    if pid_file:
+        with open(pid_file, "w") as f:
+            f.write(str(child.pid))
+    emit({"type": "text", "text": "leader"})
+    emit({"type": "done"})
     sys.exit(0)
 '''
 
@@ -130,8 +178,16 @@ class FakeProvider(BaseProvider):
         elif tp == "done":
             yield Message(kind="done", provider=self.name, raw=obj)
 
-    def _parse_json_response(self, text, model):  # pragma: no cover - unused here
-        return Response(text="", session_id="", provider=self.name,
+    def _parse_json_response(self, text, model):
+        chunks = []
+        for line in text.splitlines():
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if obj.get("type") == "text":
+                chunks.append(obj.get("text", ""))
+        return Response(text="".join(chunks), session_id="", provider=self.name,
                         model=model, usage=Usage(), messages=[], raw=[])
 
 
@@ -161,18 +217,137 @@ class StatefulNormalizeProvider(FakeProvider):
                 yield message
 
 
+def _capture_popen(monkeypatch):
+    processes = []
+    popen = base.subprocess.Popen
+
+    def capture_process(*args, **kwargs):
+        proc = popen(*args, **kwargs)
+        proc._test_pipe_fds = tuple(
+            pipe.fileno() for pipe in (proc.stdout, proc.stderr)
+            if pipe is not None
+        )
+        processes.append(proc)
+        return proc
+
+    monkeypatch.setattr(base.subprocess, "Popen", capture_process)
+    return processes
+
+
+def _assert_popen_pipes_closed(proc):
+    assert all(
+        pipe is None or pipe.closed
+        for pipe in (proc.stdin, proc.stdout, proc.stderr)
+    )
+
+
+def _capture_async_transports(monkeypatch):
+    transports = []
+    connection_made = base._AsyncJsonlProtocol.connection_made
+
+    def capture(protocol, transport):
+        transports.append(transport)
+        connection_made(protocol, transport)
+
+    monkeypatch.setattr(base._AsyncJsonlProtocol, "connection_made", capture)
+    return transports
+
+
+def _cleanup_detached_holder(pid_file):
+    if not pid_file.exists():
+        return
+    pid = int(pid_file.read_text())
+    try:
+        os.kill(pid, 9)
+    except ProcessLookupError:
+        return
+    assert _wait_for_pid_exit(pid)
+
+
 # ---- happy path ----
 
-def test_stream_ok_yields_all_events():
+def test_stream_ok_yields_all_events(monkeypatch):
+    processes = _capture_popen(monkeypatch)
     fp = FakeProvider("ok")
     kinds = [m.kind for m in fp.stream("hi")]
     assert kinds == ["session", "text", "usage", "done"]
+    assert len(processes) == 1
+    _assert_popen_pipes_closed(processes[0])
 
 
 def test_stream_unicode_roundtrips():
     fp = FakeProvider("unicode")
     texts = [m.text for m in fp.stream("hi") if m.kind == "text"]
     assert texts == ["안녕 🌟 café"]
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_stream_unicode_roundtrips_when_utf8_is_byte_split(async_mode):
+    fp = FakeProvider("unicode_split")
+    if async_mode:
+        import asyncio
+
+        async def run():
+            return [message.text async for message in fp.astream("hi")
+                    if message.kind == "text"]
+
+        texts = asyncio.run(run())
+    else:
+        texts = [message.text for message in fp.stream("hi")
+                 if message.kind == "text"]
+    assert texts == ["안녕 🌟 café"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX descriptors")
+def test_high_fd_chat_and_stream_retain_output(monkeypatch):
+    import resource
+
+    soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit != resource.RLIM_INFINITY and soft_limit <= 1150:
+        pytest.skip("RLIMIT_NOFILE is too low for a safe high-fd regression")
+    fillers = []
+    try:
+        highest = -1
+        while highest < 1100:
+            highest = os.open(os.devnull, os.O_RDONLY)
+            fillers.append(highest)
+        processes = _capture_popen(monkeypatch)
+        fp = FakeProvider("ok")
+        assert fp.chat("hi").text == "hello"
+        texts = [message.text for message in fp.stream("hi")
+                 if message.kind == "text"]
+        assert texts == ["hello"]
+        assert len(processes) == 2
+        assert all(min(proc._test_pipe_fds) >= 1100 for proc in processes)
+        for proc in processes:
+            _assert_popen_pipes_closed(proc)
+    finally:
+        for fd in fillers:
+            os.close(fd)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX selectors")
+@pytest.mark.parametrize("api", ["chat", "stream"])
+def test_sync_reader_selector_failure_fails_closed(monkeypatch, api):
+    class BrokenSelector:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def register(self, *_args):
+            raise OSError("selector registration failed")
+
+    monkeypatch.setattr(base.selectors, "DefaultSelector", BrokenSelector)
+    fp = FakeProvider("ok", timeout=1)
+    with pytest.raises(UnifiedError) as error:
+        if api == "chat":
+            fp.chat("hi")
+        else:
+            list(fp.stream("hi"))
+    assert error.value.kind == "internal"
+    assert "reader failed" in error.value.message
 
 
 def test_sync_interleaved_streams_receive_distinct_parser_state():
@@ -348,6 +523,107 @@ def test_astream_hang_before_output_fails_fast():
     assert time.time() - t0 < 4
 
 
+def test_async_protocol_keeps_delayed_final_line_within_exit_grace():
+    import asyncio
+
+    class FakeTransport:
+        def __init__(self):
+            self.closing = False
+
+        def get_returncode(self):
+            return 0
+
+        def get_pid(self):
+            return None
+
+        def is_closing(self):
+            return self.closing
+
+        def close(self):
+            self.closing = True
+
+    async def run():
+        loop = asyncio.get_running_loop()
+        protocol = base._AsyncJsonlProtocol(
+            loop,
+            max_output_bytes=4096,
+            max_stderr_bytes=4096,
+            max_buffer_bytes=4096,
+            max_events=10,
+            max_line_bytes=4096,
+        )
+        transport = FakeTransport()
+        protocol.connection_made(transport)
+        protocol.process_exited()
+        await asyncio.sleep(base._PIPE_EXIT_GRACE / 2)
+        raw = (json.dumps(
+            {"type": "text", "text": "늦은 🌟"}, ensure_ascii=False
+        ) + "\n").encode("utf-8")
+        split = raw.index("🌟".encode("utf-8")) + 2
+        protocol.pipe_data_received(1, raw[:split])
+        protocol.pipe_data_received(1, raw[split:])
+        await asyncio.sleep(base._PIPE_EXIT_GRACE)
+        queued = []
+        while not protocol.queue.empty():
+            queued.append(protocol.queue.get_nowait())
+        return transport, queued
+
+    transport, queued = asyncio.run(run())
+    lines = [payload.decode("utf-8") for kind, payload in queued
+             if kind == "line"]
+    assert lines == [json.dumps(
+        {"type": "text", "text": "늦은 🌟"}, ensure_ascii=False
+    ) + "\n"]
+    assert queued[-1][0] == "eof"
+    assert transport.is_closing()
+
+
+@pytest.mark.parametrize(
+    "expected_reason,overrides,raw",
+    [
+        ("line", {"max_line_bytes": 4}, b"xxxx"),
+        ("stdout", {"max_output_bytes": 2}, b"{}\n"),
+        ("event_count", {"max_events": 0}, b"{}\n"),
+        ("stream_buffer", {"max_buffer_bytes": 2}, b"{}\n"),
+    ],
+)
+def test_stream_reader_post_exit_limit_does_not_create_or_replace_reason(
+    expected_reason, overrides, raw
+):
+    def make_reader(terminated):
+        limits = {
+            "max_buffer_bytes": 1024,
+            "max_output_bytes": 1024,
+            "max_events": 10,
+            "max_line_bytes": 1024,
+        }
+        limits.update(overrides)
+        return base._StreamReader(
+            object(),
+            first_output=1,
+            idle=1,
+            terminate=lambda: terminated.append(True),
+            **limits,
+        )
+
+    terminated = []
+    reader = make_reader(terminated)
+    assert reader._queue_line(raw, after_exit=True) is False
+    assert reader.overflow_reason == ""
+    assert terminated == []
+
+    reader.overflow_reason = "preexisting"
+    assert reader._queue_line(raw, after_exit=True) is False
+    assert reader.overflow_reason == "preexisting"
+    assert terminated == []
+
+    pre_exit_terminated = []
+    pre_exit_reader = make_reader(pre_exit_terminated)
+    assert pre_exit_reader._queue_line(raw, after_exit=False) is False
+    assert pre_exit_reader.overflow_reason == expected_reason
+    assert pre_exit_terminated == [True]
+
+
 # ---- bounded output / exact temp-file ownership ----
 
 def test_stream_output_limit_terminates_child_promptly():
@@ -362,6 +638,29 @@ def test_stream_output_limit_terminates_child_promptly():
         list(fp.stream("hi"))
     assert ei.value.kind == "resource_limit"
     assert time.time() - t0 < 5
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_stream_oversized_line_is_resource_limit(async_mode):
+    fp = FakeProvider(
+        "oversized_line",
+        timeout=2,
+        max_stream_line_bytes=128,
+        max_stream_buffer_bytes=1024,
+    )
+
+    with pytest.raises(UnifiedError) as error:
+        if async_mode:
+            import asyncio
+
+            async def run():
+                return [message async for message in fp.astream("hi")]
+
+            asyncio.run(run())
+        else:
+            list(fp.stream("hi"))
+    assert error.value.kind == "resource_limit"
+    assert "line" in (error.value.cause or "")
 
 
 def test_chat_output_limit_is_bounded():
@@ -433,6 +732,155 @@ def test_astream_build_error_cleans_its_temp_scope():
 
 # ---- POSIX process-group cancellation ----
 
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX pipe polling")
+def test_chat_completion_ignores_detached_pipe_holder(monkeypatch, tmp_path):
+    processes = _capture_popen(monkeypatch)
+    pid_file = tmp_path / "holder.pid"
+    fp = FakeProvider(
+        "detached_pipe_holder", timeout=0.2,
+        extra_env={"FAKE_CHILD_PID_FILE": str(pid_file)},
+    )
+    try:
+        started = time.monotonic()
+        assert fp.chat("hi").text == "detached-holder"
+        elapsed = time.monotonic() - started
+        assert elapsed < 0.8, elapsed
+        assert len(processes) == 1
+        _assert_popen_pipes_closed(processes[0])
+    finally:
+        _cleanup_detached_holder(pid_file)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX pipe polling")
+def test_stream_completion_ignores_detached_pipe_holder(monkeypatch, tmp_path):
+    processes = _capture_popen(monkeypatch)
+    pid_file = tmp_path / "holder.pid"
+    fp = FakeProvider(
+        "detached_pipe_holder", timeout=0.2,
+        extra_env={"FAKE_CHILD_PID_FILE": str(pid_file)},
+    )
+    try:
+        started = time.monotonic()
+        texts = [message.text for message in fp.stream("hi")
+                 if message.kind == "text"]
+        elapsed = time.monotonic() - started
+        assert texts == ["detached-holder"]
+        assert elapsed < 0.8, elapsed
+        assert len(processes) == 1
+        _assert_popen_pipes_closed(processes[0])
+    finally:
+        _cleanup_detached_holder(pid_file)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX pipe polling")
+def test_astream_completion_ignores_detached_pipe_holder(monkeypatch, tmp_path):
+    import asyncio
+    pid_file = tmp_path / "holder.pid"
+    fp = FakeProvider(
+        "detached_pipe_holder", timeout=0.2,
+        extra_env={"FAKE_CHILD_PID_FILE": str(pid_file)},
+    )
+    transports = _capture_async_transports(monkeypatch)
+
+    async def run():
+        texts = [message.text async for message in fp.astream("hi")
+                 if message.kind == "text"]
+        await asyncio.sleep(0)
+        current = asyncio.current_task()
+        pending = [task for task in asyncio.all_tasks()
+                   if task is not current and not task.done()]
+        return texts, pending
+
+    try:
+        started = time.monotonic()
+        texts, pending = asyncio.run(run())
+        elapsed = time.monotonic() - started
+        assert texts == ["detached-holder"]
+        assert pending == []
+        assert elapsed < 0.8, elapsed
+        assert len(transports) == 1
+        assert transports[0].is_closing()
+    finally:
+        _cleanup_detached_holder(pid_file)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process exit")
+@pytest.mark.parametrize("api", ["chat", "stream", "astream"])
+def test_continuous_detached_writer_has_absolute_cutoff_without_limit(
+    tmp_path, api
+):
+    pid_file = tmp_path / f"{api}-writer.pid"
+    fp = FakeProvider(
+        "detached_continuous_writer",
+        timeout=0.3,
+        max_output_bytes=256,
+        max_stream_events=3,
+        max_stream_buffer_bytes=1024,
+        extra_env={"FAKE_CHILD_PID_FILE": str(pid_file)},
+    )
+    try:
+        started = time.monotonic()
+        if api == "chat":
+            texts = [fp.chat("hi").text]
+        elif api == "stream":
+            texts = [message.text for message in fp.stream("hi")
+                     if message.kind == "text"]
+        else:
+            import asyncio
+
+            async def run():
+                return [message.text async for message in fp.astream("hi")
+                        if message.kind == "text"]
+
+            texts = asyncio.run(run())
+        elapsed = time.monotonic() - started
+        assert texts and texts[0].startswith("leader")
+        assert len(texts) < 20
+        assert elapsed < 0.8, elapsed
+    finally:
+        _cleanup_detached_holder(pid_file)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX process exit")
+def test_gemini_stream_closes_pipes_with_detached_holder(
+    monkeypatch, tmp_path
+):
+    from unified_cli.providers.gemini import GeminiProvider
+
+    monkeypatch.setenv("UNIFIED_CLI_ENABLE_GEMINI", "1")
+    processes = _capture_popen(monkeypatch)
+    pid_file = tmp_path / "gemini-holder.pid"
+    provider = GeminiProvider(
+        bin_path=sys.executable,
+        timeout=0.2,
+        conversations_dir=str(tmp_path / "conversations"),
+        extra_env={"FAKE_CHILD_PID_FILE": str(pid_file)},
+    )
+    script = r'''
+import os, subprocess, sys
+child = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(5)"],
+    start_new_session=True,
+)
+with open(os.environ["FAKE_CHILD_PID_FILE"], "w") as f:
+    f.write(str(child.pid))
+sys.stdout.write("gemini leader\n")
+sys.stdout.flush()
+'''
+    try:
+        started = time.monotonic()
+        texts = [message.text for message in provider._stream_run(
+            [sys.executable, "-c", script]
+        ) if message.kind == "text"]
+        elapsed = time.monotonic() - started
+        assert texts == ["gemini leader\n"]
+        assert elapsed < 0.8, elapsed
+        assert len(processes) == 1
+        _assert_popen_pipes_closed(processes[0])
+    finally:
+        _cleanup_detached_holder(pid_file)
+
+
 def _wait_for_pid_exit(pid: int, timeout: float = 4) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -457,7 +905,8 @@ def test_stream_abort_kills_descendant_process():
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
-def test_stream_abort_kills_descendant_after_parent_exits():
+def test_stream_abort_kills_descendant_after_parent_exits(monkeypatch):
+    processes = _capture_popen(monkeypatch)
     fp = FakeProvider("spawn_then_exit", timeout=30)
     gen = fp.stream("hi")
     first = next(gen)
@@ -466,6 +915,8 @@ def test_stream_abort_kills_descendant_after_parent_exits():
     time.sleep(0.1)
     gen.close()
     assert _wait_for_pid_exit(pid)
+    assert len(processes) == 1
+    _assert_popen_pipes_closed(processes[0])
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
@@ -483,9 +934,10 @@ def test_astream_abort_kills_descendant_process():
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
-def test_astream_abort_kills_descendant_after_parent_exits():
+def test_astream_abort_kills_descendant_after_parent_exits(monkeypatch):
     import asyncio
     fp = FakeProvider("spawn_then_exit", timeout=30)
+    transports = _capture_async_transports(monkeypatch)
 
     async def run():
         gen = fp.astream("hi")
@@ -495,6 +947,8 @@ def test_astream_abort_kills_descendant_after_parent_exits():
         return int(first.text.split("=", 1)[1])
 
     assert _wait_for_pid_exit(asyncio.run(run()))
+    assert len(transports) == 1
+    assert transports[0].is_closing()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
@@ -513,7 +967,10 @@ def test_chat_timeout_kills_descendant_process(tmp_path):
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")
-def test_chat_completion_retires_descendant_after_parent_exits(tmp_path):
+def test_chat_completion_retires_descendant_after_parent_exits(
+    tmp_path, monkeypatch
+):
+    processes = _capture_popen(monkeypatch)
     pid_file = tmp_path / "child.pid"
     fp = FakeProvider(
         "spawn_then_exit",
@@ -523,6 +980,8 @@ def test_chat_completion_retires_descendant_after_parent_exits(tmp_path):
     fp.chat("hi")
     assert pid_file.exists()
     assert _wait_for_pid_exit(int(pid_file.read_text()))
+    assert len(processes) == 1
+    _assert_popen_pipes_closed(processes[0])
 
 
 # ---- hang-error diagnosis helper ----

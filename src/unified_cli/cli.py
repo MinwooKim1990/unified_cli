@@ -9,6 +9,7 @@ import sys
 import time
 from dataclasses import asdict
 from typing import Optional
+from urllib.parse import quote
 
 from rich.console import Console
 from rich.live import Live
@@ -547,11 +548,34 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     """Launch the localhost dashboard + OpenAI-compatible server."""
     try:
         from .server import run  # lazy (fastapi/uvicorn — optional extra)
+        if getattr(args, "manage", False):
+            from .server import prepare_manage
     except ImportError:
         console.print(f"[red]{t('cli.serve.missing_deps')}[/red]")
         console.print(t("cli.serve.install_hint"))
         return 3
+
+    manage = getattr(args, "manage", False)
+    workspaces = tuple(getattr(args, "workspace", ()) or ())
+    if workspaces and not manage:
+        err_console.print(f"[red]{t('cli.serve.workspace_requires_manage')}[/red]")
+        return 2
+
     url = f"http://127.0.0.1:{args.port}/dashboard"
+    if manage:
+        try:
+            token = prepare_manage(workspaces)
+        except UnifiedError as e:
+            err_console.print(f"[red]{escape(str(e))}[/red]")
+            return 2
+        except (OSError, TypeError, ValueError):
+            # The backend validates paths as its final authority.  Keep a
+            # malformed workspace from becoming a CLI traceback if a backend
+            # implementation raises a built-in validation error instead.
+            err_console.print(f"[red]{t('cli.serve.invalid_workspace')}[/red]")
+            return 2
+        url = f"{url}#bootstrap={quote(token, safe='')}"
+
     console.print(t("cli.serve.starting", url=url))
     if args.open:
         try:
@@ -560,9 +584,18 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         except Exception:  # noqa: BLE001 - opening a browser is best-effort
             pass
     try:
-        run(host="127.0.0.1", port=args.port)
+        if manage:
+            run(host="127.0.0.1", port=args.port,
+                manage=True, workspaces=workspaces)
+        else:
+            run(host="127.0.0.1", port=args.port)
     except UnifiedError as e:
         console.print(f"[red]{escape(str(e))}[/red]")
+        return 2
+    except OSError:
+        # `run()` failures occur after workspace preparation; report them as
+        # bind/start failures instead of incorrectly blaming a workspace.
+        err_console.print(f"[red]{t('cli.serve.server_start_failed')}[/red]")
         return 2
     return 0
 
@@ -751,9 +784,15 @@ def main(argv: list[str] | None = None) -> int:
                          help=t("cli.help.serve.port"))
     p_serve.add_argument("--open", action="store_true",
                          help=t("cli.help.serve.open"))
+    p_serve.add_argument("--manage", action="store_true",
+                         help=t("cli.help.serve.manage"))
+    p_serve.add_argument("--workspace", action="append", default=[], metavar="PATH",
+                         help=t("cli.help.serve.workspace"))
     p_serve.set_defaults(func=_cmd_serve)
 
     ns = parser.parse_args(raw)
+    if ns.cmd == "serve" and ns.workspace and not ns.manage:
+        parser.error(t("cli.serve.workspace_requires_manage"))
     # Apply --lang from the parsed namespace too (covers `--lang=ko` placed
     # after the subcommand, which the prescan above still catches, plus keeps
     # the override authoritative for the command body).
