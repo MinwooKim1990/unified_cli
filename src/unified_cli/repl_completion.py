@@ -9,52 +9,38 @@ missing — the REPL then falls back to plain `input()`.
 
 from __future__ import annotations
 
-import threading
-from dataclasses import dataclass
+import unicodedata
 from typing import Optional
 
 from . import models
 from .i18n import t
 from .models import DEFAULT_MODELS
 from .providers.gemini import gemini_enabled
+from .repl_commands import CommandSpec, DEFAULT_REGISTRY
 
 _PROVIDERS = ("claude", "codex", "gemini")
 
 
 # ---------- slash command registry (single source of truth) ----------
 
-@dataclass(frozen=True)
-class SlashCommand:
-    name: str                 # "/model"
-    arg_hint: str             # "<name>" or ""
-    desc_key: str             # i18n key for the description
-    takes: Optional[str] = None  # None | "model" | "provider" | "lang" | "path" | "int"
-    group: str = "info"       # for grouping in /help
-
-
-SLASH_COMMANDS: list[SlashCommand] = [
-    SlashCommand("/help", "", "slash.desc.help", group="info"),
-    SlashCommand("/model", "<name>", "slash.desc.model", takes="model", group="model"),
-    SlashCommand("/provider", "<claude|codex|gemini>", "slash.desc.provider", takes="provider", group="model"),
-    SlashCommand("/image", "<path>", "slash.desc.image", takes="path", group="image"),
-    SlashCommand("/images", "", "slash.desc.images", group="image"),
-    SlashCommand("/clear-images", "", "slash.desc.clear-images", group="image"),
-    SlashCommand("/new", "", "slash.desc.new", group="session"),
-    SlashCommand("/resume", "", "slash.desc.resume", group="session"),
-    SlashCommand("/save", "", "slash.desc.save", group="session"),
-    SlashCommand("/history", "[N]", "slash.desc.history", takes="int", group="session"),
-    SlashCommand("/tokens", "", "slash.desc.tokens", group="info"),
-    SlashCommand("/doctor", "", "slash.desc.doctor", group="info"),
-    SlashCommand("/status", "", "slash.desc.status", group="info"),
-    SlashCommand("/lang", "<en|ko>", "slash.desc.lang", takes="lang", group="info"),
-    SlashCommand("/exit", "", "slash.desc.exit", group="session"),
+# Historical import name retained for downstream completers/tests.
+SlashCommand = CommandSpec
+SLASH_COMMANDS: list[CommandSpec] = [
+    CommandSpec(
+        name=name,
+        arg_hint=command.arg_hint if name == command.name else "",
+        desc_key=command.desc_key,
+        takes=command.takes,
+        group=command.group,
+    )
+    for command in DEFAULT_REGISTRY.commands
+    for name in command.all_names
 ]
-
-_BY_NAME = {c.name: c for c in SLASH_COMMANDS}
+_BY_NAME = {command.name: command for command in SLASH_COMMANDS}
 
 
 def command_names() -> list[str]:
-    return [c.name for c in SLASH_COMMANDS]
+    return DEFAULT_REGISTRY.names(include_aliases=True)
 
 
 # ---------- model source (never blocks the prompt) ----------
@@ -62,7 +48,7 @@ def command_names() -> list[str]:
 def cached_or_hardcoded(provider: str) -> list:
     """Return a model list *instantly*: the warm TTL cache if present, else the
     hardcoded fallback. Never triggers a network/subprocess call on the UI
-    thread (use warm_models_async to populate the cache in the background).
+    thread (an explicit caller may use ``warm_models_async`` to refresh it).
     """
     cached = models._cached(provider)  # type: ignore[arg-type]
     if cached is not None:
@@ -70,12 +56,15 @@ def cached_or_hardcoded(provider: str) -> list:
     return models._hardcoded(provider)  # type: ignore[arg-type]
 
 
-def warm_models_async(providers=("claude", "codex")) -> threading.Thread:
-    """Populate the model cache in a daemon thread so the first /model is warm.
+def warm_models_async(providers=("claude", "codex")):
+    """Explicitly refresh model caches in a daemon thread.
 
-    Gemini is excluded by default — `agy models` is a subprocess that may not
-    be wanted (provider is gated) and can take seconds; warm it lazily instead.
+    Kept as a compatibility API, but the REPL never calls it at startup.  A
+    caller must opt in explicitly because model listing may access files,
+    network services, or provider subprocesses.
     """
+    import threading
+
     def _warm():
         for p in providers:
             try:
@@ -93,7 +82,11 @@ def warm_models_async(providers=("claude", "codex")) -> threading.Thread:
 def slash_candidates(token: str) -> list:
     """[(name, description)] for slash commands whose name starts with `token`."""
     token = token.strip()
-    return [(c.name, t(c.desc_key)) for c in SLASH_COMMANDS if c.name.startswith(token)]
+    return [
+        (command.name, t(command.desc_key))
+        for command in SLASH_COMMANDS
+        if command.name.startswith(token)
+    ]
 
 
 def _provider_meta(provider: str) -> str:
@@ -102,7 +95,9 @@ def _provider_meta(provider: str) -> str:
     return ""
 
 
-def arg_candidates(cmd: str, provider: str, token: str) -> list:
+def arg_candidates(
+    cmd: str, provider: str, token: str, full_argument: Optional[str] = None
+) -> list:
     """[(value, meta)] for the argument of a slash command.
 
     - /provider → the three providers (gemini marked locked when gated)
@@ -114,19 +109,67 @@ def arg_candidates(cmd: str, provider: str, token: str) -> list:
         return [(p, _provider_meta(p)) for p in _PROVIDERS if p.startswith(tok)]
     if cmd == "/lang":
         return [(c, "") for c in ("en", "ko") if c.startswith(tok)]
+    if cmd == "/auth":
+        words = (full_argument or token or "").split()
+        trailing_space = bool(full_argument and full_argument.endswith(" "))
+        if len(words) <= 1 and not trailing_space:
+            return [
+                (value, "") for value in ("status", "login", "logout")
+                if value.startswith(tok)
+            ]
+        return [(value, "") for value in _PROVIDERS if value.startswith(tok)]
+    if cmd == "/web":
+        return [(c, "") for c in ("default", "on", "off") if c.startswith(tok)]
+    if cmd == "/multiline":
+        return [(c, "") for c in ("on", "off") if c.startswith(tok)]
+    if cmd == "/reasoning":
+        return [(c, "") for c in ("hidden", "summary") if c.startswith(tok)]
+    if cmd == "/theme":
+        return [(c, "") for c in ("auto", "dark", "light") if c.startswith(tok)]
+    if cmd == "/timeout":
+        return [("default", "")] if "default".startswith(tok) else []
+    if cmd == "/permissions":
+        return [
+            (value, "")
+            for value in ("provider_default", "read_only", "workspace_write")
+            if value.startswith(tok)
+        ]
+    if cmd == "/effort":
+        return [
+            (value, "")
+            for value in ("default", "low", "medium", "high", "xhigh", "max")
+            if value.startswith(tok)
+        ]
+    if cmd == "/style":
+        return [
+            (value, "")
+            for value in ("default", "friendly", "pragmatic", "none")
+            if value.startswith(tok)
+        ]
+    if cmd == "/system":
+        return [(value, "") for value in ("default", "clear") if value.startswith(tok)]
+    if cmd == "/add-dir":
+        return [("clear", "")] if "clear".startswith(tok) else []
     if cmd == "/model":
+        refresh = [("--refresh", t("repl.model.refresh_meta"))]
+        if tok.startswith("-"):
+            return refresh if "--refresh".startswith(tok) else []
+        # Completion must remain terminal-local and instantaneous.  Extension
+        # model listing is only performed by an explicit `/model --refresh`.
+        if provider not in _PROVIDERS:
+            return []
         default_id = DEFAULT_MODELS.get(provider)  # type: ignore[arg-type]
         locked = provider == "gemini" and not gemini_enabled()
         out: list = []
         seen: set = set()
         for m in cached_or_hardcoded(provider):
             mid = getattr(m, "id", None)
-            if not mid or mid in seen:
+            if not _safe_model_id(mid) or mid in seen:
                 continue
             seen.add(mid)
             if tok and not mid.lower().startswith(tok):
                 continue
-            meta = getattr(m, "display_name", "") or ""
+            meta = _safe_display_meta(getattr(m, "display_name", "") or "")
             if getattr(m, "default", False) or mid == default_id:
                 meta = (meta + " ★").strip()
             if locked:
@@ -174,26 +217,150 @@ class UnifiedCompleter(Completer):  # type: ignore[misc]
             return
         last = "" if (arg == "" or arg.endswith(" ")) else arg.split()[-1]
         provider = self.current.get("provider", "claude")
-        for value, meta in arg_candidates(cmd, provider, last):
+        for value, meta in arg_candidates(cmd, provider, last, arg):
             yield Completion(value, start_position=-len(last), display_meta=meta)
 
 
-def build_session(history_path, current: dict):
-    """Construct a prompt_toolkit PromptSession with live slash completion."""
+def build_session(history_path, current: dict, *, input=None, output=None):
+    """Construct a PromptSession with safe multiline keys and a live toolbar.
+
+    Enter always submits.  Alt/Option+Enter and Ctrl+J insert a newline.  The
+    latter is registered as an escape-prefixed key where terminal encodings
+    permit it; unsupported terminals simply retain their normal behavior.
+    """
     from prompt_toolkit import PromptSession
     from prompt_toolkit.completion import FuzzyCompleter
-    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.history import FileHistory, InMemoryHistory
+    from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.shortcuts import CompleteStyle
 
+    bindings = KeyBindings()
+
+    @bindings.add("escape", "enter")
+    def _alt_enter(event):
+        if current.get("multiline", True):
+            event.current_buffer.insert_text("\n")
+
+    # Ctrl+J is LF, distinct from Enter/CR on terminals that preserve it.
+    @bindings.add("c-j")
+    def _ctrl_j(event):
+        if current.get("multiline", True):
+            event.current_buffer.insert_text("\n")
+
+    history = FileHistory(str(history_path)) if history_path is not None else InMemoryHistory()
     return PromptSession(
-        history=FileHistory(str(history_path)),
+        history=history,
         completer=FuzzyCompleter(UnifiedCompleter(current)),
         complete_while_typing=True,
         complete_style=CompleteStyle.MULTI_COLUMN,
+        key_bindings=bindings,
+        multiline=False,
+        bottom_toolbar=lambda: _bottom_toolbar(current),
+        input=input,
+        output=output,
     )
 
 
-def pick_model(provider: str) -> Optional[str]:
+def _bottom_toolbar(current: dict) -> str:
+    """Narrow-terminal-friendly, markup-free status line."""
+    from pathlib import Path
+    import shutil
+    from .usage import tracker
+
+    provider = _toolbar_piece(current.get("provider", "?"), 14)
+    model = _toolbar_piece(current.get("model", "?"), 20)
+    cwd_value = str(current.get("cwd") or "")
+    cwd = _toolbar_piece(Path(cwd_value).name or cwd_value or ".", 18)
+    permission = _toolbar_piece(current.get("permission_mode", "provider_default"), 16)
+    if current.get("web_explicit", True):
+        web = "web:on" if current.get("web_search", True) else "web:off"
+    else:
+        web = "web:default"
+    context = "ctx:" + str(current.get("context_window", 8))
+    totals = sum(a.input_tokens + a.output_tokens for a in tracker.aggregates())
+    latency = current.get("last_latency_ms", 0)
+    line = (
+        provider + "/" + model + "  " + cwd + "  perm:" + permission + "  "
+        + web + "  " + context + "  tok:" + str(totals) + "  "
+        + ("lat:" + str(latency) + "ms" if latency else "lat:—")
+    )
+    # Leave one cell for prompt_toolkit's terminal bookkeeping, but never use
+    # a wider floor than the terminal actually reports.
+    columns = max(1, shutil.get_terminal_size(fallback=(120, 24)).columns - 1)
+    return _truncate_display_width(line, columns)
+
+
+def _toolbar_piece(value: object, limit: int) -> str:
+    # Prompt-toolkit receives plain text, but terminal control characters still
+    # need removal because model/cwd values can be user-controlled.
+    from .event_renderer import safe_terminal_text
+    text = safe_terminal_text(value, max_chars=max(256, limit * 4))
+    return _truncate_display_width(text, limit)
+
+
+def _display_width(value: str) -> int:
+    """Return terminal-cell width for sanitized toolbar text.
+
+    East Asian wide/fullwidth characters take two cells; combining marks take
+    none. Ambiguous-width characters deliberately retain the portable width of
+    one cell, matching prompt_toolkit's conservative terminal behavior.
+    """
+    width = 0
+    for char in value:
+        if unicodedata.combining(char):
+            continue
+        width += 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+    return width
+
+
+def _truncate_display_width(value: str, limit: int) -> str:
+    """Clip sanitized text to ``limit`` terminal cells with an ellipsis."""
+    if limit <= 0:
+        return ""
+    if _display_width(value) <= limit:
+        return value
+    ellipsis = "…"
+    available = max(0, limit - _display_width(ellipsis))
+    out: list[str] = []
+    width = 0
+    for char in value:
+        char_width = 0 if unicodedata.combining(char) else (
+            2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+        )
+        if char_width == 0:
+            # Do not leave a leading combining mark to attach to the ellipsis.
+            if out:
+                out.append(char)
+            continue
+        if width + char_width > available:
+            break
+        out.append(char)
+        width += char_width
+    return "".join(out) + ellipsis
+
+
+def _safe_model_id(value: object) -> bool:
+    if type(value) is not str or not value or len(value) > 512:
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    if any(
+        unicodedata.category(char).startswith("C")
+        or unicodedata.category(char) in {"Zl", "Zp"}
+        for char in value
+    ):
+        return False
+    return True
+
+
+def _safe_display_meta(value: object) -> str:
+    from .event_renderer import safe_terminal_text
+    return safe_terminal_text(value, max_chars=512)
+
+
+def pick_model(provider: str, choices: Optional[list] = None) -> Optional[str]:
     """Interactive model selector (used by `/model` with no arg). Returns the
     chosen id, or None if cancelled. Default is preselected.
     """
@@ -205,13 +372,16 @@ def pick_model(provider: str) -> Optional[str]:
     values = []
     seen: set = set()
     preselect = None
-    for m in cached_or_hardcoded(provider):
+    model_choices = choices
+    if model_choices is None:
+        model_choices = cached_or_hardcoded(provider) if provider in _PROVIDERS else []
+    for m in model_choices:
         mid = getattr(m, "id", None)
-        if not mid or mid in seen:
+        if not _safe_model_id(mid) or mid in seen:
             continue
         seen.add(mid)
         label = mid
-        disp = getattr(m, "display_name", "") or ""
+        disp = _safe_display_meta(getattr(m, "display_name", "") or "")
         if disp and disp != mid:
             label = f"{mid}  —  {disp}"
         if getattr(m, "default", False) or mid == default_id:

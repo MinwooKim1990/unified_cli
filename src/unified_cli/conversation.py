@@ -31,6 +31,44 @@ class Turn:
     timestamp: float = field(default_factory=time.time)
 
 
+_FINAL_TEXT_ENVELOPES = frozenset((
+    "assistant", "message.completed", "response.completed",
+))
+
+
+def _append_novel_stream_text(chunks: list[str], message: Message) -> None:
+    """Accumulate text while reconciling explicit cumulative final envelopes.
+
+    Most provider messages are deltas and are always retained.  A small set of
+    raw markers identifies authoritative final text; only then do we remove an
+    already-recorded prefix.  Prefix comparison walks the existing chunks so
+    it does not build an extra unbounded copy of the transcript.
+    """
+    text = message.text
+    if not isinstance(text, str) or not text:
+        return
+    raw = message.raw
+    explicitly_final = isinstance(raw, dict) and (
+        raw.get("final") is True
+        or raw.get("partial") is False
+        or raw.get("type") in _FINAL_TEXT_ENVELOPES
+    )
+    if not explicitly_final or not chunks:
+        chunks.append(text)
+        return
+
+    offset = 0
+    for chunk in chunks:
+        end = offset + len(chunk)
+        if end > len(text) or text[offset:end] != chunk:
+            # This is a separate final block, not a cumulative replay.
+            chunks.append(text)
+            return
+        offset = end
+    if offset < len(text):
+        chunks.append(text[offset:])
+
+
 class UnifiedConversation:
     """Multi-turn conversation across one or more providers.
 
@@ -47,6 +85,7 @@ class UnifiedConversation:
         default_model: Optional[str] = None,
         sticky: bool = False,
         context_window: int = 8,
+        cross_provider_context: bool = True,
         provider_opts: Optional[dict] = None,
         provider_opts_by_provider: Optional[dict[ProviderId, dict]] = None,
         max_turns: Optional[int] = None,
@@ -61,10 +100,13 @@ class UnifiedConversation:
         ):
             if value is not None and value < 1:
                 raise ValueError(f"{name} must be at least 1 when set")
+        if type(cross_provider_context) is not bool:
+            raise ValueError("cross_provider_context must be a boolean")
         self.default_provider = default_provider
         self.default_model = default_model
         self.sticky = sticky
         self.context_window = context_window
+        self.cross_provider_context = cross_provider_context
         self.provider_opts = provider_opts or {}
         # Global provider_opts remain the backwards-compatible default. A
         # caller with genuinely provider-specific flags (notably the local
@@ -129,7 +171,7 @@ class UnifiedConversation:
 
     def _context_prefix_if_switch(self, provider: ProviderId) -> str:
         """Build a short '<prior-context>' prefix when switching providers."""
-        if not self.turns:
+        if not self.cross_provider_context or not self.turns:
             return ""
         last_provider = self.turns[-1].provider
         if last_provider == provider:
@@ -204,8 +246,8 @@ class UnifiedConversation:
                 session_id=native_session,
                 images=images,
             ):
-                if msg.kind == "text" and msg.text:
-                    chunks.append(msg.text)
+                if msg.kind == "text":
+                    _append_novel_stream_text(chunks, msg)
                 if msg.kind == "session" and msg.session_id:
                     session_id = msg.session_id
                     # Persist immediately: a consumer that stops early (Ctrl+C,
@@ -264,8 +306,8 @@ class UnifiedConversation:
                 session_id=native_session,
                 images=images,
             ):
-                if msg.kind == "text" and msg.text:
-                    chunks.append(msg.text)
+                if msg.kind == "text":
+                    _append_novel_stream_text(chunks, msg)
                 if msg.kind == "session" and msg.session_id:
                     session_id = msg.session_id
                     self.sessions[prov] = session_id  # persist eagerly (see stream())

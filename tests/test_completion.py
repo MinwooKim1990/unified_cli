@@ -79,6 +79,44 @@ def test_arg_candidates_lang():
     assert vals == ["en", "ko"]
 
 
+def test_arg_candidates_auth_is_explicit_provider_second():
+    actions = [v for v, _ in rc.arg_candidates("/auth", "claude", "", "")]
+    assert actions == ["status", "login", "logout"]
+    providers = [
+        v for v, _ in rc.arg_candidates("/auth", "claude", "co", "status co")
+    ]
+    assert providers == ["codex"]
+
+
+def test_model_refresh_completion_is_explicit_only():
+    assert rc.arg_candidates("/model", "claude", "--") == [
+        ("--refresh", rc.t("repl.model.refresh_meta"))
+    ]
+
+
+def test_capability_completions_are_canonical_and_complete():
+    permissions = [
+        value for value, _ in rc.arg_candidates("/permissions", "claude", "")
+    ]
+    assert permissions == ["provider_default", "read_only", "workspace_write"]
+    assert "full" not in permissions
+    assert [value for value, _ in rc.arg_candidates("/effort", "claude", "")] == [
+        "default", "low", "medium", "high", "xhigh", "max",
+    ]
+    assert [value for value, _ in rc.arg_candidates("/web", "claude", "")] == [
+        "default", "on", "off",
+    ]
+
+
+def test_toolbar_distinguishes_provider_managed_web():
+    toolbar = rc._bottom_toolbar({
+        "provider": "claude", "model": "haiku", "cwd": "/tmp",
+        "permission_mode": "provider_default", "web_search": True,
+        "web_explicit": False,
+    })
+    assert "web:default" in toolbar
+
+
 def test_has_prompt_toolkit_returns_bool():
     assert isinstance(rc.has_prompt_toolkit(), bool)
 
