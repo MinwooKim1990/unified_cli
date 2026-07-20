@@ -10,6 +10,9 @@ from typing import Literal, Optional, Union
 
 
 ProviderName = Literal["claude", "codex", "gemini"]
+# ``ProviderName`` remains the backwards-compatible type for the three
+# built-ins. Extension-facing APIs use this deliberately broader identifier.
+ProviderId = str
 MessageKind = Literal[
     "text",          # assistant text chunk or complete text
     "reasoning",     # provider's thinking (Codex reasoning, Claude thinking)
@@ -37,7 +40,7 @@ class Message:
     """Normalized streaming event — one of these per provider output item."""
 
     kind: MessageKind
-    provider: ProviderName
+    provider: ProviderId
     text: Optional[str] = None
     tool: Optional[dict] = None
     session_id: Optional[str] = None
@@ -52,7 +55,7 @@ class Response:
 
     text: str
     session_id: str
-    provider: ProviderName
+    provider: ProviderId
     model: str
     usage: Usage
     messages: list[Message]
@@ -64,11 +67,11 @@ class ModelInfo:
     """One entry in `list_models()`."""
 
     id: str
-    provider: ProviderName
+    provider: ProviderId
     display_name: str = ""
     default: bool = False
     deprecated: bool = False
-    source: Literal["api", "cache", "hardcoded"] = "hardcoded"
+    source: Literal["api", "cache", "hardcoded", "plugin"] = "hardcoded"
 
 
 # ---- image attachments ----

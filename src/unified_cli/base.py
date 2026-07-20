@@ -17,7 +17,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Callable, ClassVar, Iterator, Optional, Union
 
-from .core import Message, ModelInfo, ProviderName, Response, Usage
+from .core import Message, ModelInfo, ProviderId, Response, Usage
 from .errors import UnifiedError, classify
 from .i18n import t
 from .usage import tracker as _usage_tracker
@@ -378,7 +378,7 @@ class BaseProvider(ABC):
       - `_default_env()` → dict of env vars to set (subclass-specific)
     """
 
-    name: ClassVar[ProviderName]
+    name: ClassVar[ProviderId]
     default_model: ClassVar[str]
     api_key_env: ClassVar[str]       # e.g., "ANTHROPIC_API_KEY"
     # Some subscription CLIs are OAuth-only. Such providers still expose an

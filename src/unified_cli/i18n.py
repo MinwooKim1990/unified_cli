@@ -217,6 +217,15 @@ _EN = {
     "cli.models.col.display": "display",
     "cli.models.col.default": "default",
     "cli.models.col.source": "source",
+    # providers
+    "cli.help.providers": "List built-in and optional provider extensions",
+    "cli.help.providers.include_ext": "Include extension entry-point metadata (does not load plugin code)",
+    "cli.help.providers.json": "JSON output",
+    "cli.providers.title": "Provider registry",
+    "cli.providers.col.id": "provider",
+    "cli.providers.col.source": "source",
+    "cli.providers.col.status": "status",
+    "cli.providers.col.default": "default model",
     # durable preferences
     "cli.help.config": "View or update durable CLI preferences",
     "cli.help.config.default_provider": "View or set the provider used when none is specified",
@@ -408,6 +417,8 @@ _EN = {
     "err.factory.cannot_route": "Could not infer a provider for model '{model}'.",
     "err.factory.cannot_route.hint": "Use the `provider/model` form (e.g. claude/haiku) or a known prefix "
                                      "(claude-, gpt-, gemini-, haiku/sonnet/opus).",
+    "err.plugin.runtime": "Provider extension '{provider}' failed.",
+    "err.plugin.runtime.hint": "Check the provider extension installation and its private logs.",
 
     # ===== providers: login hints + install hints =====
     "err.claude.login_hint": "Re-run `claude /login`.",
@@ -573,6 +584,15 @@ _KO = {
     "cli.models.col.display": "표시명",
     "cli.models.col.default": "기본",
     "cli.models.col.source": "출처",
+    # providers
+    "cli.help.providers": "내장 provider 및 선택적 확장 목록",
+    "cli.help.providers.include_ext": "확장 entry point 메타데이터 포함 (plugin 코드는 로드하지 않음)",
+    "cli.help.providers.json": "JSON 출력",
+    "cli.providers.title": "Provider 레지스트리",
+    "cli.providers.col.id": "provider",
+    "cli.providers.col.source": "출처",
+    "cli.providers.col.status": "상태",
+    "cli.providers.col.default": "기본 모델",
     # 지속 설정
     "cli.help.config": "지속 저장되는 CLI 설정 조회 또는 변경",
     "cli.help.config.default_provider": "provider 미지정 시 사용할 provider 조회 또는 설정",
@@ -759,6 +779,8 @@ _KO = {
     "err.factory.cannot_route": "모델 '{model}' 의 provider 를 추론할 수 없습니다.",
     "err.factory.cannot_route.hint": "`provider/model` 형식 (예: claude/haiku) 또는 알려진 접두사 "
                                      "(claude-, gpt-, gemini-, haiku/sonnet/opus) 을 사용하세요.",
+    "err.plugin.runtime": "Provider 확장 '{provider}' 실행에 실패했습니다.",
+    "err.plugin.runtime.hint": "Provider 확장 설치 상태와 비공개 로그를 확인하세요.",
 
     # ===== providers =====
     "err.claude.login_hint": "`claude /login` 을 재실행하세요.",

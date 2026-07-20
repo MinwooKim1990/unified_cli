@@ -16,7 +16,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from . import i18n, settings
-from .core import ProviderName
+from .core import ProviderId, ProviderName
 from .errors import UnifiedError
 from .factory import create, route
 from .i18n import t
@@ -180,7 +180,11 @@ def _cmd_status(args: argparse.Namespace) -> int:
 # ----- models -----
 
 def _cmd_models(args: argparse.Namespace) -> int:
-    mods = list_models(args.provider, force_refresh=args.refresh)
+    try:
+        mods = list_models(args.provider, force_refresh=args.refresh)
+    except UnifiedError as exc:
+        err_console.print(f"[red]{escape(str(exc))}[/red]")
+        return 2
     if args.json:
         print(json.dumps(
             [{"id": m.id, "provider": m.provider, "display_name": m.display_name,
@@ -203,13 +207,58 @@ def _cmd_models(args: argparse.Namespace) -> int:
     return 0
 
 
+# ----- providers -----
+
+def _cmd_providers(args: argparse.Namespace) -> int:
+    # Registry import is intentionally command-local.  Parser construction,
+    # --help, and --version therefore cannot trigger entry-point discovery.
+    from .registry import list_providers
+
+    try:
+        descriptors = list_providers(include_ext=args.include_ext)
+    except UnifiedError as exc:
+        err_console.print(f"[red]{escape(str(exc))}[/red]")
+        return 2
+    if args.json:
+        print(json.dumps([
+            {
+                "id": item.id,
+                "source": item.source,
+                "status": item.status,
+                "default_model": item.default_model,
+                "capabilities": sorted(item.capabilities),
+                "route_prefixes": list(item.route_prefixes),
+                "server_policy": (
+                    asdict(item.server_policy) if item.server_policy else None
+                ),
+                "error": item.error,
+            }
+            for item in descriptors
+        ], ensure_ascii=False, indent=2))
+        return 0
+
+    tbl = Table(title=t("cli.providers.title"), show_lines=False,
+                header_style="bold cyan")
+    tbl.add_column(t("cli.providers.col.id"), style="bold")
+    tbl.add_column(t("cli.providers.col.source"))
+    tbl.add_column(t("cli.providers.col.status"))
+    tbl.add_column(t("cli.providers.col.default"))
+    for item in descriptors:
+        tbl.add_row(
+            escape(item.id), item.source, item.status,
+            escape(item.default_model or "-"),
+        )
+    console.print(tbl)
+    return 0
+
+
 # ----- chat -----
 
 def _resolve_session_flags(
     args: argparse.Namespace,
-    routed_provider: Optional[ProviderName],
+    routed_provider: Optional[ProviderId],
     routed_model: Optional[str],
-) -> tuple[Optional[ProviderName], Optional[str], Optional[str], Optional[str]]:
+) -> tuple[Optional[ProviderId], Optional[str], Optional[str], Optional[str]]:
     """Resolve session flags to (provider, model, session_id, saved_cwd).
 
     Rules:
@@ -619,12 +668,22 @@ def main(argv: list[str] | None = None) -> int:
     p_stat.set_defaults(func=_cmd_status)
 
     p_mod = _add("models", help=t("cli.help.models"))
-    p_mod.add_argument("provider", nargs="?", choices=["claude", "codex", "gemini"],
+    p_mod.add_argument("provider", nargs="?",
                        help=t("cli.help.models.provider"))
     p_mod.add_argument("--refresh", action="store_true",
                        help=t("cli.help.models.refresh"))
     p_mod.add_argument("--json", action="store_true", help=t("cli.help.models.json"))
     p_mod.set_defaults(func=_cmd_models)
+
+    p_providers = _add("providers", help=t("cli.help.providers"))
+    p_providers.add_argument(
+        "--include-ext", action="store_true",
+        help=t("cli.help.providers.include_ext"),
+    )
+    p_providers.add_argument(
+        "--json", action="store_true", help=t("cli.help.providers.json"),
+    )
+    p_providers.set_defaults(func=_cmd_providers)
 
     p_config = _add("config", help=t("cli.help.config"))
     config_sub = p_config.add_subparsers(dest="config_cmd", required=True)

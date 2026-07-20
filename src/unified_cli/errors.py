@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass
 from typing import Literal, Optional
 
-from .core import ProviderName
+from .core import ProviderId, ProviderName
 from .i18n import t
 
 
@@ -38,7 +38,7 @@ class UnifiedError(Exception):
     """Structured error surfaced by the unified wrapper."""
 
     kind: ErrorKind
-    provider: ProviderName
+    provider: ProviderId
     message: str
     hint: str = ""
     cause: str = ""
@@ -174,7 +174,7 @@ MATCHERS: dict[ProviderName, list[_Matcher]] = {
 
 
 def classify(
-    provider: ProviderName,
+    provider: ProviderId,
     stderr: str = "",
     stdout: str = "",
     exitcode: Optional[int] = None,
@@ -185,7 +185,18 @@ def classify(
     `kind="internal"` if nothing matches.
     """
     haystack = (stderr or "") + "\n" + (stdout or "")
-    for pattern, kind, hint_key in MATCHERS[provider]:
+    matchers = MATCHERS.get(provider)  # type: ignore[arg-type]
+    if matchers is None:
+        # Extension output is untrusted and has no core-owned matcher table.
+        # Do not reflect its stderr/stdout through the normal ``cause`` field.
+        return UnifiedError(
+            kind="internal",
+            provider=provider,
+            message=t("err.plugin.runtime", provider=provider),
+            hint=t("err.plugin.runtime.hint"),
+            cause="extension provider process failed",
+        )
+    for pattern, kind, hint_key in matchers:
         if pattern.search(haystack):
             return UnifiedError(
                 kind=kind,

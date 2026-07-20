@@ -22,7 +22,7 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-from .core import ModelInfo, ProviderName
+from .core import ModelInfo, ProviderId, ProviderName
 
 
 DEFAULT_MODELS: dict[ProviderName, str] = {
@@ -211,17 +211,25 @@ _LISTERS = {"claude": _list_claude, "codex": _list_codex, "gemini": _list_gemini
 
 
 def list_models(
-    provider: Optional[ProviderName] = None,
+    provider: Optional[ProviderId] = None,
     *,
     force_refresh: bool = False,
 ) -> list[ModelInfo]:
     """Return available models for a provider, or all providers combined."""
     if provider:
+        if provider not in _LISTERS:
+            # An extension model listing is always explicit and loads exactly
+            # that provider. Extension listers own any cache/refresh policy;
+            # core's ``force_refresh`` flag applies only to built-ins.
+            from .registry import list_extension_models
+            return list_extension_models(provider)
         if not force_refresh:
-            cached = _cached(provider)
+            cached = _cached(provider)  # type: ignore[arg-type]
             if cached is not None:
                 return cached
-        return _store(provider, _LISTERS[provider]())
+        return _store(  # type: ignore[arg-type]
+            provider, _LISTERS[provider](),  # type: ignore[index]
+        )
 
     out: list[ModelInfo] = []
     for p in ("claude", "codex", "gemini"):  # type: ignore[assignment]
