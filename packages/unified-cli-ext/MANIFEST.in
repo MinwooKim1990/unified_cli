@@ -1,0 +1,4 @@
+include README.md README.ko.md CHANGELOG.md LICENSE
+recursive-include src/unified_cli_ext *.py py.typed
+recursive-include tests *.py
+global-exclude __pycache__ *.py[cod]

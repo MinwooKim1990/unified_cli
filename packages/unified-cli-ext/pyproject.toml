@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unified-cli-ext"
+version = "0.1.0"
+description = "Hardened transport and runtime contracts for unified-cli extensions."
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Minwoo Kim", email = "kimminwoo190@gmail.com" },
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "unified-cli>=0.5,<0.6",
+]
+
+[project.optional-dependencies]
+acp = [
+    "agent-client-protocol>=0.11,<0.12; python_version >= '3.10' and python_version < '3.15'",
+]
+mcp = [
+    "mcp>=1.27,<2; python_version >= '3.10'",
+]
+all = [
+    "agent-client-protocol>=0.11,<0.12; python_version >= '3.10' and python_version < '3.15'",
+    "mcp>=1.27,<2; python_version >= '3.10'",
+]
+dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/MinwooKim1990/unified_cli"
+Repository = "https://github.com/MinwooKim1990/unified_cli"
+Issues = "https://github.com/MinwooKim1990/unified_cli/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["unified_cli_ext*"]
+
+[tool.setuptools.package-data]
+unified_cli_ext = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
