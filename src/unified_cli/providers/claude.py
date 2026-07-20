@@ -36,6 +36,7 @@ class ClaudeProvider(BaseProvider):
     # resolved via i18n at USE time — see _terse_rule() — so the active language
     # wins; class-body strings evaluate before set_lang() can run.
     _TERSE_RULE = "답변은 질문이 요구하는 만큼만 간결하게 하세요. 추가 설명은 요청받을 때만 덧붙이세요."
+    _EFFORT_VALUES = frozenset(("low", "medium", "high", "xhigh", "max"))
 
     @classmethod
     def _terse_rule(cls) -> str:
@@ -49,6 +50,7 @@ class ClaudeProvider(BaseProvider):
         allowed_tools: Optional[list[str]] = None,
         disallowed_tools: Optional[list[str]] = None,
         permission_mode: Optional[str] = None,
+        effort: Optional[str] = None,
         add_dirs: Optional[list[str]] = None,
         safe_mode: bool = False,
         tools: Optional[list[str]] = None,
@@ -62,6 +64,13 @@ class ClaudeProvider(BaseProvider):
         self.allowed_tools = list(allowed_tools or [])
         self.disallowed_tools = list(disallowed_tools or [])
         self.permission_mode = permission_mode
+        if effort is not None and (
+            type(effort) is not str or effort not in self._EFFORT_VALUES
+        ):
+            raise ValueError(
+                "Claude effort must be one of: low, medium, high, xhigh, max"
+            )
+        self.effort = effort
         self.add_dirs = list(add_dirs or [])
         self.safe_mode = safe_mode
         self.tools = None if tools is None else list(tools)
@@ -137,6 +146,8 @@ class ClaudeProvider(BaseProvider):
             args += ["--disallowedTools", ",".join(self.disallowed_tools)]
         if self.permission_mode:
             args += ["--permission-mode", self.permission_mode]
+        if self.effort:
+            args += ["--effort", self.effort]
         for d in self.add_dirs:
             args += ["--add-dir", d]
 

@@ -257,6 +257,16 @@ def test_context_prefix_skips_empty_placeholder_turn():
     assert "real q" in prefix and "real a" in prefix                 # real turn kept
 
 
+def test_cross_provider_context_can_be_disabled_without_blocking_switches():
+    from unified_cli.conversation import UnifiedConversation, Turn
+
+    conv = UnifiedConversation(
+        default_provider="claude", sticky=False, cross_provider_context=False,
+    )
+    conv.turns.append(Turn(provider="claude", prompt="private q", text="private a"))
+    assert conv._context_prefix_if_switch("codex") == ""
+
+
 def test_apply_resume_gemini_gated(monkeypatch):
     from unified_cli import repl, state
     from unified_cli.conversation import UnifiedConversation

@@ -444,7 +444,7 @@ def test_server_policy_rejects_explicit_agentic_provider_prefixes_before_state(
         assert exc.value.detail["code"] == "provider_disabled_for_server"
 
 
-def test_cli_chat_keeps_stdout_clean_and_persists_v1_session_state(
+def test_cli_chat_keeps_stdout_clean_and_persists_v2_settings_and_v1_session_state(
     fake_cli, monkeypatch, tmp_path, capsys
 ):
     from unified_cli import cli, settings, state
@@ -469,8 +469,31 @@ def test_cli_chat_keeps_stdout_clean_and_persists_v1_session_state(
 
     assert captured.out == "hello from codex\n"
     assert settings_payload == {
-        "version": 1,
-        "settings": {"lang": None, "default_provider": "codex"},
+        "version": 2,
+        "settings": {
+            "lang": None,
+            "default_provider": "codex",
+            "reasoning_display": "hidden",
+            "tool_display": "compact",
+            "theme": "auto",
+            "cross_provider_context_enabled": True,
+            "context_window": 8,
+            "repl_permission": "provider_default",
+            "browser_permission": "read_only",
+            "browser_prompt_preview": False,
+            "style": None,
+            "effort": None,
+            "reasoning_mode": None,
+            "system_prompt": None,
+            "timeout": None,
+            "tools": None,
+            "mcp": None,
+            "web": None,
+            "workspace": None,
+            "additional_dirs": [],
+            "multiline": True,
+            "provider_settings": {},
+        },
     }
     assert payload["version"] == 1
     assert payload["last_session"] | {"updated_at": 0} == {
