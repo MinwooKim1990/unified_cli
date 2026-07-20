@@ -1,0 +1,163 @@
+name: Publish unified-cli-ext to PyPI
+
+# Ext is tagged only after the matching Core release is live on PyPI. The
+# workflow deliberately tests against that published Core artifact rather than
+# the source checkout so an Ext release cannot depend on unreleased Core code.
+on:
+  push:
+    tags:
+      - "ext-v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-ext-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CORE_VERSION: "0.5.0"
+  EXT_PACKAGE_DIR: packages/unified-cli-ext
+
+jobs:
+  verify-release:
+    name: Verify Ext release provenance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the release tag with history
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the tag is an immutable commit already on main
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+
+          tag_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          checkout_commit="$(git rev-parse 'HEAD^{commit}')"
+          event_commit="$(git rev-parse "${RELEASE_SHA}^{commit}")"
+
+          test "$tag_commit" = "$checkout_commit"
+          test "$tag_commit" = "$event_commit"
+          git merge-base --is-ancestor "$tag_commit" origin/main
+
+      - name: Verify tag and package versions match
+        run: |
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          data = tomllib.loads(
+              (Path(os.environ["EXT_PACKAGE_DIR"]) / "pyproject.toml").read_text()
+          )
+          version = data["project"]["version"]
+          expected = f"ext-v{version}"
+          actual = os.environ["GITHUB_REF_NAME"]
+          if actual != expected:
+              raise SystemExit(
+                  f"refusing Ext publish: tag {actual!r} != {expected!r}"
+              )
+          PY
+
+  test-and-build:
+    name: Test against published Core and build Ext
+    needs: verify-release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.14"
+
+      - name: Install the published Core and Ext test dependencies
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m pip install "unified-cli==${CORE_VERSION}"
+          python -m pip install -e "${EXT_PACKAGE_DIR}[dev]"
+          python -m pip check
+
+      - name: Run the offline Ext suite
+        run: pytest -q "${EXT_PACKAGE_DIR}/tests"
+
+      - name: Build and inspect Ext distributions
+        run: |
+          python -m build --outdir dist/ext "${EXT_PACKAGE_DIR}"
+          python -m pip download --no-deps --only-binary=:all: \
+            "unified-cli==${CORE_VERSION}" --dest dist/core
+          python -m twine check dist/ext/*
+          python - <<'PY'
+          import os
+          import tomllib
+          import zipfile
+          from email.parser import BytesParser
+          from pathlib import Path
+
+          package = Path(os.environ["EXT_PACKAGE_DIR"])
+          expected = tomllib.loads(
+              (package / "pyproject.toml").read_text()
+          )["project"]["version"]
+          wheel = next(Path("dist/ext").glob("*.whl"))
+          with zipfile.ZipFile(wheel) as archive:
+              metadata_name = next(
+                  name for name in archive.namelist()
+                  if name.endswith(".dist-info/METADATA")
+              )
+              metadata = BytesParser().parsebytes(archive.read(metadata_name))
+              names = set(archive.namelist())
+          if metadata["Name"] != "unified-cli-ext":
+              raise SystemExit("refusing publish: wrong Ext distribution name")
+          if metadata["Version"] != expected:
+              raise SystemExit("refusing publish: wrong Ext distribution version")
+          if any(name.startswith("unified_cli/") for name in names):
+              raise SystemExit("refusing publish: Ext wheel contains Core files")
+          PY
+
+          python scripts/verify_distribution_pair.py \
+            dist/core/*.whl dist/ext/*.whl \
+            --core-version "${CORE_VERSION}"
+
+      - name: Smoke test with a fresh published-Core environment
+        run: |
+          python -m venv /tmp/unified-ext-release-smoke
+          /tmp/unified-ext-release-smoke/bin/python -m pip install --upgrade pip
+          /tmp/unified-ext-release-smoke/bin/python -m pip install "unified-cli==${CORE_VERSION}"
+          /tmp/unified-ext-release-smoke/bin/python -m pip install --no-deps dist/ext/*.whl
+          /tmp/unified-ext-release-smoke/bin/python -m pip check
+          /tmp/unified-ext-release-smoke/bin/python -c "import unified_cli, unified_cli_ext; assert unified_cli.__version__ == '${CORE_VERSION}'"
+
+      - name: Upload Ext distributions
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ext-dist
+          path: dist/ext/
+          if-no-files-found: error
+
+  publish:
+    name: Publish unified-cli-ext
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    environment: pypi-ext
+    permissions:
+      id-token: write
+    steps:
+      - name: Download Ext distributions
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ext-dist
+          path: dist/ext/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # release/v1
+        with:
+          packages-dir: dist/ext/
