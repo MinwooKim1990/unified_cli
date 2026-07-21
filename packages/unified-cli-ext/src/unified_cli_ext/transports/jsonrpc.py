@@ -16,7 +16,7 @@ from ..errors import (
     TransportTimeout,
 )
 from .jsonl import JsonlProcess
-from .security import CancellationToken, TransportLimits
+from .security import CancellationToken, ExecutableIdentity, TransportLimits
 from ..normalization.events import freeze_json
 from ..normalization.validation import validate_unicode
 
@@ -115,6 +115,7 @@ class JsonRpcProcessClient:
         self,
         argv: Sequence[str],
         *,
+        executable_identity: ExecutableIdentity,
         request_handlers: Optional[Mapping[str, Callable[[Any], Any]]] = None,
         timeout: float = 30.0,
         cwd: Optional[str] = None,
@@ -122,6 +123,7 @@ class JsonRpcProcessClient:
         allowed_provider_env: Sequence[str] = (),
         limits: TransportLimits = TransportLimits(),
         cancellation: Optional[CancellationToken] = None,
+        persistent_home: Optional[str] = None,
     ) -> None:
         handlers: Dict[str, Callable[[Any], Any]] = {}
         try:
@@ -153,6 +155,8 @@ class JsonRpcProcessClient:
             allowed_provider_env=allowed_provider_env,
             limits=limits,
             cancellation=cancellation,
+            persistent_home=persistent_home,
+            executable_identity=executable_identity,
         )
         self._next_id = 1
         self._pending = set()
@@ -168,7 +172,13 @@ class JsonRpcProcessClient:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
-        self.close()
+        try:
+            self.close()
+        except BaseException as failure:
+            if exc_type is None or (
+                isinstance(failure, TransportError) and "reaped" in str(failure)
+            ):
+                raise
 
     def close(self) -> None:
         self._transport.close()
