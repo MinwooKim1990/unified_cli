@@ -10,7 +10,9 @@ import pathlib
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
+from tools.unified_ext_lab import docker as docker_module
 from tools.unified_ext_lab.docker import (
     CONTAINER_AUTH,
     CONTAINER_TOOL,
@@ -302,7 +304,10 @@ class FakeRunnerAndPolicyTests(unittest.TestCase):
             validate_inspect(self.spec, role, payload)
         for action in GuestAction:
             self.fake.run(self.builder.exec_guest(action), timeout=1)
-        self.assertEqual([item[1] for item in self.fake.guest_actions], ["install", "test", "logout"])
+        self.assertEqual(
+            [item[1] for item in self.fake.guest_actions],
+            ["ready", "install", "test", "logout"],
+        )
 
     def test_inspect_rejects_forged_labels_and_security_drift(self):
         execute_create(self.fake, self.builder)
@@ -395,6 +400,44 @@ class FakeRunnerAndPolicyTests(unittest.TestCase):
 
 
 class FixtureIntegrityTests(unittest.TestCase):
+    def test_owned_reader_is_nonblocking_cloexec_and_detects_path_replacement(self):
+        root = os.path.realpath(tempfile.mkdtemp(prefix="owned-reader-"))
+        self.addCleanup(shutil.rmtree, root)
+        path = os.path.join(root, "locked.json")
+        replacement = os.path.join(root, "replacement.json")
+        pathlib.Path(path).write_bytes(b"locked")
+        pathlib.Path(replacement).write_bytes(b"locked")
+        os.chmod(path, 0o600)
+        os.chmod(replacement, 0o600)
+        real_open = os.open
+        observed_flags = []
+
+        def capture_open(name, flags, *args, **kwargs):
+            observed_flags.append(flags)
+            return real_open(name, flags, *args, **kwargs)
+
+        with mock.patch.object(docker_module.os, "open", new=capture_open):
+            self.assertEqual(
+                docker_module._owned_regular_bytes(path, "test lock", 64),
+                b"locked",
+            )
+        self.assertTrue(observed_flags[-1] & os.O_NONBLOCK)
+        self.assertTrue(observed_flags[-1] & os.O_CLOEXEC)
+
+        real_read = os.read
+        swapped = {"done": False}
+
+        def swap_after_read(descriptor, count):
+            payload = real_read(descriptor, count)
+            if payload and not swapped["done"]:
+                swapped["done"] = True
+                os.replace(replacement, path)
+            return payload
+
+        with mock.patch.object(docker_module.os, "read", new=swap_after_read):
+            with self.assertRaisesRegex(InvariantRefusalError, "invalid test lock"):
+                docker_module._owned_regular_bytes(path, "test lock", 64)
+
     def test_fixture_lock_matches_artifact_and_is_explicitly_scaffold_only(self):
         spec = make_spec()
         with open(spec.fixture.artifact_path, "rb") as handle:
@@ -402,6 +445,30 @@ class FixtureIntegrityTests(unittest.TestCase):
         self.assertEqual(checksum, spec.fixture.sha256)
         self.assertTrue(spec.fixture.scaffold_only)
         self.assertEqual(spec.fixture.version, "1.0.0")
+
+    def test_official_python_rootfs_uses_absolute_python_and_locked_checksum(self):
+        spec = make_spec()
+        dockerfile = pathlib.Path(spec.context, "Dockerfile").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("FROM ${BASE_IMAGE} AS runtime", dockerfile)
+        self.assertIn("FROM scratch", dockerfile)
+        self.assertIn("COPY --from=runtime / /", dockerfile)
+        guest = pathlib.Path(
+            spec.context,
+            "rootfs",
+            "opt",
+            "unified-ext-lab",
+            "guest.py",
+        ).read_text(encoding="utf-8")
+        fixture = pathlib.Path(spec.fixture.artifact_path).read_text(
+            encoding="utf-8"
+        )
+        self.assertTrue(guest.startswith("#!/usr/local/bin/python3\n"))
+        self.assertTrue(fixture.startswith("#!/usr/local/bin/python3\n"))
+        self.assertIn(
+            'FIXTURE_SHA256 = "{}"'.format(spec.fixture.sha256), guest
+        )
 
     def test_writable_volume_seed_directories_are_locked_into_the_image(self):
         spec = make_spec()

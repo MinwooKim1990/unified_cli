@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/local/bin/python3
 """Fixed synthetic guest actions for the scaffold-only extension lab image."""
 
 from __future__ import annotations
@@ -13,11 +13,13 @@ import sys
 
 
 FIXTURE = "/opt/unified-ext-lab/fixtures/fake-provider"
-FIXTURE_SHA256 = "e740b71e1de2e12fd416beada693704265f210a42cd848ee1e718019f24dfbcc"
+FIXTURE_SHA256 = "50e7754c2a4cc5fb074d640eef253f5a9b61288dcbe8074887e2cc2c728edc66"
 TOOL_DIRECTORY = "/opt/unified-ext-lab/tool"
 TOOL = TOOL_DIRECTORY + "/fake-provider"
 AUTH_DIRECTORY = "/home/lab"
 WORKSPACE = "/workspace"
+WORKSPACE_MARKER = WORKSPACE + "/project.marker"
+WORKSPACE_MARKER_BYTES = b"synthetic-extension-lab-v1\n"
 
 
 def _writable_owned_directory(path: str) -> bool:
@@ -102,9 +104,84 @@ def _logout() -> int:
     return 0
 
 
+def _workspace_ready() -> bool:
+    if not _writable_owned_directory(WORKSPACE):
+        return False
+    descriptor = None
+    try:
+        descriptor = os.open(
+            WORKSPACE_MARKER,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        info = os.fstat(descriptor)
+        payload = os.read(descriptor, len(WORKSPACE_MARKER_BYTES) + 1)
+    except OSError:
+        return False
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_uid == os.getuid()
+        and info.st_gid == os.getgid()
+        and payload == WORKSPACE_MARKER_BYTES
+    )
+
+
+def _ready() -> int:
+    status = "ready" if _workspace_ready() else "waiting"
+    print(json.dumps({"action": "ready", "status": status}, sort_keys=True))
+    return 0
+
+
+def _initialize_workspace() -> bool:
+    if not _writable_owned_directory(WORKSPACE):
+        return False
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(WORKSPACE_MARKER, flags, 0o600)
+    except FileExistsError:
+        descriptor = None
+        try:
+            descriptor = os.open(
+                WORKSPACE_MARKER,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            info = os.fstat(descriptor)
+            payload = os.read(descriptor, len(WORKSPACE_MARKER_BYTES) + 1)
+        except OSError:
+            return False
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        return (
+            stat.S_ISREG(info.st_mode)
+            and info.st_uid == os.getuid()
+            and info.st_gid == os.getgid()
+            and payload == WORKSPACE_MARKER_BYTES
+        )
+    except OSError:
+        return False
+    try:
+        written = 0
+        while written < len(WORKSPACE_MARKER_BYTES):
+            count = os.write(descriptor, WORKSPACE_MARKER_BYTES[written:])
+            if count < 1:
+                return False
+            written += count
+        os.fchmod(descriptor, 0o600)
+        return True
+    finally:
+        os.close(descriptor)
+
+
 def _idle() -> int:
     # PID 1 remains inert. Docker stop supplies the only lifecycle signal.
     import signal
+
+    if not _initialize_workspace():
+        print("synthetic workspace ownership mismatch", file=sys.stderr)
+        return 4
 
     stopped = False
 
@@ -124,6 +201,7 @@ def main() -> int:
         return 2
     actions = {
         "idle": _idle,
+        "ready": _ready,
         "install": _install,
         "logout": _logout,
         "test": _test,

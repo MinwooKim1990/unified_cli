@@ -12,7 +12,7 @@
   "files": {
     "Dockerfile": {
       "mode": "0644",
-      "sha256": "65a84f6a637cbe6caa377ab34ec28d488ff777c1fbedcc66c44b187aa7dfd1ab"
+      "sha256": "e06a1dffce3d931fafc491f01f670aebd7aa6dcf6c24ab2383275fb786f5a762"
     },
     "rootfs/home/lab/.volume-owner": {
       "mode": "0644",
@@ -20,11 +20,11 @@
     },
     "rootfs/opt/unified-ext-lab/fixtures/fake-provider": {
       "mode": "0755",
-      "sha256": "e740b71e1de2e12fd416beada693704265f210a42cd848ee1e718019f24dfbcc"
+      "sha256": "50e7754c2a4cc5fb074d640eef253f5a9b61288dcbe8074887e2cc2c728edc66"
     },
     "rootfs/opt/unified-ext-lab/guest.py": {
       "mode": "0755",
-      "sha256": "e6c79335b196d760529b612ee3c795a471b3b2e4313125e6bc99265a2ff9237e"
+      "sha256": "2b16af2cc129e8be8f19cdc1bde5de400d1dedc0d27b78228fd651aca7503ed6"
     },
     "rootfs/opt/unified-ext-lab/tool/.volume-owner": {
       "mode": "0644",

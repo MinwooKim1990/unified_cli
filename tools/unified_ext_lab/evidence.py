@@ -1,8 +1,8 @@
 """Canonical, non-promotional evidence for the offline fixture harness.
 
-Only the fake-Docker harness fixture can be represented here.  The schema has
-no extension fields and hard-codes ``promotion_eligible`` to false, preventing
-fixture output from being mistaken for provider or production evidence.
+Only the synthetic harness fixture can be represented here. The executor is
+exactly either the in-memory fake or the separately gated real-Docker profile.
+Both remain non-promotional and cannot be mistaken for provider evidence.
 """
 
 from __future__ import annotations
@@ -27,6 +27,8 @@ EVIDENCE_SCHEMA = 1
 MAX_EVIDENCE_BYTES = 1024 * 1024
 EVIDENCE_KIND = "harness_fixture"
 EXECUTOR_KIND = "fake_docker"
+REAL_EXECUTOR_KIND = "real_docker"
+EXECUTOR_KINDS = frozenset((EXECUTOR_KIND, REAL_EXECUTOR_KIND))
 PROMOTION_ELIGIBLE = False
 
 SOURCE_KINDS = frozenset(
@@ -125,6 +127,14 @@ _FORBIDDEN_FIELDS = frozenset(
         "url",
     )
 )
+
+
+class _EvidenceParentChangedError(InvariantRefusalError):
+    """Internal marker: never reconcile through a changed parent namespace."""
+
+
+class _EvidenceFinalNameRaceError(InvariantRefusalError):
+    """Internal marker: the final name appeared during atomic publication."""
 
 
 def _exact_mapping(value: object, keys: frozenset, field: str) -> Mapping[str, object]:
@@ -253,8 +263,11 @@ class FixturePlatform:
     promotion_eligible: bool = PROMOTION_ELIGIBLE
 
     def __post_init__(self) -> None:
-        if self.evidence_kind != EVIDENCE_KIND or self.executor_kind != EXECUTOR_KIND:
-            raise UsageStateError("only fake-Docker fixture evidence is supported")
+        if (
+            self.evidence_kind != EVIDENCE_KIND
+            or self.executor_kind not in EXECUTOR_KINDS
+        ):
+            raise UsageStateError("invalid harness fixture execution kind")
         if self.promotion_eligible is not False:
             raise InvariantRefusalError("fixture evidence cannot be promotional")
 
@@ -390,8 +403,14 @@ def capture_draft(
     ):
         raise UsageStateError("post-cleanup draft requires a recorded failure")
     if state.tainted:
-        raise InvariantRefusalError("tainted shell state cannot produce evidence")
+        raise InvariantRefusalError(
+            "verification/promotion-held state cannot produce evidence"
+        )
     artifact_value = ArtifactEvidence.from_value(artifact)
+    if artifact_value.to_dict() != dict(state.artifact_evidence):
+        raise InvariantRefusalError(
+            "captured artifact does not match durable artifact evidence"
+        )
     platform_value = FixturePlatform.from_value(platform)
     hashes = SchemaHashes.from_value(schema_hashes)
     draft = {
@@ -453,7 +472,9 @@ def build_manifest(
     if type(state) is not LabState or state.phase is not StatePhase.SEAL_PENDING:
         raise UsageStateError("manifest sealing requires SEAL_PENDING")
     if state.tainted:
-        raise InvariantRefusalError("tainted shell state cannot seal evidence")
+        raise InvariantRefusalError(
+            "verification/promotion-held state cannot seal evidence"
+        )
     if state.draft_evidence is None:
         raise UsageStateError("manifest sealing requires captured evidence")
     clean = CleanupEvidence.from_value(cleanup)
@@ -469,6 +490,10 @@ def build_manifest(
     ):
         raise InvariantRefusalError("cleanup evidence does not match the durable role ledger")
     draft = validate_draft(dict(state.draft_evidence))
+    if dict(draft["artifact"]) != dict(state.artifact_evidence):
+        raise InvariantRefusalError(
+            "draft artifact does not match durable artifact evidence"
+        )
     draft_operations = tuple(
         OperationObservation.from_dict(item) for item in draft["operations"]
     )
@@ -488,7 +513,7 @@ def build_manifest(
         "captured_at_ns": draft["captured_at_ns"],
         "cleanup": clean.to_dict(),
         "evidence_kind": EVIDENCE_KIND,
-        "executor_kind": EXECUTOR_KIND,
+        "executor_kind": draft["executor_kind"],
         "lab_id": state.lab_id,
         "manifest_schema_sha256": draft["manifest_schema_sha256"],
         "observed_protocol_schema_sha256": draft["observed_protocol_schema_sha256"],
@@ -506,7 +531,10 @@ def validate_manifest(value: object) -> Mapping[str, object]:
     data = _exact_mapping(value, _MANIFEST_KEYS, "evidence manifest")
     if data["schema"] != EVIDENCE_SCHEMA:
         raise UsageStateError("unsupported evidence schema")
-    if data["evidence_kind"] != EVIDENCE_KIND or data["executor_kind"] != EXECUTOR_KIND:
+    if (
+        data["evidence_kind"] != EVIDENCE_KIND
+        or data["executor_kind"] not in EXECUTOR_KINDS
+    ):
         raise UsageStateError("invalid evidence execution kind")
     if data["promotion_eligible"] is not False:
         raise InvariantRefusalError("fixture evidence cannot be promotional")
@@ -599,6 +627,19 @@ def _is_private_owned_regular(st: os.stat_result) -> bool:
     )
 
 
+def _file_identity(st: os.stat_result) -> Tuple[int, int, int, int, int, int, int, int]:
+    return (
+        st.st_dev,
+        st.st_ino,
+        st.st_mode,
+        st.st_uid,
+        st.st_nlink,
+        st.st_size,
+        st.st_mtime_ns,
+        st.st_ctime_ns,
+    )
+
+
 def _read_bounded_descriptor(descriptor: int) -> bytes:
     chunks = []
     remaining = MAX_EVIDENCE_BYTES + 1
@@ -612,11 +653,122 @@ def _read_bounded_descriptor(descriptor: int) -> bytes:
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(str(path), os.O_RDONLY)
     try:
+        before = path.lstat()
+    except OSError as error:
+        raise InvariantRefusalError(
+            "evidence directory changed during durability check"
+        ) from error
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+        raise InvariantRefusalError("unsafe evidence durability directory")
+    identity = _directory_identity(before)
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(str(path), flags)
+    except OSError as error:
+        raise InvariantRefusalError(
+            "evidence directory changed during durability check"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        post_open = path.lstat()
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or stat.S_ISLNK(post_open.st_mode)
+            or not stat.S_ISDIR(post_open.st_mode)
+            or _directory_identity(opened) != identity
+            or _directory_identity(post_open) != identity
+        ):
+            raise InvariantRefusalError(
+                "evidence directory changed during durability check"
+            )
         os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        final = path.lstat()
+        if (
+            _directory_identity(after) != identity
+            or stat.S_ISLNK(final.st_mode)
+            or not stat.S_ISDIR(final.st_mode)
+            or _directory_identity(final) != identity
+        ):
+            raise InvariantRefusalError(
+                "evidence directory changed during durability check"
+            )
     finally:
         os.close(descriptor)
+
+
+def _directory_identity(st: os.stat_result) -> Tuple[int, int, int, int, int]:
+    return (st.st_dev, st.st_ino, st.st_mode, st.st_uid, st.st_gid)
+
+
+def _open_pinned_private_parent(path: Path) -> Tuple[int, Tuple[int, int, int, int, int]]:
+    """Open and bind the exact private parent named by a canonical output path."""
+
+    _check_private_parent(path)
+    try:
+        before = path.parent.lstat()
+    except OSError as error:
+        raise _EvidenceParentChangedError(
+            "evidence output directory changed during acquisition"
+        ) from error
+    identity = _directory_identity(before)
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(str(path.parent), flags)
+    except OSError as error:
+        raise _EvidenceParentChangedError(
+            "evidence output directory changed during acquisition"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        post_open = path.parent.lstat()
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or stat.S_ISLNK(post_open.st_mode)
+            or not stat.S_ISDIR(post_open.st_mode)
+            or _directory_identity(opened) != identity
+            or _directory_identity(post_open) != identity
+        ):
+            raise _EvidenceParentChangedError(
+                "evidence output directory changed during acquisition"
+            )
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return descriptor, identity
+
+
+def _validate_pinned_private_parent(
+    path: Path,
+    descriptor: int,
+    identity: Tuple[int, int, int, int, int],
+) -> None:
+    opened = os.fstat(descriptor)
+    try:
+        named = path.parent.lstat()
+    except OSError as error:
+        raise _EvidenceParentChangedError(
+            "evidence output directory changed during publication"
+        ) from error
+    if (
+        not stat.S_ISDIR(opened.st_mode)
+        or stat.S_ISLNK(named.st_mode)
+        or not stat.S_ISDIR(named.st_mode)
+        or _directory_identity(opened) != identity
+        or _directory_identity(named) != identity
+    ):
+        raise _EvidenceParentChangedError(
+            "evidence output directory changed during publication"
+        )
 
 
 def _is_generated_temporary_name(output: Path, candidate: Path) -> bool:
@@ -634,165 +786,409 @@ def _recover_generated_temporary_links(
     expected: bytes,
     final_descriptor: int,
     final_st: os.stat_result,
+    parent_descriptor: int,
+    parent_identity: Tuple[int, int, int, int, int],
 ) -> None:
     """Remove only fully explained crash-time links to a published manifest."""
 
-    identity = (final_st.st_dev, final_st.st_ino)
+    identity = _file_identity(final_st)
     candidates = []
-    for candidate in path.parent.iterdir():
+    _validate_pinned_private_parent(path, parent_descriptor, parent_identity)
+    for candidate_name in os.listdir(parent_descriptor):
+        candidate = path.parent / candidate_name
         if not _is_generated_temporary_name(path, candidate):
             continue
         try:
-            candidate_st = candidate.lstat()
+            candidate_st = os.stat(
+                candidate_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
         except FileNotFoundError:
             continue
-        if (candidate_st.st_dev, candidate_st.st_ino) != identity:
+        if _file_identity(candidate_st) != identity:
             raise InvariantRefusalError("unexplained generated evidence temporary")
         if not _is_private_owned_regular(candidate_st):
             raise InvariantRefusalError("unsafe generated evidence temporary link")
 
         descriptor = os.open(
-            str(candidate), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            candidate_name,
+            os.O_RDONLY
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
         )
         try:
             opened = os.fstat(descriptor)
+            observed = _read_bounded_descriptor(descriptor)
+            after = os.fstat(descriptor)
             if (
-                (opened.st_dev, opened.st_ino) != identity
+                _file_identity(opened) != identity
                 or not _is_private_owned_regular(opened)
-                or _read_bounded_descriptor(descriptor) != expected
+                or _file_identity(after) != _file_identity(opened)
+                or observed != expected
             ):
                 raise InvariantRefusalError(
                     "unsafe generated evidence temporary link"
                 )
         finally:
             os.close(descriptor)
-        current = candidate.lstat()
+        current = os.stat(
+            candidate_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
         if (
-            (current.st_dev, current.st_ino) != identity
+            _file_identity(current) != identity
             or not _is_private_owned_regular(current)
         ):
             raise InvariantRefusalError("generated evidence temporary link changed")
-        candidates.append(candidate)
+        candidates.append(candidate_name)
 
     current_final = os.fstat(final_descriptor)
     if (
-        (current_final.st_dev, current_final.st_ino) != identity
+        _file_identity(current_final) != identity
         or not _is_private_owned_regular(current_final)
         or current_final.st_nlink != len(candidates) + 1
     ):
         raise InvariantRefusalError("unexplained evidence output hardlink")
+    if len(candidates) > 1:
+        # One publication attempt creates exactly one generated temp name.
+        # Refuse ambiguous extras before mutating any directory entry.
+        raise InvariantRefusalError("unexplained evidence output hardlink")
 
     removed_any = False
     try:
-        for candidate in candidates:
-            current = candidate.lstat()
+        for candidate_name in candidates:
+            _validate_pinned_private_parent(
+                path, parent_descriptor, parent_identity
+            )
+            current = os.stat(
+                candidate_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
             if (
-                (current.st_dev, current.st_ino) != identity
+                _file_identity(current) != identity
                 or not _is_private_owned_regular(current)
             ):
                 raise InvariantRefusalError(
                     "generated evidence temporary link changed"
                 )
-            candidate.unlink()
+            os.unlink(candidate_name, dir_fd=parent_descriptor)
             removed_any = True
     finally:
         if removed_any:
-            _fsync_directory(path.parent)
+            os.fsync(parent_descriptor)
+            _validate_pinned_private_parent(
+                path, parent_descriptor, parent_identity
+            )
 
     current_final = os.fstat(final_descriptor)
+    current_named = os.stat(
+        path.name,
+        dir_fd=parent_descriptor,
+        follow_symlinks=False,
+    )
     if (
-        (current_final.st_dev, current_final.st_ino) != identity
+        _file_identity(current_named) != _file_identity(current_final)
         or not _is_private_owned_regular(current_final)
         or current_final.st_nlink != 1
     ):
         raise InvariantRefusalError("evidence output hardlink recovery failed")
 
 
-def _atomic_create_no_overwrite(path: Path, payload: bytes) -> None:
-    _check_private_parent(path)
-    if path.exists() or path.is_symlink():
-        raise InvariantRefusalError("evidence output already exists")
-    temporary = path.with_name(".{}.{}.tmp".format(path.name, secrets.token_hex(8)))
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(str(temporary), flags, 0o600)
+def _same_bound_private_file(
+    before: Tuple[int, int, int, int, int, int, int, int],
+    after: os.stat_result,
+) -> bool:
+    """Match the created inode while allowing hard-link ctime/nlink changes."""
+
+    observed = _file_identity(after)
+    return (
+        observed[:4] == before[:4]
+        and observed[5:7] == before[5:7]
+        and observed[-1] >= before[-1]
+    )
+
+
+def _read_private_named_at(
+    parent_descriptor: int, name: str
+) -> Tuple[bytes, os.stat_result]:
     try:
+        named = os.stat(
+            name, dir_fd=parent_descriptor, follow_symlinks=False
+        )
+    except FileNotFoundError:
+        raise
+    if stat.S_ISLNK(named.st_mode) or not _is_private_owned_regular(named):
+        raise InvariantRefusalError("unsafe evidence output file")
+    descriptor = os.open(
+        name,
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_descriptor,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            _file_identity(opened) != _file_identity(named)
+            or not _is_private_owned_regular(opened)
+        ):
+            raise InvariantRefusalError("evidence output identity changed")
+        payload = _read_bounded_descriptor(descriptor)
+        after = os.fstat(descriptor)
+        if _file_identity(after) != _file_identity(opened):
+            raise InvariantRefusalError("evidence output identity changed")
+    finally:
+        os.close(descriptor)
+    final = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    if (
+        _file_identity(final) != _file_identity(opened)
+        or not _is_private_owned_regular(final)
+    ):
+        raise InvariantRefusalError("evidence output identity changed")
+    return payload, final
+
+
+def _unlink_bound_temporary_at(
+    parent_descriptor: int,
+    name: str,
+    expected_identity: Tuple[int, int, int, int, int, int, int, int],
+) -> bool:
+    """Remove a generated temp only while it names the exact created inode."""
+
+    try:
+        current = os.stat(
+            name, dir_fd=parent_descriptor, follow_symlinks=False
+        )
+    except FileNotFoundError:
+        return False
+    if (
+        stat.S_ISLNK(current.st_mode)
+        or not _is_private_owned_regular(current)
+        or not _same_bound_private_file(expected_identity, current)
+    ):
+        raise InvariantRefusalError("generated evidence temporary changed")
+    os.unlink(name, dir_fd=parent_descriptor)
+    return True
+
+
+def _atomic_create_no_overwrite(path: Path, payload: bytes) -> None:
+    parent_descriptor, parent_identity = _open_pinned_private_parent(path)
+    temporary_name = ".{}.{}.tmp".format(path.name, secrets.token_hex(8))
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = None
+    temporary_identity = None
+    published = False
+    temporary_removed = False
+    try:
+        try:
+            os.stat(
+                path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise _EvidenceFinalNameRaceError(
+                "evidence output already exists"
+            )
+        descriptor = os.open(
+            temporary_name,
+            flags,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
         os.fchmod(descriptor, 0o600)
         view = memoryview(payload)
         while view:
             written = os.write(descriptor, view)
             view = view[written:]
         os.fsync(descriptor)
-    except BaseException:
-        os.close(descriptor)
-        temporary.unlink(missing_ok=True)
-        raise
-    else:
-        os.close(descriptor)
-    try:
+        opened = os.fstat(descriptor)
+        if not _is_private_owned_regular(opened) or opened.st_nlink != 1:
+            raise InvariantRefusalError("unsafe generated evidence temporary")
+        temporary_identity = _file_identity(opened)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        observed = _read_bounded_descriptor(descriptor)
+        after_read = os.fstat(descriptor)
+        named = os.stat(
+            temporary_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            observed != payload
+            or _file_identity(after_read) != temporary_identity
+            or _file_identity(named) != temporary_identity
+        ):
+            raise InvariantRefusalError(
+                "generated evidence temporary changed during creation"
+            )
+        _validate_pinned_private_parent(
+            path, parent_descriptor, parent_identity
+        )
         # Hard-link publication is atomic and fails if the final name already
-        # exists.  The temporary and final names are in the same private dir.
+        # exists. Both names are resolved beneath the pinned private parent.
         try:
-            os.link(str(temporary), str(path), follow_symlinks=False)
+            os.link(
+                temporary_name,
+                path.name,
+                src_dir_fd=parent_descriptor,
+                dst_dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
         except FileExistsError as error:
-            raise InvariantRefusalError("evidence output already exists") from error
+            raise _EvidenceFinalNameRaceError(
+                "evidence output already exists"
+            ) from error
+        published = True
+        linked = os.fstat(descriptor)
+        named_temporary = os.stat(
+            temporary_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not _same_bound_private_file(temporary_identity, linked)
+            or linked.st_nlink != 2
+            or _file_identity(named_temporary) != _file_identity(linked)
+        ):
+            raise InvariantRefusalError(
+                "generated evidence temporary changed during publication"
+            )
+        temporary_removed = _unlink_bound_temporary_at(
+            parent_descriptor, temporary_name, temporary_identity
+        )
+        after_unlink = os.fstat(descriptor)
+        if (
+            not temporary_removed
+            or not _same_bound_private_file(temporary_identity, after_unlink)
+            or after_unlink.st_nlink != 1
+        ):
+            raise InvariantRefusalError(
+                "evidence output identity changed during publication"
+            )
+        os.fsync(parent_descriptor)
+        _validate_pinned_private_parent(
+            path, parent_descriptor, parent_identity
+        )
+        final_payload, final = _read_private_named_at(
+            parent_descriptor, path.name
+        )
+        if (
+            final_payload != payload
+            or final.st_nlink != 1
+            or not _same_bound_private_file(temporary_identity, final)
+        ):
+            raise InvariantRefusalError(
+                "evidence output identity changed during publication"
+            )
     finally:
-        temporary.unlink(missing_ok=True)
-    # Persist both the final hard-link and the removal of the temporary name.
-    # Syncing before unlink would leave the directory-entry cleanup vulnerable
-    # to a crash even though the manifest itself had been published.
-    _fsync_directory(path.parent)
-    st = path.lstat()
-    if (
-        not stat.S_ISREG(st.st_mode)
-        or st.st_nlink != 1
-        or stat.S_IMODE(st.st_mode) != 0o600
-        or (hasattr(os, "geteuid") and st.st_uid != os.geteuid())
-    ):
-        raise InvariantRefusalError("unsafe evidence output file")
+        try:
+            if (
+                descriptor is not None
+                and not temporary_removed
+                and not published
+            ):
+                current_identity = _file_identity(os.fstat(descriptor))
+                if _unlink_bound_temporary_at(
+                    parent_descriptor,
+                    temporary_name,
+                    current_identity,
+                ):
+                    os.fsync(parent_descriptor)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            os.close(parent_descriptor)
 
 
 def _read_existing_canonical(path: Path, expected: bytes) -> None:
     """Accept only the exact already-published private canonical manifest."""
 
-    _check_private_parent(path)
+    parent_descriptor, parent_identity = _open_pinned_private_parent(path)
     try:
-        st = path.lstat()
-    except FileNotFoundError:
-        raise UsageStateError("evidence output is absent")
-    if (
-        stat.S_ISLNK(st.st_mode)
-        or not _is_private_owned_regular(st)
-    ):
-        raise InvariantRefusalError("unsafe evidence output file")
-    descriptor = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    try:
-        opened = os.fstat(descriptor)
+        try:
+            st = os.stat(
+                path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as error:
+            raise UsageStateError("evidence output is absent") from error
         if (
-            (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino)
-            or not _is_private_owned_regular(opened)
+            stat.S_ISLNK(st.st_mode)
+            or not _is_private_owned_regular(st)
+        ):
+            raise InvariantRefusalError("unsafe evidence output file")
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                _file_identity(opened) != _file_identity(st)
+                or not _is_private_owned_regular(opened)
+            ):
+                raise InvariantRefusalError("evidence output identity changed")
+            observed = _read_bounded_descriptor(descriptor)
+            after_read = os.fstat(descriptor)
+            if _file_identity(after_read) != _file_identity(opened):
+                raise InvariantRefusalError("evidence output identity changed")
+            if observed != expected:
+                raise InvariantRefusalError(
+                    "existing evidence output does not match seal intent"
+                )
+            if opened.st_nlink != 1:
+                _recover_generated_temporary_links(
+                    path,
+                    expected,
+                    descriptor,
+                    opened,
+                    parent_descriptor,
+                    parent_identity,
+                )
+            verified = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        final = os.stat(
+            path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            _file_identity(final) != _file_identity(verified)
+            or final.st_nlink != 1
+            or not _is_private_owned_regular(final)
         ):
             raise InvariantRefusalError("evidence output identity changed")
-        observed = _read_bounded_descriptor(descriptor)
-        if observed != expected:
+        _validate_pinned_private_parent(
+            path, parent_descriptor, parent_identity
+        )
+        manifest = strict_evidence_loads(observed)
+        if canonical_evidence_bytes(manifest) != observed:
             raise InvariantRefusalError(
-                "existing evidence output does not match seal intent"
-            )
-        if opened.st_nlink != 1:
-            _recover_generated_temporary_links(
-                path, expected, descriptor, opened
+                "existing evidence output is not canonical"
             )
     finally:
-        os.close(descriptor)
-    final = path.lstat()
-    if (
-        (final.st_dev, final.st_ino) != (st.st_dev, st.st_ino)
-        or final.st_nlink != 1
-        or not _is_private_owned_regular(final)
-    ):
-        raise InvariantRefusalError("evidence output identity changed")
-    manifest = strict_evidence_loads(observed)
-    if canonical_evidence_bytes(manifest) != observed:
-        raise InvariantRefusalError("existing evidence output is not canonical")
+        os.close(parent_descriptor)
 
 
 def reconcile_manifest_output(
@@ -811,7 +1207,7 @@ def reconcile_manifest_output(
         return
     try:
         _atomic_create_no_overwrite(path, payload)
-    except InvariantRefusalError:
+    except _EvidenceFinalNameRaceError:
         # A racing publisher is acceptable only when it created the exact
         # intended private canonical file.
         _read_existing_canonical(path, payload)

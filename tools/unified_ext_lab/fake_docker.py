@@ -327,7 +327,7 @@ class FakeRunner:
         return json.dumps([records[name]], sort_keys=True, separators=(",", ":"))
 
     def _exec_guest(self, argv: Tuple[str, ...]) -> str:
-        if argv[-2] != GUEST_EXECUTABLE or argv[-1] not in ("install", "test", "logout"):
+        if argv[-2] != GUEST_EXECUTABLE or argv[-1] not in ("ready", "install", "test", "logout"):
             raise UsageStateError("fake received arbitrary guest command")
         candidates = [item for item in argv if item in self.containers]
         if len(candidates) != 1:
@@ -336,6 +336,12 @@ class FakeRunner:
         if name not in self.running:
             raise RunnerFailureError("fake container is not running")
         self.guest_actions.append((name, argv[-1]))
+        if argv[-1] == "ready":
+            return json.dumps(
+                {"action": "ready", "status": "ready"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ) + "\n"
         if argv[-1] == "test":
             return json.dumps(
                 {

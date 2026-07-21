@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 from dataclasses import dataclass
 from enum import Enum
@@ -39,6 +40,22 @@ CONTAINER_TOOL = "/opt/unified-ext-lab/tool"
 GUEST_EXECUTABLE = "/opt/unified-ext-lab/guest.py"
 MEMORY_BYTES = 1024 * 1024 * 1024
 NANO_CPUS = 1_000_000_000
+MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
+
+TMPFS_OPTIONS = MappingProxyType(
+    {
+        "/tmp": "rw,nosuid,nodev,noexec,size=64m,mode=1777",
+        CONTAINER_WORKSPACE: (
+            "rw,nosuid,nodev,noexec,size=64m,mode=0700,uid=65532,gid=65532"
+        ),
+        CONTAINER_AUTH: (
+            "rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=65532,gid=65532"
+        ),
+        CONTAINER_TOOL: (
+            "rw,nosuid,nodev,size=16m,mode=0700,uid=65532,gid=65532"
+        ),
+    }
+)
 
 FIXED_ENV = (
     "HOME=" + CONTAINER_HOME,
@@ -60,6 +77,7 @@ VOLUME_TARGETS = MappingProxyType(
 _BASE_REFERENCE_RE = re.compile(
     r"^[a-z0-9][a-z0-9./:_-]*@sha256:[0-9a-f]{64}$"
 )
+_LOCAL_IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _CHECKSUM_RE = re.compile(r"^[0-9a-f]{64}$")
 _FIXTURE_RELATIVE_PATH = os.path.join(
     "rootfs", "opt", "unified-ext-lab", "fixtures", "fake-provider"
@@ -90,6 +108,7 @@ _MAX_CONTEXT_FILE_BYTES = 16 * 1024 * 1024
 
 
 class GuestAction(str, Enum):
+    READY = "ready"
     INSTALL = "install"
     TEST = "test"
     LOGOUT = "logout"
@@ -137,6 +156,47 @@ class SyntheticFixture:
 
 
 @dataclass(frozen=True)
+class LockedContextSnapshot:
+    """A private immutable copy of the complete verified build context."""
+
+    context: str
+    context_lock: str
+    context_lock_sha256: str
+    fixture_version: str
+    fixture_sha256: str
+
+    def __post_init__(self) -> None:
+        for value, field in (
+            (self.context, "snapshot context"),
+            (self.context_lock, "snapshot context lock"),
+        ):
+            if (
+                type(value) is not str
+                or not os.path.isabs(value)
+                or os.path.realpath(value) != value
+                or os.path.normpath(value) != value
+            ):
+                raise UsageStateError("invalid {}".format(field))
+        if (
+            type(self.context_lock_sha256) is not str
+            or _CHECKSUM_RE.fullmatch(self.context_lock_sha256) is None
+            or type(self.fixture_version) is not str
+            or not self.fixture_version
+            or type(self.fixture_sha256) is not str
+            or _CHECKSUM_RE.fullmatch(self.fixture_sha256) is None
+        ):
+            raise UsageStateError("invalid locked context snapshot")
+
+
+@dataclass(frozen=True)
+class _ContextInventory:
+    root_mode: int
+    directory_modes: Mapping[str, int]
+    file_records: Mapping[str, Tuple[int, str]]
+    lock_bytes: bytes
+
+
+@dataclass(frozen=True)
 class DockerLabSpec:
     """All exact identities and locks needed to build Docker commands."""
 
@@ -149,6 +209,8 @@ class DockerLabSpec:
     resources: LabResourceSet
     docker_executable: str
     fixture: SyntheticFixture
+    context_is_snapshot: bool = False
+    ephemeral_storage: bool = False
 
     def __post_init__(self) -> None:
         if type(self.identity) is not LabIdentity:
@@ -174,10 +236,13 @@ class DockerLabSpec:
                 raise InvariantRefusalError("Docker resource identity mismatch")
         if self.image not in self.resources.resources:
             raise InvariantRefusalError("Docker image is absent from resource inventory")
-        if type(self.base_image) is not str or _BASE_REFERENCE_RE.fullmatch(
-            self.base_image
-        ) is None:
-            raise UsageStateError("base image must be pinned by sha256")
+        if type(self.base_image) is not str or (
+            _BASE_REFERENCE_RE.fullmatch(self.base_image) is None
+            and _LOCAL_IMAGE_ID_RE.fullmatch(self.base_image) is None
+        ):
+            raise UsageStateError(
+                "base image must be pinned by digest or local image ID"
+            )
         if (
             type(self.context) is not str
             or not os.path.isabs(self.context)
@@ -194,8 +259,15 @@ class DockerLabSpec:
             or _CHECKSUM_RE.fullmatch(self.context_lock_sha256) is None
         ):
             raise UsageStateError("invalid image context lock identity")
+        if type(self.context_is_snapshot) is not bool:
+            raise UsageStateError("invalid context snapshot flag")
+        if type(self.ephemeral_storage) is not bool:
+            raise UsageStateError("invalid ephemeral storage flag")
         _validate_image_context(
-            self.context, self.context_lock, self.context_lock_sha256
+            self.context,
+            self.context_lock,
+            self.context_lock_sha256,
+            private_snapshot=self.context_is_snapshot,
         )
         if (
             type(self.docker_executable) is not str
@@ -209,6 +281,48 @@ class DockerLabSpec:
         expected_fixture_path = os.path.join(self.context, _FIXTURE_RELATIVE_PATH)
         if self.fixture.artifact_path != expected_fixture_path:
             raise InvariantRefusalError("fixture does not match the image context")
+
+    @classmethod
+    def from_snapshot(
+        cls,
+        identity: LabIdentity,
+        *,
+        docker_executable: str,
+        base_image: str,
+        snapshot: LockedContextSnapshot,
+        ephemeral_storage: bool,
+    ) -> "DockerLabSpec":
+        if type(identity) is not LabIdentity or type(snapshot) is not LockedContextSnapshot:
+            raise UsageStateError("invalid Docker snapshot spec")
+        resource_tuple = tuple(
+            identity.resource(role)
+            for role in (
+                ResourceRole.IMAGE,
+                ResourceRole.CONTAINER,
+                ResourceRole.WORKSPACE,
+                ResourceRole.AUTH,
+                ResourceRole.TOOL,
+            )
+        )
+        fixture = SyntheticFixture(
+            artifact_path=os.path.join(snapshot.context, _FIXTURE_RELATIVE_PATH),
+            version=snapshot.fixture_version,
+            sha256=snapshot.fixture_sha256,
+            scaffold_only=True,
+        )
+        return cls(
+            identity=identity,
+            image=resource_tuple[0],
+            base_image=base_image,
+            context=snapshot.context,
+            context_lock=snapshot.context_lock,
+            context_lock_sha256=snapshot.context_lock_sha256,
+            resources=LabResourceSet(resource_tuple),
+            docker_executable=docker_executable,
+            fixture=fixture,
+            context_is_snapshot=True,
+            ephemeral_storage=ephemeral_storage,
+        )
 
     @classmethod
     def from_locks(
@@ -319,6 +433,133 @@ class DockerLabSpec:
         raise UsageStateError("resource role is not present")
 
 
+@dataclass(frozen=True)
+class DockerCleanupSpec:
+    """Persisted identity needed for cleanup, with no forward-run inputs."""
+
+    identity: LabIdentity
+    image: LabResource
+    resources: LabResourceSet
+    docker_executable: str
+    ephemeral_storage: bool = True
+
+    def __post_init__(self) -> None:
+        if type(self.identity) is not LabIdentity:
+            raise UsageStateError("invalid Docker cleanup identity")
+        if (
+            type(self.image) is not LabResource
+            or self.image.role is not ResourceRole.IMAGE
+            or self.image.identity != self.identity
+        ):
+            raise UsageStateError("invalid Docker cleanup image")
+        if type(self.resources) is not LabResourceSet:
+            raise UsageStateError("invalid Docker cleanup resources")
+        expected_roles = {
+            ResourceRole.IMAGE,
+            ResourceRole.CONTAINER,
+            ResourceRole.WORKSPACE,
+            ResourceRole.AUTH,
+            ResourceRole.TOOL,
+        }
+        if (
+            {resource.role for resource in self.resources.resources}
+            != expected_roles
+            or len(self.resources.resources) != len(expected_roles)
+            or any(
+                resource.identity != self.identity
+                for resource in self.resources.resources
+            )
+            or self.image not in self.resources.resources
+        ):
+            raise InvariantRefusalError("Docker cleanup inventory drift")
+        if (
+            type(self.docker_executable) is not str
+            or not os.path.isabs(self.docker_executable)
+            or os.path.normpath(self.docker_executable) != self.docker_executable
+            or os.path.realpath(self.docker_executable) != self.docker_executable
+        ):
+            raise UsageStateError(
+                "Docker cleanup executable must be absolute and canonical"
+            )
+        if self.ephemeral_storage is not True:
+            raise InvariantRefusalError(
+                "real-Docker cleanup requires ephemeral storage"
+            )
+
+    @classmethod
+    def from_persisted(
+        cls,
+        identity: LabIdentity,
+        *,
+        docker_executable: str,
+        planned_resources: object,
+    ) -> "DockerCleanupSpec":
+        if type(identity) is not LabIdentity or type(planned_resources) is not tuple:
+            raise UsageStateError("invalid persisted Docker cleanup plan")
+        resource_tuple = tuple(
+            identity.resource(role)
+            for role in (
+                ResourceRole.IMAGE,
+                ResourceRole.CONTAINER,
+                ResourceRole.WORKSPACE,
+                ResourceRole.AUTH,
+                ResourceRole.TOOL,
+            )
+        )
+        if len(planned_resources) != len(resource_tuple):
+            raise InvariantRefusalError("persisted Docker cleanup plan drift")
+        for persisted, expected in zip(planned_resources, resource_tuple):
+            if isinstance(persisted, Mapping):
+                if set(persisted) != {"role", "name", "labels"}:
+                    raise InvariantRefusalError(
+                        "persisted Docker cleanup plan drift"
+                    )
+                role = persisted["role"]
+                name = persisted["name"]
+                labels = persisted["labels"]
+            else:
+                role = getattr(persisted, "role", None)
+                name = getattr(persisted, "name", None)
+                labels = getattr(persisted, "labels", None)
+            if (
+                role != expected.role.value
+                or name != expected.name
+                or not isinstance(labels, Mapping)
+                or dict(labels) != dict(expected.labels)
+            ):
+                raise InvariantRefusalError(
+                    "persisted Docker cleanup plan drift"
+                )
+        resources = LabResourceSet(resource_tuple)
+        return cls(
+            identity=identity,
+            image=resource_tuple[0],
+            resources=resources,
+            docker_executable=docker_executable,
+        )
+
+    def resource(self, role: ResourceRole) -> LabResource:
+        normalized = _role(role)
+        for resource in self.resources.resources:
+            if resource.role is normalized:
+                return resource
+        raise UsageStateError("resource role is not present")
+
+
+def _exact_stat_identity(metadata: os.stat_result) -> Tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
 def _owned_regular_bytes(
     path: object, description: str, maximum_bytes: int
 ) -> bytes:
@@ -344,31 +585,20 @@ def _owned_regular_bytes(
         or (hasattr(os, "geteuid") and before.st_uid != os.geteuid())
     ):
         raise InvariantRefusalError("invalid " + description)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
     try:
         descriptor = os.open(path, flags)
     except OSError as error:
         raise InvariantRefusalError("invalid " + description) from error
     try:
         opened = os.fstat(descriptor)
-        identity = (
-            before.st_dev,
-            before.st_ino,
-            before.st_mode,
-            before.st_uid,
-            before.st_nlink,
-            before.st_size,
-            before.st_mtime_ns,
-        )
-        opened_identity = (
-            opened.st_dev,
-            opened.st_ino,
-            opened.st_mode,
-            opened.st_uid,
-            opened.st_nlink,
-            opened.st_size,
-            opened.st_mtime_ns,
-        )
+        identity = _exact_stat_identity(before)
+        opened_identity = _exact_stat_identity(opened)
         if identity != opened_identity:
             raise InvariantRefusalError("invalid " + description)
         chunks = []
@@ -381,16 +611,15 @@ def _owned_regular_bytes(
             remaining -= len(chunk)
         payload = b"".join(chunks)
         after = os.fstat(descriptor)
-        after_identity = (
-            after.st_dev,
-            after.st_ino,
-            after.st_mode,
-            after.st_uid,
-            after.st_nlink,
-            after.st_size,
-            after.st_mtime_ns,
-        )
-        if len(payload) > maximum_bytes or after_identity != opened_identity:
+        try:
+            named_after = os.lstat(path)
+        except OSError as error:
+            raise InvariantRefusalError("invalid " + description) from error
+        if (
+            len(payload) > maximum_bytes
+            or _exact_stat_identity(after) != opened_identity
+            or _exact_stat_identity(named_after) != opened_identity
+        ):
             raise InvariantRefusalError("invalid " + description)
         return payload
     finally:
@@ -408,6 +637,10 @@ def _unique_json_pairs(pairs: Sequence[Tuple[str, object]]) -> Dict[str, object]
 
 def _load_json_object(path: object, description: str) -> Dict[str, object]:
     payload = _owned_regular_bytes(path, description, _MAX_LOCK_BYTES)
+    return _parse_json_object(payload, description)
+
+
+def _parse_json_object(payload: bytes, description: str) -> Dict[str, object]:
     try:
         value = json.loads(
             payload.decode("utf-8", errors="strict"),
@@ -443,12 +676,15 @@ def _relative_context_path(value: object) -> str:
     return os.path.join(*path.parts)
 
 
-def _validate_image_context(
-    context: str, context_lock: str, expected_lock_sha256: str
-) -> None:
-    if _file_sha256(context_lock, "image context lock") != expected_lock_sha256:
+def _context_inventory(
+    context_lock: str, expected_lock_sha256: str
+) -> _ContextInventory:
+    lock_bytes = _owned_regular_bytes(
+        context_lock, "image context lock", _MAX_LOCK_BYTES
+    )
+    if hashlib.sha256(lock_bytes).hexdigest() != expected_lock_sha256:
         raise InvariantRefusalError("image context lock identity changed")
-    lock = _load_json_object(context_lock, "image context lock")
+    lock = _parse_json_object(lock_bytes, "image context lock")
     if set(lock) != {"schema", "root_mode", "directories", "files"}:
         raise InvariantRefusalError("invalid image context lock")
     if type(lock["schema"]) is not int or lock["schema"] != 1:
@@ -478,6 +714,24 @@ def _validate_image_context(
         or set(file_records) != _EXPECTED_CONTEXT_FILES
     ):
         raise InvariantRefusalError("image context inventory drift")
+    return _ContextInventory(
+        root_mode=root_mode,
+        directory_modes=MappingProxyType(directory_modes),
+        file_records=MappingProxyType(file_records),
+        lock_bytes=lock_bytes,
+    )
+
+
+def _validate_image_context(
+    context: str,
+    context_lock: str,
+    expected_lock_sha256: str,
+    *,
+    private_snapshot: bool = False,
+) -> None:
+    if type(private_snapshot) is not bool:
+        raise UsageStateError("invalid private snapshot flag")
+    inventory = _context_inventory(context_lock, expected_lock_sha256)
 
     try:
         root = os.lstat(context)
@@ -486,7 +740,8 @@ def _validate_image_context(
     if (
         stat.S_ISLNK(root.st_mode)
         or not stat.S_ISDIR(root.st_mode)
-        or stat.S_IMODE(root.st_mode) != root_mode
+        or stat.S_IMODE(root.st_mode)
+        != (0o700 if private_snapshot else inventory.root_mode)
         or root.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
         or (hasattr(os, "geteuid") and root.st_uid != os.geteuid())
     ):
@@ -494,6 +749,7 @@ def _validate_image_context(
 
     observed_files = set()
     observed_directories = set()
+    observed_bytes = 0
 
     def refuse_walk_error(error: OSError) -> None:
         raise InvariantRefusalError("image context cannot be inspected") from error
@@ -509,8 +765,9 @@ def _validate_image_context(
                 if (
                     stat.S_ISLNK(info.st_mode)
                     or not stat.S_ISDIR(info.st_mode)
-                    or relative not in directory_modes
-                    or stat.S_IMODE(info.st_mode) != directory_modes[relative]
+                    or relative not in inventory.directory_modes
+                    or stat.S_IMODE(info.st_mode)
+                    != inventory.directory_modes[relative]
                     or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
                     or (hasattr(os, "geteuid") and info.st_uid != os.geteuid())
                 ):
@@ -519,22 +776,33 @@ def _validate_image_context(
             for name in files:
                 path = os.path.join(directory, name)
                 relative = os.path.relpath(path, context)
-                if relative not in file_records:
+                if relative not in inventory.file_records:
                     raise InvariantRefusalError("image context inventory drift")
                 info = os.lstat(path)
                 if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
                     raise InvariantRefusalError("image context file drift")
-                expected_mode, expected_sha256 = file_records[relative]
+                expected_mode, expected_sha256 = inventory.file_records[relative]
                 payload = _owned_regular_bytes(
                     path,
                     "image context file",
                     _MAX_CONTEXT_FILE_BYTES,
                 )
+                try:
+                    verified = os.lstat(path)
+                except OSError as error:
+                    raise InvariantRefusalError(
+                        "image context file drift"
+                    ) from error
                 if (
-                    stat.S_IMODE(info.st_mode) != expected_mode
+                    _exact_stat_identity(verified)
+                    != _exact_stat_identity(info)
+                    or stat.S_IMODE(info.st_mode) != expected_mode
                     or hashlib.sha256(payload).hexdigest() != expected_sha256
                 ):
                     raise InvariantRefusalError("image context file drift")
+                observed_bytes += len(payload)
+                if observed_bytes > MAX_SNAPSHOT_BYTES:
+                    raise InvariantRefusalError("image context is too large")
                 observed_files.add(relative)
     except OSError as error:
         raise InvariantRefusalError("image context cannot be inspected") from error
@@ -543,6 +811,169 @@ def _validate_image_context(
         or observed_directories != _EXPECTED_CONTEXT_DIRECTORIES
     ):
         raise InvariantRefusalError("image context inventory drift")
+
+
+def _fixture_lock_identity(fixture_lock: str) -> Tuple[str, str]:
+    fixture_data = _load_json_object(fixture_lock, "fixture lock")
+    if (
+        set(fixture_data) != {"schema", "fixture"}
+        or fixture_data.get("schema") != 1
+        or type(fixture_data.get("fixture")) is not dict
+    ):
+        raise InvariantRefusalError("invalid fixture lock")
+    fixture = fixture_data["fixture"]
+    if set(fixture) != {"artifact", "version", "sha256", "scaffold_only"}:
+        raise InvariantRefusalError("invalid fixture lock")
+    expected_artifact = "image/" + _FIXTURE_RELATIVE_PATH.replace(os.sep, "/")
+    if (
+        fixture.get("artifact") != expected_artifact
+        or type(fixture.get("version")) is not str
+        or not fixture["version"]
+        or type(fixture.get("sha256")) is not str
+        or _CHECKSUM_RE.fullmatch(fixture["sha256"]) is None
+        or fixture.get("scaffold_only") is not True
+    ):
+        raise InvariantRefusalError("invalid fixture lock")
+    return fixture["version"], fixture["sha256"]
+
+
+def _write_private_file(path: str, payload: bytes, mode: int) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, mode)
+    except OSError as error:
+        raise InvariantRefusalError("private context snapshot cannot be created") from error
+    try:
+        os.fchmod(descriptor, mode)
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            count = os.write(descriptor, view[written:])
+            if count < 1:
+                raise InvariantRefusalError(
+                    "private context snapshot cannot be created"
+                )
+            written += count
+        os.fsync(descriptor)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != mode
+            or (hasattr(os, "geteuid") and metadata.st_uid != os.geteuid())
+        ):
+            raise InvariantRefusalError(
+                "private context snapshot cannot be verified"
+            )
+    finally:
+        os.close(descriptor)
+
+
+def snapshot_image_context(
+    private_parent: str,
+    *,
+    context: str = IMAGE_DIRECTORY,
+    context_lock: str = CONTEXT_LOCK,
+    fixture_lock: str = FIXTURE_LOCK,
+) -> LockedContextSnapshot:
+    """Copy the verified context into one private, bounded immutable snapshot."""
+
+    if (
+        type(private_parent) is not str
+        or not os.path.isabs(private_parent)
+        or os.path.normpath(private_parent) != private_parent
+        or os.path.realpath(private_parent) != private_parent
+    ):
+        raise UsageStateError("private snapshot parent must be absolute and canonical")
+    try:
+        parent_info = os.lstat(private_parent)
+    except OSError as error:
+        raise InvariantRefusalError("private snapshot parent is unavailable") from error
+    if (
+        stat.S_ISLNK(parent_info.st_mode)
+        or not stat.S_ISDIR(parent_info.st_mode)
+        or stat.S_IMODE(parent_info.st_mode) != 0o700
+        or (hasattr(os, "geteuid") and parent_info.st_uid != os.geteuid())
+    ):
+        raise InvariantRefusalError("private snapshot parent is unsafe")
+    try:
+        if os.listdir(private_parent):
+            raise InvariantRefusalError("private snapshot parent is not empty")
+    except OSError as error:
+        raise InvariantRefusalError("private snapshot parent is unavailable") from error
+    lock_sha256 = _file_sha256(context_lock, "image context lock")
+    inventory = _context_inventory(context_lock, lock_sha256)
+    _validate_image_context(context, context_lock, lock_sha256)
+    fixture_version, fixture_sha256 = _fixture_lock_identity(fixture_lock)
+    fixture_record = inventory.file_records.get(_FIXTURE_RELATIVE_PATH)
+    if fixture_record is None or fixture_record[1] != fixture_sha256:
+        raise InvariantRefusalError("fixture lock and context lock disagree")
+
+    snapshot_context = os.path.join(private_parent, "image-context")
+    snapshot_lock = os.path.join(private_parent, "image-context.lock.json")
+    try:
+        os.mkdir(snapshot_context, 0o700)
+        os.chmod(snapshot_context, 0o700)
+        for relative in sorted(
+            inventory.directory_modes,
+            key=lambda item: (item.count(os.sep), item),
+        ):
+            destination = os.path.join(snapshot_context, relative)
+            os.mkdir(destination, inventory.directory_modes[relative])
+            os.chmod(destination, inventory.directory_modes[relative])
+
+        total_bytes = 0
+        for relative in sorted(inventory.file_records):
+            expected_mode, expected_sha256 = inventory.file_records[relative]
+            source = os.path.join(context, relative)
+            payload = _owned_regular_bytes(
+                source, "image context file", _MAX_CONTEXT_FILE_BYTES
+            )
+            total_bytes += len(payload)
+            if (
+                total_bytes > MAX_SNAPSHOT_BYTES
+                or hashlib.sha256(payload).hexdigest() != expected_sha256
+            ):
+                raise InvariantRefusalError("image context changed during snapshot")
+            _write_private_file(
+                os.path.join(snapshot_context, relative), payload, expected_mode
+            )
+
+        _write_private_file(snapshot_lock, inventory.lock_bytes, 0o600)
+        _validate_image_context(
+            snapshot_context,
+            snapshot_lock,
+            lock_sha256,
+            private_snapshot=True,
+        )
+        if (
+            _file_sha256(
+                os.path.join(snapshot_context, _FIXTURE_RELATIVE_PATH),
+                "snapshot fixture",
+            )
+            != fixture_sha256
+        ):
+            raise InvariantRefusalError("snapshot fixture checksum drift")
+        return LockedContextSnapshot(
+            context=snapshot_context,
+            context_lock=snapshot_lock,
+            context_lock_sha256=lock_sha256,
+            fixture_version=fixture_version,
+            fixture_sha256=fixture_sha256,
+        )
+    except BaseException as error:
+        try:
+            if os.path.lexists(snapshot_context):
+                shutil.rmtree(snapshot_context)
+            if os.path.lexists(snapshot_lock):
+                os.unlink(snapshot_lock)
+        except BaseException as cleanup_error:
+            if hasattr(error, "add_note"):
+                error.add_note(
+                    "private context snapshot cleanup failed: "
+                    + type(cleanup_error).__name__
+                )
+        raise
 
 
 def _role(value: object) -> ResourceRole:
@@ -589,6 +1020,20 @@ def _file_sha256(path: str, description: str = "fixture artifact") -> str:
 class DockerCommandBuilder:
     """Build only the finite Docker command set used by one exact lab."""
 
+    uses_resource_ids = False
+    cleanup_roles = (
+        ResourceRole.CONTAINER,
+        ResourceRole.AUTH,
+        ResourceRole.TOOL,
+        ResourceRole.WORKSPACE,
+        ResourceRole.IMAGE,
+    )
+    create_volume_roles = (
+        ResourceRole.WORKSPACE,
+        ResourceRole.AUTH,
+        ResourceRole.TOOL,
+    )
+
     def __init__(self, spec: DockerLabSpec) -> None:
         if type(spec) is not DockerLabSpec:
             raise UsageStateError("invalid Docker lab spec")
@@ -605,6 +1050,7 @@ class DockerCommandBuilder:
             self._spec.context,
             self._spec.context_lock,
             self._spec.context_lock_sha256,
+            private_snapshot=self._spec.context_is_snapshot,
         )
         image = self._spec.image
         dockerfile = os.path.join(self._spec.context, "Dockerfile")
@@ -680,21 +1126,32 @@ class DockerCommandBuilder:
                 "1.0",
                 "--ulimit",
                 "nofile=1024:1024",
-                "--tmpfs",
-                "/tmp:rw,nosuid,nodev,noexec,size=64m,mode=1777",
             )
         )
-        for role in (ResourceRole.WORKSPACE, ResourceRole.AUTH, ResourceRole.TOOL):
-            volume = self._spec.resource(role)
-            mount = "type=volume,src={},dst={}".format(
-                volume.name, VOLUME_TARGETS[role]
-            )
-            command.extend(
-                (
-                    "--mount",
-                    mount,
+        command.extend(("--tmpfs", "/tmp:" + TMPFS_OPTIONS["/tmp"]))
+        if self._spec.ephemeral_storage:
+            for target in (
+                CONTAINER_WORKSPACE,
+                CONTAINER_AUTH,
+                CONTAINER_TOOL,
+            ):
+                command.extend(("--tmpfs", target + ":" + TMPFS_OPTIONS[target]))
+        else:
+            for role in (
+                ResourceRole.WORKSPACE,
+                ResourceRole.AUTH,
+                ResourceRole.TOOL,
+            ):
+                volume = self._spec.resource(role)
+                mount = "type=volume,src={},dst={}".format(
+                    volume.name, VOLUME_TARGETS[role]
                 )
-            )
+                command.extend(
+                    (
+                        "--mount",
+                        mount,
+                    )
+                )
         for value in FIXED_ENV:
             command.extend(("--env", value))
         command.extend(
@@ -908,7 +1365,7 @@ class DockerCommandBuilder:
                     ),
                 )
             )
-        for action in (GuestAction.INSTALL, GuestAction.TEST, GuestAction.LOGOUT):
+        for action in GuestAction:
             commands.append((self.exec_guest(action), DockerOperation.EXEC_GUEST))
         commands.extend(
             (
@@ -975,6 +1432,8 @@ def _empty_list(value: object) -> Sequence[object]:
 
 
 def _expected_mounts(spec: DockerLabSpec) -> Tuple[Tuple[object, ...], ...]:
+    if spec.ephemeral_storage:
+        return ()
     return tuple(
         (
             "volume",
@@ -1045,13 +1504,18 @@ def validate_base_image_inspect(spec: DockerLabSpec, payload: object) -> None:
         or type(decoded[0]) is not dict
     ):
         raise InvariantRefusalError("base image digest is not locally verified")
-    digests = decoded[0].get("RepoDigests")
-    if (
-        type(digests) is not list
-        or any(type(item) is not str for item in digests)
-        or spec.base_image not in digests
-    ):
-        raise InvariantRefusalError("base image digest is not locally verified")
+    record = decoded[0]
+    if _LOCAL_IMAGE_ID_RE.fullmatch(spec.base_image) is not None:
+        if record.get("Id") != spec.base_image:
+            raise InvariantRefusalError("base image id is not locally verified")
+    else:
+        digests = record.get("RepoDigests")
+        if (
+            type(digests) is not list
+            or any(type(item) is not str for item in digests)
+            or spec.base_image not in digests
+        ):
+            raise InvariantRefusalError("base image digest is not locally verified")
 
 
 def _validate_image_record(resource: LabResource, record: Dict[str, object]) -> None:
@@ -1103,11 +1567,27 @@ def _validate_container_record(
     host = _dict(record["HostConfig"])
     network = _dict(record["NetworkSettings"])
     mounts = []
+    tmpfs_mount_destinations = set()
     for mount_value in _list(record["Mounts"]):
         mount = _dict(mount_value)
-        mounts.append(
-            (mount["Type"], mount["Name"], mount["Destination"], mount["RW"])
-        )
+        if spec.ephemeral_storage:
+            if (
+                mount.get("Type") != "tmpfs"
+                or mount.get("Source", "") != ""
+                or mount.get("Destination") not in TMPFS_OPTIONS
+                or mount.get("RW") is not True
+            ):
+                raise InvariantRefusalError("inspect policy drift")
+            tmpfs_mount_destinations.add(mount["Destination"])
+        else:
+            mounts.append(
+                (mount["Type"], mount["Name"], mount["Destination"], mount["RW"])
+            )
+    if spec.ephemeral_storage and tmpfs_mount_destinations not in (
+        set(),
+        set(TMPFS_OPTIONS),
+    ):
+        raise InvariantRefusalError("inspect policy drift")
     ulimits = []
     for limit_value in _list(host["Ulimits"]):
         limit = _dict(limit_value)
@@ -1182,15 +1662,20 @@ def _validate_container_record(
     if observed != expected:
         raise InvariantRefusalError("inspect policy drift")
     tmpfs = _dict(host["Tmpfs"])
-    if set(tmpfs) != {"/tmp"}:
+    expected_targets = set(TMPFS_OPTIONS) if spec.ephemeral_storage else {"/tmp"}
+    if set(tmpfs) != expected_targets:
         raise InvariantRefusalError("inspect policy drift")
-    normalized_tmpfs = set(str(tmpfs["/tmp"]).split(","))
-    common_tmpfs = {"rw", "nosuid", "nodev", "noexec", "mode=1777"}
-    if normalized_tmpfs not in (
-        common_tmpfs | {"size=64m"},
-        common_tmpfs | {"size=67108864"},
-    ):
-        raise InvariantRefusalError("inspect policy drift")
+    for target in expected_targets:
+        normalized_tmpfs = set(str(tmpfs[target]).split(","))
+        expected = set(TMPFS_OPTIONS[target].split(","))
+        if "size=64m" in expected:
+            allowed = (expected, (expected - {"size=64m"}) | {"size=67108864"})
+        elif "size=16m" in expected:
+            allowed = (expected, (expected - {"size=16m"}) | {"size=16777216"})
+        else:  # pragma: no cover - the fixed tmpfs table is closed.
+            raise InvariantRefusalError("inspect policy drift")
+        if normalized_tmpfs not in allowed:
+            raise InvariantRefusalError("inspect policy drift")
 
 
 __all__ = [
@@ -1200,6 +1685,8 @@ __all__ = [
     "CONTAINER_TOOL",
     "CONTAINER_USER",
     "CONTAINER_WORKSPACE",
+    "CONTEXT_LOCK",
+    "DockerCleanupSpec",
     "DockerCommandBuilder",
     "DockerLabSpec",
     "DockerOperation",
@@ -1208,10 +1695,15 @@ __all__ = [
     "GUEST_EXECUTABLE",
     "GuestAction",
     "IMAGE_DIRECTORY",
+    "LockedContextSnapshot",
+    "MAX_SNAPSHOT_BYTES",
     "MEMORY_BYTES",
     "NANO_CPUS",
     "SyntheticFixture",
+    "TMPFS_OPTIONS",
     "VOLUME_TARGETS",
     "classify_docker_argv",
+    "snapshot_image_context",
+    "validate_base_image_inspect",
     "validate_inspect",
 ]

@@ -188,7 +188,15 @@ jobs:
         run: |
           python - <<'PY'
           import tarfile
-          from pathlib import Path
+          from pathlib import Path, PurePosixPath
+
+          def is_ext_lab_launcher(name):
+              parts = PurePosixPath(name).parts
+              return (
+                  len(parts) >= 2
+                  and parts[-2] == "scripts"
+                  and parts[-1].startswith("unified-ext-lab")
+              )
 
           checks = (
               ("core", "tests/test_distribution_pair.py"),
@@ -202,12 +210,14 @@ jobs:
                   raise SystemExit(
                       distribution + " sdist contains a source-only repository test"
                   )
-              if distribution == "core" and any(
+              if any(
                   "/tools/unified_ext_lab/" in name
-                  or name.endswith("/scripts/unified-ext-lab")
+                  or is_ext_lab_launcher(name)
                   for name in names
               ):
-                  raise SystemExit("core sdist contains the source-only Ext lab")
+                  raise SystemExit(
+                      distribution + " sdist contains the source-only Ext lab"
+                  )
           PY
 
       - name: Check metadata and wheel path separation

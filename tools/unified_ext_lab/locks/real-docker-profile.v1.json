@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "execution_profile": "real-docker-v1",
+  "docker_endpoint": "unix:///var/run/docker.sock",
+  "platform": "linux/amd64",
+  "base": {
+    "image": "python",
+    "digest": "sha256:72d3d75f2639ab82b34b29390ad3d6e0827c775befee94edda8e9976818f488d",
+    "source_tag": "3.12.13-slim-bookworm",
+    "source_index_digest": "sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"
+  },
+  "routable": true
+}
