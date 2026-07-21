@@ -94,16 +94,47 @@ def _normalized_distribution(value: str) -> str:
     return re.sub(r"[-_.]+", "-", value).lower()
 
 
-def _verify_ext_layout(ext: WheelContents) -> None:
-    for root in _top_level_roots(ext.names):
-        if root == "unified_cli_ext":
-            continue
-        if root.endswith(".dist-info") and _DIST_INFO_RE.fullmatch(root):
-            if root.startswith("unified_cli_ext-"):
-                continue
+def _expected_dist_info_root(contents: WheelContents) -> str:
+    distribution = re.sub(r"[-_.]+", "_", contents.distribution)
+    root = f"{distribution}-{contents.version}.dist-info"
+    if _DIST_INFO_RE.fullmatch(root) is None:
         raise VerificationError(
-            "Ext wheel contains a path outside unified_cli_ext: " + root
+            f"wheel has an invalid metadata directory identity: {contents.path}"
         )
+    return root
+
+
+def _verify_layout(contents: WheelContents, package_root: str, label: str) -> None:
+    expected_dist_info = _expected_dist_info_root(contents)
+    package_prefix = package_root + "/"
+    metadata_prefix = expected_dist_info + "/"
+    package_init = package_prefix + "__init__.py"
+    if package_init not in contents.names:
+        raise VerificationError(f"{label} wheel does not contain {package_root}")
+    unexpected = sorted(
+        name
+        for name in contents.names
+        if not name.startswith(package_prefix)
+        and not name.startswith(metadata_prefix)
+    )
+    if unexpected:
+        raise VerificationError(
+            f"{label} wheel contains a path outside {package_root}: "
+            + unexpected[0]
+        )
+    metadata_path = f"{expected_dist_info}/METADATA"
+    if metadata_path not in contents.names:
+        raise VerificationError(
+            f"{label} wheel metadata directory does not match Name and Version"
+        )
+
+
+def _verify_ext_layout(ext: WheelContents) -> None:
+    _verify_layout(ext, "unified_cli_ext", "Ext")
+
+
+def _verify_core_layout(core: WheelContents) -> None:
+    _verify_layout(core, "unified_cli", "Core")
 
 
 def _verify_core_requirement(requirements: Iterable[str]) -> None:
@@ -172,6 +203,7 @@ def verify_pair(
     if "unified_cli" in _top_level_roots(ext.names):
         raise VerificationError("Ext wheel unexpectedly contains unified_cli")
 
+    _verify_core_layout(core)
     _verify_ext_layout(ext)
     _verify_core_requirement(ext.requirements)
     return core, ext

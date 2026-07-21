@@ -1,0 +1,7 @@
+{
+  "schema": 1,
+  "base_image": {
+    "name": "registry.invalid/unified-ext-lab/python-runtime",
+    "digest": "sha256:9b1dce98e6f43553a8edfe26218aa34b535164b2084845063937821f71ef5a08"
+  }
+}

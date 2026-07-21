@@ -1,0 +1,44 @@
+{
+  "directories": {
+    "rootfs": "0755",
+    "rootfs/home": "0755",
+    "rootfs/home/lab": "0755",
+    "rootfs/opt": "0755",
+    "rootfs/opt/unified-ext-lab": "0755",
+    "rootfs/opt/unified-ext-lab/fixtures": "0755",
+    "rootfs/opt/unified-ext-lab/tool": "0755",
+    "rootfs/workspace": "0755"
+  },
+  "files": {
+    "Dockerfile": {
+      "mode": "0644",
+      "sha256": "65a84f6a637cbe6caa377ab34ec28d488ff777c1fbedcc66c44b187aa7dfd1ab"
+    },
+    "rootfs/home/lab/.volume-owner": {
+      "mode": "0644",
+      "sha256": "c5f79b27e1d538e5995cfcb7a81ea86b3deb81617bd0deb05e4b35cdd6e8199d"
+    },
+    "rootfs/opt/unified-ext-lab/fixtures/fake-provider": {
+      "mode": "0755",
+      "sha256": "e740b71e1de2e12fd416beada693704265f210a42cd848ee1e718019f24dfbcc"
+    },
+    "rootfs/opt/unified-ext-lab/guest.py": {
+      "mode": "0755",
+      "sha256": "e6c79335b196d760529b612ee3c795a471b3b2e4313125e6bc99265a2ff9237e"
+    },
+    "rootfs/opt/unified-ext-lab/tool/.volume-owner": {
+      "mode": "0644",
+      "sha256": "c5f79b27e1d538e5995cfcb7a81ea86b3deb81617bd0deb05e4b35cdd6e8199d"
+    },
+    "rootfs/workspace/README.md": {
+      "mode": "0644",
+      "sha256": "73fdb83e67cb16ffe7e695e3866449d5bf6b7fa0cb0f22d4bc12b3c998d94658"
+    },
+    "rootfs/workspace/project.marker": {
+      "mode": "0644",
+      "sha256": "75a870d36776ef10c836eec4b3af8f5f653d9dd7b9f790bf8b56f76746ff1b05"
+    }
+  },
+  "root_mode": "0755",
+  "schema": 1
+}
