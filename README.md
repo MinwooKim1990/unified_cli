@@ -46,9 +46,9 @@ pip install "unified-cli[server]"
 
 | | Core: `unified-cli` | Ext: [`unified-cli-ext`](https://pypi.org/project/unified-cli-ext/) |
 |---|---|---|
-| Included providers | Claude, Codex, Gemini (`agy`) | Grok, Kimi, Copilot, Cursor catalog metadata |
+| Included providers | Claude, Codex, Gemini (`agy`) | Nine-item catalog metadata: Grok, Kimi, Copilot, Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, Cline |
 | Default behavior | Existing defaults are unchanged | Never changes Core defaults or its server allowlist |
-| Current state | Core providers retain their existing behavior | All four entries are **Held**: discoverable metadata only, not runnable adapters |
+| Current state | Core providers retain their existing behavior | All nine entries are **Held**: discoverable metadata only, not runnable adapters |
 
 Ext is a separate PyPI distribution and Python module (`unified_cli_ext`). It
 does not bundle vendor CLIs, sign you in, call a service, or create charges.
@@ -62,9 +62,10 @@ python -m pip install unified-cli-ext
 python -c "import importlib.metadata as m; print([e.name for e in m.distribution('unified-cli-ext').entry_points if e.group == 'unified_cli.providers.v1'])"
 ```
 
-The check lists installed provider entry-point metadata. In Stage 5B it may
-list `grok`, `kimi`, `copilot`, and `cursor`; the Ext catalog classifies all
-four as **Held**. It does not run a provider, locate a vendor binary,
+The check lists installed provider entry-point metadata. In Stages 5B–5C it
+may list `grok`, `kimi`, `copilot`, `cursor`, `codebuddy`, `qoder`,
+`mistral-vibe`, `qwen`, and `cline`; the Ext catalog classifies all nine as
+**Held**. It does not run a provider, locate a vendor binary,
 authenticate, or make a network request. Do not treat a listed name as a chat
 command.
 

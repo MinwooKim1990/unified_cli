@@ -49,6 +49,11 @@ grok = "unified_cli_ext.providers.grok:PLUGIN"
 kimi = "unified_cli_ext.providers.kimi:PLUGIN"
 copilot = "unified_cli_ext.providers.copilot:PLUGIN"
 cursor = "unified_cli_ext.providers.cursor:PLUGIN"
+codebuddy = "unified_cli_ext.providers.codebuddy:PLUGIN"
+qoder = "unified_cli_ext.providers.qoder:PLUGIN"
+mistral-vibe = "unified_cli_ext.providers.mistral_vibe:PLUGIN"
+qwen = "unified_cli_ext.providers.qwen:PLUGIN"
+cline = "unified_cli_ext.providers.cline:PLUGIN"
 
 [project.urls]
 Homepage = "https://github.com/MinwooKim1990/unified_cli"

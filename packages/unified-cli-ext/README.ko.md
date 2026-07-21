@@ -1,7 +1,7 @@
 # unified-cli-ext
 
 `unified-cli-ext`는 [`unified-cli`](https://github.com/MinwooKim1990/unified_cli)를
-위한 확장 기반 패키지입니다. 0.1.0은 전송·런타임 계약(contract)과 비활성 Stage 5B
+위한 확장 기반 패키지입니다. 0.1.0은 전송·런타임 계약(contract)과 비활성 Stage 5B–5C
 카탈로그를 제공합니다. 동작하거나 활성화된 provider 어댑터는 포함하지 않습니다.
 
 ## 이 릴리스의 범위
@@ -11,8 +11,9 @@
 (Claude, Codex, Gemini/Antigravity), 로컬 서버 허용 목록은 바뀌지 않습니다. 확장
 provider의 서버 노출도 계속 꺼져 있습니다.
 
-설치되는 카탈로그에는 Grok, Kimi, Copilot, Cursor용 엔트리포인트 메타데이터가
-있습니다. 모든 항목은 **Held**입니다. 어댑터 메타데이터의 `chat`은 잠정 목표일 뿐이며
+설치되는 카탈로그에는 Grok, Kimi, Copilot, Cursor, CodeBuddy, Qoder, Mistral Vibe,
+Qwen, Cline용 엔트리포인트 메타데이터가 있습니다. 모든 항목은 **Held**입니다. 어댑터
+메타데이터의 `chat`은 잠정 목표일 뿐이며
 Core 플러그인은 실행 capability를 하나도 표시하지 않고 provider를 만들거나 명령을
 실행할 수 없습니다. 이는 동작하는 어댑터가 아니며 Preview나 Stable로 표현해서는 안
 됩니다.
@@ -20,8 +21,8 @@ Core 플러그인은 실행 capability를 하나도 표시하지 않고 provider
 0.1.0에는 자격 증명, 인증 흐름, 실제 provider 호출, 유료 서비스 호출이 없습니다.
 설치만으로 vendor CLI가 설치되거나 로그인·서비스 호출·과금이 발생하지 않습니다.
 provider 바이너리와 계정은 사용자가 직접 관리합니다. 검증은 오프라인 fixture만
-사용합니다. 각 provider의 일반 로그인 절차와 요청 한도를 따르며 계정 데이터를 읽거나
-가져오지 않습니다.
+사용합니다. 활성화된 provider가 없으므로 이 릴리스는 vendor 로그인이나 요청 처리에
+관여하지 않으며 계정 데이터를 읽거나 가져오지 않습니다.
 
 확장은 로드될 때 호스트 Python 프로세스 안에서 신뢰된 설치 코드로 실행됩니다.
 따라서 신뢰할 수 있는 배포판만 설치하세요.
