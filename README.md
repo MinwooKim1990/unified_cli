@@ -46,9 +46,9 @@ pip install "unified-cli[server]"
 
 | | Core: `unified-cli` | Ext: [`unified-cli-ext`](https://pypi.org/project/unified-cli-ext/) |
 |---|---|---|
-| Included providers | Claude, Codex, Gemini (`agy`) | 16-item catalog metadata: Grok, Kimi, Copilot, Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, Cline, OpenCode, Kilo Code, Factory Droid, Pi, Oh My Pi, Hermes, Poolside |
+| Included providers | Claude, Codex, Gemini (`agy`) | 18-item catalog metadata: Grok, Kimi, Copilot, Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, Cline, OpenCode, Kilo Code, Factory Droid, Pi, Oh My Pi, Hermes, Poolside, Amp, GitLab Duo |
 | Default behavior | Existing defaults are unchanged | Never changes Core defaults or its server allowlist |
-| Current state | Core providers retain their existing behavior | Exactly 16 inert entries are **Held**: discoverable metadata only, not runnable adapters; extension server support is disabled |
+| Current state | Core providers retain their existing behavior | Exactly 18 inert entries are **Held**: discoverable metadata only, not runnable adapters; extension server support is disabled |
 
 Ext is a separate PyPI distribution and Python module (`unified_cli_ext`). It
 does not bundle vendor CLIs, sign you in, call a service, or create charges.
@@ -62,11 +62,11 @@ python -m pip install unified-cli-ext
 python -c "import importlib.metadata as m; print([e.name for e in m.distribution('unified-cli-ext').entry_points if e.group == 'unified_cli.providers.v1'])"
 ```
 
-The check lists installed provider entry-point metadata. In Stages 5B–5E it
+The check lists installed provider entry-point metadata. In Stages 5B–5F it
 may list `grok`, `kimi`, `copilot`, `cursor`, `codebuddy`, `qoder`,
 `mistral-vibe`, `qwen`, `cline`, `opencode`, `kilo`, `droid`, `pi`,
-`oh-my-pi`, `hermes`, and `poolside`; the Ext catalog classifies all 16 as
-**Held**. It does not run a provider, locate a vendor binary,
+`oh-my-pi`, `hermes`, `poolside`, `amp`, and `gitlab-duo`; the Ext catalog
+classifies all 18 as **Held**. It does not run a provider, locate a vendor binary,
 authenticate, or make a network request. Do not treat a listed name as a chat
 command.
 

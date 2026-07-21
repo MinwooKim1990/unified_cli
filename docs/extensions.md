@@ -5,7 +5,7 @@ support Claude, Codex, and Gemini (`agy`) with its existing defaults. Installing
 Ext does not change those defaults, does not add an extension to Core's local
 server allowlist, and does not install or configure any vendor software.
 
-Stages 5B–5E install catalog metadata for exactly 16 inert Held providers. Each
+Stages 5B–5F install catalog metadata for exactly 18 inert Held providers. Each
 is discoverable through an explicit entry point, has status **Held**, and is
 incapable of starting a provider or external command. The adapter catalog
 records `chat` as a provisional design target, while the Core plugin advertises
@@ -60,11 +60,13 @@ manual design record.
 <!-- BEGIN GENERATED EXT PROVIDER SUPPORT -->
 | Provider ID | Support status | Core capabilities | Server |
 |---|---|---|---|
+| `amp` | `held` | `none` | `disabled` |
 | `cline` | `held` | `none` | `disabled` |
 | `codebuddy` | `held` | `none` | `disabled` |
 | `copilot` | `held` | `none` | `disabled` |
 | `cursor` | `held` | `none` | `disabled` |
 | `droid` | `held` | `none` | `disabled` |
+| `gitlab-duo` | `held` | `none` | `disabled` |
 | `grok` | `held` | `none` | `disabled` |
 | `hermes` | `held` | `none` | `disabled` |
 | `kilo` | `held` | `none` | `disabled` |
@@ -78,7 +80,7 @@ manual design record.
 | `qwen` | `held` | `none` | `disabled` |
 <!-- END GENERATED EXT PROVIDER SUPPORT -->
 
-## Stage 5B–5E catalog
+## Stage 5B–5F catalog
 
 “Candidate transport” records a provisional design direction, not a command
 contract. “Auto-update containment” describes the intended boundary if an
@@ -102,6 +104,8 @@ adapter is later enabled; no Held metadata executes it today.
 | `oh-my-pi` | Oh My Pi (`omp`, package `@oh-my-pi/pi-coding-agent`) | Custom NDJSON RPC candidate | `chat` candidate; Core capability none | Held | No verified update containment claim yet; configuration, resources, permissions, and process lifecycle require Stage 6 verification | [Repository](https://github.com/can1357/oh-my-pi) · [RPC](https://github.com/can1357/oh-my-pi/blob/main/docs/rpc.md) · [Approval mode](https://github.com/can1357/oh-my-pi/blob/main/docs/approval-mode.md) |
 | `hermes` | Hermes Agent (`hermes`, PyPI `hermes-agent[acp]`) | ACP stdio candidate | `chat` candidate; Core capability none | Held | Hermes pins ACP 0.9.0 while Ext targets 0.11.x; compatibility, configuration, and lifecycle require Stage 6 verification | [PyPI](https://pypi.org/project/hermes-agent/) · [Repository](https://github.com/NousResearch/hermes-agent) · [ACP guide](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/acp.md) |
 | `poolside` | Poolside Agent CLI (`pool`, official native release) | ACP stdio candidate | `chat` candidate; Core capability none | Held | No verified startup/update containment claim yet; proprietary binary identity, ACP schema, configuration, and removal require Stage 6 verification | [Install](https://docs.poolside.ai/cli/install) · [CLI reference](https://docs.poolside.ai/cli/cli-reference) · [Release](https://github.com/poolsideai/pool/releases/tag/v1.0.13) |
+| `amp` | Amp CLI (`amp`, canonical package `@ampcode/cli`) | Claude-compatible streaming JSONL input/output candidate | `chat` candidate; Core capability none | Held | Tool approval is off by default; workspace settings, plugins, MCP, EOF/process lifecycle, and paid opt-in execution require isolated Stage 6 evidence | [Manual](https://ampcode.com/manual) · [Stream schema](https://ampcode.com/manual/appendix) · [Package](https://www.npmjs.com/package/@ampcode/cli) |
+| `gitlab-duo` | GitLab Duo CLI (`duo`, compiled generic package or official npm package `@gitlab/duo-cli`) | One-shot JSON candidate | `chat` candidate; Core capability none | Held | Headless runs auto-approve tools; JSON schema 1.0, authentication/entitlement, context/MCP/hooks, cleanup, and isolation require Stage 6 evidence | [Overview](https://docs.gitlab.com/user/gitlab_duo_cli/) · [Usage](https://docs.gitlab.com/user/gitlab_duo_cli/use/) · [Setup](https://docs.gitlab.com/user/gitlab_duo_cli/set_up/) |
 
 The optional `acp` and `mcp` extras install protocol SDK dependencies only.
 They do not activate a Held provider or make a provider call.

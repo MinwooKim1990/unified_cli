@@ -1,4 +1,4 @@
-"""Stage 5B-5E contract checks for inert external provider entry points."""
+"""Stage 5B-5F contract checks for inert external provider entry points."""
 
 from __future__ import annotations
 
@@ -51,6 +51,8 @@ ENTRY_POINTS = {
     "oh-my-pi": "unified_cli_ext.providers.oh_my_pi:PLUGIN",
     "hermes": "unified_cli_ext.providers.hermes:PLUGIN",
     "poolside": "unified_cli_ext.providers.poolside:PLUGIN",
+    "amp": "unified_cli_ext.providers.amp:PLUGIN",
+    "gitlab-duo": "unified_cli_ext.providers.gitlab_duo:PLUGIN",
 }
 
 EXPECTED_COMMANDS = {
@@ -267,6 +269,30 @@ EXPECTED_COMMANDS = {
         "mode": PromptMode.PROTOCOL,
         "prompt_option": None,
     },
+    "amp": {
+        "executable": "amp",
+        "prompt": ("--execute", "--stream-json", "--stream-json-input"),
+        "transport": "jsonl",
+        "environment": frozenset(("AMP_API_KEY", "AMP_SKIP_UPDATE_CHECK")),
+        "mode": PromptMode.PROTOCOL,
+        "prompt_option": None,
+    },
+    "gitlab-duo": {
+        "executable": "duo",
+        "prompt": ("run", "--output-format", "json"),
+        "transport": "json",
+        "environment": frozenset(
+            (
+                "GITLAB_TOKEN",
+                "GITLAB_OAUTH_TOKEN",
+                "GITLAB_BASE_URL",
+                "GITLAB_URL",
+                "GITLAB_DUO_MODEL",
+            )
+        ),
+        "mode": PromptMode.OPTION_VALUE,
+        "prompt_option": "--goal",
+    },
 }
 
 EVIDENCE_FLAGS = {
@@ -357,6 +383,37 @@ EVIDENCE_FLAGS = {
         "POOLSIDE_EXEC_JSONL_SEPARATE_REQUIRES_STAGE_6_EVIDENCE",
         "POOLSIDE_UPDATE_REMOVAL_REQUIRES_STAGE_6_EVIDENCE",
     ),
+    "amp": (
+        "AMP_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE",
+        "AMP_INSTALL_CHANNEL_BINARY_IDENTITY_PROVENANCE_REQUIRES_STAGE_6_EVIDENCE",
+        "AMP_STREAM_JSON_INPUT_OUTPUT_SCHEMA_REQUIRES_STAGE_6_EVIDENCE",
+        "AMP_TEXT_TOOL_USAGE_ERROR_IMAGE_NORMALIZATION_REQUIRES_STAGE_6_EVIDENCE",
+        "AMP_AUTH_LOGIN_LOGOUT_STATUS_BILLING_REQUIRES_STAGE_6_EVIDENCE",
+        "AMP_SESSION_CONTINUE_RESUME_PERSISTENCE_REQUIRES_STAGE_6_EVIDENCE",
+        "AMP_PERMISSION_TOOL_PLUGIN_MCP_CONFIG_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "AMP_CANCEL_STEER_STDIN_EOF_PROCESS_CHILD_CLEANUP_REQUIRES_STAGE_6_EVIDENCE",
+        "AMP_UPDATE_REMOVAL_SETTINGS_ENV_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "AMP_SDK_CLI_SCHEMA_DRIFT_REQUIRES_STAGE_6_EVIDENCE",
+    ),
+    "gitlab-duo": (
+        "GITLAB_DUO_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE",
+        "GITLAB_DUO_BINARY_GENERIC_PACKAGE_NPM_PROVENANCE_HASH_SIGNATURE_REQUIRES_STAGE_6_EVIDENCE",
+        "GITLAB_DUO_BARE_SEMVER_SEPARATE_IDENTITY_PROBE_REQUIRES_STAGE_6_EVIDENCE",
+        "GITLAB_DUO_RUN_GOAL_OPTION_SINGLE_JSON_STDOUT_STDERR_EXIT_CODE_REQUIRES_STAGE_6_EVIDENCE",
+        "GITLAB_DUO_RUN_JSON_SCHEMA_1_0_NORMALIZATION_REQUIRES_STAGE_6_EVIDENCE",
+        "GITLAB_DUO_JSON_EMPTY_OUTPUT_SERIALIZATION_FAILURE_REQUIRES_STAGE_6_EVIDENCE",
+        "GITLAB_DUO_HEADLESS_AUTO_APPROVAL_SANDBOX_BOUNDARY_REQUIRES_STAGE_6_EVIDENCE",
+        "GITLAB_DUO_TOOL_MCP_HOOK_SKILL_PROJECT_CONFIG_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "GITLAB_DUO_AUTH_GLAB_HELPER_CONFIG_HOME_ENV_SECRET_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "GITLAB_DUO_SESSION_NEW_RESUME_PLAN_APPROVAL_CONTEXT_REQUIRES_STAGE_6_EVIDENCE",
+        "GITLAB_DUO_MODEL_CONTEXT_INSTRUCTION_PERSISTENCE_REQUIRES_STAGE_6_EVIDENCE",
+        "GITLAB_DUO_CANCEL_SIGNAL_WEBSOCKET_RETRY_PROCESS_CHILD_MCP_CLEANUP_REQUIRES_STAGE_6_EVIDENCE",
+        "GITLAB_DUO_USAGE_ERROR_REASONING_IMAGE_SCHEMA_REQUIRES_STAGE_6_EVIDENCE",
+        "GITLAB_DUO_TELEMETRY_LOG_UPDATE_CONFIG_CONTAINMENT_REQUIRES_STAGE_6_EVIDENCE",
+        "GITLAB_DUO_CI_CREDITS_SUBSCRIPTION_NAMESPACE_QUOTA_REQUIRES_STAGE_6_EVIDENCE",
+        "GITLAB_DUO_COMPILED_BINARY_NPM_CHANNEL_UPDATE_REMOVAL_REQUIRES_STAGE_6_EVIDENCE",
+        "GITLAB_DUO_WINDOWS_REQUIRES_SEPARATE_TRANSPORT_EVIDENCE",
+    ),
 }
 
 
@@ -375,7 +432,7 @@ def test_pyproject_registers_all_held_provider_entry_points_exactly():
     for line in section.strip().splitlines():
         provider_id, _, target = line.partition(" = ")
         declared[provider_id] = target.strip().strip('"')
-    assert len(declared) == 16
+    assert len(declared) == 18
     assert declared == ENTRY_POINTS
 
 
@@ -433,10 +490,15 @@ def test_held_specs_and_plugins_are_immutable_and_minimal(provider_id):
 def test_held_entries_record_every_remaining_evidence_gate(provider_id):
     module = _module(provider_id)
     expected = set(EVIDENCE_FLAGS[provider_id])
+    evidence_prefix = provider_id.upper().replace("-", "_") + "_"
     recorded = {
         name
         for name, value in vars(module).items()
-        if name.endswith("_STAGE_6_EVIDENCE") and value is True
+        if value is True
+        and (
+            name.endswith("_STAGE_6_EVIDENCE")
+            or (name.startswith(evidence_prefix) and name.endswith("_EVIDENCE"))
+        )
     }
     assert recorded == expected
     for flag in expected:

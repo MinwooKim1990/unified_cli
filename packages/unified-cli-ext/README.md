@@ -2,7 +2,7 @@
 
 `unified-cli-ext` is the extension foundation for
 [`unified-cli`](https://github.com/MinwooKim1990/unified_cli). Version 0.1.0
-ships transport and runtime contracts plus an inert Stage 5B–5E catalog. It does
+ships transport and runtime contracts plus an inert Stage 5B–5F catalog. It does
 **not** include a working or enabled provider adapter.
 
 ## What this release does—and does not do
@@ -15,8 +15,8 @@ exposure for extensions remains off.
 
 The installed catalog has entry-point metadata for Grok, Kimi, Copilot,
 Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, Cline, OpenCode, Kilo Code,
-Factory Droid, Pi, Oh My Pi, Hermes Agent, and Poolside Agent CLI. Exactly 16
-inert entries are **Held**. The adapter metadata records `chat` only
+Factory Droid, Pi, Oh My Pi, Hermes Agent, Poolside Agent CLI, Amp, and GitLab
+Duo CLI. Exactly 18 inert entries are **Held**. The adapter metadata records `chat` only
 as a provisional target; the Core plugin advertises no executable capability and
 cannot construct a provider or execute a command. These are not working
 adapters and must not be presented as Preview or Stable.
