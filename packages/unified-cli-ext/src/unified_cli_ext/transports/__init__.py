@@ -4,10 +4,23 @@ from .acp import AcpSdkAdapter, require_acp_sdk
 from .http_sse import HttpSseClient, SseEvent
 from .jsonl import JsonlProcess
 from .jsonrpc import JsonRpcId, JsonRpcProcessClient
-from .security import CancellationToken, IsolatedEnvironment, TransportLimits, redact_diagnostics
+from .process import FixedProcessResult, run_fixed_process
+from .security import (
+    CancellationToken,
+    DirectoryPin,
+    ExecutableIdentity,
+    IsolatedEnvironment,
+    TransportLimits,
+    private_persistent_home,
+    redact_diagnostics,
+    validated_workspace,
+)
 
 __all__ = [
     "CancellationToken",
+    "DirectoryPin",
+    "ExecutableIdentity",
+    "FixedProcessResult",
     "AcpSdkAdapter",
     "HttpSseClient",
     "IsolatedEnvironment",
@@ -17,5 +30,8 @@ __all__ = [
     "SseEvent",
     "TransportLimits",
     "redact_diagnostics",
+    "private_persistent_home",
+    "validated_workspace",
     "require_acp_sdk",
+    "run_fixed_process",
 ]
