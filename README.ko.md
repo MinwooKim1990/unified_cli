@@ -48,9 +48,9 @@ pip install "unified-cli[server]"
 
 | | Core: `unified-cli` | Ext: [`unified-cli-ext`](https://pypi.org/project/unified-cli-ext/) |
 |---|---|---|
-| 포함 provider | Claude, Codex, Gemini (`agy`) | 9개 카탈로그 메타데이터: Grok, Kimi, Copilot, Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, Cline |
+| 포함 provider | Claude, Codex, Gemini (`agy`) | 11개 카탈로그 메타데이터: Grok, Kimi, Copilot, Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, Cline, OpenCode, Kilo Code |
 | 기본 동작 | 기존 기본값은 바뀌지 않음 | Core 기본값과 서버 허용 목록을 절대 변경하지 않음 |
-| 현재 상태 | Core provider는 기존 동작을 유지 | 아홉 항목 모두 **Held**: 발견 가능한 메타데이터일 뿐, 실행 가능한 어댑터가 아님 |
+| 현재 상태 | Core provider는 기존 동작을 유지 | 정확히 11개의 비활성 항목이 **Held**: 발견 가능한 메타데이터일 뿐, 실행 가능한 어댑터가 아니며 확장 서버 지원은 비활성화됨 |
 
 Ext는 별도 PyPI 배포판이자 Python 모듈(`unified_cli_ext`)입니다. vendor CLI를
 포함하지 않고, 로그인·서비스 호출·과금 발생을 하지 않습니다. provider 바이너리와
@@ -64,10 +64,11 @@ python -m pip install unified-cli-ext
 python -c "import importlib.metadata as m; print([e.name for e in m.distribution('unified-cli-ext').entry_points if e.group == 'unified_cli.providers.v1'])"
 ```
 
-이 확인은 설치된 provider 엔트리포인트 메타데이터만 나열합니다. Stage 5B–5C에서는
+이 확인은 설치된 provider 엔트리포인트 메타데이터만 나열합니다. Stage 5B–5D에서는
 `grok`, `kimi`, `copilot`, `cursor`, `codebuddy`, `qoder`, `mistral-vibe`, `qwen`,
-`cline`이 표시될 수 있으며 Ext 카탈로그는 아홉 항목을 모두 **Held**로 분류합니다.
-provider 실행, vendor 바이너리 탐색, 인증, 네트워크 요청은 하지 않습니다. 목록에
+`cline`, `opencode`, `kilo`가 표시될 수 있으며 Ext 카탈로그는 11개 항목을 모두
+**Held**로 분류합니다. provider 실행, vendor 바이너리 탐색, 인증, 네트워크 요청은 하지
+않습니다. 목록에
 이름이 있다는 사실을 채팅 명령으로 해석하면 안 됩니다.
 
 `unified-cli providers --include-ext`는 import 없이 탐색하므로 처음에는 수명 주기

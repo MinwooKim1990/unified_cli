@@ -2,7 +2,7 @@
 
 `unified-cli-ext` is the extension foundation for
 [`unified-cli`](https://github.com/MinwooKim1990/unified_cli). Version 0.1.0
-ships transport and runtime contracts plus an inert Stage 5B–5C catalog. It does
+ships transport and runtime contracts plus an inert Stage 5B–5D catalog. It does
 **not** include a working or enabled provider adapter.
 
 ## What this release does—and does not do
@@ -14,9 +14,9 @@ Codex, and Gemini/Antigravity), or change the local server allowlist. Server
 exposure for extensions remains off.
 
 The installed catalog has entry-point metadata for Grok, Kimi, Copilot,
-Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, and Cline. Every entry is
-**Held**. The adapter metadata records `chat` only as a
-provisional target; the Core plugin advertises no executable capability and
+Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, Cline, OpenCode, and Kilo Code.
+Exactly 11 inert entries are **Held**. The adapter metadata records `chat` only
+as a provisional target; the Core plugin advertises no executable capability and
 cannot construct a provider or execute a command. These are not working
 adapters and must not be presented as Preview or Stable.
 
