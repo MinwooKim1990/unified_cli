@@ -26,8 +26,11 @@ def _wheel(
     package_root: str,
     requirements: tuple[str, ...] = (),
     extra_members: tuple[str, ...] = (),
+    dist_info_root: str | None = None,
+    package_member: str | None = None,
 ) -> Path:
     dist_root = distribution.replace("-", "_")
+    metadata_root = dist_info_root or f"{dist_root}-{version}.dist-info"
     metadata = [
         "Metadata-Version: 2.4",
         f"Name: {distribution}",
@@ -36,9 +39,9 @@ def _wheel(
     metadata.extend(f"Requires-Dist: {item}" for item in requirements)
     metadata.append("")
     with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr(f"{package_root}/__init__.py", "")
+        archive.writestr(package_member or f"{package_root}/__init__.py", "")
         archive.writestr(
-            f"{dist_root}-{version}.dist-info/METADATA",
+            f"{metadata_root}/METADATA",
             "\n".join(metadata),
         )
         for member in extra_members:
@@ -86,6 +89,116 @@ def test_ext_cannot_ship_core_paths(tmp_path):
         verify_distribution_pair.VerificationError,
         match="overlap|outside unified_cli_ext|contains unified_cli",
     ):
+        verify_distribution_pair.verify_pair(core, ext)
+
+
+@pytest.mark.parametrize(
+    "forbidden_member",
+    (
+        "tools/unified_ext_lab/state.py",
+        "scripts/unified-ext-lab",
+    ),
+)
+def test_synthetic_core_wheel_rejects_source_only_lab_paths(
+    tmp_path, forbidden_member
+):
+    core = _wheel(
+        tmp_path / "unified_cli-0.5.0-py3-none-any.whl",
+        distribution="unified-cli",
+        version="0.5.0",
+        package_root="unified_cli",
+        extra_members=(forbidden_member,),
+    )
+    ext = _wheel(
+        tmp_path / "unified_cli_ext-0.1.0-py3-none-any.whl",
+        distribution="unified-cli-ext",
+        version="0.1.0",
+        package_root="unified_cli_ext",
+        requirements=("unified-cli>=0.5,<0.6",),
+    )
+
+    with pytest.raises(
+        verify_distribution_pair.VerificationError,
+        match="outside unified_cli",
+    ):
+        verify_distribution_pair.verify_pair(core, ext)
+
+
+def test_core_rejects_any_unexpected_top_level_path(tmp_path):
+    core, ext = _valid_pair(tmp_path)
+    with zipfile.ZipFile(core, "a") as archive:
+        archive.writestr("unexpected_payload/module.py", "")
+
+    with pytest.raises(
+        verify_distribution_pair.VerificationError,
+        match="outside unified_cli",
+    ):
+        verify_distribution_pair.verify_pair(core, ext)
+
+
+@pytest.mark.parametrize(
+    ("target", "package_root"),
+    (("core", "unified_cli"), ("ext", "unified_cli_ext")),
+)
+def test_package_root_must_be_a_real_package_directory(
+    tmp_path, target, package_root
+):
+    core, ext = _valid_pair(tmp_path)
+    if target == "core":
+        core = _wheel(
+            tmp_path / "single-file-core.whl",
+            distribution="unified-cli",
+            version="0.5.0",
+            package_root=package_root,
+            package_member=package_root,
+        )
+    else:
+        ext = _wheel(
+            tmp_path / "single-file-ext.whl",
+            distribution="unified-cli-ext",
+            version="0.1.0",
+            package_root=package_root,
+            requirements=("unified-cli>=0.5,<0.6",),
+            package_member=package_root,
+        )
+
+    with pytest.raises(
+        verify_distribution_pair.VerificationError,
+        match="does not contain",
+    ):
+        verify_distribution_pair.verify_pair(core, ext)
+
+
+@pytest.mark.parametrize(
+    ("target", "mismatched_root", "message"),
+    (
+        ("core", "some_other_name-9.9.dist-info", "Core wheel"),
+        ("ext", "unified_cli_ext-9.9.dist-info", "Ext wheel"),
+    ),
+)
+def test_metadata_directory_must_match_name_and_version(
+    tmp_path, target, mismatched_root, message
+):
+    core, ext = _valid_pair(tmp_path)
+    if target == "core":
+        core = _wheel(
+            tmp_path / "mismatched-core.whl",
+            distribution="unified-cli",
+            version="0.5.0",
+            package_root="unified_cli",
+            dist_info_root=mismatched_root,
+        )
+    else:
+        ext = _wheel(
+            tmp_path / "mismatched-ext.whl",
+            distribution="unified-cli-ext",
+            version="0.1.0",
+            package_root="unified_cli_ext",
+            requirements=("unified-cli>=0.5,<0.6",),
+            dist_info_root=mismatched_root,
+        )
+
+    with pytest.raises(verify_distribution_pair.VerificationError, match=message):
         verify_distribution_pair.verify_pair(core, ext)
 
 
@@ -182,3 +295,9 @@ def test_core_sdist_excludes_repo_only_distribution_test():
     manifest = (Path(__file__).parents[1] / "MANIFEST.in").read_text(encoding="utf-8")
     assert "recursive-include tests *.py" in manifest
     assert "exclude tests/test_distribution_pair.py" in manifest
+
+
+def test_core_sdist_excludes_unified_ext_lab():
+    manifest = (Path(__file__).parents[1] / "MANIFEST.in").read_text(encoding="utf-8")
+    assert "prune tools" in manifest
+    assert "exclude scripts/unified-ext-lab" in manifest

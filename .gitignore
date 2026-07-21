@@ -37,6 +37,7 @@ tests/browser/playwright-report/
 simulation.md
 # Root-level scratch dir only — anchored so it does NOT match .github/workflows/
 /workflows/
+/.unified-ext-lab-state/
 
 # Internal dev/process docs — kept locally, not part of the public repo or sdist
 /FIX_PLAN.md

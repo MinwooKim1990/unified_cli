@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "fixture": {
+    "artifact": "image/rootfs/opt/unified-ext-lab/fixtures/fake-provider",
+    "version": "1.0.0",
+    "sha256": "e740b71e1de2e12fd416beada693704265f210a42cd848ee1e718019f24dfbcc",
+    "scaffold_only": true
+  }
+}
