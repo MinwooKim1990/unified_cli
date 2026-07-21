@@ -1,6 +1,6 @@
 """Hardened JSONL, JSON-RPC, HTTP, and SSE transports."""
 
-from .acp import AcpSdkAdapter, require_acp_sdk
+from .acp import AcpProcessTransportV1, AcpSdkAdapter, require_acp_sdk
 from .http_sse import HttpSseClient, SseEvent
 from .jsonl import JsonlProcess
 from .jsonrpc import JsonRpcId, JsonRpcProcessClient
@@ -21,6 +21,7 @@ __all__ = [
     "DirectoryPin",
     "ExecutableIdentity",
     "FixedProcessResult",
+    "AcpProcessTransportV1",
     "AcpSdkAdapter",
     "HttpSseClient",
     "IsolatedEnvironment",

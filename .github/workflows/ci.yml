@@ -94,6 +94,10 @@ jobs:
           python -m pip install -e ".[dev,server]"
           python -m pip install -e "packages/unified-cli-ext[dev]"
 
+      - name: Check generated Ext provider support tables
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.9'
+        run: python scripts/check_ext_provider_support.py --check
+
       - name: Run Ext offline fixture suite
         run: pytest -q packages/unified-cli-ext/tests
 
@@ -153,19 +157,24 @@ jobs:
           python -m build --outdir dist/core .
           python -m build --outdir dist/ext packages/unified-cli-ext
 
-      - name: Verify the Core sdist has no source-only release test
+      - name: Verify sdists have no source-only repository tests
         run: |
           python - <<'PY'
           import tarfile
           from pathlib import Path
 
-          archive_path = next(Path("dist/core").glob("*.tar.gz"))
-          with tarfile.open(archive_path, "r:gz") as archive:
-              names = archive.getnames()
-          if any(name.endswith("/tests/test_distribution_pair.py") for name in names):
-              raise SystemExit(
-                  "Core sdist contains a test that depends on source-only CI assets"
-              )
+          checks = (
+              ("core", "tests/test_distribution_pair.py"),
+              ("ext", "tests/test_ext_provider_support_docs.py"),
+          )
+          for distribution, suffix in checks:
+              archive_path = next(Path("dist", distribution).glob("*.tar.gz"))
+              with tarfile.open(archive_path, "r:gz") as archive:
+                  names = archive.getnames()
+              if any(name.endswith("/" + suffix) for name in names):
+                  raise SystemExit(
+                      distribution + " sdist contains a source-only repository test"
+                  )
           PY
 
       - name: Check metadata and wheel path separation

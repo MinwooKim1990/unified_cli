@@ -8,9 +8,9 @@
 
 Claude Code / OpenAI Codex / Google Antigravity(`agy`) 세 CLI를 **하나의 Python API + CLI** 로 통합.
 
-> Google 쪽 provider 키는 여전히 `"gemini"` (그리고 `-m gemini-3.5-flash` 등도 그대로 라우팅) 이지만, 내부적으로 **Antigravity `agy` CLI** 를 래핑합니다 — 2026년 구 `gemini` CLI 가 개인 계정에서 차단됐기 때문. 아래 마이그레이션 노트 참고.
+> Google 쪽 provider 키는 여전히 `"gemini"` (그리고 `-m gemini-3.5-flash` 등도 그대로 라우팅) 이지만, 내부적으로 **Antigravity `agy` CLI** 를 래핑합니다 — 2026년 구 `gemini` CLI 의 개인 계정 접근이 제한됐기 때문입니다. 아래 마이그레이션 노트 참고.
 >
-> ⚠️ **`gemini` provider 는 기본 비활성화** 입니다. `agy` 자동화로 Google 개인 계정이 차단된 사례가 있어, `UNIFIED_CLI_ENABLE_GEMINI=1` 을 설정해야만 본인 책임 하에 켜집니다 — [이용약관 & 계정 정지 위험](#️-이용약관--계정-정지-위험--사용-전-반드시-읽기) 참고.
+> ⚠️ **`gemini` provider 는 기본 비활성화** 입니다. `agy` 자동화는 Google 서비스 이용 제한으로 이어질 수 있어, 적용되는 정책을 확인한 뒤에만 `UNIFIED_CLI_ENABLE_GEMINI=1` 을 설정하세요 — [이용약관 및 Provider 사용 정책](#provider-usage-policy-ko) 참고.
 
 ## 설치
 
@@ -44,12 +44,47 @@ pip install "unified-cli[server]"
 > 셋 다 필요하지 않습니다 — **일부만 있어도 동작**합니다. 래퍼는 `$PATH` 에서
 > 발견되는 `claude` / `codex` / `agy` 만 사용합니다.
 
-## ⚠️ 이용약관 & 계정 정지 위험 — 사용 전 반드시 읽기
+## Core와 Ext
 
-> **각 provider 의 이용약관(ToS) 준수 책임은 사용자 본인에게 있습니다.** 이
-> CLI 들을 자동화하면 약관을 위반할 수 있으니 **사용에 따른 위험은 본인이
-> 부담**합니다. 약관은 계속 바뀌고 있으며(2026년 2월 명확화), 이 문서는 법률
-> 자문이 아닙니다.
+| | Core: `unified-cli` | Ext: [`unified-cli-ext`](https://pypi.org/project/unified-cli-ext/) |
+|---|---|---|
+| 포함 provider | Claude, Codex, Gemini (`agy`) | Grok, Kimi, Copilot, Cursor 카탈로그 메타데이터 |
+| 기본 동작 | 기존 기본값은 바뀌지 않음 | Core 기본값과 서버 허용 목록을 절대 변경하지 않음 |
+| 현재 상태 | Core provider는 기존 동작을 유지 | 네 항목 모두 **Held**: 발견 가능한 메타데이터일 뿐, 실행 가능한 어댑터가 아님 |
+
+Ext는 별도 PyPI 배포판이자 Python 모듈(`unified_cli_ext`)입니다. vendor CLI를
+포함하지 않고, 로그인·서비스 호출·과금 발생을 하지 않습니다. provider 바이너리와
+계정은 사용자가 직접 설치하고 관리합니다.
+
+<details>
+<summary>Ext 설치 및 카탈로그 메타데이터 확인</summary>
+
+```bash
+python -m pip install unified-cli-ext
+python -c "import importlib.metadata as m; print([e.name for e in m.distribution('unified-cli-ext').entry_points if e.group == 'unified_cli.providers.v1'])"
+```
+
+이 확인은 설치된 provider 엔트리포인트 메타데이터만 나열합니다. Stage 5B에서는
+`grok`, `kimi`, `copilot`, `cursor`가 표시될 수 있으며 Ext 카탈로그는 네 항목을 모두
+**Held**로 분류합니다. provider 실행, vendor 바이너리 탐색, 인증, 네트워크 요청은 하지
+않습니다. 목록에 이름이 있다는 사실을 채팅 명령으로 해석하면 안 됩니다.
+
+`unified-cli providers --include-ext`는 import 없이 탐색하므로 처음에는 수명 주기
+`discovered`, 지원 상태 `unknown`으로 표시합니다. 해당 provider를 명시적으로 요청할
+때만 그 엔트리포인트 하나를 로드해 지원 상태 `held`를 확인하며, 실행은 계속 비활성입니다.
+
+</details>
+
+provider 카탈로그, 상태 의미, 활성화 전 필요한 근거는
+[확장](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.ko.md)을 참고하세요.
+
+<a id="provider-usage-policy-ko"></a>
+
+## 이용약관 및 Provider 사용 정책 — 사용 전 확인
+
+> **각 provider 의 이용약관(ToS) 준수 책임은 사용자 본인에게 있습니다.** 자동화가
+> 모든 계정이나 사용 사례에서 허용되는 것은 아니며 서비스 이용이 제한될 수 있습니다.
+> 약관은 계속 바뀌고 있으며(2026년 2월 명확화), 이 문서는 법률 자문이 아닙니다.
 
 - **권장되는 안전한 사용 방식 = 본인 구독으로 하는 개인·로컬·단독 사용.**
   Anthropic 은 헤드리스 `claude -p` / 프로그래밍 방식 사용을 **공식적으로
@@ -57,12 +92,11 @@ pip install "unified-cli[server]"
   마세요.
 - **하지 말 것:** OpenAI 호환 서버를 공개/네트워크 인터페이스로 띄우기, 다른
   사람의 요청을 본인 구독으로 처리하기, 자격증명 공유, 접근 권한 재판매/프록시.
-  이것들은 provider 의 ToS 위반이며 **계정 정지 또는 영구 차단 위험**이 있습니다.
-- **Antigravity (`agy` / `gemini` provider) 가 가장 위험합니다.** Google 은
-  이를 자동화한 **개인 계정을 실제로 차단**했습니다(차단이 Gemini CLI / Code
-  Assist 까지 연쇄 적용). 그래서 `gemini` provider 는 이제 **기본 비활성화**
-  되어 있으며, 환경변수 `UNIFIED_CLI_ENABLE_GEMINI=1` 을 설정해야만 본인 책임
-  하에 켜집니다.
+  이는 provider 정책과 충돌할 수 있으며 서비스 이용이 제한될 수 있습니다.
+- **Antigravity (`agy` / `gemini` provider)는 추가 정책 확인이 필요합니다.** Google은
+  이를 자동화한 개인 계정에서 관련 Gemini CLI / Code Assist 접근을 포함한 이용 제한
+  사례를 알린 바 있습니다. 그래서 `gemini` provider는 **기본 비활성화**되어 있으며,
+  적용되는 정책을 확인한 뒤에만 환경변수 `UNIFIED_CLI_ENABLE_GEMINI=1`을 설정하세요.
 - **`unified-cli serve` 및 `python -m unified_cli.server` 런처는 기본적으로
   `127.0.0.1`(localhost)에 바인딩**되며, `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1`을
   설정하지 않는 한 **loopback 이 아닌 호스트를 거부**합니다. raw `uvicorn`은
@@ -280,7 +314,7 @@ conv.send("내 이름 뭐였지?", provider="codex")     # ← 자동으로 Clau
 conv.send("내 이름 한 번 더 말해", provider="gemini")  # UNIFIED_CLI_ENABLE_GEMINI=1 필요
 ```
 
-> `gemini` provider 는 **기본 비활성화** 입니다(Antigravity `agy` 자동화로 Google 계정이 차단된 사례 있음). 위·아래 `gemini` 예제는 `UNIFIED_CLI_ENABLE_GEMINI=1` 을 먼저 설정해야 동작합니다.
+> `gemini` provider 는 **기본 비활성화** 입니다(Antigravity `agy` 자동화는 Google 서비스 이용 제한으로 이어질 수 있음). 적용되는 정책을 확인한 뒤 `UNIFIED_CLI_ENABLE_GEMINI=1` 을 설정해야 위·아래 `gemini` 예제가 동작합니다.
 
 같은 provider 로 연속 호출하면 native session (`--resume`) 으로 처리되어 효율적.
 `sticky=True` 로 생성하면 첫 provider 에 고정되고 전환 시 에러.
@@ -301,7 +335,7 @@ for msg in cli.stream("오늘 최신 Python 버전은?"):
 cli = create("claude", web_search=False)
 ```
 
-> Gemini provider는 이제 Antigravity `agy` CLI를 래핑합니다. agy는 에이전틱이라 웹서치를 스스로 판단해 수행하며 on/off 토글이 없습니다 (`web_search=`는 사실상 no-op). 단, **기본 비활성화**라 `UNIFIED_CLI_ENABLE_GEMINI=1` 을 설정해야 사용할 수 있습니다(`agy` 자동화 계정 차단 위험).
+> Gemini provider는 이제 Antigravity `agy` CLI를 래핑합니다. agy는 에이전틱이라 웹서치를 스스로 판단해 수행하며 on/off 토글이 없습니다 (`web_search=`는 사실상 no-op). 단, **기본 비활성화**라 `UNIFIED_CLI_ENABLE_GEMINI=1` 을 설정해야 사용할 수 있습니다(`agy` 자동화 시 서비스 이용 제한 가능성).
 
 ## 에러 분류 + 자동 복구
 
@@ -369,8 +403,8 @@ uvicorn unified_cli.server:app --port 8000
 > (`0.0.0.0` 등)를 **거부**합니다. raw `uvicorn ... --host 0.0.0.0`은 listener를
 > 열 수 있지만, 같은 옵트인 전에는 앱의 ASGI 가드가 non-loopback bind·peer·Host를
 > HTTP 403으로 거부합니다. 기동 시 개인용 경고 로그도 출력합니다. 본인 구독을
-> 다른 사람/네트워크에 노출하면 provider ToS 위반이며 **계정 차단 위험**이 있으니
-> 로컬에서만 사용하세요.
+> 다른 사람이나 네트워크에 노출하면 provider 이용 약관에 맞지 않아 서비스 이용이
+> 제한될 수 있으니 로컬에서만 사용하세요.
 
 > **외부 모드는 공개 서비스 모드가 아닙니다.** 독립 관리 배포에서 loopback 밖으로
 > 바인딩해야 한다면 `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1`과 공백 없는 32 UTF-8

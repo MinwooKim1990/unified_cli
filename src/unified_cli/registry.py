@@ -8,7 +8,7 @@ import os
 import threading
 import unicodedata
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Literal, Optional, Tuple
+from typing import Any, Dict, Iterable, Literal, Optional, Tuple, Union
 
 try:  # Python 3.9+ (kept isolated so importing unified_cli never enumerates it)
     from importlib import metadata as importlib_metadata
@@ -22,6 +22,7 @@ from .plugin import (
     PROVIDER_PLUGIN_ABI_V1,
     ProviderPluginV1,
     ProviderServerPolicyV1,
+    ProviderSupportStatusV1,
     _valid_provider_id,
 )
 
@@ -38,12 +39,24 @@ class ProviderDescriptorV1:
 
     id: ProviderId
     source: Literal["builtin", "extension"]
-    status: Literal["builtin", "available", "loaded", "invalid", "failed"]
+    status: Literal["builtin", "discovered", "loaded", "invalid", "broken"]
     default_model: Optional[str] = None
     capabilities: frozenset[str] = frozenset()
     route_prefixes: Tuple[str, ...] = ()
     server_policy: Optional[ProviderServerPolicyV1] = None
     error: Optional[str] = None
+    # Appended so existing positional construction retains its field mapping.
+    support_status: Union[
+        ProviderSupportStatusV1, Literal["unknown"],
+    ] = "unknown"
+
+    @property
+    def lifecycle_status(
+        self,
+    ) -> Literal["builtin", "discovered", "loaded", "invalid", "broken"]:
+        """Explicit name for the backwards-compatible ``status`` field."""
+
+        return self.status
 
 
 # Unversioned convenience name.  The concrete shape remains explicitly v1 so
@@ -119,6 +132,7 @@ def _plugin_error(provider_id: ProviderId, code: str) -> UnifiedError:
         "reentrant": f"Provider extension '{provider_id}' re-entered its own loader.",
         "models": f"Provider extension '{provider_id}' could not list models.",
         "doctor": f"Provider extension '{provider_id}' doctor failed.",
+        "held": f"Provider extension '{provider_id}' is held.",
         "runtime": f"Provider extension '{provider_id}' failed while running.",
     }
     hints = {
@@ -126,6 +140,7 @@ def _plugin_error(provider_id: ProviderId, code: str) -> UnifiedError:
         "unknown": "Install a matching provider extension or use claude / codex / gemini.",
         "duplicate": "Remove the duplicate provider distribution and retry.",
         "reserved": "Use the built-in public provider id; agy is only an executable alias.",
+        "held": "Compatibility is not yet verified; use a supported provider.",
     }
     causes = {
         "discovery": "provider entry-point metadata unavailable",
@@ -289,9 +304,9 @@ def _discover_entry_points() -> Tuple[Any, ...]:
         except BaseException:
             discovery_failed = True
         if discovery_failed:
-            # Cache only a boolean.  A plugin/distribution exception may carry
-            # credentials, paths, or hostile text and must not remain attached
-            # to the safe public error or appear in a traceback.
+            # Cache only a boolean. A distribution exception may contain local
+            # details that must not remain attached to the public error or its
+            # traceback.
             _DISCOVERY_FAILED = True
             raise _plugin_error("extension", "discovery") from None
         return _ENTRY_POINTS
@@ -348,22 +363,29 @@ def extension_provider_exists(provider_id: ProviderId) -> bool:
 
 def _validate_loaded_plugin(
     provider_id: ProviderId, loaded: object,
-) -> ProviderPluginV1:
+) -> Tuple[Optional[ProviderPluginV1], Optional[str]]:
+    """Evaluate external metadata without raising Core validation errors.
+
+    Every operation in this function may execute extension-controlled code,
+    including attribute access, comparisons, iteration, and reconstruction.
+    Returning a Core-owned error code lets the caller raise known validation
+    decisions only after it has left that metadata evaluation boundary.
+    """
     if not isinstance(loaded, ProviderPluginV1):
         if getattr(loaded, "abi_version", PROVIDER_PLUGIN_ABI_V1) != PROVIDER_PLUGIN_ABI_V1:
-            raise _plugin_error(provider_id, "abi")
-        raise _plugin_error(provider_id, "metadata")
+            return None, "abi"
+        return None, "metadata"
     if loaded.abi_version != PROVIDER_PLUGIN_ABI_V1:
-        raise _plugin_error(provider_id, "abi")
+        return None, "abi"
     if loaded.id != provider_id:
-        raise _plugin_error(provider_id, "metadata")
+        return None, "metadata"
     if loaded.id in RESERVED_PROVIDER_IDS:
-        raise _plugin_error(provider_id, "reserved")
+        return None, "reserved"
     if any(prefix in RESERVED_PROVIDER_IDS for prefix in loaded.route_prefixes):
-        raise _plugin_error(provider_id, "metadata")
-    # Reconstruct the frozen value to re-run validation even if a hostile
-    # loader fabricated or mutated an instance with object.__setattr__.
-    return ProviderPluginV1(
+        return None, "metadata"
+    # Reconstruct the frozen value to re-run validation even if a custom
+    # loader created or mutated an instance with object.__setattr__.
+    plugin = ProviderPluginV1(
         id=loaded.id,
         factory=loaded.factory,
         default_model=loaded.default_model,
@@ -373,7 +395,9 @@ def _validate_loaded_plugin(
         route_prefixes=loaded.route_prefixes,
         server_policy=loaded.server_policy,
         abi_version=loaded.abi_version,
+        support_status=loaded.support_status,
     )
+    return plugin, None
 
 
 def _load_entry_point_safely(provider_id: ProviderId, entry_point: Any) -> object:
@@ -395,16 +419,17 @@ def _validate_loaded_plugin_safely(
 ) -> ProviderPluginV1:
     failed = False
     try:
-        plugin = _validate_loaded_plugin(provider_id, loaded)
+        plugin, validation_error = _validate_loaded_plugin(provider_id, loaded)
     except _CANCELLATION_EXCEPTIONS:
-        raise
-    except UnifiedError:
         raise
     except BaseException:
         failed = True
         plugin = None
+        validation_error = None
     if failed:
         raise _plugin_error(provider_id, "metadata") from None
+    if validation_error is not None:
+        raise _plugin_error(provider_id, validation_error) from None
     assert plugin is not None
     return plugin
 
@@ -480,6 +505,13 @@ def load_provider_plugin(provider_id: ProviderId) -> ProviderPluginV1:
         _LOAD_CONTEXT.active = False
 
 
+def _require_executable_support(plugin: ProviderPluginV1) -> None:
+    """Reject Held integrations before any plugin-owned callback can run."""
+
+    if plugin.support_status == "held":
+        raise _plugin_error(plugin.id, "held") from None
+
+
 def instantiate_extension_provider(
     provider_id: ProviderId,
     *,
@@ -487,6 +519,7 @@ def instantiate_extension_provider(
     **opts: Any,
 ) -> BaseProvider:
     plugin = load_provider_plugin(provider_id)
+    _require_executable_support(plugin)
     failed = False
     try:
         provider = plugin.factory(model=model or plugin.default_model, **opts)
@@ -508,6 +541,7 @@ def instantiate_extension_provider(
 def list_extension_models(provider_id: ProviderId) -> list[ModelInfo]:
     """Run one explicitly requested extension's model lister safely."""
     plugin = load_provider_plugin(provider_id)
+    _require_executable_support(plugin)
     failed = False
     try:
         # Materialize at most one item past the public limit so a buggy
@@ -579,6 +613,7 @@ def doctor_provider(provider_id: ProviderId) -> Any:
         return next(state for state in collect_states() if state.name == provider_id)
 
     plugin = load_provider_plugin(provider_id)
+    _require_executable_support(plugin)
     failed = False
     try:
         result = plugin.doctor()
@@ -601,6 +636,7 @@ def _builtin_descriptors() -> list[ProviderDescriptorV1]:
             id=provider_id,
             source="builtin",
             status="builtin",
+            support_status="stable",
             default_model=DEFAULT_MODELS[provider_id],
             route_prefixes=(provider_id,),
             server_policy=ProviderServerPolicyV1(
@@ -636,7 +672,9 @@ def list_providers(*, include_ext: bool = False) -> list[ProviderDescriptorV1]:
     for provider_id in sorted(by_name):
         entries = by_name[provider_id]
         error: Optional[str] = None
-        status: Literal["available", "loaded", "invalid", "failed"] = "available"
+        status: Literal["discovered", "loaded", "invalid", "broken"] = (
+            "discovered"
+        )
         if provider_id in RESERVED_PROVIDER_IDS:
             status, error = "invalid", "reserved_id"
         elif len(entries) > 1:
@@ -652,14 +690,18 @@ def list_providers(*, include_ext: bool = False) -> list[ProviderDescriptorV1]:
                 id=provider_id,
                 source="extension",
                 status=status,
-                default_model=loaded.default_model,
+                support_status=loaded.support_status,
+                default_model=(
+                    None if loaded.support_status == "held"
+                    else loaded.default_model
+                ),
                 capabilities=loaded.capabilities,
                 route_prefixes=loaded.route_prefixes,
                 server_policy=loaded.server_policy,
             ))
         else:
-            if failed is not None and status == "available":
-                status, error = "failed", "load_failed"
+            if failed is not None and status == "discovered":
+                status, error = "broken", "load_failed"
             descriptors.append(ProviderDescriptorV1(
                 id=provider_id,
                 source="extension",

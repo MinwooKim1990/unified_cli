@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "unified-cli-ext"
 version = "0.1.0"
-description = "Hardened transport and runtime contracts for unified-cli extensions."
+description = "Bounded transport and runtime contracts for unified-cli extensions."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
@@ -43,6 +43,12 @@ all = [
     "mcp>=1.27,<2; python_version >= '3.10'",
 ]
 dev = ["pytest>=7"]
+
+[project.entry-points."unified_cli.providers.v1"]
+grok = "unified_cli_ext.providers.grok:PLUGIN"
+kimi = "unified_cli_ext.providers.kimi:PLUGIN"
+copilot = "unified_cli_ext.providers.copilot:PLUGIN"
+cursor = "unified_cli_ext.providers.cursor:PLUGIN"
 
 [project.urls]
 Homepage = "https://github.com/MinwooKim1990/unified_cli"

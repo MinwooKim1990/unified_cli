@@ -42,11 +42,50 @@ pip install "unified-cli[server]"
 > **Any subset works** — you do not need all three. The wrapper simply uses
 > whichever of `claude` / `codex` / `agy` it finds on your `$PATH`.
 
-## ⚠️ Terms of Service & account-ban risk — read before using
+## Core and Ext
+
+| | Core: `unified-cli` | Ext: [`unified-cli-ext`](https://pypi.org/project/unified-cli-ext/) |
+|---|---|---|
+| Included providers | Claude, Codex, Gemini (`agy`) | Grok, Kimi, Copilot, Cursor catalog metadata |
+| Default behavior | Existing defaults are unchanged | Never changes Core defaults or its server allowlist |
+| Current state | Core providers retain their existing behavior | All four entries are **Held**: discoverable metadata only, not runnable adapters |
+
+Ext is a separate PyPI distribution and Python module (`unified_cli_ext`). It
+does not bundle vendor CLIs, sign you in, call a service, or create charges.
+Provider binaries and accounts remain yours to install and manage.
+
+<details>
+<summary>Install Ext and check its catalog metadata</summary>
+
+```bash
+python -m pip install unified-cli-ext
+python -c "import importlib.metadata as m; print([e.name for e in m.distribution('unified-cli-ext').entry_points if e.group == 'unified_cli.providers.v1'])"
+```
+
+The check lists installed provider entry-point metadata. In Stage 5B it may
+list `grok`, `kimi`, `copilot`, and `cursor`; the Ext catalog classifies all
+four as **Held**. It does not run a provider, locate a vendor binary,
+authenticate, or make a network request. Do not treat a listed name as a chat
+command.
+
+`unified-cli providers --include-ext` keeps discovery import-free, so a newly
+discovered extension first displays lifecycle `discovered` and support
+`unknown`. When that provider is explicitly requested, Core loads only its
+entry point, confirms support `held`, and leaves it unavailable for execution.
+
+</details>
+
+See [Extensions](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.md) for the provider catalog, status meanings,
+and the evidence required before a provider can be enabled.
+
+<a id="provider-usage-policy"></a>
+
+## Terms of Service & provider usage policy — read before using
 
 > **You are responsible for complying with each provider's Terms of Service.**
-> Automating these CLIs may breach them — **use at your own risk**. Terms are
-> evolving (clarified Feb 2026); this is not legal advice.
+> Automation may not be permitted for every account or use case, and service
+> access may be restricted. Terms are evolving (clarified Feb 2026); this is
+> not legal advice.
 
 - **Intended safe pattern = personal, local, individual use with your OWN
   subscription.** Anthropic officially supports headless `claude -p` /
@@ -54,12 +93,13 @@ pip install "unified-cli[server]"
   other people.
 - **Do NOT:** run the OpenAI-compatible server on a public/network interface,
   route other people's requests through your subscription, share credentials,
-  or resell/proxy access. These violate the providers' ToS and **risk account
-  suspension or a permanent ban**.
-- **Antigravity (`agy` / the `gemini` provider) is the riskiest.** Google has
-  **banned individual accounts** for automating it (the ban cascaded across
-  Gemini CLI / Code Assist). For that reason the `gemini` provider is now
-  **disabled by default** — enable it at your own risk by setting
+  or resell/proxy access. These may conflict with provider policies and can
+  result in service access being restricted.
+- **Antigravity (`agy` / the `gemini` provider) requires additional policy
+  review.** Google has reported access restrictions for individual accounts
+  that automate it, including related Gemini CLI / Code Assist access. For
+  that reason the `gemini` provider is **disabled by default** — enable it
+  only after reviewing the applicable policy by setting
   `UNIFIED_CLI_ENABLE_GEMINI=1`.
 - **The `unified-cli serve` and `python -m unified_cli.server` launchers bind to
   `127.0.0.1` (localhost) by default** and **refuse a non-loopback host unless**
@@ -80,13 +120,13 @@ interface, both as a **terminal CLI** and as a **Python library you can
 
 > The provider key for the Google side is still `"gemini"` (and `-m
 > gemini-3.5-flash` etc. still route to it), but it now wraps the **Antigravity
-> `agy` CLI** — Google blocked the old `gemini` CLI for individual accounts in
-> 2026. See the migration note below.
+> `agy` CLI** — access to the old `gemini` CLI was restricted for individual
+> accounts in 2026. See the migration note below.
 >
 > ⚠️ **The `gemini` provider is disabled by default** because automating `agy`
-> has gotten individual Google accounts banned. Set
-> `UNIFIED_CLI_ENABLE_GEMINI=1` to enable it, at your own risk — see
-> [Terms of Service & account-ban risk](#️-terms-of-service--account-ban-risk--read-before-using).
+> can result in Google service access restrictions. Set
+> `UNIFIED_CLI_ENABLE_GEMINI=1` only after reviewing the applicable policy — see
+> [Terms of Service & provider usage policy](#provider-usage-policy).
 
 ```bash
 # CLI
@@ -104,8 +144,8 @@ conv.send("Continue", provider="gemini")   # needs UNIFIED_CLI_ENABLE_GEMINI=1
 ```
 
 > The `gemini` provider is **disabled by default** (Antigravity `agy` automation
-> has gotten Google accounts banned). Export `UNIFIED_CLI_ENABLE_GEMINI=1` before
-> any `gemini` example below will work.
+> can result in Google service access restrictions). Export
+> `UNIFIED_CLI_ENABLE_GEMINI=1` before any `gemini` example below will work.
 
 ## Why this exists
 
@@ -172,7 +212,7 @@ Override via `-m <name>`. The wrapper passes any model ID straight through to
 the underlying CLI; `unified-cli models` shows the available list as a starting
 point. For the absolute fastest interactive feel use `-m gpt-5.3-codex-spark`.
 
-> **Gemini → Antigravity migration**: As of 2026, Google blocked the old
+> **Gemini → Antigravity migration**: As of 2026, Google restricted the old
 > `gemini` CLI for individual accounts (`IneligibleTierError: ... migrate to
 > the Antigravity suite`). The `gemini` provider now wraps the **Antigravity
 > `agy` CLI** (`~/.local/bin/agy`). `agy` is fully agentic (web search,
@@ -184,13 +224,13 @@ point. For the absolute fastest interactive feel use `-m gpt-5.3-codex-spark`.
 > silently fall back to the default. Note: `agy` headless mode outputs plain
 > text (no token-usage reporting).
 >
-> ⚠️ **Disabled by default.** Because automating `agy` has gotten individual
-> Google accounts banned, the `gemini` provider only activates when
+> ⚠️ **Disabled by default.** Because automating `agy` can lead to Google
+> service access restrictions, the `gemini` provider only activates when
 > `UNIFIED_CLI_ENABLE_GEMINI=1` is set. Without it, direct `gemini`/`agy` calls
 > (and the `gemini-*` model examples above) raise a config error. The HTTP server
 > is stricter still: it returns HTTP 403 for Gemini until its separate agentic
-> provider opt-in is enabled inside an external sandbox. Enable direct use at
-> your own risk.
+> provider opt-in is enabled inside an external sandbox. Review the applicable
+> provider policy before enabling direct use.
 
 ## Install from source (development)
 
@@ -377,8 +417,8 @@ uvicorn unified_cli.server:app --port 8000
 > Raw `uvicorn ... --host 0.0.0.0` can still open a listener, but the app's ASGI
 > guard returns HTTP 403 for that non-loopback bind, peer, or Host until the same
 > opt-in is set. It also logs a personal-use warning on startup. Exposing your
-> personal subscription to other people / over a network violates the providers'
-> ToS and **risks an account ban** — keep it local.
+> personal subscription to other people / over a network can violate provider
+> terms and lead to service-access restrictions, so keep it local.
 
 > **External mode is not a public-service mode.** If an independently managed
 > deployment must bind outside loopback, it needs both

@@ -1,25 +1,38 @@
 # unified-cli-ext
 
-`unified-cli-ext` is the Stage 2 extension foundation for
-[`unified-cli`](https://github.com/MinwooKim1990/unified_cli).  Version 0.1.0
-ships transport and contract building blocks only.  It does **not** include
-working provider adapters.
+`unified-cli-ext` is the extension foundation for
+[`unified-cli`](https://github.com/MinwooKim1990/unified_cli). Version 0.1.0
+ships transport and runtime contracts plus an inert Stage 5B catalog. It does
+**not** include a working or enabled provider adapter.
 
 ## What this release does—and does not do
 
-The package is intended for future extension authors.  It keeps future
-extension identifiers explicit and lazily resolved by Core.  Installing it
-does not add a provider to Core's built-in defaults, change Core's three
-built-in providers (Claude, Codex, and Gemini/Antigravity), or change the
-local server allowlist.  Server exposure for extensions remains off.
+The package is intended for extension authors. It keeps provider identifiers
+explicit and lazily resolved by Core. Installing it does not add a provider to
+Core's built-in defaults, change Core's three built-in providers (Claude,
+Codex, and Gemini/Antigravity), or change the local server allowlist. Server
+exposure for extensions remains off.
+
+The installed catalog has entry-point metadata for Grok, Kimi, Copilot, and
+Cursor. Every entry is **Held**. The adapter metadata records `chat` only as a
+provisional target; the Core plugin advertises no executable capability and
+cannot construct a provider or execute a command. These are not working
+adapters and must not be presented as Preview or Stable.
 
 There are no bundled credentials, authentication flows, provider calls, or
-paid-service calls in this release.  Its validation is fake/offline only.
-It does not bypass authentication or rate limits, and it does not scrape,
-collect, or recover credentials.
+paid-service calls in this release. Installation does not install vendor CLIs,
+log in, call a service, or incur charges. Provider binaries and accounts stay
+user-owned. Its validation uses offline fixtures only. It follows each
+provider's standard sign-in and request limits and does not inspect or import
+account data.
 
 Extensions are installed Python code and run as trusted code in the host
 Python process when loaded.  Install only distributions you trust.
+
+The local installation receipt API binds an explicitly selected executable or
+npm launcher to observed file identity and metadata. It does not establish the
+publisher's identity, so callers must still use the vendor's official
+distribution channel and should verify the receipt immediately before launch.
 
 ## Requirements and installation
 
@@ -30,14 +43,15 @@ compatible Core release:
 python -m pip install "unified-cli~=0.5.0" unified-cli-ext
 ```
 
-The import package is `unified_cli_ext`.  This initial release intentionally
-does not document a provider command, adapter configuration, or authentication
-setup because none is shipped.
+The import package is `unified_cli_ext`. No provider chat command, adapter
+configuration, or authentication setup is documented because no live provider
+is enabled. See the root [Extensions guide](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.md) for the
+Held catalog and official vendor documentation.
 
 ## Optional protocol dependencies
 
-Protocol SDKs are optional; they are not required to install the foundation
-and are not used to make provider calls in 0.1.0.  The available extras are
+Protocol SDKs remain optional; they are not required to install the foundation
+and do not enable provider calls in 0.1.0. The available extras are
 `acp`, `mcp`, `all` (both protocol SDKs), and `dev` (test dependencies).
 
 ```bash
@@ -54,7 +68,7 @@ python -m pip install "unified-cli-ext[mcp]"
   `mcp>=1.27,<2` while v2 compatibility is evaluated.  This extra requires
   Python 3.10 or later.
 
-## Scope and security posture
+## Runtime boundary
 
 Core owns provider discovery and policy.  Future providers must be explicitly
 requested; they are not selected by unprefixed model inference.  The Core HTTP
@@ -66,6 +80,7 @@ For the Core extension ABI and its trust boundary, see the
 
 ## Status
 
-This is a foundation release, not a catalog of supported external providers.
-Provider adapters, real protocol sessions, authentication, and network-backed
-validation are deliberately out of scope for 0.1.0.
+This is a foundation release with an inert Held catalog, not a catalog of
+supported external providers. Transport/runtime foundations are included, but
+enabled provider adapters, provider-specific verified sessions, authentication,
+and network-backed validation are deliberately out of scope for 0.1.0.

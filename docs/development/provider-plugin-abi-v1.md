@@ -49,6 +49,12 @@ It also has these ABI metadata fields:
   prefixes are rejected.
 - `server_policy`: a `ProviderServerPolicyV1` metadata value.  Its `enabled`
   and `requires_external_isolation` fields do not authorize HTTP-server use.
+- `support_status`: one of `stable`, `preview`, `experimental`, or `held`.
+  This describes integration maturity and is separate from registry lifecycle.
+  It defaults to `experimental` so omission does not imply completed
+  compatibility evidence while existing plugin constructors remain usable.
+  A `held` plugin must advertise no Core capabilities; Core stops explicit
+  create, model-list, and doctor operations before calling plugin code.
 - `abi_version`: must be `1`.
 
 Provider ids `claude`, `codex`, `gemini`, and `agy` are reserved.  Extensions
@@ -77,10 +83,12 @@ extension modules.  `--help` and `--version` also do not trigger discovery.
 
 `providers --include-ext` is deliberately metadata-only.  It enumerates entry
 points without importing their modules, so an un-loaded extension is shown as
-available based on its entry-point name only.  Consequently it cannot verify
-the plugin object's fields, expose its default model or capabilities, or prove
-that the plugin will load successfully.  Metadata for an extension already
-loaded in the current process can be shown after its validation has completed.
+`lifecycle_status="discovered"` and `support_status="unknown"` based on its
+entry-point name only. Consequently it cannot verify the plugin object's
+fields or expose its default model and capabilities. Metadata for an extension
+already loaded in the current process is shown after validation, with lifecycle
+and support status reported separately. `status` remains a compatibility alias
+for `lifecycle_status` in the JSON descriptor.
 An entry-point initializer must not recursively load another provider. Core
 rejects nested loads so circular imports cannot deadlock registry threads.
 
@@ -98,13 +106,14 @@ existing `/v1` contract nor reveals whether an extension is installed. A
 plugin's `server_policy` is descriptive metadata only and cannot override that
 rule.
 
-## Trust model
+## Runtime ownership
 
 An extension runs in the same Python process as the host when it is loaded.
 Installing one therefore grants it the process's effective permissions.  Only
-install provider distributions that you trust, and treat entry-point discovery
-and loading as part of your Python environment's supply-chain boundary. Core
+install provider distributions whose source and ownership you have verified,
+and treat entry-point loading as part of your Python environment's package
+provenance boundary. Core
 wraps the four public runtime calls (`chat`, `stream`, `achat`, and `astream`)
 and converts unexpected extension exceptions to a generic error without
-retaining their text or traceback context. This error boundary is not a
-sandbox and does not restrict what trusted plugin import code can access.
+retaining their text or traceback context. This boundary does not isolate
+plugin code from the host Python process.

@@ -51,6 +51,7 @@ from .plugin import (
     ProviderModelListerV1,
     ProviderPluginV1,
     ProviderServerPolicyV1,
+    ProviderSupportStatusV1,
 )
 from .providers import ClaudeProvider, CodexProvider, GeminiProvider
 from .registry import (
@@ -88,6 +89,7 @@ __all__ = [
     "ProviderModelListerV1",
     "ProviderPluginV1",
     "ProviderServerPolicyV1",
+    "ProviderSupportStatusV1",
     "Response",
     "Usage",
     "DEFAULT_MODELS",

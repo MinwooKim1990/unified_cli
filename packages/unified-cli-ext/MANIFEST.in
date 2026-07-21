@@ -1,4 +1,7 @@
 include README.md README.ko.md CHANGELOG.md LICENSE
 recursive-include src/unified_cli_ext *.py py.typed
 recursive-include tests *.py
+# This repository-level documentation check depends on root docs and scripts,
+# which are intentionally outside the standalone Ext source distribution.
+exclude tests/test_ext_provider_support_docs.py
 global-exclude __pycache__ *.py[cod]

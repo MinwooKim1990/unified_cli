@@ -394,7 +394,8 @@ _EN = {
     "cli.providers.title": "Provider registry",
     "cli.providers.col.id": "provider",
     "cli.providers.col.source": "source",
-    "cli.providers.col.status": "status",
+    "cli.providers.col.status": "lifecycle",
+    "cli.providers.col.support": "support",
     "cli.providers.col.default": "default model",
     # durable preferences
     "cli.help.config": "View or update durable CLI preferences",
@@ -936,7 +937,8 @@ _KO = {
     "cli.providers.title": "Provider 레지스트리",
     "cli.providers.col.id": "provider",
     "cli.providers.col.source": "출처",
-    "cli.providers.col.status": "상태",
+    "cli.providers.col.status": "수명 주기",
+    "cli.providers.col.support": "지원 상태",
     "cli.providers.col.default": "기본 모델",
     # 지속 설정
     "cli.help.config": "지속 저장되는 CLI 설정 조회 또는 변경",

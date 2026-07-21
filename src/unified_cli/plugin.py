@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from dataclasses import dataclass, field
-from typing import Any, Callable, FrozenSet, Iterable, Tuple
+from typing import Any, Callable, FrozenSet, Iterable, Literal, Tuple
 
 from .base import BaseProvider
 from .core import ModelInfo, ProviderId
@@ -23,6 +23,9 @@ PROVIDER_PLUGIN_ABI_V1 = 1
 ProviderFactoryV1 = Callable[..., BaseProvider]
 ProviderModelListerV1 = Callable[[], Iterable[ModelInfo]]
 ProviderDoctorV1 = Callable[[], Any]
+ProviderSupportStatusV1 = Literal[
+    "stable", "preview", "experimental", "held",
+]
 
 _ID_RE = re.compile(r"^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$")
 _CAPABILITY_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
@@ -30,13 +33,16 @@ _CORE_ROUTING_PREFIXES = (
     "claude-", "gpt-", "o1-", "o3-", "codex-", "gemini-",
 )
 _MAX_MODEL_ID_CHARS = 512
+_PROVIDER_SUPPORT_STATUSES = frozenset({
+    "stable", "preview", "experimental", "held",
+})
 
 
 def _valid_provider_id(value: object) -> bool:
     return (
-        # Entry-point metadata is untrusted. Reject ``str`` subclasses so
-        # hostile overrides of ``__len__``/comparison cannot execute outside
-        # the registry's sanitizing boundary.
+        # Entry-point metadata comes from another distribution. Reject
+        # ``str`` subclasses so custom ``__len__``/comparison methods are not
+        # evaluated outside the registry's normalization boundary.
         type(value) is str
         and len(value) <= 64
         and _ID_RE.fullmatch(value) is not None
@@ -102,6 +108,10 @@ class ProviderPluginV1:
         default_factory=ProviderServerPolicyV1
     )
     abi_version: int = PROVIDER_PLUGIN_ABI_V1
+    # Appended with a conservative default so existing positional and keyword
+    # call sites remain source-compatible without implying release-level
+    # compatibility evidence. Runtime availability belongs to the registry.
+    support_status: ProviderSupportStatusV1 = "experimental"
 
     def __post_init__(self) -> None:
         if self.abi_version != PROVIDER_PLUGIN_ABI_V1:
@@ -116,6 +126,11 @@ class ProviderPluginV1:
             raise TypeError("provider model_lister must be callable")
         if not callable(self.doctor):
             raise TypeError("provider doctor must be callable")
+        if (
+            type(self.support_status) is not str
+            or self.support_status not in _PROVIDER_SUPPORT_STATUSES
+        ):
+            raise ValueError("invalid provider support status")
 
         capabilities = self.capabilities
         if isinstance(capabilities, str):
@@ -131,6 +146,8 @@ class ProviderPluginV1:
             for item in frozen_capabilities
         ):
             raise ValueError("invalid provider capability name")
+        if self.support_status == "held" and frozen_capabilities:
+            raise ValueError("held provider plugins cannot advertise capabilities")
         object.__setattr__(self, "capabilities", frozen_capabilities)
 
         prefixes = self.route_prefixes or (self.id,)
@@ -161,4 +178,5 @@ __all__ = [
     "ProviderModelListerV1",
     "ProviderPluginV1",
     "ProviderServerPolicyV1",
+    "ProviderSupportStatusV1",
 ]
