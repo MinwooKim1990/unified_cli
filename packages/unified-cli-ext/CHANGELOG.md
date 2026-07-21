@@ -16,7 +16,8 @@ Initial extension-foundation release for `unified-cli` 0.5.x.
   publisher identity.
 - Adds inert Held catalog metadata for Grok, Kimi, Copilot, Cursor, CodeBuddy,
   Qoder, Mistral Vibe, Qwen, Cline, OpenCode, Kilo Code, Factory Droid, Pi,
-  Oh My Pi, Hermes Agent, and Poolside Agent CLI. These entries
+  Oh My Pi, Hermes Agent, Poolside Agent CLI, Amp, and GitLab Duo CLI. These
+  entries
   remain unavailable until provider-specific compatibility evidence is
   completed and reviewed.
 - Separates registry lifecycle from integration support status and generates

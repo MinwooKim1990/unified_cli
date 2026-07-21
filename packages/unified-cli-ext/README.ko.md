@@ -1,7 +1,7 @@
 # unified-cli-ext
 
 `unified-cli-ext`는 [`unified-cli`](https://github.com/MinwooKim1990/unified_cli)를
-위한 확장 기반 패키지입니다. 0.1.0은 전송·런타임 계약(contract)과 비활성 Stage 5B–5E
+위한 확장 기반 패키지입니다. 0.1.0은 전송·런타임 계약(contract)과 비활성 Stage 5B–5F
 카탈로그를 제공합니다. 동작하거나 활성화된 provider 어댑터는 포함하지 않습니다.
 
 ## 이 릴리스의 범위
@@ -13,7 +13,7 @@ provider의 서버 노출도 계속 꺼져 있습니다.
 
 설치되는 카탈로그에는 Grok, Kimi, Copilot, Cursor, CodeBuddy, Qoder, Mistral Vibe,
 Qwen, Cline, OpenCode, Kilo Code, Factory Droid, Pi, Oh My Pi, Hermes Agent,
-Poolside Agent CLI용 엔트리포인트 메타데이터가 있습니다. 정확히 16개의
+Poolside Agent CLI, Amp, GitLab Duo CLI용 엔트리포인트 메타데이터가 있습니다. 정확히 18개의
 비활성 항목은 모두 **Held**입니다. 어댑터
 메타데이터의 `chat`은 잠정 목표일 뿐이며
 Core 플러그인은 실행 capability를 하나도 표시하지 않고 provider를 만들거나 명령을

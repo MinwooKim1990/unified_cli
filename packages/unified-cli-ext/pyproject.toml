@@ -61,6 +61,8 @@ pi = "unified_cli_ext.providers.pi:PLUGIN"
 oh-my-pi = "unified_cli_ext.providers.oh_my_pi:PLUGIN"
 hermes = "unified_cli_ext.providers.hermes:PLUGIN"
 poolside = "unified_cli_ext.providers.poolside:PLUGIN"
+amp = "unified_cli_ext.providers.amp:PLUGIN"
+gitlab-duo = "unified_cli_ext.providers.gitlab_duo:PLUGIN"
 
 [project.urls]
 Homepage = "https://github.com/MinwooKim1990/unified_cli"
