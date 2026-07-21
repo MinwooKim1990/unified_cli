@@ -24,6 +24,7 @@ from .contract import (
     ProbeFormat,
     PromptCommandSpec,
     PromptMode,
+    PromptSentinelPolicy,
     ProviderAdapterSpecV1,
     TransportKind,
     VersionProbeSpec,
@@ -59,6 +60,7 @@ def held_adapter_spec(
     prompt_argv: Tuple[str, ...],
     prompt_mode: PromptMode,
     prompt_option: Optional[str],
+    sentinel_policy: PromptSentinelPolicy = PromptSentinelPolicy.FORBIDDEN,
     transport: TransportKind,
     environment_keys: FrozenSet[str] = frozenset(),
     version_marker: str,
@@ -94,6 +96,7 @@ def held_adapter_spec(
         prompt=PromptCommandSpec(
             fixed_argv=prompt_argv,
             mode=prompt_mode,
+            sentinel_policy=sentinel_policy,
             prompt_option=prompt_option,
         ),
         transport=transport,

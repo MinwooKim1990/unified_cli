@@ -54,6 +54,8 @@ qoder = "unified_cli_ext.providers.qoder:PLUGIN"
 mistral-vibe = "unified_cli_ext.providers.mistral_vibe:PLUGIN"
 qwen = "unified_cli_ext.providers.qwen:PLUGIN"
 cline = "unified_cli_ext.providers.cline:PLUGIN"
+opencode = "unified_cli_ext.providers.opencode:PLUGIN"
+kilo = "unified_cli_ext.providers.kilo:PLUGIN"
 
 [project.urls]
 Homepage = "https://github.com/MinwooKim1990/unified_cli"

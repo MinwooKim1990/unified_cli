@@ -24,6 +24,7 @@ from unified_cli import registry as core_registry
 from unified_cli_ext.providers import (
     AdapterStatus,
     PromptMode,
+    PromptSentinelPolicy,
     ProviderAdapterSpecV1,
     ProviderCapability,
 )
@@ -43,6 +44,8 @@ ENTRY_POINTS = {
     "mistral-vibe": "unified_cli_ext.providers.mistral_vibe:PLUGIN",
     "qwen": "unified_cli_ext.providers.qwen:PLUGIN",
     "cline": "unified_cli_ext.providers.cline:PLUGIN",
+    "opencode": "unified_cli_ext.providers.opencode:PLUGIN",
+    "kilo": "unified_cli_ext.providers.kilo:PLUGIN",
 }
 
 EXPECTED_COMMANDS = {
@@ -145,6 +148,38 @@ EXPECTED_COMMANDS = {
         "mode": PromptMode.PROTOCOL,
         "prompt_option": None,
     },
+    "opencode": {
+        "executable": "opencode",
+        "prompt": ("--pure", "run", "--format", "json"),
+        "transport": "jsonl",
+        "environment": frozenset(
+            (
+                "OPENCODE_DISABLE_AUTOUPDATE",
+                "OPENCODE_DISABLE_DEFAULT_PLUGINS",
+                "OPENCODE_DISABLE_LSP_DOWNLOAD",
+                "OPENCODE_DISABLE_MODELS_FETCH",
+                "OPENCODE_DISABLE_CLAUDE_CODE",
+            )
+        ),
+        "mode": PromptMode.POSITIONAL_AFTER_SENTINEL,
+        "prompt_option": None,
+    },
+    "kilo": {
+        "executable": "kilo",
+        "prompt": (
+            "--pure",
+            "acp",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--no-mdns",
+        ),
+        "transport": "acp",
+        "environment": frozenset(("KILO_DISABLE_AUTOUPDATE",)),
+        "mode": PromptMode.PROTOCOL,
+        "prompt_option": None,
+    },
 }
 
 EVIDENCE_FLAGS = {
@@ -165,6 +200,22 @@ EVIDENCE_FLAGS = {
         "CLINE_CONFIG_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
         "CLINE_ACP_REQUIRES_SEPARATE_STAGE_6_EVIDENCE",
     ),
+    "opencode": (
+        "OPENCODE_ONE_SHOT_STDIN_EOF_REQUIRES_STAGE_6_EVIDENCE",
+        "OPENCODE_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE",
+        "OPENCODE_OUTPUT_SCHEMA_REQUIRES_STAGE_6_EVIDENCE",
+        "OPENCODE_PERMISSION_CONFIG_MCP_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "OPENCODE_PROCESS_SESSION_CLEANUP_REQUIRES_STAGE_6_EVIDENCE",
+        "OPENCODE_HTTP_SSE_SEPARATE_REQUIRES_STAGE_6_EVIDENCE",
+        "OPENCODE_ACP_SEPARATE_REQUIRES_STAGE_6_EVIDENCE",
+    ),
+    "kilo": (
+        "KILO_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE",
+        "KILO_ACP_LIFECYCLE_REQUIRES_STAGE_6_EVIDENCE",
+        "KILO_LOOPBACK_PROCESS_CLEANUP_REQUIRES_STAGE_6_EVIDENCE",
+        "KILO_PERMISSION_CONFIG_MCP_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "KILO_AUTH_SESSION_MODEL_EVENT_SCHEMA_REQUIRES_STAGE_6_EVIDENCE",
+    ),
 }
 
 
@@ -179,8 +230,12 @@ def test_pyproject_registers_all_held_provider_entry_points_exactly():
     group = '[project.entry-points."unified_cli.providers.v1"]'
     assert group in text
     section = text.split(group, 1)[1].split("\n[", 1)[0]
-    for provider_id, target in ENTRY_POINTS.items():
-        assert '{} = "{}"'.format(provider_id, target) in section
+    declared = {}
+    for line in section.strip().splitlines():
+        provider_id, _, target = line.partition(" = ")
+        declared[provider_id] = target.strip().strip('"')
+    assert len(declared) == 11
+    assert declared == ENTRY_POINTS
 
 
 @pytest.mark.parametrize("provider_id", tuple(ENTRY_POINTS))
@@ -199,6 +254,10 @@ def test_held_specs_and_plugins_are_immutable_and_minimal(provider_id):
     assert spec.prompt.fixed_argv == expected["prompt"]
     assert spec.prompt.mode is expected["mode"]
     assert spec.prompt.prompt_option == expected["prompt_option"]
+    if expected["mode"] is PromptMode.POSITIONAL_AFTER_SENTINEL:
+        assert spec.prompt.sentinel_policy is PromptSentinelPolicy.REQUIRED
+    else:
+        assert spec.prompt.sentinel_policy is PromptSentinelPolicy.FORBIDDEN
     assert spec.transport.value == expected["transport"]
     assert spec.environment.allowed_keys == expected["environment"]
     assert spec.environment.required_keys == frozenset()

@@ -5,8 +5,8 @@ support Claude, Codex, and Gemini (`agy`) with its existing defaults. Installing
 Ext does not change those defaults, does not add an extension to Core's local
 server allowlist, and does not install or configure any vendor software.
 
-Stages 5B–5C install catalog metadata for nine possible providers. Each is
-discoverable through an explicit entry point, has status **Held**, and is
+Stages 5B–5D install catalog metadata for exactly 11 inert Held providers. Each
+is discoverable through an explicit entry point, has status **Held**, and is
 incapable of starting a provider or external command. The adapter catalog
 records `chat` as a provisional design target, while the Core plugin advertises
 no executable capability. There is no supported provider chat command for
@@ -65,13 +65,15 @@ manual design record.
 | `copilot` | `held` | `none` | `disabled` |
 | `cursor` | `held` | `none` | `disabled` |
 | `grok` | `held` | `none` | `disabled` |
+| `kilo` | `held` | `none` | `disabled` |
 | `kimi` | `held` | `none` | `disabled` |
 | `mistral-vibe` | `held` | `none` | `disabled` |
+| `opencode` | `held` | `none` | `disabled` |
 | `qoder` | `held` | `none` | `disabled` |
 | `qwen` | `held` | `none` | `disabled` |
 <!-- END GENERATED EXT PROVIDER SUPPORT -->
 
-## Stage 5B–5C catalog
+## Stage 5B–5D catalog
 
 “Candidate transport” records a provisional design direction, not a command
 contract. “Auto-update containment” describes the intended boundary if an
@@ -88,6 +90,8 @@ adapter is later enabled; no Held metadata executes it today.
 | `mistral-vibe` | Mistral Vibe (`vibe`, `mistral-vibe`) | JSONL message stream candidate | `chat` candidate; Core capability none | Held | Candidate private config with update checks off; direct and `vibe-acp` paths require separate verification | [Install](https://docs.mistral.ai/getting-started/quickstarts/vibe-code/install-cli) · [CLI workflow](https://docs.mistral.ai/vibe/code/cli/work-with-cli) · [ACP surfaces](https://docs.mistral.ai/vibe/code/choose-cli-vscode-web-sessions) |
 | `qwen` | Qwen Code (`qwen`, `@qwen-code/qwen-code`) | JSONL candidate | `chat` candidate; Core capability none | Held | Backend selection, credentials, update behavior, and event schema require verification | [Repository](https://github.com/QwenLM/qwen-code) · [Headless mode](https://qwenlm.github.io/qwen-code-docs/en/users/features/headless/) · [Authentication](https://qwenlm.github.io/qwen-code-docs/en/users/configuration/auth/) |
 | `cline` | Cline CLI (`cline`) | JSONL candidate; separate ACP candidate | `chat` candidate; Core capability none | Held | Candidate `CLINE_NO_AUTO_UPDATE=1`; stdin EOF, event schema, and local configuration isolation require verification | [CLI overview](https://docs.cline.bot/usage/cli-overview) · [CLI reference](https://docs.cline.bot/cli/cli-reference) · [Release source](https://github.com/cline/cline/tree/cli-v3.0.46/apps/cli) |
+| `opencode` | OpenCode (`opencode`, package `opencode-ai`) | `JSONL one-shot` candidate | `chat` candidate; Core capability none | Held | Candidate disable controls require verification; stdin EOF, config/MCP isolation, and process/session lifecycle remain Stage 6 gates | [Documentation](https://opencode.ai/docs/) · [CLI](https://opencode.ai/docs/cli/) · [Server](https://opencode.ai/docs/server/) |
+| `kilo` | Kilo Code (`kilo`, package `@kilocode/cli`) | `ACP stdio with an internal loopback server` candidate | `chat` candidate; Core capability none | Held | No verified auto-update containment claim yet; ACP loopback/process/config/permission lifecycles require Stage 6 verification | [CLI](https://kilo.ai/docs/code-with-ai/platforms/cli) · [CLI reference](https://kilo.ai/docs/code-with-ai/platforms/cli-reference) · [Release](https://github.com/Kilo-Org/kilocode/releases/tag/v7.4.11) |
 
 The optional `acp` and `mcp` extras install protocol SDK dependencies only.
 They do not activate a Held provider or make a provider call.
