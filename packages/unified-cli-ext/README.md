@@ -2,7 +2,7 @@
 
 `unified-cli-ext` is the extension foundation for
 [`unified-cli`](https://github.com/MinwooKim1990/unified_cli). Version 0.1.0
-ships transport and runtime contracts plus an inert Stage 5B catalog. It does
+ships transport and runtime contracts plus an inert Stage 5B–5C catalog. It does
 **not** include a working or enabled provider adapter.
 
 ## What this release does—and does not do
@@ -13,8 +13,9 @@ Core's built-in defaults, change Core's three built-in providers (Claude,
 Codex, and Gemini/Antigravity), or change the local server allowlist. Server
 exposure for extensions remains off.
 
-The installed catalog has entry-point metadata for Grok, Kimi, Copilot, and
-Cursor. Every entry is **Held**. The adapter metadata records `chat` only as a
+The installed catalog has entry-point metadata for Grok, Kimi, Copilot,
+Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, and Cline. Every entry is
+**Held**. The adapter metadata records `chat` only as a
 provisional target; the Core plugin advertises no executable capability and
 cannot construct a provider or execute a command. These are not working
 adapters and must not be presented as Preview or Stable.
@@ -22,9 +23,9 @@ adapters and must not be presented as Preview or Stable.
 There are no bundled credentials, authentication flows, provider calls, or
 paid-service calls in this release. Installation does not install vendor CLIs,
 log in, call a service, or incur charges. Provider binaries and accounts stay
-user-owned. Its validation uses offline fixtures only. It follows each
-provider's standard sign-in and request limits and does not inspect or import
-account data.
+user-owned. Its validation uses offline fixtures only. Because no provider is
+enabled, this release does not participate in vendor sign-in or request
+handling and does not read or import account data.
 
 Extensions are installed Python code and run as trusted code in the host
 Python process when loaded.  Install only distributions you trust.

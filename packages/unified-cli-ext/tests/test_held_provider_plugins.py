@@ -1,4 +1,4 @@
-"""Stage 5B contract checks for inert external provider entry points."""
+"""Stage 5B/5C contract checks for inert external provider entry points."""
 
 from __future__ import annotations
 
@@ -21,7 +21,12 @@ from unified_cli import (
     list_providers,
 )
 from unified_cli import registry as core_registry
-from unified_cli_ext.providers import AdapterStatus, ProviderAdapterSpecV1, ProviderCapability
+from unified_cli_ext.providers import (
+    AdapterStatus,
+    PromptMode,
+    ProviderAdapterSpecV1,
+    ProviderCapability,
+)
 from unified_cli_ext.providers.held import (
     HELD_UNAVAILABLE_MESSAGE,
     HeldProviderUnavailableError,
@@ -33,6 +38,11 @@ ENTRY_POINTS = {
     "kimi": "unified_cli_ext.providers.kimi:PLUGIN",
     "copilot": "unified_cli_ext.providers.copilot:PLUGIN",
     "cursor": "unified_cli_ext.providers.cursor:PLUGIN",
+    "codebuddy": "unified_cli_ext.providers.codebuddy:PLUGIN",
+    "qoder": "unified_cli_ext.providers.qoder:PLUGIN",
+    "mistral-vibe": "unified_cli_ext.providers.mistral_vibe:PLUGIN",
+    "qwen": "unified_cli_ext.providers.qwen:PLUGIN",
+    "cline": "unified_cli_ext.providers.cline:PLUGIN",
 }
 
 EXPECTED_COMMANDS = {
@@ -47,12 +57,16 @@ EXPECTED_COMMANDS = {
         ),
         "transport": "jsonl",
         "environment": frozenset(),
+        "mode": PromptMode.OPTION_VALUE,
+        "prompt_option": "-p",
     },
     "kimi": {
         "executable": "kimi",
         "prompt": ("--output-format", "stream-json"),
         "transport": "jsonl",
         "environment": frozenset(("KIMI_CODE_NO_AUTO_UPDATE",)),
+        "mode": PromptMode.OPTION_VALUE,
+        "prompt_option": "-p",
     },
     "copilot": {
         "executable": "copilot",
@@ -66,18 +80,97 @@ EXPECTED_COMMANDS = {
         ),
         "transport": "plain",
         "environment": frozenset(),
+        "mode": PromptMode.OPTION_VALUE,
+        "prompt_option": "-p",
     },
     "cursor": {
         "executable": "cursor-agent",
         "prompt": ("--print", "--output-format", "json"),
         "transport": "json",
         "environment": frozenset(),
+        "mode": PromptMode.STDIN,
+        "prompt_option": None,
     },
+    "codebuddy": {
+        "executable": "codebuddy",
+        "prompt": (
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--include-partial-messages",
+            "--strict-mcp-config",
+        ),
+        "transport": "jsonl",
+        "environment": frozenset(("DISABLE_AUTOUPDATER",)),
+        "mode": PromptMode.PROTOCOL,
+        "prompt_option": None,
+    },
+    "qoder": {
+        "executable": "qodercli",
+        "prompt": ("--acp",),
+        "transport": "acp",
+        "environment": frozenset(("QODER_PERSONAL_ACCESS_TOKEN",)),
+        "mode": PromptMode.PROTOCOL,
+        "prompt_option": None,
+    },
+    "mistral-vibe": {
+        "executable": "vibe",
+        "prompt": (
+            "--output",
+            "streaming",
+            "--agent",
+            "plan",
+            "--disabled-tools",
+            "*",
+        ),
+        "transport": "jsonl",
+        "environment": frozenset(),
+        "mode": PromptMode.OPTION_VALUE,
+        "prompt_option": "--prompt",
+    },
+    "qwen": {
+        "executable": "qwen",
+        "prompt": ("--output-format", "stream-json"),
+        "transport": "jsonl",
+        "environment": frozenset(),
+        "mode": PromptMode.OPTION_VALUE,
+        "prompt_option": "--prompt",
+    },
+    "cline": {
+        "executable": "cline",
+        "prompt": ("--json",),
+        "transport": "jsonl",
+        "environment": frozenset(("CLINE_NO_AUTO_UPDATE",)),
+        "mode": PromptMode.PROTOCOL,
+        "prompt_option": None,
+    },
+}
+
+EVIDENCE_FLAGS = {
+    "codebuddy": (
+        "CODEBUDDY_PROTOCOL_FRAME_REQUIRES_STAGE_6_EVIDENCE",
+        "CODEBUDDY_NO_TOOLS_CONFIG_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "CODEBUDDY_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE",
+    ),
+    "qoder": ("QODER_REQUIRES_STAGE_6_EVIDENCE",),
+    "mistral-vibe": (
+        "MISTRAL_VIBE_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE",
+        "MISTRAL_VIBE_ACP_REQUIRES_SEPARATE_STAGE_6_EVIDENCE",
+    ),
+    "qwen": ("QWEN_REQUIRES_STAGE_6_EVIDENCE",),
+    "cline": (
+        "CLINE_ONE_SHOT_LIFECYCLE_REQUIRES_STAGE_6_EVIDENCE",
+        "CLINE_OUTPUT_SCHEMA_REQUIRES_STAGE_6_EVIDENCE",
+        "CLINE_CONFIG_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "CLINE_ACP_REQUIRES_SEPARATE_STAGE_6_EVIDENCE",
+    ),
 }
 
 
 def _module(provider_id):
-    return importlib.import_module("unified_cli_ext.providers." + provider_id)
+    module_name = ENTRY_POINTS[provider_id].partition(":")[0]
+    return importlib.import_module(module_name)
 
 
 def test_pyproject_registers_all_held_provider_entry_points_exactly():
@@ -104,6 +197,8 @@ def test_held_specs_and_plugins_are_immutable_and_minimal(provider_id):
     assert spec.binary.version_probe.command.argv == ("--version",)
     assert spec.binary.feature_probe.command.argv == ("--help",)
     assert spec.prompt.fixed_argv == expected["prompt"]
+    assert spec.prompt.mode is expected["mode"]
+    assert spec.prompt.prompt_option == expected["prompt_option"]
     assert spec.transport.value == expected["transport"]
     assert spec.environment.allowed_keys == expected["environment"]
     assert spec.environment.required_keys == frozenset()
@@ -132,6 +227,13 @@ def test_held_specs_and_plugins_are_immutable_and_minimal(provider_id):
     }
     with pytest.raises(TypeError):
         doctor["available"] = True
+
+
+@pytest.mark.parametrize("provider_id", tuple(EVIDENCE_FLAGS))
+def test_stage5c_entries_record_every_remaining_evidence_gate(provider_id):
+    module = _module(provider_id)
+    for flag in EVIDENCE_FLAGS[provider_id]:
+        assert getattr(module, flag) is True
 
 
 @pytest.mark.parametrize("provider_id", tuple(ENTRY_POINTS))
@@ -234,7 +336,10 @@ assert not any(name.startswith("unified_cli_ext.providers.") and name.rsplit("."
 '''.format(
         root=str(root),
         ext_source=str(ext_source),
-        providers=tuple(ENTRY_POINTS),
+        providers=tuple(
+            target.partition(":")[0].rsplit(".", 1)[-1]
+            for target in ENTRY_POINTS.values()
+        ),
     )
     result = subprocess.run(
         [sys.executable, "-I", "-c", script],

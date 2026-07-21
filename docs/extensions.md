@@ -5,7 +5,7 @@ support Claude, Codex, and Gemini (`agy`) with its existing defaults. Installing
 Ext does not change those defaults, does not add an extension to Core's local
 server allowlist, and does not install or configure any vendor software.
 
-Stage 5B installs catalog metadata for four possible providers. Each is
+Stages 5B–5C install catalog metadata for nine possible providers. Each is
 discoverable through an explicit entry point, has status **Held**, and is
 incapable of starting a provider or external command. The adapter catalog
 records `chat` as a provisional design target, while the Core plugin advertises
@@ -60,13 +60,18 @@ manual design record.
 <!-- BEGIN GENERATED EXT PROVIDER SUPPORT -->
 | Provider ID | Support status | Core capabilities | Server |
 |---|---|---|---|
+| `cline` | `held` | `none` | `disabled` |
+| `codebuddy` | `held` | `none` | `disabled` |
 | `copilot` | `held` | `none` | `disabled` |
 | `cursor` | `held` | `none` | `disabled` |
 | `grok` | `held` | `none` | `disabled` |
 | `kimi` | `held` | `none` | `disabled` |
+| `mistral-vibe` | `held` | `none` | `disabled` |
+| `qoder` | `held` | `none` | `disabled` |
+| `qwen` | `held` | `none` | `disabled` |
 <!-- END GENERATED EXT PROVIDER SUPPORT -->
 
-## Stage 5B catalog
+## Stage 5B–5C catalog
 
 “Candidate transport” records a provisional design direction, not a command
 contract. “Auto-update containment” describes the intended boundary if an
@@ -78,6 +83,11 @@ adapter is later enabled; no Held metadata executes it today.
 | `kimi` | Kimi Code CLI (`kimi`), the current successor—not the legacy Python `kimi-cli` | JSONL | `chat` candidate; Core capability none | Held | Candidate opt-in `KIMI_CODE_NO_AUTO_UPDATE`; requires verification before use | [Getting started](https://moonshotai.github.io/kimi-code/en/guides/getting-started.html) · [Kimi command](https://moonshotai.github.io/kimi-code/en/reference/kimi-command.html) · [Kimi ACP](https://moonshotai.github.io/kimi-code/en/reference/kimi-acp.html) |
 | `copilot` | GitHub Copilot CLI (`copilot`, `@github/copilot`) | Plain text | `chat` candidate; Core capability none | Held | Candidate `--no-auto-update`; requires verification before use | [Install](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli) · [CLI command reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference) · [ACP server](https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server) |
 | `cursor` | Cursor Agent CLI (`cursor-agent`) | JSON | `chat` candidate; Core capability none | Held | No containment claim yet; update behavior must be verified before use | [Install](https://cursor.com/docs/cli/installation) · [Parameters](https://cursor.com/docs/cli/reference/parameters) · [Output format](https://cursor.com/docs/cli/reference/output-format) · [ACP](https://cursor.com/docs/cli/acp) |
+| `codebuddy` | CodeBuddy Code (`codebuddy`, `@tencent-ai/codebuddy-code`) | JSONL protocol candidate | `chat` candidate; Core capability none | Held | Candidate `DISABLE_AUTOUPDATER=1`; exact frame and config isolation require verification | [CLI reference](https://www.codebuddy.ai/docs/cli/cli-reference) · [Headless mode](https://www.codebuddy.ai/docs/cli/headless) · [ACP](https://www.codebuddy.ai/docs/cli/acp) |
+| `qoder` | Qoder CLI (`qodercli`, `@qoder-ai/qodercli`) | ACP stdio candidate | `chat` candidate; Core capability none | Held | Candidate private setting `general.enableAutoUpdate=false`; ACP lifecycle requires verification | [Quick start](https://docs.qoder.com/en/cli/quick-start) · [ACP](https://docs.qoder.com/en/cli/acp) · [Permissions](https://docs.qoder.com/en/cli/permissions) |
+| `mistral-vibe` | Mistral Vibe (`vibe`, `mistral-vibe`) | JSONL message stream candidate | `chat` candidate; Core capability none | Held | Candidate private config with update checks off; direct and `vibe-acp` paths require separate verification | [Install](https://docs.mistral.ai/getting-started/quickstarts/vibe-code/install-cli) · [CLI workflow](https://docs.mistral.ai/vibe/code/cli/work-with-cli) · [ACP surfaces](https://docs.mistral.ai/vibe/code/choose-cli-vscode-web-sessions) |
+| `qwen` | Qwen Code (`qwen`, `@qwen-code/qwen-code`) | JSONL candidate | `chat` candidate; Core capability none | Held | Backend selection, credentials, update behavior, and event schema require verification | [Repository](https://github.com/QwenLM/qwen-code) · [Headless mode](https://qwenlm.github.io/qwen-code-docs/en/users/features/headless/) · [Authentication](https://qwenlm.github.io/qwen-code-docs/en/users/configuration/auth/) |
+| `cline` | Cline CLI (`cline`) | JSONL candidate; separate ACP candidate | `chat` candidate; Core capability none | Held | Candidate `CLINE_NO_AUTO_UPDATE=1`; stdin EOF, event schema, and local configuration isolation require verification | [CLI overview](https://docs.cline.bot/usage/cli-overview) · [CLI reference](https://docs.cline.bot/cli/cli-reference) · [Release source](https://github.com/cline/cline/tree/cli-v3.0.46/apps/cli) |
 
 The optional `acp` and `mcp` extras install protocol SDK dependencies only.
 They do not activate a Held provider or make a provider call.
