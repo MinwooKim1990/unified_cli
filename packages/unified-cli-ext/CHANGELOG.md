@@ -15,7 +15,8 @@ Initial extension-foundation release for `unified-cli` 0.5.x.
   npm launchers. Receipts bind inspected local files; they do not establish
   publisher identity.
 - Adds inert Held catalog metadata for Grok, Kimi, Copilot, Cursor, CodeBuddy,
-  Qoder, Mistral Vibe, Qwen, Cline, OpenCode, and Kilo Code. These entries
+  Qoder, Mistral Vibe, Qwen, Cline, OpenCode, Kilo Code, Factory Droid, Pi,
+  Oh My Pi, Hermes Agent, and Poolside Agent CLI. These entries
   remain unavailable until provider-specific compatibility evidence is
   completed and reviewed.
 - Separates registry lifecycle from integration support status and generates

@@ -5,7 +5,7 @@ support Claude, Codex, and Gemini (`agy`) with its existing defaults. Installing
 Ext does not change those defaults, does not add an extension to Core's local
 server allowlist, and does not install or configure any vendor software.
 
-Stages 5B–5D install catalog metadata for exactly 11 inert Held providers. Each
+Stages 5B–5E install catalog metadata for exactly 16 inert Held providers. Each
 is discoverable through an explicit entry point, has status **Held**, and is
 incapable of starting a provider or external command. The adapter catalog
 records `chat` as a provisional design target, while the Core plugin advertises
@@ -64,16 +64,21 @@ manual design record.
 | `codebuddy` | `held` | `none` | `disabled` |
 | `copilot` | `held` | `none` | `disabled` |
 | `cursor` | `held` | `none` | `disabled` |
+| `droid` | `held` | `none` | `disabled` |
 | `grok` | `held` | `none` | `disabled` |
+| `hermes` | `held` | `none` | `disabled` |
 | `kilo` | `held` | `none` | `disabled` |
 | `kimi` | `held` | `none` | `disabled` |
 | `mistral-vibe` | `held` | `none` | `disabled` |
+| `oh-my-pi` | `held` | `none` | `disabled` |
 | `opencode` | `held` | `none` | `disabled` |
+| `pi` | `held` | `none` | `disabled` |
+| `poolside` | `held` | `none` | `disabled` |
 | `qoder` | `held` | `none` | `disabled` |
 | `qwen` | `held` | `none` | `disabled` |
 <!-- END GENERATED EXT PROVIDER SUPPORT -->
 
-## Stage 5B–5D catalog
+## Stage 5B–5E catalog
 
 “Candidate transport” records a provisional design direction, not a command
 contract. “Auto-update containment” describes the intended boundary if an
@@ -92,6 +97,11 @@ adapter is later enabled; no Held metadata executes it today.
 | `cline` | Cline CLI (`cline`) | JSONL candidate; separate ACP candidate | `chat` candidate; Core capability none | Held | Candidate `CLINE_NO_AUTO_UPDATE=1`; stdin EOF, event schema, and local configuration isolation require verification | [CLI overview](https://docs.cline.bot/usage/cli-overview) · [CLI reference](https://docs.cline.bot/cli/cli-reference) · [Release source](https://github.com/cline/cline/tree/cli-v3.0.46/apps/cli) |
 | `opencode` | OpenCode (`opencode`, package `opencode-ai`) | `JSONL one-shot` candidate | `chat` candidate; Core capability none | Held | Candidate disable controls require verification; stdin EOF, config/MCP isolation, and process/session lifecycle remain Stage 6 gates | [Documentation](https://opencode.ai/docs/) · [CLI](https://opencode.ai/docs/cli/) · [Server](https://opencode.ai/docs/server/) |
 | `kilo` | Kilo Code (`kilo`, package `@kilocode/cli`) | `ACP stdio with an internal loopback server` candidate | `chat` candidate; Core capability none | Held | No verified auto-update containment claim yet; ACP loopback/process/config/permission lifecycles require Stage 6 verification | [CLI](https://kilo.ai/docs/code-with-ai/platforms/cli) · [CLI reference](https://kilo.ai/docs/code-with-ai/platforms/cli-reference) · [Release](https://github.com/Kilo-Org/kilocode/releases/tag/v7.4.11) |
+| `droid` | Factory Droid (`droid`, npm package `droid`) | Vendor stream JSON-RPC candidate | `chat` candidate; Core capability none | Held | Candidate update control, protocol envelope, permission flow, and process lifecycle require Stage 6 verification | [CLI reference](https://docs.factory.ai/reference/cli-reference) · [Droid Exec](https://docs.factory.ai/cli/droid-exec/overview) · [Package metadata](https://registry.npmjs.org/droid/latest) |
+| `pi` | Pi Coding Agent (`pi`, package `@earendil-works/pi-coding-agent`) | Custom NDJSON RPC candidate | `chat` candidate; Core capability none | Held | Candidate `--offline` and resource-disable flags require Stage 6 verification; this is not JSON-RPC | [Package](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/package.json) · [README](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md) · [RPC](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md) |
+| `oh-my-pi` | Oh My Pi (`omp`, package `@oh-my-pi/pi-coding-agent`) | Custom NDJSON RPC candidate | `chat` candidate; Core capability none | Held | No verified update containment claim yet; configuration, resources, permissions, and process lifecycle require Stage 6 verification | [Repository](https://github.com/can1357/oh-my-pi) · [RPC](https://github.com/can1357/oh-my-pi/blob/main/docs/rpc.md) · [Approval mode](https://github.com/can1357/oh-my-pi/blob/main/docs/approval-mode.md) |
+| `hermes` | Hermes Agent (`hermes`, PyPI `hermes-agent[acp]`) | ACP stdio candidate | `chat` candidate; Core capability none | Held | Hermes pins ACP 0.9.0 while Ext targets 0.11.x; compatibility, configuration, and lifecycle require Stage 6 verification | [PyPI](https://pypi.org/project/hermes-agent/) · [Repository](https://github.com/NousResearch/hermes-agent) · [ACP guide](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/acp.md) |
+| `poolside` | Poolside Agent CLI (`pool`, official native release) | ACP stdio candidate | `chat` candidate; Core capability none | Held | No verified startup/update containment claim yet; proprietary binary identity, ACP schema, configuration, and removal require Stage 6 verification | [Install](https://docs.poolside.ai/cli/install) · [CLI reference](https://docs.poolside.ai/cli/cli-reference) · [Release](https://github.com/poolsideai/pool/releases/tag/v1.0.13) |
 
 The optional `acp` and `mcp` extras install protocol SDK dependencies only.
 They do not activate a Held provider or make a provider call.
