@@ -1,4 +1,4 @@
-"""Stage 5B/5C contract checks for inert external provider entry points."""
+"""Stage 5B-5E contract checks for inert external provider entry points."""
 
 from __future__ import annotations
 
@@ -46,6 +46,11 @@ ENTRY_POINTS = {
     "cline": "unified_cli_ext.providers.cline:PLUGIN",
     "opencode": "unified_cli_ext.providers.opencode:PLUGIN",
     "kilo": "unified_cli_ext.providers.kilo:PLUGIN",
+    "droid": "unified_cli_ext.providers.droid:PLUGIN",
+    "pi": "unified_cli_ext.providers.pi:PLUGIN",
+    "oh-my-pi": "unified_cli_ext.providers.oh_my_pi:PLUGIN",
+    "hermes": "unified_cli_ext.providers.hermes:PLUGIN",
+    "poolside": "unified_cli_ext.providers.poolside:PLUGIN",
 }
 
 EXPECTED_COMMANDS = {
@@ -180,6 +185,88 @@ EXPECTED_COMMANDS = {
         "mode": PromptMode.PROTOCOL,
         "prompt_option": None,
     },
+    "droid": {
+        "executable": "droid",
+        "prompt": (
+            "exec",
+            "--input-format",
+            "stream-jsonrpc",
+            "--output-format",
+            "stream-jsonrpc",
+        ),
+        "transport": "jsonrpc",
+        "environment": frozenset(
+            ("FACTORY_API_KEY", "FACTORY_DROID_AUTO_UPDATE_ENABLED")
+        ),
+        "mode": PromptMode.PROTOCOL,
+        "prompt_option": None,
+    },
+    "pi": {
+        "executable": "pi",
+        "prompt": (
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--offline",
+            "--no-tools",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-context-files",
+            "--no-approve",
+        ),
+        "transport": "jsonl",
+        "environment": frozenset(),
+        "mode": PromptMode.PROTOCOL,
+        "prompt_option": None,
+    },
+    "oh-my-pi": {
+        "executable": "omp",
+        "prompt": (
+            "--mode",
+            "rpc",
+            "--no-session",
+            "--no-tools",
+            "--no-extensions",
+            "--no-skills",
+            "--no-rules",
+            "--no-lsp",
+            "--no-pty",
+            "--no-prewalk",
+            "--no-title",
+            "--approval-mode",
+            "always-ask",
+        ),
+        "transport": "jsonl",
+        "environment": frozenset(),
+        "mode": PromptMode.PROTOCOL,
+        "prompt_option": None,
+    },
+    "hermes": {
+        "executable": "hermes",
+        "prompt": ("acp",),
+        "transport": "acp",
+        "environment": frozenset(),
+        "mode": PromptMode.PROTOCOL,
+        "prompt_option": None,
+    },
+    "poolside": {
+        "executable": "pool",
+        "prompt": ("acp",),
+        "transport": "acp",
+        "environment": frozenset(
+            (
+                "POOLSIDE_API_KEY",
+                "POOLSIDE_TOKEN",
+                "POOLSIDE_API_URL",
+                "POOLSIDE_STANDALONE_BASE_URL",
+                "POOLSIDE_STANDALONE_MODEL",
+            )
+        ),
+        "mode": PromptMode.PROTOCOL,
+        "prompt_option": None,
+    },
 }
 
 EVIDENCE_FLAGS = {
@@ -216,6 +303,60 @@ EVIDENCE_FLAGS = {
         "KILO_PERMISSION_CONFIG_MCP_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
         "KILO_AUTH_SESSION_MODEL_EVENT_SCHEMA_REQUIRES_STAGE_6_EVIDENCE",
     ),
+    "droid": (
+        "DROID_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE",
+        "DROID_STREAM_JSONRPC_ENVELOPE_PROTOCOL_VERSION_REQUIRES_STAGE_6_EVIDENCE",
+        "DROID_SESSION_NOTIFICATION_TURN_SCHEMA_REQUIRES_STAGE_6_EVIDENCE",
+        "DROID_PERMISSION_ASK_USER_DEFAULT_DENY_REQUIRES_STAGE_6_EVIDENCE",
+        "DROID_AUTH_ACCOUNT_BILLING_POLICY_REQUIRES_STAGE_6_EVIDENCE",
+        "DROID_MODEL_IMAGE_MCP_USAGE_ERROR_REQUIRES_STAGE_6_EVIDENCE",
+        "DROID_RESUME_FORK_INTERRUPT_PERSISTENCE_REQUIRES_STAGE_6_EVIDENCE",
+        "DROID_PROCESS_BACKPRESSURE_CLEANUP_REQUIRES_STAGE_6_EVIDENCE",
+        "DROID_UPDATE_REMOVAL_CONFIG_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "DROID_SDK_CLI_PROTOCOL_DRIFT_REQUIRES_STAGE_6_EVIDENCE",
+    ),
+    "pi": (
+        "PI_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE",
+        "PI_RPC_FRAMING_EVENT_ERROR_USAGE_SCHEMA_REQUIRES_STAGE_6_EVIDENCE",
+        "PI_AUTH_MODEL_CONFIG_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "PI_TOOL_RESOURCE_PERMISSION_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "PI_OFFLINE_UPDATE_PACKAGE_TELEMETRY_CONTAINMENT_REQUIRES_STAGE_6_EVIDENCE",
+        "PI_RPC_CANCEL_STDIN_EOF_PROCESS_CLEANUP_REQUIRES_STAGE_6_EVIDENCE",
+        "PI_SESSION_RESUME_IMAGE_REQUIRES_STAGE_6_EVIDENCE",
+    ),
+    "oh-my-pi": (
+        "OH_MY_PI_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE",
+        "OH_MY_PI_RPC_READY_FRAMING_COMPLETION_ERROR_USAGE_SCHEMA_REQUIRES_STAGE_6_EVIDENCE",
+        "OH_MY_PI_CONFIG_ENV_AUTH_MODEL_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "OH_MY_PI_TOOL_EXTENSION_RULE_MCP_SUBAGENT_PERMISSION_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "OH_MY_PI_RPC_CANCEL_STDIN_EOF_WORKER_MCP_CLEANUP_REQUIRES_STAGE_6_EVIDENCE",
+        "OH_MY_PI_SESSION_RESUME_IMAGE_REQUIRES_STAGE_6_EVIDENCE",
+        "OH_MY_PI_ACP_REQUIRES_SEPARATE_STAGE_6_EVIDENCE",
+        "OH_MY_PI_UPDATE_CHECK_CONTAINMENT_REQUIRES_STAGE_6_EVIDENCE",
+    ),
+    "hermes": (
+        "HERMES_ACP_0_9_0_VS_EXT_0_11_X_COMPATIBILITY_REQUIRES_STAGE_6_EVIDENCE",
+        "HERMES_VERSION_HELP_ACP_CHECK_OUTPUT_REQUIRES_STAGE_6_EVIDENCE",
+        "HERMES_ACP_NEGOTIATION_EVENT_ERROR_USAGE_SCHEMA_REQUIRES_STAGE_6_EVIDENCE",
+        "HERMES_AUTH_MODEL_CONFIG_HOME_PROFILE_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "HERMES_ACP_PERMISSION_ALLOWLIST_TOOL_MCP_PLUGIN_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "HERMES_ACP_CANCEL_STDIO_EOF_SESSION_WORKER_CHILD_CLEANUP_REQUIRES_STAGE_6_EVIDENCE",
+        "HERMES_ACP_SESSION_PERSISTENCE_RESUME_DOC_DRIFT_REQUIRES_STAGE_6_EVIDENCE",
+        "HERMES_ACP_NON_TEXT_IMAGE_LIMIT_REQUIRES_STAGE_6_EVIDENCE",
+        "HERMES_TUI_JSONRPC_AND_HTTP_SSE_REQUIRE_SEPARATE_STAGE_6_EVIDENCE",
+        "HERMES_INSTALL_CHANNEL_UPDATE_POSTINSTALL_PROVENANCE_REQUIRES_STAGE_6_EVIDENCE",
+    ),
+    "poolside": (
+        "POOLSIDE_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE",
+        "POOLSIDE_INSTALL_CHANNEL_BINARY_IDENTITY_PROVENANCE_REQUIRES_STAGE_6_EVIDENCE",
+        "POOLSIDE_ACP_HANDSHAKE_EVENT_SCHEMA_REQUIRES_STAGE_6_EVIDENCE",
+        "POOLSIDE_AUTH_MODEL_SESSION_REQUIRES_STAGE_6_EVIDENCE",
+        "POOLSIDE_PERMISSION_TOOL_MCP_CONFIG_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "POOLSIDE_IMAGE_USAGE_ERROR_SCHEMA_REQUIRES_STAGE_6_EVIDENCE",
+        "POOLSIDE_PROCESS_CHILD_CLEANUP_REQUIRES_STAGE_6_EVIDENCE",
+        "POOLSIDE_EXEC_JSONL_SEPARATE_REQUIRES_STAGE_6_EVIDENCE",
+        "POOLSIDE_UPDATE_REMOVAL_REQUIRES_STAGE_6_EVIDENCE",
+    ),
 }
 
 
@@ -234,7 +375,7 @@ def test_pyproject_registers_all_held_provider_entry_points_exactly():
     for line in section.strip().splitlines():
         provider_id, _, target = line.partition(" = ")
         declared[provider_id] = target.strip().strip('"')
-    assert len(declared) == 11
+    assert len(declared) == 16
     assert declared == ENTRY_POINTS
 
 
@@ -289,9 +430,16 @@ def test_held_specs_and_plugins_are_immutable_and_minimal(provider_id):
 
 
 @pytest.mark.parametrize("provider_id", tuple(EVIDENCE_FLAGS))
-def test_stage5c_entries_record_every_remaining_evidence_gate(provider_id):
+def test_held_entries_record_every_remaining_evidence_gate(provider_id):
     module = _module(provider_id)
-    for flag in EVIDENCE_FLAGS[provider_id]:
+    expected = set(EVIDENCE_FLAGS[provider_id])
+    recorded = {
+        name
+        for name, value in vars(module).items()
+        if name.endswith("_STAGE_6_EVIDENCE") and value is True
+    }
+    assert recorded == expected
+    for flag in expected:
         assert getattr(module, flag) is True
 
 
