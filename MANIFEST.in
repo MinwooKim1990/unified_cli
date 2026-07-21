@@ -21,10 +21,10 @@ exclude PHASE0_VERIFICATION.md
 exclude UX_TEST_REPORT.md
 exclude simulation.md
 
-# The extension lab is a source-checkout development harness, not Core package
-# content. Keep both its modules and launcher out of the Core source archive.
+# The extension labs are source-checkout development harnesses, not Core
+# package content. Keep every lab module and launcher out of the Core archive.
 prune tools
-exclude scripts/unified-ext-lab
+exclude scripts/unified-ext-lab*
 
 # Prune build/dev/cache noise
 prune .venv

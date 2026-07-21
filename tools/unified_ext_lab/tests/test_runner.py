@@ -53,6 +53,36 @@ class SubprocessRunnerTests(unittest.TestCase):
         self.runners.append(runner)
         return runner
 
+    def test_identity_reader_is_nonblocking_cloexec_and_checks_named_identity(self):
+        real_open = os.open
+        observed_flags = []
+
+        def capture_open(name, flags, *args, **kwargs):
+            observed_flags.append(flags)
+            return real_open(name, flags, *args, **kwargs)
+
+        with mock.patch.object(runner_module.os, "open", new=capture_open):
+            runner_module._capture_identity(self.executable)
+        self.assertTrue(observed_flags[-1] & os.O_NONBLOCK)
+        self.assertTrue(observed_flags[-1] & os.O_CLOEXEC)
+
+        replacement = os.path.join(self.directory, "replacement")
+        shutil.copyfile(self.executable, replacement)
+        os.chmod(replacement, 0o700)
+        real_read = os.read
+        swapped = {"done": False}
+
+        def swap_after_read(descriptor, count):
+            payload = real_read(descriptor, count)
+            if payload and not swapped["done"]:
+                swapped["done"] = True
+                os.replace(replacement, self.executable)
+            return payload
+
+        with mock.patch.object(runner_module.os, "read", new=swap_after_read):
+            with self.assertRaisesRegex(InvariantRefusalError, "identity changed"):
+                runner_module._capture_identity(self.executable)
+
     def run_python(
         self, runner: SubprocessRunner, program: str, *, timeout: float = 2
     ) -> CommandResult:

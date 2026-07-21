@@ -14,11 +14,15 @@ the host, access credentials, or contact Docker or a provider.
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import errno
+import hashlib
 import json
 import os
 import secrets
 import stat
-from dataclasses import dataclass, replace
+import sys
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
@@ -40,11 +44,24 @@ except ImportError:  # pragma: no cover - exercised by the explicit helper test.
     _fcntl = None
 
 
-STATE_SCHEMA = 2
+STATE_SCHEMA = 3
+LEGACY_FIXTURE_STATE_SCHEMA = 2
+FIXTURE_EXECUTION_PROFILE = "fixture-fake-v1"
+REAL_DOCKER_EXECUTION_PROFILE = "real-docker-v1"
+EXECUTION_PROFILES = frozenset(
+    (FIXTURE_EXECUTION_PROFILE, REAL_DOCKER_EXECUTION_PROFILE)
+)
 MAX_STATE_BYTES = 1024 * 1024
 STATE_FILE_NAME = "state.json"
+STATE_REPLACE_BACKUP_NAME = ".state.json.replace-backup"
+STATE_REPLACE_INTENT_NAME = ".state.json.replace-intent"
+STATE_REPLACE_BACKUP_REMOVING_NAME = ".state.json.replace-backup-removing"
+STATE_REPLACE_INTENT_REMOVING_NAME = ".state.json.replace-intent-removing"
 LOCK_FILE_NAME = "state.lock"
+ROOT_LOCK_FILE_PREFIX = ".lab-name-lock."
 _LOCK_CAPABILITY = object()
+
+_FileIdentity = Tuple[int, int, int, int, int, int, int, int]
 
 
 class StatePhase(str, Enum):
@@ -82,6 +99,15 @@ PENDING_STEPS = MappingProxyType(
         StatePhase.DESTROY_PENDING: "destroy",
         StatePhase.VERIFY_CLEAN_PENDING: "verify_clean",
         StatePhase.SEAL_PENDING: "seal",
+    }
+)
+
+STABLE_FORWARD_STEPS = MappingProxyType(
+    {
+        StatePhase.NEW: "create",
+        StatePhase.CREATED: "install",
+        StatePhase.INSTALLED: "test",
+        StatePhase.TESTED: "evidence",
     }
 )
 
@@ -427,6 +453,15 @@ def _validate_baselines(value: object) -> Mapping[str, bool]:
 
 
 _ARTIFACT_KEYS = frozenset(("package", "version", "source_kind", "source_locator", "sha256"))
+_LEGACY_SYNTHETIC_ARTIFACT = MappingProxyType(
+    {
+        "package": "synthetic-cli-fixture",
+        "version": "1.0.0",
+        "source_kind": "local_fixture",
+        "source_locator": "fixtures/synthetic-cli-fixture-1.0.0-50e7754c2a4c",
+        "sha256": "50e7754c2a4cc5fb074d640eef253f5a9b61288dcbe8074887e2cc2c728edc66",
+    }
+)
 _DRAFT_KEYS = frozenset(
     (
         "evidence_kind",
@@ -441,6 +476,63 @@ _DRAFT_KEYS = frozenset(
 )
 
 
+def _validate_execution_profile(value: object) -> str:
+    if type(value) is not str or value not in EXECUTION_PROFILES:
+        raise UsageStateError("invalid execution profile")
+    return value
+
+
+def _executor_for_profile(execution_profile: str) -> str:
+    return {
+        FIXTURE_EXECUTION_PROFILE: "fake_docker",
+        REAL_DOCKER_EXECUTION_PROFILE: "real_docker",
+    }[execution_profile]
+
+
+def _validate_artifact_evidence(value: object) -> Mapping[str, object]:
+    data = _exact_mapping(value, _ARTIFACT_KEYS, "artifact evidence")
+    from .evidence import ArtifactEvidence
+
+    artifact = ArtifactEvidence.from_value(data)
+    copied = artifact.to_dict()
+    _check_forbidden_keys(copied)
+    return MappingProxyType(copied)
+
+
+def _validate_resource_ids(
+    value: object, planned_resources: Tuple[PlannedResource, ...]
+) -> Mapping[str, str]:
+    if not isinstance(value, Mapping):
+        raise UsageStateError("invalid resource ids")
+    planned_roles = frozenset(resource.role for resource in planned_resources)
+    result = {}
+    for key, resource_id in value.items():
+        try:
+            role = ResourceRole(key)
+        except (TypeError, ValueError):
+            raise UsageStateError("invalid resource id role")
+        if role.value not in planned_roles:
+            raise UsageStateError("resource id role was not planned")
+        if type(resource_id) is not str:
+            raise UsageStateError("invalid resource id")
+        if role is ResourceRole.IMAGE:
+            valid = (
+                len(resource_id) == 71
+                and resource_id.startswith("sha256:")
+                and all(character in "0123456789abcdef" for character in resource_id[7:])
+            )
+        elif role is ResourceRole.CONTAINER:
+            valid = len(resource_id) == 64 and all(
+                character in "0123456789abcdef" for character in resource_id
+            )
+        else:
+            valid = False
+        if not valid:
+            raise UsageStateError("invalid resource id")
+        result[role.value] = resource_id
+    return MappingProxyType(result)
+
+
 def _validate_draft(value: object) -> Optional[Mapping[str, object]]:
     if value is None:
         return None
@@ -448,7 +540,7 @@ def _validate_draft(value: object) -> Optional[Mapping[str, object]]:
     _exact_mapping(data["artifact"], _ARTIFACT_KEYS, "draft artifact")
     if data["evidence_kind"] != "harness_fixture":
         raise UsageStateError("invalid draft evidence kind")
-    if data["executor_kind"] != "fake_docker":
+    if data["executor_kind"] not in ("fake_docker", "real_docker"):
         raise UsageStateError("invalid draft executor kind")
     if data["promotion_eligible"] is not False:
         raise InvariantRefusalError("fixture evidence cannot be promotional")
@@ -482,7 +574,7 @@ def _validate_draft(value: object) -> Optional[Mapping[str, object]]:
 
 @dataclass(frozen=True)
 class LabState:
-    """Immutable schema-v2 state; use :meth:`transition` to advance it."""
+    """Immutable schema-v3 state; use :meth:`transition` to advance it."""
 
     schema: int
     revision: int
@@ -490,7 +582,14 @@ class LabState:
     provider_id: str
     ownership_token: str
     phase: StatePhase
+    execution_profile: str = FIXTURE_EXECUTION_PROFILE
     planned_resources: Tuple[PlannedResource, ...] = ()
+    resource_ids: Mapping[str, str] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    artifact_evidence: Mapping[str, object] = field(
+        default_factory=lambda: _LEGACY_SYNTHETIC_ARTIFACT
+    )
     generation: int = 0
     auth_generation: int = 0
     pending_step: Optional[str] = None
@@ -500,7 +599,9 @@ class LabState:
     operations: Tuple[OperationObservation, ...] = ()
     draft_evidence: Optional[Mapping[str, object]] = None
     seal_intent: Optional[SealIntent] = None
-    baseline_equalities: Mapping[str, bool] = MappingProxyType({})
+    baseline_equalities: Mapping[str, bool] = field(
+        default_factory=lambda: MappingProxyType({})
+    )
 
     def __post_init__(self) -> None:
         if self.schema != STATE_SCHEMA:
@@ -511,6 +612,8 @@ class LabState:
         object.__setattr__(self, "ownership_token", validate_ownership_token(self.ownership_token))
         phase = _phase(self.phase)
         object.__setattr__(self, "phase", phase)
+        execution_profile = _validate_execution_profile(self.execution_profile)
+        object.__setattr__(self, "execution_profile", execution_profile)
         if type(self.planned_resources) is not tuple:
             raise UsageStateError("planned resources must be an immutable tuple")
         if len(set(resource.role for resource in self.planned_resources)) != len(self.planned_resources):
@@ -525,6 +628,16 @@ class LabState:
                 raise UsageStateError("planned resource provider mismatch")
             if labels[LABEL_PREFIX + "/ownership-token"] != self.ownership_token:
                 raise UsageStateError("planned resource token mismatch")
+        object.__setattr__(
+            self,
+            "resource_ids",
+            _validate_resource_ids(self.resource_ids, self.planned_resources),
+        )
+        object.__setattr__(
+            self,
+            "artifact_evidence",
+            _validate_artifact_evidence(self.artifact_evidence),
+        )
         _strict_nonnegative_int(self.generation, "generation")
         _strict_nonnegative_int(self.auth_generation, "auth generation")
         required_pending = PENDING_STEPS.get(phase)
@@ -560,6 +673,22 @@ class LabState:
         ):
             raise UsageStateError("invalid operation observations")
         validated_draft = _validate_draft(self.draft_evidence)
+        if (
+            validated_draft is not None
+            and validated_draft["executor_kind"]
+            != _executor_for_profile(execution_profile)
+        ):
+            raise InvariantRefusalError(
+                "draft executor does not match execution profile"
+            )
+        if (
+            validated_draft is not None
+            and dict(validated_draft["artifact"])
+            != dict(self.artifact_evidence)
+        ):
+            raise InvariantRefusalError(
+                "draft artifact does not match durable artifact evidence"
+            )
         if phase in _DRAFT_FORBIDDEN_PHASES and validated_draft is not None:
             raise UsageStateError("draft evidence is premature for state phase")
         if phase in _DRAFT_REQUIRED_PHASES and validated_draft is None:
@@ -590,6 +719,8 @@ class LabState:
         ownership_token: object,
         planned_resources: Sequence[Union[PlannedResource, Mapping[str, object]]],
         baseline_equalities: Optional[Mapping[str, bool]] = None,
+        execution_profile: object = FIXTURE_EXECUTION_PROFILE,
+        artifact_evidence: Optional[Mapping[str, object]] = None,
     ) -> "LabState":
         resources = tuple(
             PlannedResource.from_value(item)
@@ -602,7 +733,13 @@ class LabState:
             provider_id=provider_id,
             ownership_token=ownership_token,
             phase=StatePhase.NEW,
+            execution_profile=execution_profile,
             planned_resources=resources,
+            artifact_evidence=(
+                _LEGACY_SYNTHETIC_ARTIFACT
+                if artifact_evidence is None
+                else artifact_evidence
+            ),
             baseline_equalities={} if baseline_equalities is None else baseline_equalities,
         )
 
@@ -624,10 +761,12 @@ class LabState:
                 "promotion_eligible": self.draft_evidence["promotion_eligible"],
             }
         return {
+            "artifact_evidence": dict(self.artifact_evidence),
             "auth_generation": self.auth_generation,
             "baseline_equalities": dict(self.baseline_equalities),
             "created_roles": list(self.created_roles),
             "draft_evidence": draft,
+            "execution_profile": self.execution_profile,
             "generation": self.generation,
             "lab_id": self.lab_id,
             "operations": [operation.to_dict() for operation in self.operations],
@@ -637,6 +776,7 @@ class LabState:
             "planned_resources": [resource.to_dict() for resource in self.planned_resources],
             "provider_id": self.provider_id,
             "removed_roles": list(self.removed_roles),
+            "resource_ids": dict(self.resource_ids),
             "revision": self.revision,
             "schema": self.schema,
             "seal_intent": None if self.seal_intent is None else self.seal_intent.to_dict(),
@@ -645,7 +785,7 @@ class LabState:
 
     @classmethod
     def from_dict(cls, value: object) -> "LabState":
-        keys = frozenset(
+        schema_v2_keys = frozenset(
             (
                 "schema",
                 "revision",
@@ -666,7 +806,41 @@ class LabState:
                 "baseline_equalities",
             )
         )
-        data = _exact_mapping(value, keys, "state")
+        early_schema_v3_keys = schema_v2_keys | frozenset(("execution_profile",))
+        schema_v3_keys = early_schema_v3_keys | frozenset(
+            ("artifact_evidence", "resource_ids")
+        )
+        if not isinstance(value, Mapping):
+            raise UsageStateError("invalid state fields")
+        if value.get("schema") == LEGACY_FIXTURE_STATE_SCHEMA:
+            legacy = _exact_mapping(value, schema_v2_keys, "state")
+            data = dict(legacy)
+            data["schema"] = STATE_SCHEMA
+            # Schema 2 was emitted only by the fixture-only launcher. Never
+            # infer a real executor from legacy content or its filesystem.
+            data["execution_profile"] = FIXTURE_EXECUTION_PROFILE
+            legacy_draft = data.get("draft_evidence")
+            data["artifact_evidence"] = (
+                dict(legacy_draft["artifact"])
+                if isinstance(legacy_draft, Mapping)
+                and isinstance(legacy_draft.get("artifact"), Mapping)
+                else dict(_LEGACY_SYNTHETIC_ARTIFACT)
+            )
+            data["resource_ids"] = {}
+        else:
+            keys = frozenset(value.keys())
+            if keys == early_schema_v3_keys:
+                data = dict(value)
+                early_draft = data.get("draft_evidence")
+                data["artifact_evidence"] = (
+                    dict(early_draft["artifact"])
+                    if isinstance(early_draft, Mapping)
+                    and isinstance(early_draft.get("artifact"), Mapping)
+                    else dict(_LEGACY_SYNTHETIC_ARTIFACT)
+                )
+                data["resource_ids"] = {}
+            else:
+                data = _exact_mapping(value, schema_v3_keys, "state")
         _check_forbidden_keys(data)
         if (
             type(data["planned_resources"]) is not list
@@ -683,7 +857,10 @@ class LabState:
             provider_id=data["provider_id"],
             ownership_token=data["ownership_token"],
             phase=data["phase"],
+            execution_profile=data["execution_profile"],
             planned_resources=tuple(PlannedResource.from_dict(item) for item in data["planned_resources"]),
+            resource_ids=data["resource_ids"],
+            artifact_evidence=data["artifact_evidence"],
             generation=data["generation"],
             auth_generation=data["auth_generation"],
             pending_step=data["pending_step"],
@@ -728,7 +905,9 @@ class LabState:
             StatePhase.PASSED,
             StatePhase.FAILED_CLEAN,
         ):
-            raise InvariantRefusalError("tainted state cannot produce evidence")
+            raise InvariantRefusalError(
+                "tainted verification/promotion-held state cannot produce evidence"
+            )
         updates = dict(safe_updates)
         if "created_roles" in updates:
             updates["created_roles"] = tuple(updates["created_roles"])
@@ -779,6 +958,10 @@ class LabState:
             raise UsageStateError("seal phase requires a seal intent")
         if target is StatePhase.EVIDENCE_CAPTURED or "draft_evidence" in updates:
             validated_draft = _validate_draft(effective_draft)
+            if dict(validated_draft["artifact"]) != dict(self.artifact_evidence):
+                raise InvariantRefusalError(
+                    "captured artifact does not match durable artifact evidence"
+                )
             effective_operations = updates.get("operations", self.operations)
             draft_operations = tuple(
                 OperationObservation.from_dict(item)
@@ -798,10 +981,11 @@ class LabState:
         return replace(self, **updates)
 
     def mark_tainted(self) -> "LabState":
-        """Return a same-phase revision that permanently records shell use.
+        """Enter the irreversible verification and promotion hold.
 
-        A command layer must persist this state before launching a shell.  The
-        flag is monotonic and there is intentionally no API that clears it.
+        A command layer must persist this state before any action that makes
+        automated verification or promotion ineligible. The flag is monotonic
+        and there is intentionally no API that clears it.
         """
 
         if self.phase in (
@@ -809,7 +993,9 @@ class LabState:
             StatePhase.PASSED,
             StatePhase.FAILED_CLEAN,
         ):
-            raise UsageStateError("sealed state cannot start a shell")
+            raise UsageStateError(
+                "sealed state cannot enter the verification/promotion hold"
+            )
         if self.tainted:
             return self
         return replace(self, revision=self.revision + 1, tainted=True)
@@ -838,6 +1024,38 @@ class LabState:
             self,
             revision=self.revision + 1,
             created_roles=self.created_roles + (value,),
+        )
+
+    def record_resource_id(
+        self,
+        role: Union[ResourceRole, str],
+        resource_id: object,
+    ) -> "LabState":
+        """Record one immutable daemon identity for exact cleanup."""
+
+        if self.phase not in (
+            StatePhase.CREATE_PENDING,
+            StatePhase.DESTROY_PENDING,
+        ):
+            raise UsageStateError(
+                "resource ids can only be recorded during create or cleanup"
+            )
+        try:
+            normalized = role if isinstance(role, ResourceRole) else ResourceRole(role)
+        except (TypeError, ValueError):
+            raise UsageStateError("invalid resource id role")
+        candidate = dict(self.resource_ids)
+        existing = candidate.get(normalized.value)
+        if existing is not None:
+            if existing != resource_id:
+                raise InvariantRefusalError("recorded resource id is immutable")
+            return self
+        candidate[normalized.value] = resource_id
+        validated = _validate_resource_ids(candidate, self.planned_resources)
+        return replace(
+            self,
+            revision=self.revision + 1,
+            resource_ids=validated,
         )
 
     def record_removed_role(self, role: Union[ResourceRole, str]) -> "LabState":
@@ -872,6 +1090,34 @@ class LabState:
             raise UsageStateError("invalid pending failure observation")
         if observation.step != interrupted_step or observation.outcome != "failed":
             raise UsageStateError("pending failure observation does not match step")
+        return replace(
+            self,
+            phase=StatePhase.RECOVERY_REQUIRED,
+            revision=self.revision + 1,
+            pending_step=interrupted_step,
+            operations=self.operations + (observation,),
+        )
+
+    def interrupt_stable_forward(self) -> "LabState":
+        """Explicitly abandon one stable forward phase into cleanup recovery.
+
+        Ordinary loading deliberately does not call this method. Command layers
+        use it only after an interruption occurred before the next pending
+        intent could be committed.
+        """
+
+        interrupted_step = STABLE_FORWARD_STEPS.get(self.phase)
+        if interrupted_step is None:
+            raise UsageStateError(
+                "only a stable forward state can be interrupted into recovery"
+            )
+        observation = OperationObservation(
+            step=interrupted_step,
+            outcome="failed",
+            exit_code=1,
+            latency_ns=0,
+            error_code="interrupted",
+        )
         return replace(
             self,
             phase=StatePhase.RECOVERY_REQUIRED,
@@ -951,6 +1197,69 @@ def canonical_json_bytes(value: object) -> bytes:
     return encoded
 
 
+def _rename_noreplace_primitive() -> Optional[object]:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        function = getattr(libc, "renameatx_np", None)
+        if function is not None:
+            function.argtypes = (
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            )
+            function.restype = ctypes.c_int
+            return (function, 0x00000004)  # RENAME_EXCL
+    if sys.platform.startswith("linux"):
+        function = getattr(libc, "renameat2", None)
+        if function is not None:
+            function.argtypes = (
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            )
+            function.restype = ctypes.c_int
+            return (function, 0x00000001)  # RENAME_NOREPLACE
+    return None
+
+
+def _rename_noreplace_at(
+    source_directory: int,
+    source: str,
+    destination_directory: int,
+    destination: str,
+) -> None:
+    primitive = _rename_noreplace_primitive()
+    if primitive is None:
+        raise UnsupportedError("atomic no-replace rename is unsupported")
+    function, flag = primitive
+    ctypes.set_errno(0)
+    result = function(
+        source_directory,
+        os.fsencode(source),
+        destination_directory,
+        os.fsencode(destination),
+        flag,
+    )
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number == errno.EEXIST:
+        raise FileExistsError(
+            error_number, os.strerror(error_number), destination
+        )
+    if error_number in (
+        errno.ENOSYS,
+        errno.EINVAL,
+        getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+    ):
+        raise UnsupportedError("atomic no-replace rename is unsupported")
+    raise OSError(error_number, os.strerror(error_number), destination)
+
+
 def ensure_process_lock_supported() -> None:
     if os.name != "posix" or _fcntl is None:
         raise UnsupportedError("process locking is unsupported on this platform")
@@ -959,7 +1268,12 @@ def ensure_process_lock_supported() -> None:
         or not hasattr(os, "O_NOFOLLOW")
         or os.open not in os.supports_dir_fd
         or os.stat not in os.supports_dir_fd
+        or os.mkdir not in os.supports_dir_fd
+        or os.unlink not in os.supports_dir_fd
+        or os.link not in os.supports_dir_fd
+        or os.rename not in os.supports_dir_fd
         or os.stat not in os.supports_follow_symlinks
+        or _rename_noreplace_primitive() is None
     ):
         raise UnsupportedError("safe process locking is unsupported on this platform")
 
@@ -986,7 +1300,11 @@ def _check_private_file_stat(st: os.stat_result, field: str) -> None:
 
 
 def _same_inode(left: os.stat_result, right: os.stat_result) -> bool:
-    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+    return (left.st_dev, left.st_ino, left.st_ctime_ns) == (
+        right.st_dev,
+        right.st_ino,
+        right.st_ctime_ns,
+    )
 
 
 def _ensure_private_directory(path: Path, create: bool) -> None:
@@ -1062,39 +1380,72 @@ def _check_directory_descriptor_path(descriptor: int, path: Path) -> None:
         raise InvariantRefusalError("state directory changed during acquisition")
 
 
-def _stat_private_lock_file(directory_descriptor: int) -> os.stat_result:
+def _stat_identity(st: os.stat_result) -> _FileIdentity:
+    return (
+        st.st_dev,
+        st.st_ino,
+        st.st_mode,
+        st.st_uid,
+        st.st_nlink,
+        st.st_size,
+        st.st_mtime_ns,
+        st.st_ctime_ns,
+    )
+
+
+def _same_file_after_rename(
+    before: _FileIdentity, after: os.stat_result
+) -> bool:
+    """Match a renamed inode while accounting for the rename ctime update."""
+
+    observed = _stat_identity(after)
+    return observed[:-1] == before[:-1] and observed[-1] >= before[-1]
+
+
+def _stat_private_lock_file(
+    directory_descriptor: int,
+    name: str = LOCK_FILE_NAME,
+    field: str = "state lock",
+) -> os.stat_result:
     try:
         named = os.stat(
-            LOCK_FILE_NAME,
+            name,
             dir_fd=directory_descriptor,
             follow_symlinks=False,
         )
     except FileNotFoundError as error:
-        raise InvariantRefusalError("state lock changed during acquisition") from error
+        raise InvariantRefusalError("{} changed during acquisition".format(field)) from error
     if stat.S_ISLNK(named.st_mode):
-        raise InvariantRefusalError("unsafe state lock")
-    _check_private_file_stat(named, "state lock")
+        raise InvariantRefusalError("unsafe {}".format(field))
+    _check_private_file_stat(named, field)
     return named
 
 
 def _check_lock_descriptor_path(
     descriptor: int,
     directory_descriptor: int,
+    name: str = LOCK_FILE_NAME,
+    field: str = "state lock",
 ) -> None:
     opened = os.fstat(descriptor)
-    _check_private_file_stat(opened, "state lock")
-    named = _stat_private_lock_file(directory_descriptor)
+    _check_private_file_stat(opened, field)
+    named = _stat_private_lock_file(directory_descriptor, name, field)
     if not _same_inode(opened, named):
-        raise InvariantRefusalError("state lock changed during acquisition")
+        raise InvariantRefusalError("{} changed during acquisition".format(field))
 
 
-def _open_private_lock_file(directory_descriptor: int) -> int:
+def _open_private_lock_file(
+    directory_descriptor: int,
+    name: str = LOCK_FILE_NAME,
+    field: str = "state lock",
+) -> int:
     flags = os.O_RDWR | os.O_NONBLOCK | os.O_NOFOLLOW
     flags |= getattr(os, "O_CLOEXEC", 0)
     created = False
+    named = None
     try:
         descriptor = os.open(
-            LOCK_FILE_NAME,
+            name,
             flags | os.O_CREAT | os.O_EXCL,
             0o600,
             dir_fd=directory_descriptor,
@@ -1103,21 +1454,29 @@ def _open_private_lock_file(directory_descriptor: int) -> int:
         # Validate the name before opening as well as the resulting descriptor.
         # O_NONBLOCK prevents a raced-in special file such as a FIFO from
         # stalling acquisition before fstat can reject it.
-        _stat_private_lock_file(directory_descriptor)
+        named = _stat_private_lock_file(directory_descriptor, name, field)
         try:
             descriptor = os.open(
-                LOCK_FILE_NAME,
+                name,
                 flags,
                 dir_fd=directory_descriptor,
             )
         except FileNotFoundError as error:
-            raise InvariantRefusalError("state lock changed during acquisition") from error
+            raise InvariantRefusalError(
+                "{} changed during acquisition".format(field)
+            ) from error
     else:
         created = True
     try:
         if created:
             os.fchmod(descriptor, 0o600)
-        _check_lock_descriptor_path(descriptor, directory_descriptor)
+        elif _stat_identity(os.fstat(descriptor)) != _stat_identity(named):
+            raise InvariantRefusalError(
+                "{} changed during acquisition".format(field)
+            )
+        _check_lock_descriptor_path(
+            descriptor, directory_descriptor, name, field
+        )
     except BaseException:
         os.close(descriptor)
         raise
@@ -1133,51 +1492,854 @@ def _unlock_and_close(descriptor: int, locked: bool) -> None:
 
 
 def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(str(path), os.O_RDONLY)
     try:
+        before = path.lstat()
+    except OSError as error:
+        raise InvariantRefusalError(
+            "directory changed during durability check"
+        ) from error
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+        raise InvariantRefusalError("unsafe durability directory")
+    identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_mode,
+        before.st_uid,
+        before.st_gid,
+    )
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(str(path), flags)
+    except OSError as error:
+        raise InvariantRefusalError(
+            "directory changed during durability check"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        post_open = path.lstat()
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or stat.S_ISLNK(post_open.st_mode)
+            or not stat.S_ISDIR(post_open.st_mode)
+            or (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_mode,
+                opened.st_uid,
+                opened.st_gid,
+            )
+            != identity
+            or (
+                post_open.st_dev,
+                post_open.st_ino,
+                post_open.st_mode,
+                post_open.st_uid,
+                post_open.st_gid,
+            )
+            != identity
+        ):
+            raise InvariantRefusalError(
+                "directory changed during durability check"
+            )
         os.fsync(descriptor)
+        after = os.fstat(descriptor)
+        final = path.lstat()
+        if (
+            (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_uid,
+                after.st_gid,
+            )
+            != identity
+            or stat.S_ISLNK(final.st_mode)
+            or not stat.S_ISDIR(final.st_mode)
+            or (
+                final.st_dev,
+                final.st_ino,
+                final.st_mode,
+                final.st_uid,
+                final.st_gid,
+            )
+            != identity
+        ):
+            raise InvariantRefusalError(
+                "directory changed during durability check"
+            )
     finally:
         os.close(descriptor)
 
 
-def _atomic_replace(path: Path, payload: bytes) -> None:
-    if path.exists() or path.is_symlink():
-        _check_private_file(path)
-    temporary = path.with_name(".{}.{}.tmp".format(path.name, secrets.token_hex(8)))
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    descriptor = os.open(str(temporary), flags, 0o600)
+def _fsync_directory_descriptor(descriptor: int) -> None:
+    os.fsync(descriptor)
+
+
+def _ensure_private_directory_at(
+    parent_descriptor: int, name: str, *, create: bool
+) -> None:
     try:
-        os.fchmod(descriptor, 0o600)
-        view = memoryview(payload)
-        while view:
-            written = os.write(descriptor, view)
-            view = view[written:]
-        os.fsync(descriptor)
+        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        if not create:
+            raise UsageStateError("state directory does not exist")
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_descriptor)
+        except FileExistsError:
+            pass
+        current = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        _check_private_directory_stat(current, "state directory")
+        child = _open_private_directory_at(parent_descriptor, name)
+        try:
+            _fsync_directory_descriptor(child)
+        finally:
+            os.close(child)
+        _fsync_directory_descriptor(parent_descriptor)
+        return
+    if stat.S_ISLNK(current.st_mode):
+        raise InvariantRefusalError("unsafe state directory")
+    _check_private_directory_stat(current, "state directory")
+
+
+def _open_private_directory_at(parent_descriptor: int, name: str) -> int:
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    try:
+        opened = os.fstat(descriptor)
+        _check_private_directory_stat(opened, "state directory")
+        named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if stat.S_ISLNK(named.st_mode):
+            raise InvariantRefusalError("unsafe state directory")
+        _check_private_directory_stat(named, "state directory")
+        if not _same_inode(opened, named):
+            raise InvariantRefusalError("state directory changed during acquisition")
     except BaseException:
         os.close(descriptor)
-        temporary.unlink(missing_ok=True)
         raise
-    else:
-        os.close(descriptor)
+    return descriptor
+
+
+def _check_directory_descriptor_entry(
+    descriptor: int,
+    parent_descriptor: int,
+    name: str,
+) -> None:
+    opened = os.fstat(descriptor)
+    _check_private_directory_stat(opened, "state directory")
     try:
-        os.replace(str(temporary), str(path))
-        _fsync_directory(path.parent)
+        named = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError as error:
+        raise InvariantRefusalError("state directory changed while locked") from error
+    if stat.S_ISLNK(named.st_mode):
+        raise InvariantRefusalError("unsafe state directory")
+    _check_private_directory_stat(named, "state directory")
+    if not _same_inode(opened, named):
+        raise InvariantRefusalError("state directory changed while locked")
+
+
+def _stat_private_named_state_file(
+    directory_descriptor: int,
+    name: str,
+    field: str = "state file",
+) -> os.stat_result:
+    try:
+        named = os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        raise
+    if stat.S_ISLNK(named.st_mode):
+        raise InvariantRefusalError("unsafe {}".format(field))
+    _check_private_file_stat(named, field)
+    return named
+
+
+def _stat_private_state_file(directory_descriptor: int) -> os.stat_result:
+    return _stat_private_named_state_file(
+        directory_descriptor, STATE_FILE_NAME
+    )
+
+
+def _read_private_named_state_file_at(
+    directory_descriptor: int,
+    name: str,
+    field: str = "state file",
+) -> Tuple[bytes, os.stat_result]:
+    named = _stat_private_named_state_file(
+        directory_descriptor, name, field
+    )
+    descriptor = os.open(
+        name,
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=directory_descriptor,
+    )
+    try:
+        opened = os.fstat(descriptor)
+        _check_private_file_stat(opened, field)
+        if _stat_identity(opened) != _stat_identity(named):
+            raise InvariantRefusalError(
+                "{} identity changed while locked".format(field)
+            )
+        chunks = []
+        remaining = MAX_STATE_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if _stat_identity(after) != _stat_identity(opened):
+            raise InvariantRefusalError(
+                "{} identity changed while locked".format(field)
+            )
     finally:
-        temporary.unlink(missing_ok=True)
+        os.close(descriptor)
+    final_named = _stat_private_named_state_file(
+        directory_descriptor, name, field
+    )
+    if _stat_identity(final_named) != _stat_identity(opened):
+        raise InvariantRefusalError(
+            "{} identity changed while locked".format(field)
+        )
+    return payload, final_named
+
+
+def _write_all(descriptor: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        written = os.write(descriptor, view)
+        view = view[written:]
+
+
+@dataclass(frozen=True)
+class _StateReplaceIntent:
+    """Exact, private authorization for one no-replace state transaction."""
+
+    lab_id: str
+    execution_profile: str
+    predecessor_payload_sha256: str
+    successor_payload_sha256: str
+    predecessor_revision: int
+    successor_revision: int
+    predecessor_file_identity: _FileIdentity
+    format: int = 1
+
+    def __post_init__(self) -> None:
+        if self.format != 1:
+            raise UsageStateError("unsupported state replacement intent")
+        validate_lab_id(self.lab_id)
+        _validate_execution_profile(self.execution_profile)
+        for value, field in (
+            (self.predecessor_payload_sha256, "predecessor payload digest"),
+            (self.successor_payload_sha256, "successor payload digest"),
+        ):
+            if (
+                type(value) is not str
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise UsageStateError("invalid {}".format(field))
+        _strict_nonnegative_int(
+            self.predecessor_revision, "predecessor state revision"
+        )
+        _strict_nonnegative_int(
+            self.successor_revision, "successor state revision"
+        )
+        if (
+            type(self.predecessor_file_identity) is not tuple
+            or len(self.predecessor_file_identity) != 8
+            or any(
+                type(item) is not int or item < 0
+                for item in self.predecessor_file_identity
+            )
+        ):
+            raise UsageStateError("invalid predecessor file identity")
+
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "execution_profile": self.execution_profile,
+            "format": self.format,
+            "lab_id": self.lab_id,
+            "predecessor_file_identity": list(
+                self.predecessor_file_identity
+            ),
+            "predecessor_payload_sha256": self.predecessor_payload_sha256,
+            "predecessor_revision": self.predecessor_revision,
+            "successor_payload_sha256": self.successor_payload_sha256,
+            "successor_revision": self.successor_revision,
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "_StateReplaceIntent":
+        keys = frozenset(
+            (
+                "execution_profile",
+                "format",
+                "lab_id",
+                "predecessor_file_identity",
+                "predecessor_payload_sha256",
+                "predecessor_revision",
+                "successor_payload_sha256",
+                "successor_revision",
+            )
+        )
+        data = _exact_mapping(value, keys, "state replacement intent")
+        identity = data["predecessor_file_identity"]
+        if type(identity) is not list:
+            raise UsageStateError("invalid predecessor file identity")
+        return cls(
+            execution_profile=data["execution_profile"],
+            format=data["format"],
+            lab_id=data["lab_id"],
+            predecessor_file_identity=tuple(identity),
+            predecessor_payload_sha256=data["predecessor_payload_sha256"],
+            predecessor_revision=data["predecessor_revision"],
+            successor_payload_sha256=data["successor_payload_sha256"],
+            successor_revision=data["successor_revision"],
+        )
+
+
+def _payload_sha256(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _state_from_transaction_payload(payload: bytes) -> LabState:
+    return LabState.from_dict(strict_json_loads(payload))
+
+
+def _new_state_replace_intent_at(
+    directory_descriptor: int, intent: _StateReplaceIntent
+) -> Tuple[bytes, _FileIdentity]:
+    payload = canonical_json_bytes(intent.to_dict())
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(
+            STATE_REPLACE_INTENT_NAME,
+            flags,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+    except FileExistsError as error:
+        raise InvariantRefusalError(
+            "unfinished state replacement requires recovery"
+        ) from error
+    try:
+        os.fchmod(descriptor, 0o600)
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+        opened = os.fstat(descriptor)
+        _check_private_file_stat(opened, "state replacement intent")
+    finally:
+        os.close(descriptor)
+    named = _stat_private_named_state_file(
+        directory_descriptor,
+        STATE_REPLACE_INTENT_NAME,
+        "state replacement intent",
+    )
+    if _stat_identity(named) != _stat_identity(opened):
+        raise InvariantRefusalError(
+            "state replacement intent changed during creation"
+        )
+    _fsync_directory_descriptor(directory_descriptor)
+    return payload, _stat_identity(named)
+
+
+def _read_state_replace_intent_at(
+    directory_descriptor: int,
+) -> Tuple[_StateReplaceIntent, bytes, os.stat_result]:
+    payload, named = _read_private_named_state_file_at(
+        directory_descriptor,
+        STATE_REPLACE_INTENT_NAME,
+        "state replacement intent",
+    )
+    try:
+        intent = _StateReplaceIntent.from_dict(strict_json_loads(payload))
+        if canonical_json_bytes(intent.to_dict()) != payload:
+            raise UsageStateError("noncanonical state replacement intent")
+    except UsageStateError as error:
+        raise InvariantRefusalError("invalid state replacement intent") from error
+    return intent, payload, named
+
+
+def _remove_exact_private_file_at(
+    directory_descriptor: int,
+    name: str,
+    expected_identity: _FileIdentity,
+    expected_payload: bytes,
+    field: str,
+) -> None:
+    current = _stat_private_named_state_file(
+        directory_descriptor, name, field
+    )
+    if _stat_identity(current) != expected_identity:
+        raise InvariantRefusalError("{} changed before removal".format(field))
+    quarantine_names = {
+        STATE_REPLACE_BACKUP_NAME: STATE_REPLACE_BACKUP_REMOVING_NAME,
+        STATE_REPLACE_INTENT_NAME: STATE_REPLACE_INTENT_REMOVING_NAME,
+    }
+    try:
+        quarantine = quarantine_names[name]
+    except KeyError as error:
+        raise UsageStateError("unsupported private transaction removal") from error
+    _rename_noreplace_at(
+        directory_descriptor,
+        name,
+        directory_descriptor,
+        quarantine,
+    )
+    moved_payload, moved = _read_private_named_state_file_at(
+        directory_descriptor, quarantine, field
+    )
+    if (
+        not _same_file_after_rename(expected_identity, moved)
+        or moved_payload != expected_payload
+    ):
+        raise InvariantRefusalError("{} changed during removal".format(field))
+    os.unlink(quarantine, dir_fd=directory_descriptor)
+
+
+def _restore_interrupted_private_removal_at(
+    directory_descriptor: int,
+    name: str,
+    quarantine: str,
+    field: str,
+) -> None:
+    """Put a crash-interrupted exact-file removal back for normal recovery."""
+
+    try:
+        payload, moved = _read_private_named_state_file_at(
+            directory_descriptor, quarantine, field
+        )
+    except FileNotFoundError:
+        return
+    try:
+        _stat_private_named_state_file(directory_descriptor, name, field)
+    except FileNotFoundError:
+        pass
+    else:
+        raise InvariantRefusalError(
+            "{} and its removal record both exist".format(field)
+        )
+    moved_identity = _stat_identity(moved)
+    try:
+        _rename_noreplace_at(
+            directory_descriptor,
+            quarantine,
+            directory_descriptor,
+            name,
+        )
+    except FileExistsError as error:
+        raise InvariantRefusalError(
+            "{} changed during removal recovery".format(field)
+        ) from error
+    restored_payload, restored = _read_private_named_state_file_at(
+        directory_descriptor, name, field
+    )
+    if (
+        restored_payload != payload
+        or not _same_file_after_rename(moved_identity, restored)
+    ):
+        raise InvariantRefusalError(
+            "{} changed during removal recovery".format(field)
+        )
+    _fsync_directory_descriptor(directory_descriptor)
+
+
+def _same_bound_private_file(
+    before: _FileIdentity, after: os.stat_result
+) -> bool:
+    """Match the exact created inode while allowing link/rename ctime changes."""
+
+    observed = _stat_identity(after)
+    return (
+        observed[:4] == before[:4]
+        and observed[5:7] == before[5:7]
+        and observed[-1] >= before[-1]
+    )
+
+
+def _unlink_bound_temporary_at(
+    directory_descriptor: int,
+    name: str,
+    expected_identity: _FileIdentity,
+) -> bool:
+    """Remove the generated name only while it still names our exact inode."""
+
+    try:
+        current = os.stat(
+            name, dir_fd=directory_descriptor, follow_symlinks=False
+        )
+    except FileNotFoundError:
+        return False
+    if (
+        stat.S_ISLNK(current.st_mode)
+        or not _same_bound_private_file(expected_identity, current)
+    ):
+        raise InvariantRefusalError("temporary state file changed")
+    os.unlink(name, dir_fd=directory_descriptor)
+    return True
+
+
+def _new_private_temporary(
+    directory_descriptor: int, payload: bytes
+) -> Tuple[str, int, _FileIdentity]:
+    temporary = ".{}.{}.tmp".format(STATE_FILE_NAME, secrets.token_hex(8))
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(temporary, flags, 0o600, dir_fd=directory_descriptor)
+    try:
+        os.fchmod(descriptor, 0o600)
+        _write_all(descriptor, payload)
+        os.fsync(descriptor)
+        opened = os.fstat(descriptor)
+        _check_private_file_stat(opened, "temporary state file")
+        identity = _stat_identity(opened)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        observed = b""
+        while len(observed) <= MAX_STATE_BYTES:
+            chunk = os.read(descriptor, MAX_STATE_BYTES + 1 - len(observed))
+            if not chunk:
+                break
+            observed += chunk
+        after = os.fstat(descriptor)
+        named = _stat_private_named_state_file(
+            directory_descriptor, temporary, "temporary state file"
+        )
+        if (
+            observed != payload
+            or _stat_identity(after) != identity
+            or _stat_identity(named) != identity
+        ):
+            raise InvariantRefusalError(
+                "temporary state file changed during creation"
+            )
+    except BaseException:
+        try:
+            owned_identity = _stat_identity(os.fstat(descriptor))
+            _unlink_bound_temporary_at(
+                directory_descriptor, temporary, owned_identity
+            )
+        except FileNotFoundError:
+            pass
+        finally:
+            os.close(descriptor)
+        raise
+    return temporary, descriptor, identity
+
+
+def _atomic_create_at(directory_descriptor: int, payload: bytes) -> os.stat_result:
+    try:
+        _stat_private_state_file(directory_descriptor)
+    except FileNotFoundError:
+        pass
+    else:
+        raise UsageStateError("lab state already exists")
+    temporary, temporary_descriptor, temporary_identity = (
+        _new_private_temporary(directory_descriptor, payload)
+    )
+    try:
+        try:
+            _rename_noreplace_at(
+                directory_descriptor,
+                temporary,
+                directory_descriptor,
+                STATE_FILE_NAME,
+            )
+        except FileExistsError as error:
+            raise UsageStateError("lab state already exists") from error
+        published_payload, published = _read_private_named_state_file_at(
+            directory_descriptor, STATE_FILE_NAME
+        )
+        if (
+            published_payload != payload
+            or not _same_bound_private_file(
+                temporary_identity, published
+            )
+            or published.st_nlink != 1
+        ):
+            raise InvariantRefusalError(
+                "state file identity changed during publication"
+            )
+    finally:
+        try:
+            _unlink_bound_temporary_at(
+                directory_descriptor, temporary, temporary_identity
+            )
+        finally:
+            os.close(temporary_descriptor)
+    _fsync_directory_descriptor(directory_descriptor)
+    created_payload, created = _read_private_named_state_file_at(
+        directory_descriptor, STATE_FILE_NAME
+    )
+    if (
+        created_payload != payload
+        or not _same_bound_private_file(temporary_identity, created)
+        or created.st_nlink != 1
+    ):
+        raise InvariantRefusalError(
+            "state file identity changed during publication"
+        )
+    return created
+
+
+def _atomic_replace_at(
+    directory_descriptor: int,
+    payload: bytes,
+    expected_identity: _FileIdentity,
+) -> os.stat_result:
+    predecessor_payload, current = _read_private_named_state_file_at(
+        directory_descriptor, STATE_FILE_NAME
+    )
+    if _stat_identity(current) != expected_identity:
+        raise InvariantRefusalError("state file identity changed while locked")
+    predecessor_state = _state_from_transaction_payload(predecessor_payload)
+    successor_state = _state_from_transaction_payload(payload)
+    if canonical_json_bytes(strict_json_loads(payload)) != payload:
+        raise InvariantRefusalError("successor state payload is not canonical")
+    same_lineage = (
+        predecessor_state.lab_id == successor_state.lab_id
+        and predecessor_state.provider_id == successor_state.provider_id
+        and predecessor_state.ownership_token == successor_state.ownership_token
+        and predecessor_state.execution_profile
+        == successor_state.execution_profile
+        and predecessor_state.planned_resources
+        == successor_state.planned_resources
+        and predecessor_state.artifact_evidence
+        == successor_state.artifact_evidence
+    )
+    normal_successor = (
+        successor_state.revision == predecessor_state.revision + 1
+    )
+    exact_migration = (
+        successor_state.revision == predecessor_state.revision
+        and successor_state == predecessor_state
+        and payload != predecessor_payload
+    )
+    if not same_lineage or (not normal_successor and not exact_migration):
+        raise InvariantRefusalError("invalid state replacement successor")
+
+    temporary, temporary_descriptor, temporary_identity = (
+        _new_private_temporary(directory_descriptor, payload)
+    )
+    try:
+        intent = _StateReplaceIntent(
+            lab_id=predecessor_state.lab_id,
+            execution_profile=predecessor_state.execution_profile,
+            predecessor_payload_sha256=_payload_sha256(predecessor_payload),
+            successor_payload_sha256=_payload_sha256(payload),
+            predecessor_revision=predecessor_state.revision,
+            successor_revision=successor_state.revision,
+            predecessor_file_identity=expected_identity,
+        )
+        intent_payload, intent_identity = _new_state_replace_intent_at(
+            directory_descriptor, intent
+        )
+        current_payload, current = _read_private_named_state_file_at(
+            directory_descriptor, STATE_FILE_NAME
+        )
+        if (
+            _stat_identity(current) != expected_identity
+            or current_payload != predecessor_payload
+        ):
+            raise InvariantRefusalError("state file identity changed while locked")
+        current_intent = _stat_private_named_state_file(
+            directory_descriptor,
+            STATE_REPLACE_INTENT_NAME,
+            "state replacement intent",
+        )
+        if _stat_identity(current_intent) != intent_identity:
+            raise InvariantRefusalError(
+                "state replacement intent changed while locked"
+            )
+
+        # A portable rename() is not compare-and-swap: a non-cooperating
+        # same-user writer can replace state.json after the identity check and
+        # be silently overwritten.  Move the current name aside and publish
+        # the new name with kernel-enforced no-replace operations instead.
+        try:
+            _rename_noreplace_at(
+                directory_descriptor,
+                STATE_FILE_NAME,
+                directory_descriptor,
+                STATE_REPLACE_BACKUP_NAME,
+            )
+        except FileExistsError as error:
+            raise InvariantRefusalError(
+                "unfinished state replacement requires recovery"
+            ) from error
+
+        backup = _stat_private_named_state_file(
+            directory_descriptor,
+            STATE_REPLACE_BACKUP_NAME,
+            "state replacement backup",
+        )
+        if not _same_file_after_rename(expected_identity, backup):
+            # The checked target was replaced immediately before the first
+            # rename. Restore exactly what was moved, but never overwrite a
+            # new state.json that may have appeared in the meantime.
+            try:
+                _rename_noreplace_at(
+                    directory_descriptor,
+                    STATE_REPLACE_BACKUP_NAME,
+                    directory_descriptor,
+                    STATE_FILE_NAME,
+                )
+            except FileExistsError:
+                pass
+            raise InvariantRefusalError(
+                "state file identity changed while locked"
+            )
+        backup_payload, backup = _read_private_named_state_file_at(
+            directory_descriptor,
+            STATE_REPLACE_BACKUP_NAME,
+            "state replacement backup",
+        )
+        if (
+            not _same_file_after_rename(expected_identity, backup)
+            or backup_payload != predecessor_payload
+        ):
+            raise InvariantRefusalError(
+                "state replacement backup does not match transaction intent"
+            )
+        current_intent = _stat_private_named_state_file(
+            directory_descriptor,
+            STATE_REPLACE_INTENT_NAME,
+            "state replacement intent",
+        )
+        if _stat_identity(current_intent) != intent_identity:
+            raise InvariantRefusalError(
+                "state replacement intent changed while locked"
+            )
+
+        try:
+            _rename_noreplace_at(
+                directory_descriptor,
+                temporary,
+                directory_descriptor,
+                STATE_FILE_NAME,
+            )
+        except FileExistsError as error:
+            # Preserve any raced-in target. Restoring the old state is only
+            # attempted if the target name is still absent.
+            try:
+                _rename_noreplace_at(
+                    directory_descriptor,
+                    STATE_REPLACE_BACKUP_NAME,
+                    directory_descriptor,
+                    STATE_FILE_NAME,
+                )
+            except FileExistsError:
+                pass
+            raise InvariantRefusalError(
+                "state file changed during replacement"
+            ) from error
+
+        published_payload, published = _read_private_named_state_file_at(
+            directory_descriptor, STATE_FILE_NAME
+        )
+        if (
+            not _same_file_after_rename(temporary_identity, published)
+            or published_payload != payload
+        ):
+            raise InvariantRefusalError(
+                "state file identity changed during replacement"
+            )
+        _fsync_directory_descriptor(directory_descriptor)
+
+        backup_payload, backup = _read_private_named_state_file_at(
+            directory_descriptor,
+            STATE_REPLACE_BACKUP_NAME,
+            "state replacement backup",
+        )
+        if (
+            backup_payload != predecessor_payload
+            or _payload_sha256(backup_payload)
+            != intent.predecessor_payload_sha256
+        ):
+            raise InvariantRefusalError(
+                "state replacement backup identity changed"
+            )
+        _remove_exact_private_file_at(
+            directory_descriptor,
+            STATE_REPLACE_BACKUP_NAME,
+            _stat_identity(backup),
+            predecessor_payload,
+            "state replacement backup",
+        )
+        _fsync_directory_descriptor(directory_descriptor)
+
+        observed_intent, observed_intent_payload, observed_intent_named = (
+            _read_state_replace_intent_at(directory_descriptor)
+        )
+        if (
+            observed_intent != intent
+            or observed_intent_payload != intent_payload
+            or _stat_identity(observed_intent_named) != intent_identity
+        ):
+            raise InvariantRefusalError(
+                "state replacement intent changed while locked"
+            )
+        _remove_exact_private_file_at(
+            directory_descriptor,
+            STATE_REPLACE_INTENT_NAME,
+            intent_identity,
+            intent_payload,
+            "state replacement intent",
+        )
+        _fsync_directory_descriptor(directory_descriptor)
+    finally:
+        try:
+            _unlink_bound_temporary_at(
+                directory_descriptor, temporary, temporary_identity
+            )
+        finally:
+            os.close(temporary_descriptor)
+    replaced_payload, replaced = _read_private_named_state_file_at(
+        directory_descriptor, STATE_FILE_NAME
+    )
+    if (
+        replaced_payload != payload
+        or not _same_file_after_rename(temporary_identity, replaced)
+    ):
+        raise InvariantRefusalError(
+            "state file identity changed during replacement"
+        )
+    if replaced.st_nlink != 1:
+        raise InvariantRefusalError("unsafe state file")
+    return replaced
 
 
 class LabStateStore:
     """Root-scoped state store.  All I/O requires :meth:`locked`."""
 
-    def __init__(self, root: Union[str, os.PathLike]) -> None:
+    def __init__(
+        self,
+        root: Union[str, os.PathLike],
+        execution_profile: object = FIXTURE_EXECUTION_PROFILE,
+    ) -> None:
         self.root = Path(root)
         if (
             not self.root.is_absolute()
             or os.path.normpath(str(self.root)) != str(self.root)
         ):
             raise UsageStateError("state root must be absolute")
+        self.execution_profile = _validate_execution_profile(execution_profile)
 
     @classmethod
     def for_repository(
@@ -1189,7 +2351,7 @@ class LabStateStore:
         if not repository.is_absolute() or not repository.is_dir() or repository.is_symlink():
             raise UsageStateError("invalid repository root")
         root = repository / ".unified-ext-lab-state" if state_root is None else Path(state_root)
-        return cls(root)
+        return cls(root, FIXTURE_EXECUTION_PROFILE)
 
     @contextlib.contextmanager
     def locked(self, lab_id: object) -> Iterator["LockedLabStateStore"]:
@@ -1197,57 +2359,367 @@ class LabStateStore:
         lab = validate_lab_id(lab_id)
         _ensure_private_directory(self.root, create=True)
         lab_root = self.root / lab
-        _ensure_private_directory(lab_root, create=True)
-        directory_descriptor = _open_private_directory(lab_root)
-        directory_locked = False
-        descriptor = None
-        descriptor_locked = False
+        root_descriptor = _open_private_directory(self.root)
+        name_lock_name = ROOT_LOCK_FILE_PREFIX + lab
+        name_lock_descriptor = None
+        name_lock_locked = False
+        lab_descriptor = None
+        lab_descriptor_locked = False
+        legacy_descriptor = None
+        legacy_descriptor_locked = False
         try:
-            # The directory lock remains stable if state.lock is renamed.  It
-            # serializes new implementations while the file lock preserves
-            # compatibility with already-running older implementations.
-            _fcntl.flock(directory_descriptor, _fcntl.LOCK_EX)
-            directory_locked = True
-            _check_directory_descriptor_path(directory_descriptor, lab_root)
-            descriptor = _open_private_lock_file(directory_descriptor)
-            _fcntl.flock(descriptor, _fcntl.LOCK_EX)
-            descriptor_locked = True
-            # flock may have blocked while another process renamed state.lock.
-            # Never expose a store unless the locked descriptor is still the
-            # exact regular, private file currently named by the directory.
-            _check_lock_descriptor_path(descriptor, directory_descriptor)
-            locked = LockedLabStateStore(lab_root, lab, _LOCK_CAPABILITY)
+            _check_directory_descriptor_path(root_descriptor, self.root)
+            # The primary lock name lives in the pinned root, so replacing the
+            # per-lab directory cannot create a second cooperating context.
+            name_lock_descriptor = _open_private_lock_file(
+                root_descriptor,
+                name_lock_name,
+                "lab name lock",
+            )
+            _fcntl.flock(name_lock_descriptor, _fcntl.LOCK_EX)
+            name_lock_locked = True
+            _check_directory_descriptor_path(root_descriptor, self.root)
+            _check_lock_descriptor_path(
+                name_lock_descriptor,
+                root_descriptor,
+                name_lock_name,
+                "lab name lock",
+            )
+
+            _ensure_private_directory_at(root_descriptor, lab, create=True)
+            lab_descriptor = _open_private_directory_at(root_descriptor, lab)
+            _fcntl.flock(lab_descriptor, _fcntl.LOCK_EX)
+            lab_descriptor_locked = True
+            _check_directory_descriptor_entry(
+                lab_descriptor, root_descriptor, lab
+            )
+
+            # Preserve compatibility with already-running schema-2 stores that
+            # know only the directory and in-directory state.lock locks.
+            legacy_descriptor = _open_private_lock_file(lab_descriptor)
+            _fcntl.flock(legacy_descriptor, _fcntl.LOCK_EX)
+            legacy_descriptor_locked = True
+            _check_lock_descriptor_path(legacy_descriptor, lab_descriptor)
+            locked = LockedLabStateStore(
+                lab_root,
+                lab,
+                self.execution_profile,
+                root_path=self.root,
+                root_descriptor=root_descriptor,
+                lab_descriptor=lab_descriptor,
+                name_lock_descriptor=name_lock_descriptor,
+                name_lock_name=name_lock_name,
+                legacy_lock_descriptor=legacy_descriptor,
+                capability=_LOCK_CAPABILITY,
+            )
             try:
                 yield locked
             finally:
                 locked.invalidate()
         finally:
             try:
-                if descriptor is not None:
-                    _unlock_and_close(descriptor, descriptor_locked)
+                if legacy_descriptor is not None:
+                    _unlock_and_close(
+                        legacy_descriptor, legacy_descriptor_locked
+                    )
             finally:
-                _unlock_and_close(directory_descriptor, directory_locked)
+                try:
+                    if lab_descriptor is not None:
+                        _unlock_and_close(
+                            lab_descriptor, lab_descriptor_locked
+                        )
+                finally:
+                    try:
+                        if name_lock_descriptor is not None:
+                            _unlock_and_close(
+                                name_lock_descriptor, name_lock_locked
+                            )
+                    finally:
+                        os.close(root_descriptor)
 
 
 class LockedLabStateStore:
     """Operations available while the per-lab process lock is held."""
 
-    def __init__(self, root: Path, lab_id: str, capability: object = None) -> None:
-        if capability is not _LOCK_CAPABILITY:
+    def __init__(
+        self,
+        root: Path,
+        lab_id: str,
+        execution_profile: object = FIXTURE_EXECUTION_PROFILE,
+        *,
+        root_path: Optional[Path] = None,
+        root_descriptor: Optional[int] = None,
+        lab_descriptor: Optional[int] = None,
+        name_lock_descriptor: Optional[int] = None,
+        name_lock_name: Optional[str] = None,
+        legacy_lock_descriptor: Optional[int] = None,
+        capability: object = None,
+    ) -> None:
+        if (
+            capability is not _LOCK_CAPABILITY
+            or type(root_descriptor) is not int
+            or type(lab_descriptor) is not int
+            or type(name_lock_descriptor) is not int
+            or type(legacy_lock_descriptor) is not int
+            or type(name_lock_name) is not str
+            or not isinstance(root_path, Path)
+        ):
             raise UsageStateError("locked state store requires an active process lock")
         self.root = root
+        self.root_path = root_path
         self.lab_id = lab_id
+        self.execution_profile = _validate_execution_profile(execution_profile)
         self.path = root / STATE_FILE_NAME
+        self._root_descriptor = root_descriptor
+        self._lab_descriptor = lab_descriptor
+        self._name_lock_descriptor = name_lock_descriptor
+        self._name_lock_name = name_lock_name
+        self._legacy_lock_descriptor = legacy_lock_descriptor
+        self._state_identity: Optional[_FileIdentity] = None
         self._cached: Optional[LabState] = None
         self._active = True
 
     def _require_active(self) -> None:
         if not self._active:
             raise UsageStateError("state lock is no longer active")
+        _check_directory_descriptor_path(
+            self._root_descriptor, self.root_path
+        )
+        _check_lock_descriptor_path(
+            self._name_lock_descriptor,
+            self._root_descriptor,
+            self._name_lock_name,
+            "lab name lock",
+        )
+        _check_directory_descriptor_entry(
+            self._lab_descriptor,
+            self._root_descriptor,
+            self.lab_id,
+        )
+        _check_lock_descriptor_path(
+            self._legacy_lock_descriptor, self._lab_descriptor
+        )
 
     def invalidate(self) -> None:
         self._active = False
         self._cached = None
+        self._state_identity = None
+
+    def _recover_atomic_replacement(self) -> None:
+        """Finish or roll back an interrupted no-replace state transaction."""
+
+        _restore_interrupted_private_removal_at(
+            self._lab_descriptor,
+            STATE_REPLACE_INTENT_NAME,
+            STATE_REPLACE_INTENT_REMOVING_NAME,
+            "state replacement intent",
+        )
+        _restore_interrupted_private_removal_at(
+            self._lab_descriptor,
+            STATE_REPLACE_BACKUP_NAME,
+            STATE_REPLACE_BACKUP_REMOVING_NAME,
+            "state replacement backup",
+        )
+        try:
+            intent, intent_payload, intent_named = _read_state_replace_intent_at(
+                self._lab_descriptor
+            )
+        except FileNotFoundError:
+            try:
+                _stat_private_named_state_file(
+                    self._lab_descriptor,
+                    STATE_REPLACE_BACKUP_NAME,
+                    "state replacement backup",
+                )
+            except FileNotFoundError:
+                return
+            raise InvariantRefusalError(
+                "unfinished state replacement is missing transaction intent"
+            )
+
+        if (
+            intent.lab_id != self.lab_id
+            or intent.execution_profile != self.execution_profile
+        ):
+            raise InvariantRefusalError(
+                "state replacement intent does not match locked state"
+            )
+        intent_identity = _stat_identity(intent_named)
+
+        def require_unchanged_intent() -> None:
+            observed, observed_payload, observed_named = (
+                _read_state_replace_intent_at(self._lab_descriptor)
+            )
+            if (
+                observed != intent
+                or observed_payload != intent_payload
+                or _stat_identity(observed_named) != intent_identity
+            ):
+                raise InvariantRefusalError(
+                    "state replacement intent changed during recovery"
+                )
+
+        def validate_bound_state(
+            payload: bytes,
+            digest: str,
+            revision: int,
+            field: str,
+        ) -> LabState:
+            if _payload_sha256(payload) != digest:
+                raise InvariantRefusalError(
+                    "{} does not match transaction intent".format(field)
+                )
+            try:
+                state = _state_from_transaction_payload(payload)
+            except UsageStateError as error:
+                raise InvariantRefusalError(
+                    "{} is invalid".format(field)
+                ) from error
+            if (
+                state.lab_id != self.lab_id
+                or state.execution_profile != self.execution_profile
+                or state.revision != revision
+            ):
+                raise InvariantRefusalError(
+                    "{} does not match transaction intent".format(field)
+                )
+            return state
+
+        try:
+            backup_payload, backup_named = _read_private_named_state_file_at(
+                self._lab_descriptor,
+                STATE_REPLACE_BACKUP_NAME,
+                "state replacement backup",
+            )
+        except FileNotFoundError:
+            backup_payload = None
+            backup_named = None
+
+        try:
+            current_payload, current_named = _read_private_named_state_file_at(
+                self._lab_descriptor, STATE_FILE_NAME
+            )
+        except FileNotFoundError:
+            current_payload = None
+            current_named = None
+
+        require_unchanged_intent()
+
+        if backup_payload is None:
+            if current_payload is None:
+                raise InvariantRefusalError(
+                    "state replacement intent has no bound state files"
+                )
+            current_digest = _payload_sha256(current_payload)
+            if current_digest == intent.predecessor_payload_sha256:
+                validate_bound_state(
+                    current_payload,
+                    intent.predecessor_payload_sha256,
+                    intent.predecessor_revision,
+                    "state replacement predecessor",
+                )
+                if _stat_identity(current_named) != tuple(
+                    intent.predecessor_file_identity
+                ):
+                    raise InvariantRefusalError(
+                        "state replacement predecessor identity changed"
+                    )
+            elif current_digest == intent.successor_payload_sha256:
+                validate_bound_state(
+                    current_payload,
+                    intent.successor_payload_sha256,
+                    intent.successor_revision,
+                    "state replacement successor",
+                )
+            else:
+                raise InvariantRefusalError(
+                    "state file does not match transaction intent"
+                )
+            require_unchanged_intent()
+            _remove_exact_private_file_at(
+                self._lab_descriptor,
+                STATE_REPLACE_INTENT_NAME,
+                intent_identity,
+                intent_payload,
+                "state replacement intent",
+            )
+            _fsync_directory_descriptor(self._lab_descriptor)
+            return
+
+        validate_bound_state(
+            backup_payload,
+            intent.predecessor_payload_sha256,
+            intent.predecessor_revision,
+            "state replacement backup",
+        )
+        if not _same_file_after_rename(
+            tuple(intent.predecessor_file_identity), backup_named
+        ):
+            raise InvariantRefusalError(
+                "state replacement backup identity changed"
+            )
+
+        if current_payload is None:
+            # The process stopped after moving the exact predecessor aside but
+            # before publishing the successor. Restore only that bound inode.
+            backup_identity = _stat_identity(backup_named)
+            try:
+                _rename_noreplace_at(
+                    self._lab_descriptor,
+                    STATE_REPLACE_BACKUP_NAME,
+                    self._lab_descriptor,
+                    STATE_FILE_NAME,
+                )
+            except FileExistsError as error:
+                raise InvariantRefusalError(
+                    "state file changed during replacement recovery"
+                ) from error
+            restored_payload, restored = _read_private_named_state_file_at(
+                self._lab_descriptor, STATE_FILE_NAME
+            )
+            if (
+                restored_payload != backup_payload
+                or not _same_file_after_rename(backup_identity, restored)
+            ):
+                raise InvariantRefusalError(
+                    "state file identity changed during replacement recovery"
+                )
+            _fsync_directory_descriptor(self._lab_descriptor)
+            require_unchanged_intent()
+            _remove_exact_private_file_at(
+                self._lab_descriptor,
+                STATE_REPLACE_INTENT_NAME,
+                intent_identity,
+                intent_payload,
+                "state replacement intent",
+            )
+            _fsync_directory_descriptor(self._lab_descriptor)
+            return
+
+        validate_bound_state(
+            current_payload,
+            intent.successor_payload_sha256,
+            intent.successor_revision,
+            "state replacement successor",
+        )
+        require_unchanged_intent()
+        _remove_exact_private_file_at(
+            self._lab_descriptor,
+            STATE_REPLACE_BACKUP_NAME,
+            _stat_identity(backup_named),
+            backup_payload,
+            "state replacement backup",
+        )
+        _fsync_directory_descriptor(self._lab_descriptor)
+        require_unchanged_intent()
+        _remove_exact_private_file_at(
+            self._lab_descriptor,
+            STATE_REPLACE_INTENT_NAME,
+            intent_identity,
+            intent_payload,
+            "state replacement intent",
+        )
+        _fsync_directory_descriptor(self._lab_descriptor)
 
     def create_initial(
         self,
@@ -1255,45 +2727,56 @@ class LockedLabStateStore:
         ownership_token: object,
         planned_resources: Sequence[Union[PlannedResource, Mapping[str, object]]],
         baseline_equalities: Optional[Mapping[str, bool]] = None,
+        artifact_evidence: Optional[Mapping[str, object]] = None,
     ) -> LabState:
         self._require_active()
-        if self.path.exists() or self.path.is_symlink():
-            raise UsageStateError("lab state already exists")
         state = LabState.initial(
             self.lab_id,
             provider_id,
             ownership_token,
             planned_resources,
             baseline_equalities,
+            self.execution_profile,
+            artifact_evidence,
         )
-        self._write(state)
+        self._create(state)
         return state
 
     def load(self) -> LabState:
         self._require_active()
         if self._cached is not None:
             return self._cached
-        _check_private_file(self.path)
-        descriptor = os.open(str(self.path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        try:
-            chunks = []
-            remaining = MAX_STATE_BYTES + 1
-            while remaining:
-                chunk = os.read(descriptor, remaining)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                remaining -= len(chunk)
-            payload = b"".join(chunks)
-        finally:
-            os.close(descriptor)
-        state = LabState.from_dict(strict_json_loads(payload))
+        self._recover_atomic_replacement()
+        payload, final_named = _read_private_named_state_file_at(
+            self._lab_descriptor, STATE_FILE_NAME
+        )
+        self._require_active()
+        self._state_identity = _stat_identity(final_named)
+        document = strict_json_loads(payload)
+        legacy_fixture = (
+            isinstance(document, Mapping)
+            and document.get("schema") == LEGACY_FIXTURE_STATE_SCHEMA
+        )
+        early_schema_v3 = (
+            isinstance(document, Mapping)
+            and document.get("schema") == STATE_SCHEMA
+            and "resource_ids" not in document
+            and "artifact_evidence" not in document
+        )
+        state = LabState.from_dict(document)
         if state.lab_id != self.lab_id:
             raise InvariantRefusalError("state lab does not match directory")
+        if state.execution_profile != self.execution_profile:
+            raise InvariantRefusalError("state execution profile mismatch")
         recovered = recover_interrupted_state(state)
         if recovered is not state:
             self._write(recovered)
             return recovered
+        if legacy_fixture or early_schema_v3:
+            # Commit the explicit fixture profile migration while the same
+            # private per-lab lock that authorized the read is still held.
+            self._write(state)
+            return state
         self._cached = state
         return state
 
@@ -1312,7 +2795,7 @@ class LockedLabStateStore:
         return updated
 
     def mark_tainted(self, expected: Union[StatePhase, str]) -> LabState:
-        """Durably taint the current phase before an interactive shell starts."""
+        """Durably enter the irreversible verification/promotion hold."""
 
         self._require_active()
         current = self.load()
@@ -1335,6 +2818,23 @@ class LockedLabStateStore:
         if current.phase is not _phase(expected):
             raise UsageStateError("state phase changed")
         updated = current.record_owned_role(role)
+        if updated is not current:
+            self._write(updated)
+        return updated
+
+    def record_resource_id(
+        self,
+        expected: Union[StatePhase, str],
+        role: Union[ResourceRole, str],
+        resource_id: object,
+    ) -> LabState:
+        """Persist one immutable image or container daemon identity."""
+
+        self._require_active()
+        current = self.load()
+        if current.phase is not _phase(expected):
+            raise UsageStateError("state phase changed")
+        updated = current.record_resource_id(role, resource_id)
         if updated is not current:
             self._write(updated)
         return updated
@@ -1371,9 +2871,46 @@ class LockedLabStateStore:
         self._write(updated)
         return updated
 
+    def interrupt_stable_forward(
+        self, expected: Union[StatePhase, str]
+    ) -> LabState:
+        """Explicitly persist stable-forward interruption as cleanup recovery."""
+
+        self._require_active()
+        current = self.load()
+        expected_phase = _phase(expected)
+        if (
+            current.phase is not expected_phase
+            or expected_phase not in STABLE_FORWARD_STEPS
+        ):
+            raise UsageStateError(
+                "state phase changed or is not stable forward"
+            )
+        updated = current.interrupt_stable_forward()
+        self._write(updated)
+        return updated
+
+    def _create(self, state: LabState) -> None:
+        self._require_active()
+        self._recover_atomic_replacement()
+        created = _atomic_create_at(
+            self._lab_descriptor, canonical_json_bytes(state.to_dict())
+        )
+        self._require_active()
+        self._state_identity = _stat_identity(created)
+        self._cached = state
+
     def _write(self, state: LabState) -> None:
         self._require_active()
-        _atomic_replace(self.path, canonical_json_bytes(state.to_dict()))
+        if self._state_identity is None:
+            raise UsageStateError("state must be loaded before replacement")
+        replaced = _atomic_replace_at(
+            self._lab_descriptor,
+            canonical_json_bytes(state.to_dict()),
+            self._state_identity,
+        )
+        self._require_active()
+        self._state_identity = _stat_identity(replaced)
         self._cached = state
 
 

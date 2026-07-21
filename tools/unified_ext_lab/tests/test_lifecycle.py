@@ -11,7 +11,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tools.unified_ext_lab.docker import DockerLabSpec, DockerOperation
+from tools.unified_ext_lab.docker import (
+    DockerCommandBuilder,
+    DockerLabSpec,
+    DockerOperation,
+)
 from tools.unified_ext_lab.errors import (
     InvariantRefusalError,
     RunnerFailureError,
@@ -19,7 +23,12 @@ from tools.unified_ext_lab.errors import (
 )
 from tools.unified_ext_lab.lifecycle import FixtureLifecycle
 from tools.unified_ext_lab.model import LabIdentity, ResourceRole
-from tools.unified_ext_lab.state import LockedLabStateStore, StatePhase
+from tools.unified_ext_lab.state import (
+    REAL_DOCKER_EXECUTION_PROFILE,
+    LabStateStore,
+    LockedLabStateStore,
+    StatePhase,
+)
 from tools.unified_ext_lab.tests.fake_runner import FakeRunner
 
 
@@ -30,6 +39,23 @@ class _Clock:
     def __call__(self) -> int:
         self.value += 100
         return self.value
+
+
+class _IdBoundCommandBuilder(DockerCommandBuilder):
+    """Minimal injected command builder with the real-profile ID policy."""
+
+    uses_resource_ids = True
+
+    def list_identity(self, role: ResourceRole):
+        return ()
+
+
+class _MissingResourceIdPolicy:
+    pass
+
+
+class _AmbiguousResourceIdPolicy:
+    uses_resource_ids = 1
 
 
 class FixtureLifecycleTests(unittest.TestCase):
@@ -101,6 +127,85 @@ class FixtureLifecycleTests(unittest.TestCase):
         self.assertNotIn("seal", [item["step"] for item in manifest["operations"]])
         self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(self.state_root.stat().st_mode), 0o700)
+
+    def test_lifecycle_refuses_store_or_executor_profile_mismatch(self):
+        real_store = LabStateStore(
+            self.root / "real-state", REAL_DOCKER_EXECUTION_PROFILE
+        )
+        with self.assertRaisesRegex(InvariantRefusalError, "execution profile"):
+            FixtureLifecycle(real_store, self.spec, FakeRunner(self.spec))
+        with self.assertRaisesRegex(InvariantRefusalError, "executor profile"):
+            FixtureLifecycle(
+                real_store,
+                self.spec,
+                FakeRunner(self.spec),
+                execution_profile=REAL_DOCKER_EXECUTION_PROFILE,
+                executor_kind="fake_docker",
+            )
+
+    def test_command_builder_profile_policy_is_checked_at_construction(self):
+        real_store = LabStateStore(
+            self.root / "real-command-builder-state",
+            REAL_DOCKER_EXECUTION_PROFILE,
+        )
+        fixture_builder = DockerCommandBuilder(self.spec)
+        real_builder = _IdBoundCommandBuilder(self.spec)
+
+        with self.assertRaisesRegex(
+            InvariantRefusalError, "command builder profile mismatch"
+        ):
+            FixtureLifecycle(
+                real_store,
+                self.spec,
+                self.runner,
+                execution_profile=REAL_DOCKER_EXECUTION_PROFILE,
+                executor_kind="real_docker",
+            )
+        with self.assertRaisesRegex(
+            InvariantRefusalError, "command builder profile mismatch"
+        ):
+            FixtureLifecycle(
+                real_store,
+                self.spec,
+                self.runner,
+                execution_profile=REAL_DOCKER_EXECUTION_PROFILE,
+                executor_kind="real_docker",
+                command_builder=fixture_builder,
+            )
+        with self.assertRaisesRegex(
+            InvariantRefusalError, "command builder profile mismatch"
+        ):
+            FixtureLifecycle(
+                self.store,
+                self.spec,
+                self.runner,
+                command_builder=real_builder,
+            )
+
+        real_lifecycle = FixtureLifecycle(
+            real_store,
+            self.spec,
+            self.runner,
+            execution_profile=REAL_DOCKER_EXECUTION_PROFILE,
+            executor_kind="real_docker",
+            command_builder=real_builder,
+        )
+        fixture_lifecycle = FixtureLifecycle(self.store, self.spec, self.runner)
+        self.assertIs(real_lifecycle.spec, self.spec)
+        self.assertIsInstance(fixture_lifecycle._commands, DockerCommandBuilder)
+
+    def test_command_builder_requires_an_unambiguous_resource_id_policy(self):
+        for builder in (_MissingResourceIdPolicy(), _AmbiguousResourceIdPolicy()):
+            with self.subTest(builder=type(builder).__name__):
+                with self.assertRaisesRegex(
+                    UsageStateError, "invalid lifecycle resource-id policy"
+                ):
+                    FixtureLifecycle(
+                        self.store,
+                        self.spec,
+                        self.runner,
+                        command_builder=builder,
+                    )
 
     def test_install_failure_enters_recovery_and_seals_failed_clean(self):
         self.lifecycle.create()

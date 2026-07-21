@@ -97,6 +97,8 @@ def test_ext_cannot_ship_core_paths(tmp_path):
     (
         "tools/unified_ext_lab/state.py",
         "scripts/unified-ext-lab",
+        "scripts/unified-ext-lab-real-docker",
+        "scripts/unified-ext-lab-future-gate",
     ),
 )
 def test_synthetic_core_wheel_rejects_source_only_lab_paths(
@@ -297,7 +299,34 @@ def test_core_sdist_excludes_repo_only_distribution_test():
     assert "exclude tests/test_distribution_pair.py" in manifest
 
 
-def test_core_sdist_excludes_unified_ext_lab():
+def test_core_sdist_excludes_every_unified_ext_lab_launcher_and_module_tree():
     manifest = (Path(__file__).parents[1] / "MANIFEST.in").read_text(encoding="utf-8")
+    lines = set(manifest.splitlines())
     assert "prune tools" in manifest
-    assert "exclude scripts/unified-ext-lab" in manifest
+    assert "exclude scripts/unified-ext-lab*" in lines
+    assert "exclude scripts/unified-ext-lab" not in lines
+    assert "exclude scripts/unified-ext-lab-real-docker" not in lines
+
+
+def test_built_sdist_ci_rejects_every_unified_ext_lab_launcher_prefix():
+    workflow = (
+        Path(__file__).parents[1] / ".github" / "workflows" / "ci.yml"
+    ).read_text(encoding="utf-8")
+    assert "from pathlib import Path, PurePosixPath" in workflow
+    assert 'parts[-2] == "scripts"' in workflow
+    assert 'parts[-1].startswith("unified-ext-lab")' in workflow
+    assert 'name.endswith("/scripts/unified-ext-lab")' not in workflow
+    assert 'distribution == "core" and any(' not in workflow
+
+
+def test_package_discovery_is_limited_to_each_distribution_source_tree():
+    root = Path(__file__).parents[1]
+    core_config = (root / "pyproject.toml").read_text(encoding="utf-8")
+    ext_config = (
+        root / "packages" / "unified-cli-ext" / "pyproject.toml"
+    ).read_text(encoding="utf-8")
+
+    assert 'where = ["src"]' in core_config
+    assert 'include = ["unified_cli*"]' in core_config
+    assert 'where = ["src"]' in ext_config
+    assert 'include = ["unified_cli_ext*"]' in ext_config

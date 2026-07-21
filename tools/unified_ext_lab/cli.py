@@ -29,6 +29,9 @@ _PROVIDER_ID = "synthetic"
 # resulting tuple in memory, so this is never executed or resolved as a binary.
 _FAKE_DOCKER_EXECUTABLE = "/offline/fake-docker"
 _TERMINAL_CLEAN_PHASES = frozenset((StatePhase.PASSED, StatePhase.FAILED_CLEAN))
+_STABLE_FORWARD_PHASES = frozenset(
+    (StatePhase.NEW, StatePhase.CREATED, StatePhase.INSTALLED, StatePhase.TESTED)
+)
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -133,6 +136,10 @@ def _cleanup_and_seal(
     if state.phase in (StatePhase.PASSED, StatePhase.FAILED_CLEAN):
         return None
     if state.phase is StatePhase.SEAL_PENDING:
+        if state.tainted:
+            return CleanupIncompleteError(
+                "fixture cleanup is held by permanent taint"
+            )
         try:
             lifecycle.seal(evidence_output)
         except LabError as error:
@@ -175,18 +182,31 @@ def _cleanup_and_seal(
     ):
         try:
             state, summary = lifecycle.verify_clean()
-        except LabError as error:
-            if first_error is None:
-                first_error = error
-            return first_error
-        if state.phase is not StatePhase.CLEAN_VERIFIED or summary.remaining_count:
-            return first_error or CleanupIncompleteError(
+        except LabError:
+            return CleanupIncompleteError(
+                "fixture cleanup could not be verified"
+            )
+        if (
+            state.phase is not StatePhase.CLEAN_VERIFIED
+            or summary.remaining_count != 0
+        ):
+            return CleanupIncompleteError(
                 "fixture cleanup could not be verified"
             )
 
     if state.phase is not StatePhase.CLEAN_VERIFIED:
-        return first_error or UsageStateError(
-            "state is not eligible for cleanup-only recovery"
+        if (
+            state.phase is StatePhase.DIRTY
+            or state.tainted
+            or first_error is not None
+        ):
+            return CleanupIncompleteError(
+                "fixture cleanup could not be verified"
+            )
+        return UsageStateError("state is not eligible for cleanup-only recovery")
+    if state.tainted:
+        return CleanupIncompleteError(
+            "fixture cleanup is held by permanent taint"
         )
     try:
         lifecycle.seal(evidence_output)
@@ -195,14 +215,24 @@ def _cleanup_and_seal(
     return first_error
 
 
-def _stabilize_interruption(lifecycle: FixtureLifecycle) -> None:
-    """Best-effort reload that durably converts a non-seal pending state."""
+def _stabilize_interruption(
+    lifecycle: FixtureLifecycle, store: LabStateStore
+) -> None:
+    """Best-effort conversion of pending or stable forward state to cleanup-only."""
 
+    # Preserve the fixture CLI's historical best-effort status probe. Besides
+    # normalizing a pending intent, this consumes a nested interruption without
+    # allowing it to suppress the subsequent cleanup attempt.
     try:
         lifecycle.status()
-    except KeyboardInterrupt:
+    except BaseException:
         pass
-    except Exception:
+    try:
+        with store.locked(lifecycle.spec.identity.lab_id) as locked:
+            state = locked.load()
+            if state.phase in _STABLE_FORWARD_PHASES:
+                locked.interrupt_stable_forward(state.phase)
+    except BaseException:
         pass
 
 
@@ -242,7 +272,8 @@ def _fixture_run(
     spec = DockerLabSpec.from_locks(
         identity, docker_executable=_FAKE_DOCKER_EXECUTABLE
     )
-    lifecycle = FixtureLifecycle(LabStateStore(state_root), spec, runner_factory(spec))
+    store = LabStateStore(state_root)
+    lifecycle = FixtureLifecycle(store, spec, runner_factory(spec))
     forward_error: Optional[LabError] = None
     uncertain_exit: Optional[int] = None
     try:
@@ -254,20 +285,20 @@ def _fixture_run(
         forward_error = error
     except KeyboardInterrupt:
         uncertain_exit = 130
-        _stabilize_interruption(lifecycle)
+        _stabilize_interruption(lifecycle, store)
     except Exception:
         uncertain_exit = 1
-        _stabilize_interruption(lifecycle)
+        _stabilize_interruption(lifecycle, store)
 
     try:
         cleanup_error = _cleanup_and_seal(lifecycle, evidence_output)
     except KeyboardInterrupt:
         uncertain_exit = 130
-        _stabilize_interruption(lifecycle)
+        _stabilize_interruption(lifecycle, store)
         cleanup_error = CleanupIncompleteError("fixture cleanup was interrupted")
     except Exception:
         uncertain_exit = uncertain_exit or 1
-        _stabilize_interruption(lifecycle)
+        _stabilize_interruption(lifecycle, store)
         cleanup_error = CleanupIncompleteError("fixture cleanup was interrupted")
     if cleanup_error is not None and (
         forward_error is None or isinstance(cleanup_error, CleanupIncompleteError)
@@ -312,6 +343,8 @@ def _fixture_recover(
     store = LabStateStore(state_root)
     with store.locked(lab_id) as locked:
         state = locked.load()
+        if state.phase in _STABLE_FORWARD_PHASES:
+            state = locked.interrupt_stable_forward(state.phase)
     if state.provider_id != _PROVIDER_ID:
         raise UsageStateError("fixture recovery requires synthetic private state")
     identity = LabIdentity(state.lab_id, state.provider_id, state.ownership_token)
@@ -322,11 +355,11 @@ def _fixture_recover(
     try:
         recovery_error = _cleanup_and_seal(lifecycle, evidence_output)
     except KeyboardInterrupt:
-        _stabilize_interruption(lifecycle)
+        _stabilize_interruption(lifecycle, store)
         recovery_error = None
         uncertain_exit = 130
     except Exception:
-        _stabilize_interruption(lifecycle)
+        _stabilize_interruption(lifecycle, store)
         recovery_error = None
         uncertain_exit = 1
     else:

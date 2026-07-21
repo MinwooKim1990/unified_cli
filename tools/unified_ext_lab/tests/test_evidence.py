@@ -27,6 +27,8 @@ from tools.unified_ext_lab.evidence import (
 )
 from tools.unified_ext_lab.model import LabIdentity
 from tools.unified_ext_lab.state import (
+    FIXTURE_EXECUTION_PROFILE,
+    REAL_DOCKER_EXECUTION_PROFILE,
     LabState,
     OperationObservation,
     SealIntent,
@@ -61,7 +63,12 @@ CLEANUP = {
 }
 
 
-def evidence_pending(*, tainted: bool = False, failed: bool = False) -> LabState:
+def evidence_pending(
+    *,
+    tainted: bool = False,
+    failed: bool = False,
+    execution_profile: str = FIXTURE_EXECUTION_PROFILE,
+) -> LabState:
     operation = (
         OperationObservation("test", "failed", 6, 25, "test_failure")
         if failed
@@ -73,6 +80,8 @@ def evidence_pending(*, tainted: bool = False, failed: bool = False) -> LabState
         "provider",
         TOKEN,
         (identity.resource("container"), identity.resource("auth")),
+        execution_profile=execution_profile,
+        artifact_evidence=ARTIFACT,
     )
     state = state.transition(StatePhase.CREATE_PENDING)
     state = state.record_owned_role("container")
@@ -89,9 +98,17 @@ def evidence_pending(*, tainted: bool = False, failed: bool = False) -> LabState
     return state.mark_tainted() if tainted else state
 
 
-def seal_pending(*, failed: bool = False) -> LabState:
-    state = evidence_pending(failed=failed)
-    draft = capture_draft(state, ARTIFACT, PLATFORM, HASHES, clock_ns=lambda: 123456789)
+def seal_pending(*, failed: bool = False, executor_kind: str = "fake_docker") -> LabState:
+    execution_profile = {
+        "fake_docker": FIXTURE_EXECUTION_PROFILE,
+        "real_docker": REAL_DOCKER_EXECUTION_PROFILE,
+    }[executor_kind]
+    state = evidence_pending(
+        failed=failed, execution_profile=execution_profile
+    )
+    platform = dict(PLATFORM)
+    platform["executor_kind"] = executor_kind
+    draft = capture_draft(state, ARTIFACT, platform, HASHES, clock_ns=lambda: 123456789)
     state = state.transition(StatePhase.EVIDENCE_CAPTURED, draft_evidence=draft)
     state = state.transition(StatePhase.LOGOUT_PENDING)
     state = state.transition(
@@ -121,6 +138,38 @@ def seal_pending(*, failed: bool = False) -> LabState:
 
 
 class EvidenceValidationTests(unittest.TestCase):
+    def test_artifact_identity_is_bound_across_capture_state_and_manifest(self):
+        state = evidence_pending()
+        other = dict(ARTIFACT)
+        other["sha256"] = "f" * 64
+        with self.assertRaisesRegex(
+            InvariantRefusalError, "durable artifact"
+        ):
+            capture_draft(
+                state, other, PLATFORM, HASHES, clock_ns=lambda: 1
+            )
+
+        sealed = seal_pending()
+        object.__setattr__(sealed, "artifact_evidence", other)
+        with self.assertRaisesRegex(
+            InvariantRefusalError, "durable artifact"
+        ):
+            build_manifest(sealed, CLEANUP)
+
+    def test_real_docker_manifest_preserves_executor_but_is_non_promotional(self):
+        manifest = build_manifest(
+            seal_pending(executor_kind="real_docker"), CLEANUP
+        )
+        self.assertEqual(manifest["evidence_kind"], "harness_fixture")
+        self.assertEqual(manifest["executor_kind"], "real_docker")
+        self.assertIs(manifest["promotion_eligible"], False)
+        self.assertEqual(
+            strict_evidence_loads(canonical_evidence_bytes(manifest))[
+                "executor_kind"
+            ],
+            "real_docker",
+        )
+
     def test_fake_clock_produces_golden_canonical_bytes(self):
         manifest = build_manifest(seal_pending(), CLEANUP)
         payload = canonical_evidence_bytes(manifest)
@@ -167,7 +216,9 @@ class EvidenceValidationTests(unittest.TestCase):
             build_manifest(state, CLEANUP)
 
     def test_early_failure_captures_only_after_cleanup_and_seals_failed_clean(self):
-        state = LabState.initial("lab", "provider", TOKEN, ())
+        state = LabState.initial(
+            "lab", "provider", TOKEN, (), artifact_evidence=ARTIFACT
+        )
         state = state.transition(StatePhase.CREATE_PENDING)
         state = state.fail_pending(
             OperationObservation("create", "failed", 5, 2, "runner_failure")
@@ -211,8 +262,10 @@ class EvidenceValidationTests(unittest.TestCase):
         with self.assertRaises(InvariantRefusalError):
             validate_manifest(manifest)
 
-    def test_shell_taint_blocks_capture(self):
-        with self.assertRaises(InvariantRefusalError):
+    def test_irreversible_verification_hold_blocks_capture(self):
+        with self.assertRaisesRegex(
+            InvariantRefusalError, "verification/promotion-held"
+        ):
             capture_draft(
                 evidence_pending(tainted=True), ARTIFACT, PLATFORM, HASHES, clock_ns=lambda: 1
             )
@@ -323,6 +376,206 @@ class SealTests(unittest.TestCase):
         with self.assertRaises(InvariantRefusalError):
             seal_manifest(seal_pending(), CLEANUP, output)
 
+    def test_direct_seal_rejects_swapped_temporary_and_does_not_remove_it(self):
+        from tools.unified_ext_lab import evidence as evidence_module
+
+        output = self.root / "manifest.json"
+        temporary_name = ".manifest.json.0123456789abcdef.tmp"
+        temporary = self.root / temporary_name
+        displaced = self.root / "owned-temp-displaced"
+        real_link = evidence_module.os.link
+        swapped = {"value": False}
+
+        def swap_before_link(source, destination, *args, **kwargs):
+            if source == temporary_name and not swapped["value"]:
+                swapped["value"] = True
+                os.rename(str(temporary), str(displaced))
+                temporary.write_bytes(b"same-user replacement")
+                temporary.chmod(0o600)
+            return real_link(source, destination, *args, **kwargs)
+
+        with mock.patch.object(
+            evidence_module.secrets,
+            "token_hex",
+            return_value="0123456789abcdef",
+        ), mock.patch.object(
+            evidence_module.os, "link", side_effect=swap_before_link
+        ):
+            with self.assertRaisesRegex(
+                InvariantRefusalError, "temporary changed"
+            ):
+                seal_manifest(seal_pending(), CLEANUP, output)
+
+        self.assertTrue(swapped["value"])
+        self.assertTrue(temporary.exists())
+        self.assertEqual(temporary.read_bytes(), b"same-user replacement")
+        self.assertTrue(displaced.exists())
+        self.assertTrue(output.exists())
+        self.assertEqual(
+            (output.stat().st_dev, output.stat().st_ino),
+            (temporary.stat().st_dev, temporary.stat().st_ino),
+        )
+
+    def test_direct_seal_keeps_original_parent_pinned_through_fsync(self):
+        from tools.unified_ext_lab import evidence as evidence_module
+
+        output = self.root / "manifest.json"
+        displaced_parent = self.root.with_name("evidence-displaced")
+        real_link = evidence_module.os.link
+        swapped = {"value": False}
+
+        def replace_parent_after_link(source, destination, *args, **kwargs):
+            result = real_link(source, destination, *args, **kwargs)
+            if destination == output.name and not swapped["value"]:
+                swapped["value"] = True
+                os.rename(str(self.root), str(displaced_parent))
+                self.root.mkdir(mode=0o700)
+            return result
+
+        with mock.patch.object(
+            evidence_module.os, "link", side_effect=replace_parent_after_link
+        ):
+            with self.assertRaisesRegex(
+                InvariantRefusalError, "directory changed during publication"
+            ):
+                seal_manifest(seal_pending(), CLEANUP, output)
+
+        self.assertTrue(swapped["value"])
+        self.assertFalse(output.exists())
+        self.assertTrue((displaced_parent / output.name).exists())
+
+    def test_reconcile_never_accepts_exact_bytes_from_a_replaced_parent(self):
+        from tools.unified_ext_lab import evidence as evidence_module
+
+        output = self.root / "manifest.json"
+        payload = canonical_evidence_bytes(
+            build_manifest(seal_pending(), CLEANUP)
+        )
+        displaced_parent = self.root.with_name("evidence-reconcile-displaced")
+        real_link = evidence_module.os.link
+        swapped = {"value": False}
+
+        def replace_parent_with_exact_output(source, destination, *args, **kwargs):
+            result = real_link(source, destination, *args, **kwargs)
+            if destination == output.name and not swapped["value"]:
+                swapped["value"] = True
+                os.rename(str(self.root), str(displaced_parent))
+                self.root.mkdir(mode=0o700)
+                output.write_bytes(payload)
+                output.chmod(0o600)
+            return result
+
+        with mock.patch.object(
+            evidence_module.os,
+            "link",
+            side_effect=replace_parent_with_exact_output,
+        ):
+            with self.assertRaisesRegex(
+                InvariantRefusalError, "directory changed during publication"
+            ):
+                reconcile_manifest_output(output, payload)
+
+        self.assertTrue(swapped["value"])
+        self.assertEqual(output.read_bytes(), payload)
+        self.assertEqual(
+            (displaced_parent / output.name).read_bytes(), payload
+        )
+
+    def test_reconcile_preserves_generated_temp_mutation_invariant(self):
+        from tools.unified_ext_lab import evidence as evidence_module
+
+        output = self.root / "manifest.json"
+        payload = canonical_evidence_bytes(
+            build_manifest(seal_pending(), CLEANUP)
+        )
+        temporary_name = ".manifest.json.0123456789abcdef.tmp"
+        temporary = self.root / temporary_name
+        real_read = evidence_module._read_bounded_descriptor
+        mutated = {"value": False}
+
+        def mutate_temporary_after_read(descriptor):
+            observed = real_read(descriptor)
+            if temporary.exists() and not mutated["value"]:
+                mutated["value"] = True
+                temporary.write_bytes(b"mutated")
+                temporary.chmod(0o600)
+            return observed
+
+        with mock.patch.object(
+            evidence_module.secrets,
+            "token_hex",
+            return_value="0123456789abcdef",
+        ), mock.patch.object(
+            evidence_module,
+            "_read_bounded_descriptor",
+            side_effect=mutate_temporary_after_read,
+        ):
+            with self.assertRaisesRegex(
+                InvariantRefusalError,
+                "generated evidence temporary changed during creation",
+            ):
+                reconcile_manifest_output(output, payload)
+
+        self.assertTrue(mutated["value"])
+        self.assertFalse(output.exists())
+        self.assertFalse(temporary.exists())
+
+    def test_reconcile_accepts_exact_concurrent_final_name_publisher(self):
+        from tools.unified_ext_lab import evidence as evidence_module
+
+        output = self.root / "manifest.json"
+        payload = canonical_evidence_bytes(
+            build_manifest(seal_pending(), CLEANUP)
+        )
+        temporary_name = ".manifest.json.0123456789abcdef.tmp"
+        temporary = self.root / temporary_name
+        raced = {"value": False}
+
+        def publish_exact_final_then_collide(*_args, **_kwargs):
+            raced["value"] = True
+            output.write_bytes(payload)
+            output.chmod(0o600)
+            raise FileExistsError("concurrent exact publisher")
+
+        with mock.patch.object(
+            evidence_module.secrets,
+            "token_hex",
+            return_value="0123456789abcdef",
+        ), mock.patch.object(
+            evidence_module.os,
+            "link",
+            side_effect=publish_exact_final_then_collide,
+        ):
+            reconcile_manifest_output(output, payload)
+
+        self.assertTrue(raced["value"])
+        self.assertEqual(output.read_bytes(), payload)
+        self.assertFalse(temporary.exists())
+
+    def test_directory_fsync_rejects_fifo_swap_without_opening_it(self):
+        from tools.unified_ext_lab import evidence as evidence_module
+
+        displaced = self.root.with_name("evidence-fsync-displaced")
+        real_lstat = Path.lstat
+        swapped = {"value": False}
+
+        def swap_after_lstat(path):
+            observed = real_lstat(path)
+            if path == self.root and not swapped["value"]:
+                swapped["value"] = True
+                os.rename(str(self.root), str(displaced))
+                os.mkfifo(str(self.root), 0o600)
+            return observed
+
+        with mock.patch.object(Path, "lstat", swap_after_lstat):
+            with self.assertRaisesRegex(
+                InvariantRefusalError, "durability check"
+            ):
+                evidence_module._fsync_directory(self.root)
+        self.assertTrue(swapped["value"])
+        self.root.unlink()
+        os.rename(str(displaced), str(self.root))
+
     def test_reconcile_accepts_only_exact_private_canonical_existing_bytes(self):
         output = self.root / "manifest.json"
         payload = seal_manifest(seal_pending(), CLEANUP, output)
@@ -332,14 +585,79 @@ class SealTests(unittest.TestCase):
         with self.assertRaisesRegex(InvariantRefusalError, "does not match"):
             reconcile_manifest_output(output, payload)
 
+    def test_existing_reader_rejects_same_length_restored_mtime_mutation(self):
+        from tools.unified_ext_lab import evidence as evidence_module
+
+        output = self.root / "manifest.json"
+        payload = seal_manifest(seal_pending(), CLEANUP, output)
+        changed = bytearray(payload)
+        changed[payload.index(b"a" * 8)] = ord("f")
+        changed_payload = bytes(changed)
+        self.assertEqual(len(changed_payload), len(payload))
+        before = output.stat()
+        real_open = evidence_module.os.open
+        mutated = {"value": False}
+
+        def mutate_before_open(path, flags, *args, **kwargs):
+            if path == output.name and not mutated["value"]:
+                mutated["value"] = True
+                output.write_bytes(changed_payload)
+                os.utime(
+                    str(output),
+                    ns=(before.st_atime_ns, before.st_mtime_ns),
+                )
+                self.assertEqual(output.stat().st_size, before.st_size)
+                self.assertEqual(output.stat().st_mtime_ns, before.st_mtime_ns)
+                self.assertNotEqual(output.stat().st_ctime_ns, before.st_ctime_ns)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(
+            evidence_module.os, "open", side_effect=mutate_before_open
+        ):
+            with self.assertRaisesRegex(
+                InvariantRefusalError, "identity changed"
+            ):
+                reconcile_manifest_output(output, payload)
+        self.assertTrue(mutated["value"])
+        output.write_bytes(payload)
+        output.chmod(0o600)
+        reconcile_manifest_output(output, payload)
+
+    def test_existing_reader_fifo_replacement_fails_promptly(self):
+        from tools.unified_ext_lab import evidence as evidence_module
+
+        output = self.root / "manifest.json"
+        payload = seal_manifest(seal_pending(), CLEANUP, output)
+        displaced = output.with_name("displaced-manifest.json")
+        real_stat = evidence_module.os.stat
+        replaced = {"value": False}
+
+        def replace_after_stat(path, *args, **kwargs):
+            observed = real_stat(path, *args, **kwargs)
+            if path == output.name and not replaced["value"]:
+                replaced["value"] = True
+                os.rename(str(output), str(displaced))
+                os.mkfifo(str(output), 0o600)
+            return observed
+
+        with mock.patch.object(
+            evidence_module.os, "stat", side_effect=replace_after_stat
+        ):
+            with self.assertRaises(InvariantRefusalError):
+                reconcile_manifest_output(output, payload)
+        self.assertTrue(replaced["value"])
+        output.unlink()
+        os.rename(str(displaced), str(output))
+        reconcile_manifest_output(output, payload)
+
     def test_hardlink_temp_unlink_is_followed_by_parent_fsync(self):
         output = self.root / "manifest.json"
         events = []
-        real_unlink = Path.unlink
+        real_unlink = os.unlink
         real_fsync = os.fsync
 
         def tracked_unlink(path, *args, **kwargs):
-            if path.name.endswith(".tmp"):
+            if str(path).endswith(".tmp"):
                 events.append("unlink")
             return real_unlink(path, *args, **kwargs)
 
@@ -347,7 +665,10 @@ class SealTests(unittest.TestCase):
             events.append("fsync-after-unlink" if "unlink" in events else "fsync")
             return real_fsync(descriptor)
 
-        with mock.patch.object(Path, "unlink", tracked_unlink), mock.patch(
+        with mock.patch(
+            "tools.unified_ext_lab.evidence.os.unlink",
+            side_effect=tracked_unlink,
+        ), mock.patch(
             "tools.unified_ext_lab.evidence.os.fsync", side_effect=tracked_fsync
         ):
             seal_manifest(seal_pending(), CLEANUP, output)
@@ -357,11 +678,11 @@ class SealTests(unittest.TestCase):
         output = self.root / "manifest.json"
         payload = canonical_evidence_bytes(build_manifest(seal_pending(), CLEANUP))
         temporary_name = ".manifest.json.0123456789abcdef.tmp"
-        real_unlink = Path.unlink
+        real_unlink = os.unlink
         injected = {"done": False}
 
         def crash_before_temp_unlink(path, *args, **kwargs):
-            if path.name == temporary_name and not injected["done"]:
+            if str(path) == temporary_name and not injected["done"]:
                 injected["done"] = True
                 raise RuntimeError("injected crash after publication")
             return real_unlink(path, *args, **kwargs)
@@ -369,7 +690,10 @@ class SealTests(unittest.TestCase):
         with mock.patch(
             "tools.unified_ext_lab.evidence.secrets.token_hex",
             return_value="0123456789abcdef",
-        ), mock.patch.object(Path, "unlink", crash_before_temp_unlink):
+        ), mock.patch(
+            "tools.unified_ext_lab.evidence.os.unlink",
+            side_effect=crash_before_temp_unlink,
+        ):
             with self.assertRaisesRegex(RuntimeError, "after publication"):
                 seal_manifest(seal_pending(), CLEANUP, output)
 
@@ -384,18 +708,20 @@ class SealTests(unittest.TestCase):
 
         events = []
         real_fsync = os.fsync
+        real_recovery_unlink = os.unlink
 
         def tracked_recovery_unlink(path, *args, **kwargs):
-            if path.name == temporary_name:
+            if str(path) == temporary_name:
                 events.append("unlink")
-            return real_unlink(path, *args, **kwargs)
+            return real_recovery_unlink(path, *args, **kwargs)
 
         def tracked_recovery_fsync(descriptor):
             events.append("fsync-after-unlink" if "unlink" in events else "fsync")
             return real_fsync(descriptor)
 
-        with mock.patch.object(
-            Path, "unlink", tracked_recovery_unlink
+        with mock.patch(
+            "tools.unified_ext_lab.evidence.os.unlink",
+            side_effect=tracked_recovery_unlink,
         ), mock.patch(
             "tools.unified_ext_lab.evidence.os.fsync",
             side_effect=tracked_recovery_fsync,
@@ -406,6 +732,42 @@ class SealTests(unittest.TestCase):
         self.assertEqual(output.stat().st_nlink, 1)
         self.assertFalse(temporary.exists())
         self.assertIn("fsync-after-unlink", events)
+
+    def test_reconcile_keeps_parent_pinned_while_removing_crash_temp(self):
+        from tools.unified_ext_lab import evidence as evidence_module
+
+        output = self.root / "manifest.json"
+        payload = seal_manifest(seal_pending(), CLEANUP, output)
+        temporary_name = ".manifest.json.0123456789abcdef.tmp"
+        temporary = self.root / temporary_name
+        os.link(str(output), str(temporary))
+        displaced_parent = self.root.with_name("evidence-recovery-displaced")
+        real_unlink = evidence_module.os.unlink
+        swapped = {"value": False}
+
+        def replace_parent_before_unlink(path, *args, **kwargs):
+            if str(path) == temporary_name and not swapped["value"]:
+                swapped["value"] = True
+                os.rename(str(self.root), str(displaced_parent))
+                self.root.mkdir(mode=0o700)
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(
+            evidence_module.os,
+            "unlink",
+            side_effect=replace_parent_before_unlink,
+        ):
+            with self.assertRaisesRegex(
+                InvariantRefusalError, "directory changed during publication"
+            ):
+                reconcile_manifest_output(output, payload)
+
+        self.assertTrue(swapped["value"])
+        self.assertFalse(output.exists())
+        displaced_output = displaced_parent / output.name
+        self.assertTrue(displaced_output.exists())
+        self.assertEqual(displaced_output.read_bytes(), payload)
+        self.assertEqual(displaced_output.stat().st_nlink, 1)
 
     def test_reconcile_rejects_unexplained_or_inexact_hardlink(self):
         for link_name in (
@@ -428,6 +790,24 @@ class SealTests(unittest.TestCase):
                 self.assertEqual(output.stat().st_nlink, 2)
                 hardlink.unlink()
                 output.unlink()
+
+    def test_reconcile_refuses_multiple_generated_links_before_mutation(self):
+        output = self.root / "manifest.json"
+        payload = seal_manifest(seal_pending(), CLEANUP, output)
+        first = self.root / ".manifest.json.0123456789abcdef.tmp"
+        second = self.root / ".manifest.json.fedcba9876543210.tmp"
+        os.link(str(output), str(first))
+        os.link(str(output), str(second))
+
+        with self.assertRaisesRegex(
+            InvariantRefusalError, "unexplained evidence output hardlink"
+        ):
+            reconcile_manifest_output(output, payload)
+
+        self.assertTrue(output.exists())
+        self.assertTrue(first.exists())
+        self.assertTrue(second.exists())
+        self.assertEqual(output.stat().st_nlink, 3)
 
     def test_reconcile_does_not_remove_exactly_named_unrelated_temp(self):
         output = self.root / "manifest.json"

@@ -1,8 +1,19 @@
-# unified-ext-lab development harness
+# unified-ext-lab development harnesses
 
-`unified-ext-lab` is a source-only development harness for validating the
-`unified-cli-ext` execution boundary. It is not part of either PyPI package and
-does not change the installed `unified-cli` command.
+The repository has two source-only development harnesses for the
+`unified-cli-ext` execution boundary. Neither is part of the Core or Ext wheel
+or sdist, and neither changes the installed `unified-cli` command.
+
+- `unified-ext-lab` is the existing offline, in-memory fake-Docker fixture.
+- `unified-ext-lab-real-docker` is a separate local-engine synthetic
+  conformance tool. It is not Provider compatibility, authentication, account,
+  or entitlement validation.
+
+Every evidence manifest emitted by either tool is marked
+`promotion_eligible=false`; dirty or held runs may emit no evidence manifest.
+Any emitted manifest is useful only as bounded engineering evidence; it does
+not change a Provider from `Held`, does not authorize a release, and does not
+affect `main` or release branches.
 
 ## Current scope
 
@@ -20,16 +31,42 @@ Passing this scaffold proves the command, ownership, lifecycle, cleanup, and
 recording contracts. It does not promote any Ext provider from `Held` and is
 not evidence of real Docker or provider compatibility.
 
+## Stage 6B local Docker conformance scope
+
+`unified-ext-lab-real-docker` is an explicit opt-in tool for a maintainer's
+already-running local Docker engine. It runs only the repository's synthetic
+guest and fake provider fixture. It accepts canonical absolute paths only for
+the required `--state-root` and `--evidence-output` persistence outputs. It
+accepts no caller-controlled Docker executable, host, context, platform,
+provider, account, credential, URL, working directory, argv, timeout, shell,
+guest command, or guest/runtime path input. In particular, it cannot be
+redirected to a provider CLI, another Docker endpoint, or arbitrary host files
+through generic command-line parameters.
+
+The conformance run never pulls an image. Base-image preparation is a distinct
+operation and requires the explicit `--allow-network` acknowledgement; it is
+the only operation that may contact a registry. Running preparation is not
+implicit in a conformance invocation.
+
+No actual Docker invocation has been made for Stage 6B at the time of this
+record. The implementation and its tests establish a local-engine synthetic
+conformance boundary only. Docker availability, real provider installation,
+authentication, browser callbacks, account access, paid calls, and provider
+protocol compatibility remain outside this gate and require separate approval
+and provider-specific evidence.
+
 ## Repository boundary
 
-All harness code lives under `tools/unified_ext_lab/` with a source checkout
-launcher under `scripts/`. Core only discovers packages below `src/`, while Ext
-only discovers packages below `packages/unified-cli-ext/src/`. CI additionally
-checks that neither wheel nor sdist contains the harness.
+All harness code lives under `tools/unified_ext_lab/` with source-checkout
+launchers under `scripts/`. Core only discovers packages below `src/`, while
+Ext only discovers packages below `packages/unified-cli-ext/src/`. The Core
+sdist manifest prunes the complete `tools/` tree and excludes every launcher
+matching `scripts/unified-ext-lab*`. CI inspects the built archives and checks
+that no lab code or matching launcher enters either wheel or sdist.
 
 The harness must never be installed editable into the maintainer's active
-`unified-cli` environment. Development and tests run from the dedicated
-`codex/platform-ext-lab` worktree with an explicit `PYTHONPATH`.
+`unified-cli` environment. Development and tests run from dedicated platform
+worktrees with an explicit `PYTHONPATH`.
 
 ## Fixed execution boundary
 
@@ -43,16 +80,26 @@ container specification requires:
 - no network;
 - bounded CPU, memory, process count, open files, and output;
 - a fixed `tmpfs` for `/tmp`;
-- separate named workspace, auth, and tool volumes;
 - no host HOME, Keychain, SSH agent, Docker socket, git configuration, or
   credential-helper mount;
 - a private Docker CLI HOME, config directory, and temporary directory.
 
-Every managed object has a deterministic name plus the complete lab,
-provider, role, and random ownership-token label set. Cleanup checks both the
-exact recorded name and the complete label set, then validates inspect data
-before acting. A renamed, relabeled, duplicated, or policy-drifted object is
-reported as remaining and is not removed.
+Stage 6A's offline fixture model uses separate named workspace, auth, and tool
+volumes. Its cleanup recognizes a fixture object only when both its planned
+name and its complete lab, provider, role, and random ownership-token label
+set agree, then validates the inspected fixture data before acting. A renamed,
+relabeled, duplicated, or policy-drifted fixture object is left in place and
+reported as remaining.
+
+Stage 6B's real-Docker run instead requires ephemeral storage: `/tmp` and the
+workspace, auth, and tool locations use fixed `tmpfs` mounts, so it does not
+create those named volumes. Once the daemon has returned an image or container
+ID and the harness has made it durable, cleanup targets that exact ID. Later
+name, tag, or label drift does not redirect that deletion. Before an ID is
+durable, discovery is intentionally conservative: the planned name and the
+complete ownership-label set must agree before an object can be recorded or
+removed. A replacement object is never substituted for the durable ID; it
+remains visible to clean verification and keeps the run `DIRTY`.
 
 ## Durable lifecycle
 
@@ -61,6 +108,11 @@ pending state after interruption appends exactly one failed `interrupted`
 observation and converts it to `RECOVERY_REQUIRED`; forward create, install,
 test, or evidence work cannot resume from recovery. Recovery can only perform
 local logout, exact-object removal, clean verification, and evidence sealing.
+If interruption occurs between operations while state is stably `NEW`,
+`CREATED`, `INSTALLED`, or `TESTED`, the run handler and explicit recovery
+command durably convert that phase to the corresponding cleanup-only
+`RECOVERY_REQUIRED` state before cleanup. They never re-enter the next forward
+pending phase.
 `SEAL_PENDING` is deliberately different: it retains a non-sensitive hash of
 the canonical output path, the exact expected payload hash, and the result.
 After a crash it publishes an absent output or accepts an existing output only
@@ -101,9 +153,11 @@ the lock filename cannot create two active harness contexts. This is a
 cooperation boundary among harness processes, not a claim that an unrelated
 same-user process that ignores advisory locking can be controlled.
 
-An interactive shell, when implemented in the later real-Docker slice, must
-durably taint the lab before it starts. Tainted runs can be cleaned but can
-never capture or seal evidence.
+Neither launcher exposes an interactive shell. More generally, interactive
+shell use or unresolved uncertainty about whether a daemon mutation occurred
+creates a permanent evidence and promotion hold: cleanup may continue, but
+evidence capture, sealing, and any promotion use remain held for that run.
+This is an evidence safeguard, not a claim that cleanup cannot still succeed.
 
 ## Evidence meaning
 
@@ -148,9 +202,7 @@ scripts/unified-ext-lab fixture-recover \
 ```
 
 `fixture-run` always uses the in-memory runner. It accepts no executable,
-provider, URL, account, credential, or shell input. The separate create,
-install, shell, test, and real-engine commands remain unavailable until the
-later opt-in conformance gate is implemented and independently reviewed.
+provider, URL, account, credential, or shell input.
 `fixture-recover` is also offline-only. It reconstructs the same synthetic
 specification and in-memory runner from the private state identity and token,
 performs no forward create/install/test/evidence work, and starts at the
@@ -159,6 +211,44 @@ earliest safe logout, destroy, verify, or seal step implied by state. A
 unexpected in-process interruption into durable recovery and attempts cleanup;
 keyboard interruption returns exit status `130`. A `SIGKILL` cannot run a
 handler, so a later explicit `fixture-recover` invocation is required.
+
+The separate Stage 6B launcher exposes only its fixed command grammar. The
+state root is a caller-owned private canonical directory; real-Docker state is
+always placed in its internal `real-docker-v1/<lab-id>` namespace and that
+namespace cannot be selected from the command line.
+
+```sh
+scripts/unified-ext-lab-real-docker prepare-base \
+  --allow-network \
+  --json
+
+scripts/unified-ext-lab-real-docker conformance-run \
+  --lab-id conformance-one \
+  --state-root /absolute/private/state \
+  --evidence-output /absolute/private/result.json \
+  --json
+
+scripts/unified-ext-lab-real-docker conformance-status \
+  --lab-id conformance-one \
+  --state-root /absolute/private/state \
+  --json
+
+scripts/unified-ext-lab-real-docker conformance-recover \
+  --lab-id conformance-one \
+  --state-root /absolute/private/state \
+  --evidence-output /absolute/private/result.json \
+  --json
+```
+
+`prepare-base` is the only network-capable command and does nothing without
+the exact `--allow-network` flag. `conformance-run` requires a reachable fixed
+Docker engine and an already-local locked base image. `conformance-recover`
+performs daemon reachability checking followed only by state stabilization,
+logout, exact removal, clean verification, and sealing; it never pulls or
+resumes create, install, test, or evidence work. Its cleanup-only discovery
+does not load or enforce the forward routing hold, Buildx binary, base-image
+lock, platform, or build-context snapshot. `conformance-status` performs no
+Docker discovery or daemon probe.
 
 The fixture suite does not require Docker or network access:
 
@@ -177,5 +267,8 @@ Before this slice can merge into `codex/platform-next`, it must also pass:
 - an independent runner/command-boundary review;
 - zero P0, P1, or unresolved P2 findings.
 
-Real Docker, provider installation, provider login, browser callbacks, and paid
-calls belong to later opt-in gates and are not started by this scaffold.
+Actual Stage 6B Docker execution is a separately approved, opt-in operational
+gate and is not started by the fixture scaffold. Provider installation, login,
+browser callbacks, and paid calls are later provider-specific opt-in gates.
+The source-only Stage 6B real-Docker launcher remains synthetic and
+non-promotional.

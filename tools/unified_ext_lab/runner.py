@@ -166,14 +166,59 @@ class _KqueueExitObserver:
         self._queue.close()
 
 
-def _digest_file(path: str) -> str:
+def _exact_stat_identity(metadata: os.stat_result) -> Tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _digest_file(path: str, expected: os.stat_result) -> str:
     digest = hashlib.sha256()
-    with open(path, "rb", buffering=0) as handle:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise InvariantRefusalError(
+            "runner executable identity is unreadable"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+        identity = _exact_stat_identity(opened)
+        if identity != _exact_stat_identity(expected):
+            raise InvariantRefusalError("runner executable identity changed")
         while True:
-            chunk = handle.read(_READ_CHUNK_BYTES)
+            chunk = os.read(descriptor, _READ_CHUNK_BYTES)
             if not chunk:
-                return digest.hexdigest()
+                break
             digest.update(chunk)
+        after = os.fstat(descriptor)
+        try:
+            named_after = os.lstat(path)
+        except OSError as error:
+            raise InvariantRefusalError(
+                "runner executable identity changed"
+            ) from error
+        if (
+            _exact_stat_identity(after) != identity
+            or _exact_stat_identity(named_after) != identity
+        ):
+            raise InvariantRefusalError("runner executable identity changed")
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
 
 
 def _capture_identity(path: object) -> ExecutableIdentity:
@@ -195,7 +240,7 @@ def _capture_identity(path: object) -> ExecutableIdentity:
     if not os.access(path, os.X_OK):
         raise InvariantRefusalError("runner executable is not executable")
     try:
-        digest = _digest_file(path)
+        digest = _digest_file(path, metadata)
     except OSError as error:
         raise InvariantRefusalError("runner executable identity is unreadable") from error
     return ExecutableIdentity(
@@ -242,6 +287,9 @@ class SubprocessRunner:
         self._cancelled = threading.Event()
         self._run_lock = threading.Lock()
         self._closed = False
+        self._buildx_identity: Optional[ExecutableIdentity] = None
+        self._bound_buildx_identity: Optional[ExecutableIdentity] = None
+        self._bound_buildx_executable: Optional[str] = None
         created_root = tempfile.mkdtemp(prefix="unified-ext-lab-runner-")
         try:
             self._private_root = os.path.realpath(created_root)
@@ -283,6 +331,47 @@ class SubprocessRunner:
         os.chmod(path, 0o700)
         return path
 
+    def bind_docker_buildx(self, executable: str) -> ExecutableIdentity:
+        """Copy one identity-bound Buildx companion into private Docker config.
+
+        The fixed plugin name is intentional. Docker may discover only this
+        reviewed copy through the runner's empty private ``DOCKER_CONFIG``;
+        ambient user plugin directories and PATH are never consulted.
+        """
+
+        with self._run_lock:
+            if self._closed:
+                raise UsageStateError("runner is closed")
+            if self._buildx_identity is not None:
+                raise UsageStateError("Docker Buildx companion is already bound")
+            identity = _capture_identity(executable)
+            plugin_directory = os.path.join(self._docker_config, "cli-plugins")
+            os.mkdir(plugin_directory, 0o700)
+            os.chmod(plugin_directory, 0o700)
+            bound = os.path.join(plugin_directory, "docker-buildx")
+            try:
+                shutil.copyfile(identity.canonical_path, bound)
+                os.chmod(bound, 0o500)
+                bound_identity = _capture_identity(bound)
+                if _capture_identity(identity.canonical_path) != identity:
+                    raise InvariantRefusalError(
+                        "Docker Buildx companion identity changed"
+                    )
+                if bound_identity.sha256 != identity.sha256:
+                    raise InvariantRefusalError(
+                        "Docker Buildx companion identity changed"
+                    )
+            except BaseException:
+                try:
+                    shutil.rmtree(plugin_directory)
+                except FileNotFoundError:
+                    pass
+                raise
+            self._buildx_identity = identity
+            self._bound_buildx_identity = bound_identity
+            self._bound_buildx_executable = bound
+            return identity
+
     def _environment(self) -> dict:
         # Do not start from os.environ.  In particular, credential helpers,
         # auth variables, SSH agents, Git configuration, and proxy settings do
@@ -323,10 +412,24 @@ class SubprocessRunner:
         if current != self._identity:
             raise InvariantRefusalError("runner executable identity changed")
 
-    def _check_identity(self) -> None:
+    def _check_identity(self, *, require_buildx: bool = True) -> None:
+        if type(require_buildx) is not bool:
+            raise UsageStateError("invalid companion identity policy")
         self._check_source_identity()
         if _capture_identity(self._bound_executable) != self._bound_identity:
             raise InvariantRefusalError("runner executable identity changed")
+        if require_buildx and self._buildx_identity is not None:
+            if (
+                self._bound_buildx_identity is None
+                or self._bound_buildx_executable is None
+                or _capture_identity(self._buildx_identity.canonical_path)
+                != self._buildx_identity
+                or _capture_identity(self._bound_buildx_executable)
+                != self._bound_buildx_identity
+            ):
+                raise InvariantRefusalError(
+                    "Docker Buildx companion identity changed"
+                )
 
     @staticmethod
     def _waitid_observer_available() -> bool:
@@ -450,7 +553,12 @@ class SubprocessRunner:
                 raise UsageStateError("runner is closed")
             if self._cancelled.is_set():
                 raise RunnerFailureError("runner cancelled")
-            self._check_identity()
+            requires_buildx = (
+                len(command) > 3
+                and command[1] == "--host"
+                and command[3] in ("build", "buildx")
+            )
+            self._check_identity(require_buildx=requires_buildx)
             return self._run_locked(command, timeout_seconds)
 
     def _run_locked(self, argv: Tuple[str, ...], timeout: float) -> CommandResult:

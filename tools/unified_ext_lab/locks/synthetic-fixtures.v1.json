@@ -3,7 +3,7 @@
   "fixture": {
     "artifact": "image/rootfs/opt/unified-ext-lab/fixtures/fake-provider",
     "version": "1.0.0",
-    "sha256": "e740b71e1de2e12fd416beada693704265f210a42cd848ee1e718019f24dfbcc",
+    "sha256": "50e7754c2a4cc5fb074d640eef253f5a9b61288dcbe8074887e2cc2c728edc66",
     "scaffold_only": true
   }
 }

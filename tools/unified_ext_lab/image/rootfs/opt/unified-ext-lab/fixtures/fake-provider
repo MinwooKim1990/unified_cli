@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/local/bin/python3
 """Deterministic synthetic protocol fixture; never contacts a service."""
 
 from __future__ import annotations

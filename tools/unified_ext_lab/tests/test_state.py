@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import stat
@@ -14,6 +15,9 @@ from unittest import mock
 from tools.unified_ext_lab.errors import InvariantRefusalError, UsageStateError
 from tools.unified_ext_lab.model import LabIdentity
 from tools.unified_ext_lab.state import (
+    FIXTURE_EXECUTION_PROFILE,
+    REAL_DOCKER_EXECUTION_PROFILE,
+    STATE_SCHEMA,
     LabState,
     LabStateStore,
     LockedLabStateStore,
@@ -29,6 +33,13 @@ from tools.unified_ext_lab.state import (
 
 
 TOKEN = "0123456789abcdef0123456789abcdef"
+CUSTOM_ARTIFACT = {
+    "package": "synthetic-cli-fixture",
+    "version": "2.0.0",
+    "source_kind": "local_fixture",
+    "source_locator": "fixtures/synthetic-cli-fixture-2.0.0-" + "a" * 12,
+    "sha256": "a" * 64,
+}
 
 
 def seal_intent() -> SealIntent:
@@ -47,6 +58,139 @@ def initial_state() -> LabState:
 
 
 class LifecycleTests(unittest.TestCase):
+    def test_default_mappings_are_immutable_and_empty_defaults_are_not_shared(self):
+        first = LabState(
+            STATE_SCHEMA, 0, "lab", "provider", TOKEN, StatePhase.NEW
+        )
+        second = LabState(
+            STATE_SCHEMA, 0, "lab", "provider", TOKEN, StatePhase.NEW
+        )
+
+        self.assertEqual(dict(first.resource_ids), {})
+        self.assertEqual(dict(first.baseline_equalities), {})
+        self.assertIsNot(first.resource_ids, second.resource_ids)
+        self.assertIsNot(first.baseline_equalities, second.baseline_equalities)
+        for mapping in (
+            first.resource_ids,
+            first.artifact_evidence,
+            first.baseline_equalities,
+        ):
+            with self.subTest(mapping=mapping):
+                with self.assertRaises(TypeError):
+                    mapping["cannot_mutate"] = "value"
+
+    def test_explicit_stable_forward_interruption_is_narrow_and_not_automatic(self):
+        expected = {
+            StatePhase.NEW: "create",
+            StatePhase.CREATED: "install",
+            StatePhase.INSTALLED: "test",
+            StatePhase.TESTED: "evidence",
+        }
+        state = initial_state()
+        stable_states = [state]
+        for pending, stable in (
+            (StatePhase.CREATE_PENDING, StatePhase.CREATED),
+            (StatePhase.INSTALL_PENDING, StatePhase.INSTALLED),
+            (StatePhase.TEST_PENDING, StatePhase.TESTED),
+        ):
+            state = state.transition(pending).transition(stable)
+            stable_states.append(state)
+        for stable_state in stable_states:
+            with self.subTest(phase=stable_state.phase.value):
+                round_trip = LabState.from_dict(stable_state.to_dict())
+                self.assertEqual(round_trip.phase, stable_state.phase)
+                interrupted = round_trip.interrupt_stable_forward()
+                self.assertEqual(interrupted.phase, StatePhase.RECOVERY_REQUIRED)
+                self.assertEqual(
+                    interrupted.pending_step, expected[stable_state.phase]
+                )
+                self.assertEqual(interrupted.operations[-1].error_code, "interrupted")
+                self.assertEqual(interrupted.revision, stable_state.revision + 1)
+        with self.assertRaises(UsageStateError):
+            state.transition(StatePhase.EVIDENCE_PENDING).interrupt_stable_forward()
+
+    def test_resource_ids_are_planned_typed_and_immutable(self):
+        identity = LabIdentity("lab", "provider", TOKEN)
+        state = LabState.initial(
+            "lab",
+            "provider",
+            TOKEN,
+            (
+                identity.resource("image"),
+                identity.resource("container"),
+                identity.resource("auth"),
+            ),
+            artifact_evidence=CUSTOM_ARTIFACT,
+        ).transition(StatePhase.CREATE_PENDING)
+        image_id = "sha256:" + "a" * 64
+        container_id = "b" * 64
+        state = state.record_resource_id("image", image_id)
+        state = state.record_resource_id("container", container_id)
+        self.assertEqual(
+            dict(state.resource_ids),
+            {"image": image_id, "container": container_id},
+        )
+        self.assertEqual(dict(state.artifact_evidence), CUSTOM_ARTIFACT)
+        self.assertIs(state.record_resource_id("image", image_id), state)
+        with self.assertRaises(InvariantRefusalError):
+            state.record_resource_id("image", "sha256:" + "c" * 64)
+        with self.assertRaises(InvariantRefusalError):
+            state.record_resource_id("container", "c" * 64)
+        with self.assertRaises(UsageStateError):
+            state.record_resource_id("auth", "c" * 64)
+        fresh = LabState.initial(
+            "lab",
+            "provider",
+            TOKEN,
+            (identity.resource("image"), identity.resource("container")),
+        ).transition(StatePhase.CREATE_PENDING)
+        for role, resource_id in (
+            ("container", "sha256:" + "c" * 64),
+            ("image", "c" * 64),
+        ):
+            with self.subTest(role=role):
+                with self.assertRaises(UsageStateError):
+                    fresh.record_resource_id(role, resource_id)
+        restored = LabState.from_dict(state.to_dict())
+        self.assertEqual(dict(restored.resource_ids), dict(state.resource_ids))
+        self.assertEqual(dict(restored.artifact_evidence), CUSTOM_ARTIFACT)
+
+    def test_schema_two_migrates_only_to_fixture_profile(self):
+        legacy = initial_state().to_dict()
+        legacy["schema"] = 2
+        legacy.pop("execution_profile")
+        legacy.pop("resource_ids")
+        legacy.pop("artifact_evidence")
+        migrated = LabState.from_dict(legacy)
+        self.assertEqual(migrated.schema, STATE_SCHEMA)
+        self.assertEqual(
+            migrated.execution_profile, FIXTURE_EXECUTION_PROFILE
+        )
+        self.assertEqual(
+            LabState.from_dict(migrated.to_dict()).execution_profile,
+            FIXTURE_EXECUTION_PROFILE,
+        )
+        claimed_real = dict(legacy)
+        claimed_real["execution_profile"] = REAL_DOCKER_EXECUTION_PROFILE
+        with self.assertRaises(UsageStateError):
+            LabState.from_dict(claimed_real)
+
+    def test_legacy_draft_migration_infers_the_exact_captured_artifact(self):
+        captured = self._to_evidence_captured()
+        for schema in (2, 3):
+            with self.subTest(schema=schema):
+                document = captured.to_dict()
+                document.pop("resource_ids")
+                document.pop("artifact_evidence")
+                if schema == 2:
+                    document["schema"] = 2
+                    document.pop("execution_profile")
+                migrated = LabState.from_dict(document)
+                self.assertEqual(
+                    dict(migrated.artifact_evidence),
+                    dict(migrated.draft_evidence["artifact"]),
+                )
+
     def test_every_success_transition_and_immutability(self):
         state = initial_state()
         self.assertEqual(state.phase, StatePhase.NEW)
@@ -69,13 +213,7 @@ class LifecycleTests(unittest.TestCase):
             else:
                 self.assertIsNone(state.pending_step)
         draft = {
-            "artifact": {
-                "package": "pkg",
-                "version": "1.0.0",
-                "source_kind": "wheel",
-                "source_locator": "fixtures/pkg-1.0.0.whl",
-                "sha256": "a" * 64,
-            },
+            "artifact": dict(state.artifact_evidence),
             "captured_at_ns": 5,
             "evidence_kind": "harness_fixture",
             "executor_kind": "fake_docker",
@@ -149,6 +287,42 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaises(InvariantRefusalError):
             state.transition(StatePhase.EVIDENCE_CAPTURED, draft_evidence={})
 
+    def test_draft_artifact_must_equal_durable_artifact_evidence(self):
+        state = initial_state()
+        for phase in (
+            StatePhase.CREATE_PENDING,
+            StatePhase.CREATED,
+            StatePhase.INSTALL_PENDING,
+            StatePhase.INSTALLED,
+            StatePhase.TEST_PENDING,
+            StatePhase.TESTED,
+            StatePhase.EVIDENCE_PENDING,
+        ):
+            state = state.transition(phase)
+        draft = {
+            "artifact": dict(CUSTOM_ARTIFACT),
+            "captured_at_ns": 1,
+            "evidence_kind": "harness_fixture",
+            "executor_kind": "fake_docker",
+            "manifest_schema_sha256": "b" * 64,
+            "observed_protocol_schema_sha256": "c" * 64,
+            "operations": [],
+            "promotion_eligible": False,
+        }
+        with self.assertRaisesRegex(
+            InvariantRefusalError, "durable artifact"
+        ):
+            state.transition(
+                StatePhase.EVIDENCE_CAPTURED, draft_evidence=draft
+            )
+
+        captured = self._to_evidence_captured().to_dict()
+        captured["artifact_evidence"] = dict(CUSTOM_ARTIFACT)
+        with self.assertRaisesRegex(
+            InvariantRefusalError, "durable artifact"
+        ):
+            LabState.from_dict(captured)
+
     def test_mark_tainted_is_monotonic_same_phase_revision(self):
         state = initial_state()
         tainted = state.mark_tainted()
@@ -217,13 +391,7 @@ class LifecycleTests(unittest.TestCase):
         ):
             state = state.transition(phase)
         draft = {
-            "artifact": {
-                "package": "pkg",
-                "version": "1",
-                "source_kind": "fixture",
-                "source_locator": "pkg-1.tgz",
-                "sha256": "a" * 64,
-            },
+            "artifact": dict(state.artifact_evidence),
             "captured_at_ns": 1,
             "evidence_kind": "harness_fixture",
             "executor_kind": "fake_docker",
@@ -242,6 +410,705 @@ class StoreTests(unittest.TestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_store_refuses_cross_profile_state(self):
+        root = self.base / "profile-bound"
+        real = LabStateStore(root, REAL_DOCKER_EXECUTION_PROFILE)
+        with real.locked("lab") as locked:
+            state = locked.create_initial("provider", TOKEN, ())
+        self.assertEqual(state.execution_profile, REAL_DOCKER_EXECUTION_PROFILE)
+        with LabStateStore(root, FIXTURE_EXECUTION_PROFILE).locked("lab") as locked:
+            with self.assertRaisesRegex(
+                InvariantRefusalError, "execution profile"
+            ):
+                locked.load()
+
+    def test_locked_explicit_stable_interruption_and_resource_id_are_durable(self):
+        root = self.base / "explicit-recovery"
+        identity = LabIdentity("lab", "provider", TOKEN)
+        store = LabStateStore(root)
+        with store.locked("lab") as locked:
+            locked.create_initial(
+                "provider",
+                TOKEN,
+                (identity.resource("image"), identity.resource("container")),
+                artifact_evidence=CUSTOM_ARTIFACT,
+            )
+            locked.transition(StatePhase.NEW, StatePhase.CREATE_PENDING)
+            recorded = locked.record_resource_id(
+                StatePhase.CREATE_PENDING,
+                "image",
+                "sha256:" + "d" * 64,
+            )
+            self.assertEqual(recorded.resource_ids["image"], "sha256:" + "d" * 64)
+            locked.transition(StatePhase.CREATE_PENDING, StatePhase.CREATED)
+        with store.locked("lab") as locked:
+            stable = locked.load()
+            self.assertEqual(stable.phase, StatePhase.CREATED)
+            recovered = locked.interrupt_stable_forward(StatePhase.CREATED)
+        self.assertEqual(recovered.phase, StatePhase.RECOVERY_REQUIRED)
+        self.assertEqual(recovered.pending_step, "install")
+        with store.locked("lab") as locked:
+            persisted = locked.load()
+        self.assertEqual(persisted.phase, StatePhase.RECOVERY_REQUIRED)
+        self.assertEqual(persisted.resource_ids["image"], "sha256:" + "d" * 64)
+        self.assertEqual(dict(persisted.artifact_evidence), CUSTOM_ARTIFACT)
+
+    def test_lab_directory_replacement_cannot_bypass_name_lock_or_receive_writes(self):
+        from tools.unified_ext_lab import state as state_module
+
+        root = self.base / "rename-protected"
+        store = LabStateStore(root)
+        real_flock = state_module._fcntl.flock
+        with store.locked("lab") as first:
+            first.create_initial("provider", TOKEN, ())
+            lab = root / "lab"
+            displaced = root / "displaced-lab"
+            os.rename(str(lab), str(displaced))
+            lab.mkdir(mode=0o700)
+
+            with self.assertRaisesRegex(
+                InvariantRefusalError, "state directory changed while locked"
+            ):
+                first.transition(StatePhase.NEW, StatePhase.CREATE_PENDING)
+            self.assertFalse((lab / "state.json").exists())
+            self.assertEqual(
+                strict_json_loads((displaced / "state.json").read_bytes())["phase"],
+                StatePhase.NEW.value,
+            )
+
+            def nonblocking_flock(descriptor, operation):
+                if operation == state_module._fcntl.LOCK_EX:
+                    operation |= state_module._fcntl.LOCK_NB
+                return real_flock(descriptor, operation)
+
+            yielded = {"value": False}
+            with mock.patch.object(
+                state_module._fcntl, "flock", nonblocking_flock
+            ):
+                with self.assertRaises(BlockingIOError):
+                    with store.locked("lab"):
+                        yielded["value"] = True
+            self.assertFalse(yielded["value"])
+
+    def test_state_operations_are_descriptor_relative_and_reject_file_replacement(self):
+        root = self.base / "descriptor-relative"
+        store = LabStateStore(root)
+        with store.locked("lab") as locked:
+            locked.path = self.base / "unused-pathname"
+            locked.create_initial("provider", TOKEN, ())
+            state_path = root / "lab" / "state.json"
+            original = root / "lab" / "original-state.json"
+            os.rename(str(state_path), str(original))
+            replacement = LabState.initial("lab", "other", "f" * 32, ())
+            state_path.write_bytes(canonical_json_bytes(replacement.to_dict()))
+            state_path.chmod(0o600)
+            with self.assertRaisesRegex(
+                InvariantRefusalError, "state file identity changed while locked"
+            ):
+                locked.transition(StatePhase.NEW, StatePhase.CREATE_PENDING)
+            observed = strict_json_loads(state_path.read_bytes())
+            self.assertEqual(observed["provider_id"], "other")
+            self.assertEqual(observed["phase"], StatePhase.NEW.value)
+
+    def test_initial_state_publication_rejects_swapped_temporary_inode(self):
+        from tools.unified_ext_lab import state as state_module
+
+        root = self.base / "create-temp-swap"
+        store = LabStateStore(root)
+        real_rename_noreplace = state_module._rename_noreplace_at
+        swapped = {"value": False}
+        displaced = root / "lab" / "owned-temp-displaced"
+
+        def swap_before_rename(
+            source_directory, source, destination_directory, destination
+        ):
+            if (
+                destination == state_module.STATE_FILE_NAME
+                and str(source).startswith(".state.json.")
+                and not swapped["value"]
+            ):
+                swapped["value"] = True
+                source_path = root / "lab" / str(source)
+                os.rename(str(source_path), str(displaced))
+                source_path.write_bytes(b"same-user replacement")
+                source_path.chmod(0o600)
+            return real_rename_noreplace(
+                source_directory,
+                source,
+                destination_directory,
+                destination,
+            )
+
+        with store.locked("lab") as locked:
+            with mock.patch.object(
+                state_module,
+                "_rename_noreplace_at",
+                side_effect=swap_before_rename,
+            ):
+                with self.assertRaisesRegex(
+                    InvariantRefusalError, "state file identity changed"
+                ):
+                    locked.create_initial("provider", TOKEN, ())
+
+        self.assertTrue(swapped["value"])
+        generated = [
+            item
+            for item in (root / "lab").iterdir()
+            if item.name.startswith(".state.json.") and item.name.endswith(".tmp")
+        ]
+        self.assertEqual(generated, [])
+        self.assertTrue(displaced.exists())
+        final = root / "lab" / state_module.STATE_FILE_NAME
+        self.assertTrue(final.exists())
+        self.assertEqual(final.read_bytes(), b"same-user replacement")
+        self.assertNotEqual(
+            (final.stat().st_dev, final.stat().st_ino),
+            (displaced.stat().st_dev, displaced.stat().st_ino),
+        )
+
+    def test_directory_fsync_rejects_fifo_swap_without_opening_it(self):
+        from tools.unified_ext_lab import state as state_module
+
+        directory = self.base / "fsync-directory"
+        directory.mkdir(mode=0o700)
+        displaced = self.base / "fsync-directory-displaced"
+        real_lstat = Path.lstat
+        swapped = {"value": False}
+
+        def swap_after_lstat(path):
+            observed = real_lstat(path)
+            if path == directory and not swapped["value"]:
+                swapped["value"] = True
+                os.rename(str(directory), str(displaced))
+                os.mkfifo(str(directory), 0o600)
+            return observed
+
+        with mock.patch.object(Path, "lstat", swap_after_lstat):
+            with self.assertRaisesRegex(
+                InvariantRefusalError, "durability check"
+            ):
+                state_module._fsync_directory(directory)
+        self.assertTrue(swapped["value"])
+
+    def test_state_reader_rejects_same_length_restored_mtime_mutation(self):
+        from tools.unified_ext_lab import state as state_module
+
+        root = self.base / "state-ctime"
+        store = LabStateStore(root)
+        with store.locked("lab") as locked:
+            locked.create_initial("provider", TOKEN, ())
+        state_path = root / "lab" / state_module.STATE_FILE_NAME
+        original_payload = state_path.read_bytes()
+        replacement = LabState.initial("lab", "provides", TOKEN, ())
+        replacement_payload = canonical_json_bytes(replacement.to_dict())
+        self.assertEqual(len(replacement_payload), len(original_payload))
+        before = state_path.stat()
+        real_open = state_module.os.open
+        mutated = {"value": False}
+
+        def mutate_before_open(name, flags, *args, **kwargs):
+            if (
+                name == state_module.STATE_FILE_NAME
+                and flags & os.O_RDONLY == os.O_RDONLY
+                and not mutated["value"]
+            ):
+                mutated["value"] = True
+                state_path.write_bytes(replacement_payload)
+                os.utime(
+                    str(state_path),
+                    ns=(before.st_atime_ns, before.st_mtime_ns),
+                )
+                self.assertEqual(state_path.stat().st_size, before.st_size)
+                self.assertEqual(
+                    state_path.stat().st_mtime_ns, before.st_mtime_ns
+                )
+                self.assertNotEqual(
+                    state_path.stat().st_ctime_ns, before.st_ctime_ns
+                )
+            return real_open(name, flags, *args, **kwargs)
+
+        with store.locked("lab") as locked:
+            with mock.patch.object(
+                state_module.os, "open", side_effect=mutate_before_open
+            ):
+                with self.assertRaisesRegex(
+                    InvariantRefusalError, "identity changed"
+                ):
+                    locked.load()
+        self.assertTrue(mutated["value"])
+        state_path.write_bytes(original_payload)
+        state_path.chmod(0o600)
+        with store.locked("lab") as locked:
+            self.assertEqual(locked.load().provider_id, "provider")
+
+    def test_state_reader_fifo_replacement_fails_and_releases_locks(self):
+        from tools.unified_ext_lab import state as state_module
+
+        root = self.base / "state-fifo"
+        store = LabStateStore(root)
+        with store.locked("lab") as locked:
+            locked.create_initial("provider", TOKEN, ())
+        state_path = root / "lab" / state_module.STATE_FILE_NAME
+        displaced = state_path.with_name("displaced-state.json")
+        real_open = state_module.os.open
+        replaced = {"value": False}
+
+        def replace_with_fifo(name, flags, *args, **kwargs):
+            if name == state_module.STATE_FILE_NAME and not replaced["value"]:
+                replaced["value"] = True
+                os.rename(str(state_path), str(displaced))
+                os.mkfifo(str(state_path), 0o600)
+            return real_open(name, flags, *args, **kwargs)
+
+        with store.locked("lab") as locked:
+            with mock.patch.object(
+                state_module.os, "open", side_effect=replace_with_fifo
+            ):
+                with self.assertRaises(InvariantRefusalError):
+                    locked.load()
+        self.assertTrue(replaced["value"])
+        state_path.unlink()
+        os.rename(str(displaced), str(state_path))
+        with store.locked("lab") as locked:
+            self.assertEqual(locked.load().phase, StatePhase.NEW)
+
+    def test_lock_reader_rejects_same_inode_ctime_mutation(self):
+        from tools.unified_ext_lab import state as state_module
+
+        root = self.base / "lock-ctime"
+        store = LabStateStore(root)
+        with store.locked("lab"):
+            pass
+        lock_path = root / "lab" / state_module.LOCK_FILE_NAME
+        before = lock_path.stat()
+        real_stat_lock = state_module._stat_private_lock_file
+        mutated = {"value": False}
+
+        def mutate_after_stat(
+            directory_descriptor,
+            name=state_module.LOCK_FILE_NAME,
+            field="state lock",
+        ):
+            observed = real_stat_lock(directory_descriptor, name, field)
+            if name == state_module.LOCK_FILE_NAME and not mutated["value"]:
+                mutated["value"] = True
+                os.chmod(str(lock_path), 0o644)
+                os.chmod(str(lock_path), 0o600)
+                self.assertEqual(lock_path.stat().st_ino, before.st_ino)
+                self.assertNotEqual(
+                    lock_path.stat().st_ctime_ns, before.st_ctime_ns
+                )
+            return observed
+
+        with mock.patch.object(
+            state_module,
+            "_stat_private_lock_file",
+            side_effect=mutate_after_stat,
+        ):
+            with self.assertRaisesRegex(
+                InvariantRefusalError, "changed during acquisition"
+            ):
+                with store.locked("lab"):
+                    pass
+        self.assertTrue(mutated["value"])
+        with store.locked("lab"):
+            pass
+
+    def test_atomic_update_never_overwrites_replacement_injected_at_rename(self):
+        from tools.unified_ext_lab import state as state_module
+
+        root = self.base / "rename-cas"
+        store = LabStateStore(root)
+        replacement = LabState.initial("lab", "other", "e" * 32, ())
+        injected = {"value": False}
+        real_rename = state_module.os.rename
+        real_rename_noreplace = state_module._rename_noreplace_at
+
+        with store.locked("lab") as locked:
+            locked.create_initial("provider", TOKEN, ())
+
+            def inject_before_backup(
+                source_directory,
+                source,
+                destination_directory,
+                destination,
+            ):
+                if (
+                    source == state_module.STATE_FILE_NAME
+                    and destination == state_module.STATE_REPLACE_BACKUP_NAME
+                    and not injected["value"]
+                ):
+                    injected["value"] = True
+                    state_path = root / "lab" / "state.json"
+                    real_rename(str(state_path), str(state_path.with_name("displaced.json")))
+                    state_path.write_bytes(canonical_json_bytes(replacement.to_dict()))
+                    state_path.chmod(0o600)
+                return real_rename_noreplace(
+                    source_directory,
+                    source,
+                    destination_directory,
+                    destination,
+                )
+
+            with mock.patch.object(
+                state_module,
+                "_rename_noreplace_at",
+                side_effect=inject_before_backup,
+            ):
+                with self.assertRaises(InvariantRefusalError):
+                    locked.transition(StatePhase.NEW, StatePhase.CREATE_PENDING)
+
+        observed = strict_json_loads((root / "lab" / "state.json").read_bytes())
+        self.assertTrue(injected["value"])
+        self.assertEqual(observed["provider_id"], "other")
+        self.assertEqual(observed["phase"], StatePhase.NEW.value)
+
+    def test_transaction_intent_is_no_overwrite_and_race_detected(self):
+        from tools.unified_ext_lab import state as state_module
+
+        reserved_root = self.base / "intent-no-overwrite"
+        reserved_store = LabStateStore(reserved_root)
+        with reserved_store.locked("lab") as locked:
+            locked.create_initial("provider", TOKEN, ())
+            intent_path = (
+                reserved_root
+                / "lab"
+                / state_module.STATE_REPLACE_INTENT_NAME
+            )
+            reserved = b"reserved transaction evidence\n"
+            intent_path.write_bytes(reserved)
+            intent_path.chmod(0o600)
+            with self.assertRaisesRegex(
+                InvariantRefusalError, "requires recovery"
+            ):
+                locked.transition(StatePhase.NEW, StatePhase.CREATE_PENDING)
+            self.assertEqual(intent_path.read_bytes(), reserved)
+
+        raced_root = self.base / "intent-race"
+        raced_store = LabStateStore(raced_root)
+        real_rename_noreplace = state_module._rename_noreplace_at
+        mutated = {"value": False}
+        with raced_store.locked("lab") as locked:
+            locked.create_initial("provider", TOKEN, ())
+            intent_path = (
+                raced_root / "lab" / state_module.STATE_REPLACE_INTENT_NAME
+            )
+
+            def mutate_intent_then_rename(
+                source_directory,
+                source,
+                destination_directory,
+                destination,
+            ):
+                if (
+                    source == state_module.STATE_FILE_NAME
+                    and destination == state_module.STATE_REPLACE_BACKUP_NAME
+                    and not mutated["value"]
+                ):
+                    mutated["value"] = True
+                    before = intent_path.stat()
+                    payload = bytearray(intent_path.read_bytes())
+                    marker = b'"predecessor_payload_sha256":"'
+                    index = payload.index(marker) + len(marker)
+                    payload[index] = ord("f") if payload[index] != ord("f") else ord("e")
+                    intent_path.write_bytes(bytes(payload))
+                    os.utime(
+                        str(intent_path),
+                        ns=(before.st_atime_ns, before.st_mtime_ns),
+                    )
+                    self.assertEqual(intent_path.stat().st_size, before.st_size)
+                    self.assertEqual(
+                        intent_path.stat().st_mtime_ns, before.st_mtime_ns
+                    )
+                    self.assertNotEqual(
+                        intent_path.stat().st_ctime_ns, before.st_ctime_ns
+                    )
+                return real_rename_noreplace(
+                    source_directory,
+                    source,
+                    destination_directory,
+                    destination,
+                )
+
+            with mock.patch.object(
+                state_module,
+                "_rename_noreplace_at",
+                side_effect=mutate_intent_then_rename,
+            ):
+                with self.assertRaisesRegex(
+                    InvariantRefusalError, "intent changed"
+                ):
+                    locked.transition(
+                        StatePhase.NEW, StatePhase.CREATE_PENDING
+                    )
+        self.assertTrue(mutated["value"])
+        self.assertTrue(intent_path.exists())
+        self.assertTrue(
+            (
+                raced_root
+                / "lab"
+                / state_module.STATE_REPLACE_BACKUP_NAME
+            ).exists()
+        )
+
+    def test_interrupted_no_replace_transaction_restores_or_finishes(self):
+        from tools.unified_ext_lab import state as state_module
+
+        for point in (
+            "after_intent",
+            "after_backup",
+            "after_publish",
+            "during_backup_cleanup",
+            "after_backup_cleanup",
+            "during_intent_cleanup",
+        ):
+            with self.subTest(point=point):
+                root = self.base / ("transaction-" + point)
+                store = LabStateStore(root)
+                real_rename_noreplace = state_module._rename_noreplace_at
+                real_remove = state_module._remove_exact_private_file_at
+                real_unlink = state_module.os.unlink
+                with store.locked("lab") as locked:
+                    initial = locked.create_initial("provider", TOKEN, ())
+
+                    def crash_at_rename(
+                        source_directory,
+                        source,
+                        destination_directory,
+                        destination,
+                    ):
+                        moving_backup = (
+                            source == state_module.STATE_FILE_NAME
+                            and destination
+                            == state_module.STATE_REPLACE_BACKUP_NAME
+                        )
+                        publishing = (
+                            source.startswith(".state.json.")
+                            and source.endswith(".tmp")
+                            and destination == state_module.STATE_FILE_NAME
+                        )
+                        if point == "after_intent" and moving_backup:
+                            raise RuntimeError("injected crash after intent")
+                        result = real_rename_noreplace(
+                            source_directory,
+                            source,
+                            destination_directory,
+                            destination,
+                        )
+                        if point == "after_backup" and moving_backup:
+                            raise RuntimeError("injected crash after backup")
+                        if point == "after_publish" and publishing:
+                            raise RuntimeError("injected crash after publish")
+                        return result
+
+                    def crash_after_remove(
+                        directory_descriptor,
+                        name,
+                        expected_identity,
+                        expected_payload,
+                        field,
+                    ):
+                        result = real_remove(
+                            directory_descriptor,
+                            name,
+                            expected_identity,
+                            expected_payload,
+                            field,
+                        )
+                        if (
+                            point == "after_backup_cleanup"
+                            and name == state_module.STATE_REPLACE_BACKUP_NAME
+                        ):
+                            raise RuntimeError(
+                                "injected crash after backup cleanup"
+                            )
+                        return result
+
+                    def crash_during_unlink(path, *args, **kwargs):
+                        if (
+                            point == "during_backup_cleanup"
+                            and path
+                            == state_module.STATE_REPLACE_BACKUP_REMOVING_NAME
+                        ) or (
+                            point == "during_intent_cleanup"
+                            and path
+                            == state_module.STATE_REPLACE_INTENT_REMOVING_NAME
+                        ):
+                            raise RuntimeError(
+                                "injected crash during transaction cleanup"
+                            )
+                        return real_unlink(path, *args, **kwargs)
+
+                    with mock.patch.object(
+                        state_module,
+                        "_rename_noreplace_at",
+                        side_effect=crash_at_rename,
+                    ), mock.patch.object(
+                        state_module,
+                        "_remove_exact_private_file_at",
+                        side_effect=crash_after_remove,
+                    ), mock.patch.object(
+                        state_module.os,
+                        "unlink",
+                        side_effect=crash_during_unlink,
+                    ):
+                        with self.assertRaisesRegex(RuntimeError, "injected crash"):
+                            locked.transition(
+                                StatePhase.NEW, StatePhase.CREATE_PENDING
+                            )
+
+                state_path = root / "lab" / state_module.STATE_FILE_NAME
+                backup_path = (
+                    root / "lab" / state_module.STATE_REPLACE_BACKUP_NAME
+                )
+                intent_path = (
+                    root / "lab" / state_module.STATE_REPLACE_INTENT_NAME
+                )
+                intent_removing_path = (
+                    root
+                    / "lab"
+                    / state_module.STATE_REPLACE_INTENT_REMOVING_NAME
+                )
+                backup_removing_path = (
+                    root
+                    / "lab"
+                    / state_module.STATE_REPLACE_BACKUP_REMOVING_NAME
+                )
+                self.assertTrue(
+                    intent_path.exists() or intent_removing_path.exists()
+                )
+
+                with store.locked("lab") as locked:
+                    recovered = locked.load()
+
+                self.assertFalse(backup_path.exists())
+                self.assertFalse(intent_path.exists())
+                self.assertFalse(backup_removing_path.exists())
+                self.assertFalse(intent_removing_path.exists())
+                self.assertTrue(state_path.exists())
+                if point in ("after_intent", "after_backup"):
+                    self.assertEqual(recovered.phase, StatePhase.NEW)
+                    self.assertEqual(recovered.revision, initial.revision)
+                else:
+                    self.assertEqual(
+                        recovered.phase, StatePhase.RECOVERY_REQUIRED
+                    )
+                    self.assertEqual(recovered.pending_step, "create")
+
+    def test_ambiguous_interrupted_transaction_is_preserved_and_refused(self):
+        from tools.unified_ext_lab import state as state_module
+
+        root = self.base / "transaction-ambiguous"
+        store = LabStateStore(root)
+        real_rename_noreplace = state_module._rename_noreplace_at
+        with store.locked("lab") as locked:
+            initial = locked.create_initial("provider", TOKEN, ())
+
+            def crash_after_backup(
+                source_directory,
+                source,
+                destination_directory,
+                destination,
+            ):
+                result = real_rename_noreplace(
+                    source_directory,
+                    source,
+                    destination_directory,
+                    destination,
+                )
+                if (
+                    source == state_module.STATE_FILE_NAME
+                    and destination == state_module.STATE_REPLACE_BACKUP_NAME
+                ):
+                    raise RuntimeError("injected crash after backup")
+                return result
+
+            with mock.patch.object(
+                state_module,
+                "_rename_noreplace_at",
+                side_effect=crash_after_backup,
+            ):
+                with self.assertRaises(RuntimeError):
+                    locked.transition(
+                        StatePhase.NEW, StatePhase.CREATE_PENDING
+                    )
+        state_path = root / "lab" / state_module.STATE_FILE_NAME
+        backup_path = root / "lab" / state_module.STATE_REPLACE_BACKUP_NAME
+        intent_path = root / "lab" / state_module.STATE_REPLACE_INTENT_NAME
+        # This is an individually valid same-lineage revision+1 state, but it
+        # is not the exact CREATE_PENDING successor authorized by the intent.
+        replacement = initial.mark_tainted()
+        state_path.write_bytes(canonical_json_bytes(replacement.to_dict()))
+        state_path.chmod(0o600)
+
+        with store.locked("lab") as locked:
+            with self.assertRaisesRegex(
+                InvariantRefusalError, "transaction intent"
+            ):
+                locked.load()
+
+        self.assertTrue(state_path.exists())
+        self.assertTrue(backup_path.exists())
+        self.assertTrue(intent_path.exists())
+        self.assertEqual(
+            strict_json_loads(state_path.read_bytes())["phase"],
+            StatePhase.NEW.value,
+        )
+        self.assertTrue(strict_json_loads(state_path.read_bytes())["tainted"])
+
+    def test_state_file_symlink_hardlink_mode_and_owner_are_refused(self):
+        from tools.unified_ext_lab import state as state_module
+
+        for variant in ("symlink", "hardlink", "mode", "owner"):
+            with self.subTest(variant=variant):
+                root = self.base / ("state-file-" + variant)
+                store = LabStateStore(root)
+                with store.locked("lab") as locked:
+                    locked.create_initial("provider", TOKEN, ())
+                state_path = root / "lab" / "state.json"
+                context = contextlib.nullcontext()
+                if variant == "symlink":
+                    original = state_path.with_name("original.json")
+                    os.rename(str(state_path), str(original))
+                    state_path.symlink_to(original.name)
+                elif variant == "hardlink":
+                    os.link(str(state_path), str(state_path.with_name("extra.json")))
+                elif variant == "mode":
+                    state_path.chmod(0o644)
+                else:
+                    context = mock.patch.object(
+                        state_module.os,
+                        "geteuid",
+                        return_value=os.geteuid() + 1,
+                    )
+                with context:
+                    with self.assertRaises(InvariantRefusalError):
+                        with store.locked("lab") as locked:
+                            locked.load()
+
+    def test_store_durably_rewrites_valid_schema_two_as_fixture_profile(self):
+        root = self.base / "legacy-migration"
+        store = LabStateStore(root)
+        with store.locked("lab") as locked:
+            state = locked.create_initial("provider", TOKEN, ())
+        legacy = state.to_dict()
+        legacy["schema"] = 2
+        legacy.pop("execution_profile")
+        legacy.pop("resource_ids")
+        legacy.pop("artifact_evidence")
+        path = root / "lab" / "state.json"
+        path.write_bytes(canonical_json_bytes(legacy))
+        path.chmod(0o600)
+
+        with store.locked("lab") as locked:
+            migrated = locked.load()
+        persisted = strict_json_loads(path.read_bytes())
+        self.assertEqual(migrated.execution_profile, FIXTURE_EXECUTION_PROFILE)
+        self.assertEqual(persisted["schema"], STATE_SCHEMA)
+        self.assertEqual(
+            persisted["execution_profile"], FIXTURE_EXECUTION_PROFILE
+        )
 
     def test_private_modes_atomic_transition_and_pending_restart_recovery(self):
         root = self.base / "state"
@@ -283,7 +1150,7 @@ class StoreTests(unittest.TestCase):
             with self.assertRaises(UsageStateError):
                 locked.transition(StatePhase.CREATED, StatePhase.INSTALL_PENDING)
 
-    def test_locked_mark_tainted_is_durable_before_shell(self):
+    def test_locked_verification_promotion_hold_is_durable_and_irreversible(self):
         store = LabStateStore(self.base / "state")
         with store.locked("lab") as locked:
             initial = locked.create_initial("provider", TOKEN, ())
@@ -413,6 +1280,7 @@ class StoreTests(unittest.TestCase):
             if (
                 operation == state_module._fcntl.LOCK_EX
                 and stat.S_ISREG(os.fstat(descriptor).st_mode)
+                and os.fstat(descriptor).st_ino == lock_path.stat().st_ino
                 and not replaced["value"]
             ):
                 replaced["value"] = True
@@ -460,11 +1328,8 @@ class StoreTests(unittest.TestCase):
             finally:
                 os.close(replacement)
 
-            def nonblocking_directory_flock(descriptor, operation):
-                if (
-                    operation == state_module._fcntl.LOCK_EX
-                    and stat.S_ISDIR(os.fstat(descriptor).st_mode)
-                ):
+            def nonblocking_flock(descriptor, operation):
+                if operation == state_module._fcntl.LOCK_EX:
                     operation |= state_module._fcntl.LOCK_NB
                 return real_flock(descriptor, operation)
 
@@ -472,7 +1337,7 @@ class StoreTests(unittest.TestCase):
             with mock.patch.object(
                 state_module._fcntl,
                 "flock",
-                nonblocking_directory_flock,
+                nonblocking_flock,
             ):
                 with self.assertRaises(BlockingIOError):
                     with store.locked("lab"):
@@ -486,6 +1351,14 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(UsageStateError):
             LabStateStore(str(self.base / "child" / ".." / "state"))
         with mock.patch("tools.unified_ext_lab.state._fcntl", None):
+            from tools.unified_ext_lab.errors import UnsupportedError
+
+            with self.assertRaises(UnsupportedError):
+                ensure_process_lock_supported()
+        with mock.patch(
+            "tools.unified_ext_lab.state._rename_noreplace_primitive",
+            return_value=None,
+        ):
             from tools.unified_ext_lab.errors import UnsupportedError
 
             with self.assertRaises(UnsupportedError):
@@ -515,13 +1388,7 @@ class StoreTests(unittest.TestCase):
         state = state.transition(StatePhase.EVIDENCE_PENDING)
         states[state.phase] = state
         draft = {
-            "artifact": {
-                "package": "pkg",
-                "version": "1",
-                "source_kind": "fixture",
-                "source_locator": "pkg-1.tgz",
-                "sha256": "a" * 64,
-            },
+            "artifact": dict(state.artifact_evidence),
             "captured_at_ns": 1,
             "evidence_kind": "harness_fixture",
             "executor_kind": "fake_docker",
@@ -548,7 +1415,7 @@ class StoreTests(unittest.TestCase):
                 root = self.base / ("restart-" + phase.value.lower())
                 store = LabStateStore(root)
                 with store.locked("lab") as locked:
-                    locked._write(pending_state)
+                    locked._create(pending_state)
                 with store.locked("lab") as locked:
                     first = locked.load()
                 with store.locked("lab") as locked:
@@ -578,17 +1445,39 @@ class StoreTests(unittest.TestCase):
 
     def test_new_directory_fsyncs_child_then_parent_and_propagates_failure(self):
         calls = []
+        descriptor_calls = []
         real_fsync = __import__("tools.unified_ext_lab.state", fromlist=["_fsync_directory"])._fsync_directory
+        real_descriptor_fsync = __import__(
+            "tools.unified_ext_lab.state",
+            fromlist=["_fsync_directory_descriptor"],
+        )._fsync_directory_descriptor
 
         def record(path):
             calls.append(Path(path))
             real_fsync(path)
 
+        def record_descriptor(descriptor):
+            info = os.fstat(descriptor)
+            descriptor_calls.append((info.st_dev, info.st_ino))
+            real_descriptor_fsync(descriptor)
+
         root = self.base / "ordered"
-        with mock.patch("tools.unified_ext_lab.state._fsync_directory", side_effect=record):
+        with mock.patch(
+            "tools.unified_ext_lab.state._fsync_directory", side_effect=record
+        ), mock.patch(
+            "tools.unified_ext_lab.state._fsync_directory_descriptor",
+            side_effect=record_descriptor,
+        ):
             with LabStateStore(root).locked("lab"):
                 pass
-        self.assertEqual(calls[:4], [root, root.parent, root / "lab", root])
+        self.assertEqual(calls, [root, root.parent])
+        self.assertEqual(
+            descriptor_calls[:2],
+            [
+                ((root / "lab").stat().st_dev, (root / "lab").stat().st_ino),
+                (root.stat().st_dev, root.stat().st_ino),
+            ],
+        )
 
         failed = self.base / "failed-fsync"
         count = {"value": 0}

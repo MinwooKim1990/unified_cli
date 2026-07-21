@@ -17,6 +17,7 @@ from tools.unified_ext_lab.docker import DockerOperation, classify_docker_argv
 from tools.unified_ext_lab.errors import UsageStateError
 from tools.unified_ext_lab.fake_docker import FakeRunner
 from tools.unified_ext_lab.lifecycle import FixtureLifecycle
+from tools.unified_ext_lab.state import LabStateStore, StatePhase
 
 
 class _RaiseOnceRunner(FakeRunner):
@@ -46,6 +47,32 @@ class _RaiseOnceOnOperationRunner(FakeRunner):
         ):
             self.raised = True
             raise self.error
+        return super().run(argv, timeout=timeout)
+
+
+class _LogoutFailureRunner(FakeRunner):
+    def __init__(self, *, fail_remove: bool) -> None:
+        super().__init__()
+        self.fail_remove = fail_remove
+        self.logout_failed = False
+        self.remove_failed = False
+
+    def run(self, argv, *, timeout):
+        operation = classify_docker_argv(argv, self._operations)
+        if (
+            operation is DockerOperation.EXEC_GUEST
+            and argv[-1] == "logout"
+            and not self.logout_failed
+        ):
+            self.logout_failed = True
+            self.inject_failure(DockerOperation.EXEC_GUEST)
+        elif (
+            operation is DockerOperation.REMOVE_CONTAINER
+            and self.fail_remove
+            and not self.remove_failed
+        ):
+            self.remove_failed = True
+            self.inject_failure(DockerOperation.REMOVE_CONTAINER)
         return super().run(argv, timeout=timeout)
 
 
@@ -237,6 +264,77 @@ class FixtureCliTests(unittest.TestCase):
         self.assertTrue(runner.containers)
         self.assertFalse(self.output.exists())
 
+    def test_logout_error_cannot_mask_removal_residue(self) -> None:
+        runner = _LogoutFailureRunner(fail_remove=True)
+        code, _stdout, stderr = self.run_main(
+            *self.fixture_arguments(), runner_factory=_bound_factory(runner)
+        )
+
+        self.assertEqual(code, 7)
+        self.assertEqual(stderr, "error: cleanup incomplete\n")
+        self.assertTrue(runner.logout_failed)
+        self.assertTrue(runner.remove_failed)
+        self.assertTrue(runner.containers)
+        self.assertFalse(self.output.exists())
+        with LabStateStore(self.state_root).locked("fixture-lab") as locked:
+            state = locked.load()
+        self.assertEqual(state.phase, StatePhase.DIRTY)
+        self.assertEqual(
+            [(item.step, item.outcome) for item in state.operations[:4]],
+            [
+                ("create", "succeeded"),
+                ("install", "succeeded"),
+                ("test", "succeeded"),
+                ("evidence", "succeeded"),
+            ],
+        )
+
+    def test_verified_clean_seal_preserves_logout_error(self) -> None:
+        runner = _LogoutFailureRunner(fail_remove=False)
+        code, _stdout, stderr = self.run_main(
+            *self.fixture_arguments(), runner_factory=_bound_factory(runner)
+        )
+
+        self.assertEqual(code, 5)
+        self.assertEqual(stderr, "error: fixture runner failure\n")
+        self.assertTrue(runner.logout_failed)
+        self.assertFalse(runner.images)
+        self.assertFalse(runner.containers)
+        self.assertFalse(runner.volumes)
+        self.assertEqual(
+            json.loads(self.output.read_text(encoding="utf-8"))["result"],
+            "failed_clean",
+        )
+        with LabStateStore(self.state_root).locked("fixture-lab") as locked:
+            self.assertEqual(locked.load().phase, StatePhase.FAILED_CLEAN)
+
+    def test_logout_error_cannot_mask_permanent_taint_hold(self) -> None:
+        runner = _LogoutFailureRunner(fail_remove=False)
+        original_logout = FixtureLifecycle.logout
+
+        def taint_then_logout(lifecycle):
+            lifecycle.mark_shell_tainted()
+            return original_logout(lifecycle)
+
+        with mock.patch.object(
+            FixtureLifecycle, "logout", taint_then_logout
+        ):
+            code, _stdout, stderr = self.run_main(
+                *self.fixture_arguments(), runner_factory=_bound_factory(runner)
+            )
+
+        self.assertEqual(code, 7)
+        self.assertEqual(stderr, "error: cleanup incomplete\n")
+        self.assertTrue(runner.logout_failed)
+        self.assertFalse(runner.images)
+        self.assertFalse(runner.containers)
+        self.assertFalse(runner.volumes)
+        self.assertFalse(self.output.exists())
+        with LabStateStore(self.state_root).locked("fixture-lab") as locked:
+            state = locked.load()
+        self.assertEqual(state.phase, StatePhase.CLEAN_VERIFIED)
+        self.assertTrue(state.tainted)
+
     def test_keyboard_interrupt_is_durable_cleaned_and_returns_130(self) -> None:
         runner = _RaiseOnceRunner(KeyboardInterrupt())
         code, _stdout, stderr = self.run_main(
@@ -251,6 +349,30 @@ class FixtureCliTests(unittest.TestCase):
             if item["error_code"] == "interrupted"
         ]
         self.assertEqual(len(interrupted), 1)
+
+    def test_keyboard_interrupt_before_install_pending_is_durable_cleanup_only(self) -> None:
+        runner = FakeRunner()
+        with mock.patch.object(
+            FixtureLifecycle, "install", side_effect=KeyboardInterrupt()
+        ):
+            code, _stdout, stderr = self.run_main(
+                *self.fixture_arguments(), runner_factory=_bound_factory(runner)
+            )
+        self.assertEqual(code, 130)
+        self.assertIn("interrupted", stderr)
+        manifest = json.loads(self.output.read_text(encoding="utf-8"))
+        self.assertEqual(manifest["result"], "failed_clean")
+        interrupted = [
+            item
+            for item in manifest["operations"]
+            if item["error_code"] == "interrupted"
+        ]
+        self.assertEqual(
+            [(item["step"], item["outcome"]) for item in interrupted],
+            [("install", "failed")],
+        )
+        with LabStateStore(self.state_root).locked("fixture-lab") as locked:
+            self.assertEqual(locked.load().phase, StatePhase.FAILED_CLEAN)
 
     def test_unexpected_runner_exception_is_cleaned_and_returns_stable_one(self) -> None:
         runner = _RaiseOnceRunner(RuntimeError("unexpected"))
@@ -601,6 +723,44 @@ class FixtureCliTests(unittest.TestCase):
         self.assertNotIn("\0create\0", flattened)
         self.assertNotIn("\0start\0", flattened)
         self.assertNotIn(str(self.base), stdout)
+
+    def test_fixture_recover_converts_stable_created_interruption_to_cleanup_only(self) -> None:
+        runner = FakeRunner()
+        with mock.patch.object(
+            FixtureLifecycle, "install", side_effect=SystemExit(99)
+        ):
+            code, _stdout, _stderr = self.run_main(
+                *self.fixture_arguments(), runner_factory=_bound_factory(runner)
+            )
+        self.assertEqual(code, 99)
+        self.assertFalse(self.output.exists())
+        with LabStateStore(self.state_root).locked("fixture-lab") as locked:
+            interrupted = locked.load()
+        self.assertEqual(interrupted.phase, StatePhase.CREATED)
+
+        code, stdout, stderr = self.run_main(
+            *self.recovery_arguments_for(self.state_root, self.output),
+            "--json",
+            runner_factory=_bound_factory(runner),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertEqual(json.loads(stdout)["phase"], "FAILED_CLEAN")
+        manifest = json.loads(self.output.read_text(encoding="utf-8"))
+        interrupted_operations = [
+            item
+            for item in manifest["operations"]
+            if item["error_code"] == "interrupted"
+        ]
+        self.assertEqual(
+            [(item["step"], item["outcome"]) for item in interrupted_operations],
+            [("install", "failed")],
+        )
+        flattened = "\n".join(
+            "\0".join(command) for command in runner.commands
+        )
+        self.assertNotIn("\0install", flattened)
+        self.assertNotIn("\0test", flattened)
 
     def test_fixture_recover_exposes_no_provider_executable_url_account_or_shell(self) -> None:
         for forbidden in (
