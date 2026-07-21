@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 import time
 import traceback
@@ -120,8 +121,13 @@ def test_public_builtins_and_backwards_imports_remain_exact(monkeypatch):
     assert set(PROVIDERS) == {"claude", "codex", "gemini"}
     assert unified_cli.ProviderName is not None
     assert unified_cli.ProviderId is str
+    assert unified_cli.ProviderSupportStatusV1 is not None
     assert unified_cli.ClaudeProvider is PROVIDERS["claude"]
-    assert [item.id for item in list_providers()] == ["claude", "codex", "gemini"]
+    descriptors = list_providers()
+    assert [item.id for item in descriptors] == ["claude", "codex", "gemini"]
+    assert all(item.status == "builtin" for item in descriptors)
+    assert all(item.lifecycle_status == "builtin" for item in descriptors)
+    assert all(item.support_status == "stable" for item in descriptors)
     assert calls["n"] == 0
 
 
@@ -154,7 +160,11 @@ def test_extension_listing_is_metadata_only_and_does_not_load_slow_plugin(monkey
 
     descriptors = list_providers(include_ext=True)
 
-    assert [(d.id, d.status) for d in descriptors][-1] == ("slow", "available")
+    assert [(d.id, d.status) for d in descriptors][-1] == (
+        "slow", "discovered",
+    )
+    assert descriptors[-1].lifecycle_status == "discovered"
+    assert descriptors[-1].support_status == "unknown"
     assert calls["n"] == 1
     assert ep.load_calls == 0
 
@@ -282,6 +292,7 @@ def test_plugin_metadata_is_immutable_and_normalized():
     )
     assert plugin.capabilities == frozenset({"chat", "stream"})
     assert plugin.route_prefixes == ("acme",)
+    assert plugin.support_status == "experimental"
     with pytest.raises(FrozenInstanceError):
         plugin.id = "changed"  # type: ignore[misc]
 
@@ -304,6 +315,42 @@ def test_plugin_metadata_is_immutable_and_normalized():
         )
     with pytest.raises(ValueError, match="invalid provider plugin id"):
         _plugin("gpt-addon")
+
+    positional = ProviderPluginV1(
+        "positional",
+        lambda **kw: DummyProvider(**kw),
+        "m",
+        lambda: [],
+        lambda: None,
+        frozenset(),
+        ("positional",),
+        ProviderServerPolicyV1(),
+        1,
+    )
+    assert positional.support_status == "experimental"
+
+
+@pytest.mark.parametrize(
+    "support_status",
+    ["Held", "unknown", "held\n", 1, None],
+)
+def test_plugin_support_status_rejects_malformed_values_locally(support_status):
+    with pytest.raises(ValueError, match="invalid provider support status"):
+        ProviderPluginV1(
+            id="bad-support",
+            factory=lambda **kw: DummyProvider(**kw),
+            default_model="m",
+            model_lister=lambda: [],
+            doctor=lambda: None,
+            support_status=support_status,  # type: ignore[arg-type]
+        )
+
+    assert create("claude", bin_path="/bin/echo").name == "claude"
+
+
+def test_held_plugin_cannot_advertise_executable_capabilities():
+    with pytest.raises(ValueError, match="cannot advertise capabilities"):
+        _plugin("held-capabilities", support_status="held")
 
 
 def test_loading_is_thread_safe_and_cached(monkeypatch):
@@ -452,6 +499,113 @@ def test_hostile_loaded_metadata_is_wrapped_without_secret_leak(monkeypatch):
     assert exc.value.kind == "config"
 
 
+def test_plugin_unified_error_from_metadata_access_is_sanitized(monkeypatch):
+    secret = "plugin-owned-unified-metadata-detail"
+
+    class UnifiedErrorMetadata:
+        @property
+        def abi_version(self):
+            raise UnifiedError(
+                kind="internal",
+                provider="external-source",
+                message=secret,
+                hint=secret,
+                cause=secret,
+            )
+
+    ep = FakeEntryPoint("unified-metadata", UnifiedErrorMetadata())
+    _set_entry_points(monkeypatch, [ep])
+
+    with pytest.raises(UnifiedError) as exc:
+        load_provider_plugin("unified-metadata")
+
+    formatted = "".join(traceback.format_exception(
+        type(exc.value), exc.value, exc.value.__traceback__,
+    ))
+    assert exc.value.kind == "config"
+    assert exc.value.message == (
+        "Provider extension 'unified-metadata' has invalid metadata."
+    )
+    assert exc.value.cause == "provider plugin metadata rejected"
+    assert secret not in str(exc.value)
+    assert secret not in formatted
+    assert exc.value.__cause__ is None
+    assert exc.value.__context__ is None
+    descriptor = next(
+        item for item in list_providers(include_ext=True)
+        if item.id == "unified-metadata"
+    )
+    assert descriptor.lifecycle_status == "broken"
+    assert create("codex", bin_path="/bin/echo").name == "codex"
+
+
+def test_metadata_value_evaluation_failures_are_sanitized(monkeypatch):
+    class MetadataAbort(BaseException):
+        pass
+
+    def external_unified_error(secret):
+        return UnifiedError(
+            kind="internal",
+            provider="external-source",
+            message=secret,
+            hint=secret,
+            cause=secret,
+        )
+
+    class EqualityBomb:
+        def __ne__(self, other):
+            del other
+            raise external_unified_error("plugin-owned-equality-detail")
+
+    class IterationBomb:
+        def __iter__(self):
+            raise MetadataAbort("plugin-owned-iteration-detail")
+
+    class CoercionBomb:
+        def __iter__(self):
+            return iter(())
+
+        def __bool__(self):
+            raise MetadataAbort("plugin-owned-coercion-detail")
+
+    equality_plugin = _plugin("metadata-equality")
+    object.__setattr__(equality_plugin, "abi_version", EqualityBomb())
+    iteration_plugin = _plugin("metadata-iteration")
+    object.__setattr__(iteration_plugin, "capabilities", IterationBomb())
+    coercion_plugin = _plugin("metadata-coercion")
+    object.__setattr__(coercion_plugin, "route_prefixes", CoercionBomb())
+    entries = [
+        FakeEntryPoint("metadata-equality", equality_plugin),
+        FakeEntryPoint("metadata-iteration", iteration_plugin),
+        FakeEntryPoint("metadata-coercion", coercion_plugin),
+    ]
+    _set_entry_points(monkeypatch, entries)
+
+    secrets = {
+        "metadata-equality": "plugin-owned-equality-detail",
+        "metadata-iteration": "plugin-owned-iteration-detail",
+        "metadata-coercion": "plugin-owned-coercion-detail",
+    }
+    for provider_id, secret in secrets.items():
+        with pytest.raises(UnifiedError, match="invalid metadata") as exc:
+            load_provider_plugin(provider_id)
+        formatted = "".join(traceback.format_exception(
+            type(exc.value), exc.value, exc.value.__traceback__,
+        ))
+        assert exc.value.kind == "config"
+        assert secret not in str(exc.value)
+        assert secret not in formatted
+        assert exc.value.__cause__ is None
+        assert exc.value.__context__ is None
+        descriptor = next(
+            item for item in list_providers(include_ext=True)
+            if item.id == provider_id
+        )
+        assert descriptor.lifecycle_status == "broken"
+
+    assert create("claude", bin_path="/bin/echo").name == "claude"
+
+
 def test_hostile_entry_point_name_subclass_is_rejected_without_execution(monkeypatch):
     secret = "credential-from-entry-point-name"
 
@@ -516,6 +670,76 @@ def test_explicit_extension_model_lister_and_doctor_are_safe(monkeypatch):
     assert [model.id for model in list_models("inspectable")] == ["m1"]
     assert doctor_provider("inspectable") == {"status": "ok"}
     assert ep.load_calls == 1
+
+
+def test_held_support_blocks_all_plugin_callbacks(monkeypatch):
+    calls = {"factory": 0, "models": 0, "doctor": 0}
+    secret = "\x1b[31mplugin-owned-held-detail"
+
+    def forbidden(name):
+        def callback(*args, **kwargs):
+            del args, kwargs
+            calls[name] += 1
+            raise RuntimeError(secret)
+
+        return callback
+
+    plugin = ProviderPluginV1(
+        id="held-provider",
+        factory=forbidden("factory"),
+        default_model="unavailable",
+        model_lister=forbidden("models"),
+        doctor=forbidden("doctor"),
+        capabilities=frozenset(),
+        support_status="held",
+    )
+    ep = FakeEntryPoint("held-provider", plugin)
+    _set_entry_points(monkeypatch, [ep])
+
+    before = list_providers(include_ext=True)[-1]
+    assert before.lifecycle_status == "discovered"
+    assert before.support_status == "unknown"
+    assert ep.load_calls == 0
+
+    for call in (
+        lambda: create("held-provider"),
+        lambda: list_models("held-provider"),
+        lambda: doctor_provider("held-provider"),
+    ):
+        with pytest.raises(
+            UnifiedError, match="is held",
+        ) as exc:
+            call()
+        assert exc.value.kind == "config"
+        assert secret not in str(exc.value)
+
+    assert calls == {"factory": 0, "models": 0, "doctor": 0}
+    assert ep.load_calls == 1
+    after = list_providers(include_ext=True)[-1]
+    assert after.lifecycle_status == "loaded"
+    assert after.support_status == "held"
+    assert after.default_model is None
+    assert after.capabilities == frozenset()
+
+
+def test_mutated_support_metadata_is_safely_isolated(monkeypatch):
+    secret = "\x1b[31mprivate-support-metadata"
+    plugin = _plugin("mutated-support")
+    object.__setattr__(plugin, "support_status", secret)
+    _set_entry_points(
+        monkeypatch, [FakeEntryPoint("mutated-support", plugin)],
+    )
+
+    with pytest.raises(UnifiedError, match="invalid metadata") as exc:
+        load_provider_plugin("mutated-support")
+    assert secret not in str(exc.value)
+    assert secret not in "".join(traceback.format_exception(
+        type(exc.value), exc.value, exc.value.__traceback__,
+    ))
+    descriptor = list_providers(include_ext=True)[-1]
+    assert descriptor.lifecycle_status == "broken"
+    assert descriptor.support_status == "unknown"
+    assert create("codex", bin_path="/bin/echo").name == "codex"
 
 
 @pytest.mark.parametrize(
@@ -813,8 +1037,19 @@ def test_providers_cli_plain_and_json_remain_metadata_only(monkeypatch, capsys):
 
     assert main(["providers", "--include-ext", "--json"]) == 0
     output = capsys.readouterr().out
-    assert '"id": "acme"' in output
-    assert '"status": "available"' in output
+    payload = json.loads(output)
+    extension = next(item for item in payload if item["id"] == "acme")
+    assert extension["status"] == "discovered"
+    assert extension["lifecycle_status"] == "discovered"
+    assert extension["support_status"] == "unknown"
+    assert ep.load_calls == 0
+
+    assert main(["providers", "--include-ext"]) == 0
+    output = capsys.readouterr().out
+    assert "lifecycle" in output
+    assert "support" in output
+    assert "discovered" in output
+    assert "unknown" in output
     assert ep.load_calls == 0
 
 
@@ -835,6 +1070,42 @@ def test_models_cli_can_explicitly_list_one_extension(monkeypatch, capsys):
     assert '"provider": "acme"' in output
     assert '"source": "plugin"' in output
     assert ep.load_calls == 1
+
+
+def test_models_cli_rejects_held_provider_and_reports_loaded_support(
+    monkeypatch, capsys,
+):
+    calls = {"models": 0}
+
+    def forbidden_models():
+        calls["models"] += 1
+        raise AssertionError("held model callback ran")
+
+    plugin = ProviderPluginV1(
+        id="held-cli",
+        factory=lambda **kw: DummyProvider(**kw),
+        default_model="unavailable",
+        model_lister=forbidden_models,
+        doctor=lambda: None,
+        support_status="held",
+    )
+    ep = FakeEntryPoint("held-cli", plugin)
+    _set_entry_points(monkeypatch, [ep])
+    from unified_cli.cli import main
+
+    assert main(["models", "held-cli", "--json"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "is held" in captured.err
+    assert calls["models"] == 0
+    assert ep.load_calls == 1
+
+    assert main(["providers", "--include-ext", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    extension = next(item for item in payload if item["id"] == "held-cli")
+    assert extension["lifecycle_status"] == "loaded"
+    assert extension["support_status"] == "held"
+    assert extension["default_model"] is None
 
 
 def test_server_rejects_extension_prefix_with_legacy_error_before_route_or_state(

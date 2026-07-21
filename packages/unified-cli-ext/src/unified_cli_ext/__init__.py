@@ -39,6 +39,7 @@ from .normalization import (
 from .permissions import PermissionPolicy, map_permission_decision
 from .tools import McpCallableBridge, ToolCorrelator, require_mcp_sdk, validate_correlation_id
 from .transports import (
+    AcpProcessTransportV1,
     AcpSdkAdapter,
     CancellationToken,
     HttpSseClient,
@@ -57,6 +58,7 @@ __version__ = "0.1.0"
 
 __all__ = [
     "__version__",
+    "AcpProcessTransportV1",
     "AcpSdkAdapter",
     "CancellationToken",
     "ConfigurationError",

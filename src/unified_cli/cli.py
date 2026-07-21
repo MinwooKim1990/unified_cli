@@ -226,6 +226,8 @@ def _cmd_providers(args: argparse.Namespace) -> int:
                 "id": item.id,
                 "source": item.source,
                 "status": item.status,
+                "lifecycle_status": item.lifecycle_status,
+                "support_status": item.support_status,
                 "default_model": item.default_model,
                 "capabilities": sorted(item.capabilities),
                 "route_prefixes": list(item.route_prefixes),
@@ -243,10 +245,12 @@ def _cmd_providers(args: argparse.Namespace) -> int:
     tbl.add_column(t("cli.providers.col.id"), style="bold")
     tbl.add_column(t("cli.providers.col.source"))
     tbl.add_column(t("cli.providers.col.status"))
+    tbl.add_column(t("cli.providers.col.support"))
     tbl.add_column(t("cli.providers.col.default"))
     for item in descriptors:
         tbl.add_row(
-            escape(item.id), item.source, item.status,
+            escape(item.id), item.source, item.lifecycle_status,
+            item.support_status,
             escape(item.default_model or "-"),
         )
     console.print(tbl)

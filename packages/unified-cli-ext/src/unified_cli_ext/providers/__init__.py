@@ -39,6 +39,16 @@ from .contract import (
     valid_provider_id,
 )
 from .registry import ProviderAdapterRegistryV1
+from .installation import (
+    INSTALLATION_RECEIPT_ABI_V1,
+    ArtifactIdentityV1,
+    DirectoryIdentityV1,
+    DistributionTypeV1,
+    InstallationReceiptKindV1,
+    InstallationReceiptV1,
+    SymlinkIdentityV1,
+    VerifiedLaunchV1,
+)
 from .runtime import (
     AdapterInspectionV1,
     BinaryProvenance,
@@ -51,23 +61,29 @@ from .runtime import (
 
 
 __all__ = [
+    "INSTALLATION_RECEIPT_ABI_V1",
     "PROVIDER_ADAPTER_ABI_V1",
     "AdapterDescriptorV1",
     "AdapterInspectionV1",
     "AdapterServerPolicy",
     "AdapterStatus",
     "AuthSpec",
+    "ArtifactIdentityV1",
     "BinaryProvenance",
     "BinarySpec",
     "BuiltPromptInvocation",
     "DeclarativeProbeSpec",
     "DoctorProbeSpec",
     "DynamicArgument",
+    "DirectoryIdentityV1",
+    "DistributionTypeV1",
     "EnvironmentPolicy",
     "ExitStatusProbeSpec",
     "FeatureProbeSpec",
     "FixedCommandSpec",
     "InteractiveAuthSessionV1",
+    "InstallationReceiptKindV1",
+    "InstallationReceiptV1",
     "JsonProbeSpec",
     "ModelProbeSpec",
     "OperationLimits",
@@ -83,9 +99,11 @@ __all__ = [
     "ProviderAdapterSpecV1",
     "ProviderAdapterV1",
     "ProviderCapability",
+    "SymlinkIdentityV1",
     "TransportKind",
     "TransportConfig",
     "VersionProbeSpec",
+    "VerifiedLaunchV1",
     "describe_adapter",
     "drain_pending_cleanups",
     "valid_provider_id",
