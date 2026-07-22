@@ -23,10 +23,13 @@ import time
 import urllib.request
 from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, Iterable, Optional, Tuple
 
 from .core import ModelInfo, ProviderId, ProviderName
 from .errors import UnifiedError
+
+if TYPE_CHECKING:
+    from .extension_config import ExtensionLaunchOverridesV1
 
 
 DEFAULT_MODELS: dict[ProviderName, str] = {
@@ -512,15 +515,27 @@ def list_models(
     provider: Optional[ProviderId] = None,
     *,
     force_refresh: bool = False,
+    extension_launch: Optional["ExtensionLaunchOverridesV1"] = None,
 ) -> list[ModelInfo]:
     """Return available models for a provider, or all providers combined."""
+    if extension_launch is not None and (not provider or provider in _LISTERS):
+        raise UnifiedError(
+            kind="config",
+            provider=provider or "claude",
+            message=(
+                "Extension launch configuration requires one explicit "
+                "extension provider."
+            ),
+        )
     if provider:
         if provider not in _LISTERS:
             # An extension model listing is always explicit and loads exactly
             # that provider. Extension listers own any cache/refresh policy;
             # core's ``force_refresh`` flag applies only to built-ins.
             from .registry import list_extension_models
-            return list_extension_models(provider)
+            return list_extension_models(
+                provider, extension_launch=extension_launch,
+            )
         return _refresh_models(  # type: ignore[arg-type]
             provider, force_refresh=force_refresh
         )

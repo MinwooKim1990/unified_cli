@@ -13,6 +13,18 @@ import unified_cli_ext.transports.process as process_transport
 
 from unified_cli.base import BaseProvider
 from unified_cli.errors import UnifiedError
+from unified_cli.extension_config import ExtensionLaunchOverridesV1
+from unified_cli.plugin import ProviderCreateRequestV1, ProviderLaunchContextV1
+from unified_cli import registry as core_registry
+from unified_cli import settings as core_settings
+from unified_cli.factory import create as core_create
+from unified_cli.models import list_models as core_list_models
+from unified_cli.registry import (
+    _reset_provider_registry_for_tests,
+    clear_extension_provider_configuration,
+    configure_extension_provider,
+    doctor_provider as core_doctor_provider,
+)
 from unified_cli_ext import ConfigurationError, ProtocolError
 from unified_cli_ext.providers import (
     AdapterStatus,
@@ -23,6 +35,7 @@ from unified_cli_ext.providers import (
     FeatureProbeSpec,
     FixedCommandSpec,
     InstallationReceiptV1,
+    installation_receipt_from_envelope,
     JsonProbeSpec,
     OperationLimits,
     PromptCommandSpec,
@@ -283,6 +296,102 @@ def test_plugin_is_lazy_requires_verified_launch_and_held_stays_inert(
     assert held.support_status == "held"
     with pytest.raises(ConfigurationError, match="unavailable"):
         held.factory(cwd=str(tmp_path), bin_path=adapter_binary)
+
+
+def test_configuration_binder_closes_all_operations_over_one_direct_receipt(
+    tmp_path, adapter_binary
+):
+    plugin = adapter_plugin(
+        _bridge_spec(),
+        default_model="fixture-model",
+        map_record=_record_mapper,
+    )
+    provider_home = str(tmp_path / "provider-home")
+    bound = plugin.launch_binder(
+        ProviderLaunchContextV1(
+            provider_id="fixture-provider",
+            bin_path=adapter_binary,
+            provider_home=provider_home,
+            provider_env={
+                "SAFE_BRIDGE": "enabled",
+                "UNDECLARED_SECRET": "not-forwarded",
+            },
+        )
+    )
+
+    assert bound.provider_id == "fixture-provider"
+    assert bound.provider_home == provider_home
+    assert bound.normalized_receipt is not None
+    receipt = installation_receipt_from_envelope(bound.normalized_receipt)
+    assert receipt.acquisition_source == "configured-local-installation"
+    assert receipt.verify().argv_prefix == (adapter_binary,)
+    assert [item.id for item in bound.model_lister()] == ["fixture-model"]
+    assert bound.doctor()["available"] is True
+
+    provider = bound.factory(
+        ProviderCreateRequestV1(
+            provider_id="fixture-provider",
+            model="fixture-model",
+            workspace=str(tmp_path),
+        )
+    )
+    assert provider.chat("bound").text == "Hello"
+
+    with open(adapter_binary, "ab") as handle:
+        handle.write(b"changed")
+    with pytest.raises(ConfigurationError, match="changed"):
+        bound.model_lister()
+
+
+def test_core_registry_persists_and_reuses_bridge_receipt_for_every_operation(
+    monkeypatch, tmp_path, adapter_binary
+):
+    plugin = adapter_plugin(
+        _bridge_spec(),
+        default_model="fixture-model",
+        map_record=_record_mapper,
+    )
+
+    class EntryPoint:
+        name = "fixture-provider"
+        group = core_registry.ENTRY_POINT_GROUP
+
+        @staticmethod
+        def load():
+            return plugin
+
+    state_root = tmp_path / "core-settings"
+    monkeypatch.setattr(core_settings, "SETTINGS_DIR", state_root)
+    monkeypatch.setattr(
+        core_settings, "SETTINGS_FILE", state_root / "settings.json",
+    )
+    monkeypatch.setattr(
+        core_registry.importlib_metadata,
+        "entry_points",
+        lambda: [EntryPoint()],
+    )
+    _reset_provider_registry_for_tests()
+    try:
+        stored = configure_extension_provider(
+            "fixture-provider",
+            ExtensionLaunchOverridesV1(
+                bin_path=adapter_binary,
+                provider_home=str(tmp_path / "provider-home"),
+                extra_env={"SAFE_BRIDGE": "enabled"},
+            ),
+        )
+        receipt = installation_receipt_from_envelope(stored.receipt)
+        assert receipt.verify().argv_prefix == (adapter_binary,)
+
+        provider = core_create("fixture-provider", cwd=str(tmp_path))
+        assert provider.chat("normal").text == "Hello"
+        assert [item.id for item in core_list_models("fixture-provider")] == [
+            "fixture-model"
+        ]
+        assert core_doctor_provider("fixture-provider")["available"] is True
+        assert clear_extension_provider_configuration("fixture-provider") is True
+    finally:
+        _reset_provider_registry_for_tests()
 
 
 def test_mapper_and_transport_capabilities_fail_closed():

@@ -19,12 +19,20 @@ import unicodedata
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Callable, Iterator, Optional, Tuple, Union
+from typing import Any, Callable, Iterator, Optional, Tuple
 
 from unified_cli.base import BaseProvider
 from unified_cli.core import Message, ModelInfo, Response, Usage
 from unified_cli.errors import UnifiedError
-from unified_cli.plugin import ProviderPluginV1, ProviderServerPolicyV1
+from unified_cli.plugin import (
+    PROVIDER_CONFIGURATION_ABI_V1,
+    BoundProviderOperationsV1,
+    ProviderCreateRequestV1,
+    ProviderLaunchContextV1,
+    ProviderPluginV1,
+    ProviderReceiptEnvelopeV1,
+    ProviderServerPolicyV1,
+)
 from unified_cli.usage import tracker as _usage_tracker
 
 from ..errors import (
@@ -53,7 +61,11 @@ from ..normalization import (
     freeze_json,
 )
 from ..transports import CancellationToken
-from ..transports.security import strict_json_loads, validated_workspace
+from ..transports.security import (
+    private_persistent_home,
+    strict_json_loads,
+    validated_workspace,
+)
 from .contract import (
     AdapterStatus,
     OperationLimits,
@@ -63,7 +75,11 @@ from .contract import (
     TransportKind,
 )
 from .held import held_plugin
-from .installation import InstallationReceiptV1
+from .installation import (
+    InstallationReceiptV1,
+    installation_receipt_from_record,
+    installation_receipt_to_record,
+)
 from .runtime import (
     AdapterInspectionV1,
     BinaryProvenance,
@@ -90,6 +106,9 @@ _UNSUPPORTED_CAPABILITIES = frozenset(
     )
 )
 _MAX_MODEL_ID_CHARS = 512
+INSTALLATION_RECEIPT_MEDIA_TYPE_V1 = (
+    "application/vnd.unified-cli-ext.installation-receipt.v1+json"
+)
 
 
 @dataclass(frozen=True)
@@ -139,6 +158,36 @@ def _core_error(provider: str, error: ExtensionError) -> UnifiedError:
     else:
         message = "Provider runtime failed."
     return UnifiedError(kind="internal", provider=provider, message=message)
+
+
+def installation_receipt_envelope(
+    receipt: InstallationReceiptV1, *, persistent: bool = True
+) -> ProviderReceiptEnvelopeV1:
+    """Return a Core-owned serialized envelope for one verified receipt."""
+
+    if type(receipt) is not InstallationReceiptV1:
+        raise ConfigurationError("provider installation receipt is invalid")
+    return ProviderReceiptEnvelopeV1(
+        provider_id=receipt.provider_id,
+        media_type=INSTALLATION_RECEIPT_MEDIA_TYPE_V1,
+        payload=installation_receipt_to_record(receipt, persistent=persistent),
+    )
+
+
+def installation_receipt_from_envelope(
+    envelope: ProviderReceiptEnvelopeV1,
+) -> InstallationReceiptV1:
+    """Decode and reverify exactly the bridge-owned receipt media type."""
+
+    if (
+        type(envelope) is not ProviderReceiptEnvelopeV1
+        or envelope.media_type != INSTALLATION_RECEIPT_MEDIA_TYPE_V1
+    ):
+        raise ConfigurationError("provider installation receipt envelope is invalid")
+    receipt = installation_receipt_from_record(envelope.payload)
+    if receipt.provider_id != envelope.provider_id:
+        raise ConfigurationError("provider installation receipt id changed")
+    return receipt
 
 
 def _validated_model_id(value: object) -> str:
@@ -1163,7 +1212,7 @@ class _AdapterPluginRuntime:
         self,
         bin_path: Optional[str],
         receipt: Optional[InstallationReceiptV1],
-    ) -> Union[str, InstallationReceiptV1]:
+    ) -> InstallationReceiptV1:
         if bin_path is not None and receipt is not None:
             raise ConfigurationError(
                 "bin_path and installation receipt are mutually exclusive"
@@ -1171,7 +1220,11 @@ class _AdapterPluginRuntime:
         if bin_path is not None:
             if type(bin_path) is not str:
                 raise ConfigurationError("provider binary path is invalid")
-            return bin_path
+            return InstallationReceiptV1.capture_explicit_direct(
+                provider_id=self.spec.id,
+                executable_path=bin_path,
+                executable_basename=self.spec.binary.executable,
+            )
         if receipt is not None:
             if type(receipt) is not InstallationReceiptV1:
                 raise ConfigurationError("provider installation receipt is invalid")
@@ -1203,10 +1256,7 @@ class _AdapterPluginRuntime:
     ) -> Tuple[ProviderAdapterV1, BinaryProvenance, AdapterInspectionV1]:
         adapter = ProviderAdapterV1(self.spec)
         candidate = self._candidate(bin_path, receipt)
-        if type(candidate) is str:
-            binary = adapter.resolve_binary(candidate)
-        else:
-            binary = adapter.resolve_installation(candidate)
+        binary = adapter.resolve_installation(candidate)
         inspection = adapter.inspect(
             binary,
             provider_env=provider_env,
@@ -1308,6 +1358,136 @@ class _AdapterPluginRuntime:
                 if max_stream_line_bytes is None
                 else min(max_stream_line_bytes, limits.max_stdout_bytes)
             ),
+        )
+
+    def _models_with_context(
+        self,
+        receipt: InstallationReceiptV1,
+        provider_env: Mapping[str, str],
+        provider_home: Optional[str],
+    ) -> Tuple[ModelInfo, ...]:
+        receipt.verify()
+        if self.spec.models is None:
+            return (
+                ModelInfo(
+                    id=self.default_model,
+                    provider=self.spec.id,
+                    default=True,
+                    source="plugin",
+                ),
+            )
+        adapter, _binary, inspection = self._gate(
+            bin_path=None,
+            receipt=receipt,
+            provider_env=provider_env,
+            provider_home=provider_home,
+        )
+        model_ids = adapter.list_models(
+            inspection,
+            provider_env=provider_env,
+            provider_home=provider_home,
+        )
+        return tuple(
+            ModelInfo(
+                id=value,
+                provider=self.spec.id,
+                default=value == self.default_model,
+                source="plugin",
+            )
+            for value in model_ids
+        )
+
+    def _doctor_with_context(
+        self,
+        receipt: InstallationReceiptV1,
+        provider_env: Mapping[str, str],
+        provider_home: Optional[str],
+    ) -> Mapping[str, object]:
+        try:
+            _adapter, _binary, inspection = self._gate(
+                bin_path=None,
+                receipt=receipt,
+                provider_env=provider_env,
+                provider_home=provider_home,
+            )
+        except (KeyboardInterrupt, GeneratorExit):
+            raise
+        except ExtensionError:
+            return MappingProxyType(
+                {
+                    "id": self.spec.id,
+                    "available": False,
+                    "status": self.spec.status.value,
+                }
+            )
+        return MappingProxyType(
+            {
+                "id": self.spec.id,
+                "available": True,
+                "status": self.spec.status.value,
+                "version": inspection.version,
+            }
+        )
+
+    def bind(self, context: ProviderLaunchContextV1) -> BoundProviderOperationsV1:
+        """Close every Core operation over one verified launch snapshot."""
+
+        if (
+            type(context) is not ProviderLaunchContextV1
+            or context.provider_id != self.spec.id
+        ):
+            raise ConfigurationError("provider launch context does not match adapter")
+        decoded = (
+            None
+            if context.receipt is None
+            else installation_receipt_from_envelope(context.receipt)
+        )
+        receipt = self._candidate(context.bin_path, decoded)
+        if receipt.provider_id != self.spec.id:
+            raise ConfigurationError("provider installation receipt id changed")
+        receipt.verify()
+        selected_env = self.spec.environment.select(context.provider_env)
+        provider_home = context.provider_home
+        if provider_home is not None:
+            provider_home = private_persistent_home(provider_home)
+
+        def create_bound(request: ProviderCreateRequestV1) -> AdapterProviderBridge:
+            if (
+                type(request) is not ProviderCreateRequestV1
+                or request.provider_id != self.spec.id
+            ):
+                raise ConfigurationError("provider create request does not match adapter")
+            return self.factory(
+                model=request.model,
+                cwd=request.workspace,
+                receipt=receipt,
+                extra_env=selected_env,
+                provider_home=provider_home,
+                timeout=request.timeout,
+                max_output_bytes=request.max_output_bytes,
+                max_stderr_bytes=request.max_stderr_bytes,
+                max_stream_buffer_bytes=request.max_stream_buffer_bytes,
+                max_stream_events=request.max_stream_events,
+                max_stream_line_bytes=request.max_stream_line_bytes,
+                web_search=False,
+                first_output_timeout=None,
+            )
+
+        def list_bound_models() -> Tuple[ModelInfo, ...]:
+            return self._models_with_context(receipt, selected_env, provider_home)
+
+        def doctor_bound() -> Mapping[str, object]:
+            return self._doctor_with_context(receipt, selected_env, provider_home)
+
+        return BoundProviderOperationsV1(
+            provider_id=self.spec.id,
+            factory=create_bound,
+            model_lister=list_bound_models,
+            doctor=doctor_bound,
+            normalized_receipt=installation_receipt_envelope(
+                receipt, persistent=True
+            ),
+            provider_home=provider_home,
         )
 
     def models(self) -> Tuple[ModelInfo, ...]:
@@ -1435,6 +1615,9 @@ def adapter_plugin(
         route_prefixes=(spec.id,),
         server_policy=ProviderServerPolicyV1(enabled=False),
         support_status=spec.status.value.lower(),
+        configuration_abi_version=PROVIDER_CONFIGURATION_ABI_V1,
+        launch_binder=runtime.bind,
+        environment_keys=spec.environment.allowed_keys,
     )
 
 
@@ -1448,6 +1631,9 @@ __all__ = [
     "AdapterRecordMapperV1",
     "AdapterResponseMapperV1",
     "AdapterStateFactoryV1",
+    "INSTALLATION_RECEIPT_MEDIA_TYPE_V1",
     "adapter_plugin",
+    "installation_receipt_envelope",
+    "installation_receipt_from_envelope",
     "provider_plugin",
 ]
