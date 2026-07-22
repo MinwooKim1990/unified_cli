@@ -43,7 +43,7 @@ from .conversation import UnifiedConversation
 from .core import Message, ModelInfo, ProviderId, ProviderName, Response, Usage
 from .errors import ErrorKind, UnifiedError, classify
 from .factory import PROVIDERS, create, route
-from .models import DEFAULT_MODELS, list_models
+from .models import DEFAULT_MODELS, invalidate_model_cache, list_models
 from .plugin import (
     PROVIDER_PLUGIN_ABI_V1,
     ProviderDoctorV1,
@@ -97,6 +97,7 @@ __all__ = [
     "classify",
     "create",
     "doctor_provider",
+    "invalidate_model_cache",
     "list_models",
     "list_providers",
     "load_provider_plugin",

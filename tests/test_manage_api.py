@@ -333,30 +333,44 @@ def test_verify_fixed_argv_temp_cwd_minimal_env_and_redaction(tmp_path, monkeypa
     assert result["commands"]["login"] == "claude auth login"
 
 
-def test_unsupported_verify_never_spawns_and_verify_is_single_flight(tmp_path, monkeypatch):
+def test_unsupported_verify_never_spawns_and_different_providers_do_not_block(
+    tmp_path, monkeypatch,
+):
     runtime = manage.ManageRuntime([str(tmp_path)])
     calls = []
-    entered = threading.Event()
+    both_entered = threading.Event()
     release = threading.Event()
+    lock = threading.Lock()
 
     def blocked(argv, cwd):
-        calls.append((argv, cwd))
-        entered.set()
+        with lock:
+            calls.append((argv, cwd))
+            if len(calls) == 2:
+                both_entered.set()
         release.wait(2)
         return {"ok": True, "code": "ok", "output": "v"}
 
     monkeypatch.setattr(manage, "_run_verify_argv", blocked)
     with pytest.raises(manage.ManageError, match="unsupported"):
         runtime.verify_provider("extension")
-    thread = threading.Thread(target=lambda: runtime.verify_provider("gemini"))
-    thread.start()
-    assert entered.wait(1)
-    with pytest.raises(manage.ManageError) as error:
-        runtime.verify_provider("codex")
-    assert error.value.code == "verify_busy"
+    threads = [
+        threading.Thread(
+            target=lambda provider=provider: runtime.verify_provider(provider)
+        )
+        for provider in ("gemini", "codex")
+    ]
+    for thread in threads:
+        thread.start()
+    assert both_entered.wait(1)
     release.set()
-    thread.join(2)
-    assert [call[0] for call in calls] == [("agy", "--version")]
+    for thread in threads:
+        thread.join(2)
+        assert not thread.is_alive()
+    assert {call[0] for call in calls} == {
+        ("agy", "--version"),
+        ("codex", "--version"),
+        ("codex", "login", "status"),
+    }
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX process-group verifier cleanup")

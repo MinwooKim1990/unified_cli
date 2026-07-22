@@ -80,6 +80,28 @@ extension declares server-related metadata.
 For the Core extension ABI and its trust boundary, see the
 [provider plugin ABI](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/development/provider-plugin-abi-v1.md).
 
+### Explicit probe caches
+
+`ProviderAdapterV1` starts with empty caches and populates them only when a
+caller explicitly invokes `inspect`, `authenticated`, or `list_models`.
+Successful immutable records have separate bounded monotonic TTLs: five
+minutes for inspection, 15 seconds for authentication status, and one minute
+for non-empty model lists. Every hit first re-verifies the cheap
+`BinaryProvenance` metadata;
+replacement of the exact executable invalidates its probe records. Account-
+sensitive keys also include the validated provider-home directory identity and
+digests of the adapter's selected environment values. Raw secrets are not cache
+keys or values.
+
+These APIs do not expose a provider-supplied account identifier, so the cache
+does not claim to identify an account beyond that home/environment boundary.
+An account changed by an external process can remain represented until the
+short auth TTL expires. Adapter login/logout preparation invalidates auth and
+model records for that context. Callers can request `force_refresh=True` on
+the three probe methods or call `invalidate_cache()` explicitly. Exceptions,
+cancellations, and permission failures are not retained as successful cache
+records, and none of this imports a plugin or probes a provider at startup.
+
 ## Status
 
 This is a foundation release with an inert Held catalog, not a catalog of
