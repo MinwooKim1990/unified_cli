@@ -103,7 +103,7 @@ class ProviderProfileTests(unittest.TestCase):
             ),
             "kimi": (
                 "@moonshot-ai/kimi-code",
-                "0.29.0",
+                "0.28.1",
                 "kimi",
                 ("kimi", "--version"),
                 ("kimi", "--help"),
@@ -113,7 +113,7 @@ class ProviderProfileTests(unittest.TestCase):
                 "@github/copilot",
                 "1.0.73",
                 "copilot",
-                ("copilot", "--binary-version"),
+                ("copilot", "--version"),
                 ("copilot", "help"),
                 None,
             ),

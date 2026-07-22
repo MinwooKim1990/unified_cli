@@ -35,9 +35,9 @@ PROFILES = {
     },
     "kimi": {
         "binary": "kimi",
-        "expected_version": "0.29.0",
+        "expected_version": "0.28.1",
         "help": ("kimi", "--help"),
-        "profile_sha256": "38c678c1303e7843b9cec4a196315cf3c52c7ecc1a39b431343c863c64d7c330",
+        "profile_sha256": "acc11d5a7e1760a3822dc0f61c061b363fed1e5b7bf737406d98486e700828a9",
         "status": None,
         "version": ("kimi", "--version"),
     },
@@ -45,9 +45,9 @@ PROFILES = {
         "binary": "copilot",
         "expected_version": "1.0.73",
         "help": ("copilot", "help"),
-        "profile_sha256": "029a29799cd7c507de7faf443b865b4fcfa5179c26290664051e62fe44961631",
+        "profile_sha256": "6e0fc1b73bf48de3cddd084eff8638ec753da4373bd8a60071035aa18d9deb3e",
         "status": None,
-        "version": ("copilot", "--binary-version"),
+        "version": ("copilot", "--version"),
     },
     "cursor": {
         "binary": "agent",
@@ -89,6 +89,8 @@ def _safe_environment(provider_id: str, binary_directory: str) -> dict:
         environment["KIMI_CODE_NO_AUTO_UPDATE"] = "1"
         environment["KIMI_DISABLE_CRON"] = "1"
         environment["KIMI_DISABLE_TELEMETRY"] = "1"
+    elif provider_id == "grok":
+        environment["GROK_DISABLE_AUTOUPDATER"] = "1"
     elif provider_id == "copilot":
         environment["COPILOT_AUTO_UPDATE"] = "false"
     return environment

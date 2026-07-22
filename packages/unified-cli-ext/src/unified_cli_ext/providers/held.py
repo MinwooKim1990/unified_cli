@@ -65,6 +65,8 @@ def held_adapter_spec(
     environment_keys: FrozenSet[str] = frozenset(),
     version_marker: str,
     help_chat_marker: str,
+    version_argv: Tuple[str, ...] = ("--version",),
+    help_argv: Tuple[str, ...] = ("--help",),
 ) -> ProviderAdapterSpecV1:
     """Build immutable, execution-disabled adapter metadata.
 
@@ -81,13 +83,13 @@ def held_adapter_spec(
             executable=executable,
             expected_identity=provider_id,
             version_probe=VersionProbeSpec(
-                command=_command("--version"),
+                command=_command(*version_argv),
                 minimum_version=(0,),
                 format=ProbeFormat.PLAIN_TEXT,
                 version_marker=version_marker,
             ),
             feature_probe=FeatureProbeSpec(
-                command=_command("--help"),
+                command=_command(*help_argv),
                 required_features=frozenset(("chat",)),
                 format=ProbeFormat.PLAIN_TEXT,
                 feature_markers={"chat": help_chat_marker},

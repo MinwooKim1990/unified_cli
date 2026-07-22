@@ -55,18 +55,40 @@ ENTRY_POINTS = {
     "gitlab-duo": "unified_cli_ext.providers.gitlab_duo:PLUGIN",
 }
 
+STAGE_6_RESEARCH_PROVIDER_IDS = ("grok", "kimi", "copilot", "cursor")
+
 EXPECTED_COMMANDS = {
     "grok": {
         "executable": "grok",
         "prompt": (
             "--no-auto-update",
+            "--sandbox",
+            "strict",
             "--permission-mode",
             "dontAsk",
+            "--allow",
+            "Read",
+            "--allow",
+            "Grep",
+            "--deny",
+            "Bash",
+            "--deny",
+            "Edit",
+            "--deny",
+            "MCPTool",
+            "--deny",
+            "WebFetch",
+            "--deny",
+            "WebSearch",
+            "--disable-web-search",
+            "--no-subagents",
+            "--no-memory",
+            "--verbatim",
             "--output-format",
             "streaming-json",
         ),
         "transport": "jsonl",
-        "environment": frozenset(),
+        "environment": frozenset(("GROK_DISABLE_AUTOUPDATER",)),
         "mode": PromptMode.OPTION_VALUE,
         "prompt_option": "-p",
     },
@@ -74,30 +96,41 @@ EXPECTED_COMMANDS = {
         "executable": "kimi",
         "prompt": ("--output-format", "stream-json"),
         "transport": "jsonl",
-        "environment": frozenset(("KIMI_CODE_NO_AUTO_UPDATE",)),
+        "environment": frozenset(
+            ("KIMI_CODE_NO_AUTO_UPDATE", "KIMI_DISABLE_TELEMETRY")
+        ),
         "mode": PromptMode.OPTION_VALUE,
         "prompt_option": "-p",
     },
     "copilot": {
         "executable": "copilot",
+        "feature_probe": ("help",),
         "prompt": (
             "--silent",
             "--no-ask-user",
             "--no-auto-update",
+            "--no-custom-instructions",
+            "--no-remote",
+            "--no-remote-export",
             "--disable-builtin-mcps",
             "--available-tools",
             "view,glob,grep",
+            "--deny-tool=write",
+            "--deny-tool=shell",
+            "--deny-tool=url",
+            "--deny-tool=memory",
+            "--output-format=text",
         ),
         "transport": "plain",
-        "environment": frozenset(),
+        "environment": frozenset(("COPILOT_HOME",)),
         "mode": PromptMode.OPTION_VALUE,
         "prompt_option": "-p",
     },
     "cursor": {
-        "executable": "cursor-agent",
-        "prompt": ("--print", "--output-format", "json"),
+        "executable": "agent",
+        "prompt": ("--help",),
         "transport": "json",
-        "environment": frozenset(),
+        "environment": frozenset(("CURSOR_API_KEY",)),
         "mode": PromptMode.STDIN,
         "prompt_option": None,
     },
@@ -296,6 +329,50 @@ EXPECTED_COMMANDS = {
 }
 
 EVIDENCE_FLAGS = {
+    "grok": (
+        "GROK_VERSION_HELP_IDENTITY_PROVENANCE_REQUIRES_STAGE_6_EVIDENCE",
+        "GROK_XAI_BINARY_NAME_COLLISION_REQUIRES_STAGE_6_EVIDENCE",
+        "GROK_PROMPT_OUTPUT_FRAMING_REQUIRES_STAGE_6_EVIDENCE",
+        "GROK_PERMISSION_TOOL_MCP_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "GROK_AUTH_SESSION_MODEL_REQUIRES_STAGE_6_EVIDENCE",
+        "GROK_CANCELLATION_PROCESS_CLEANUP_REQUIRES_STAGE_6_EVIDENCE",
+        "GROK_UPDATE_REMOVAL_REQUIRES_STAGE_6_EVIDENCE",
+        "GROK_QUOTA_USAGE_ERROR_REQUIRES_STAGE_6_EVIDENCE",
+        "GROK_ACP_REQUIRES_SEPARATE_STAGE_6_EVIDENCE",
+    ),
+    "kimi": (
+        "KIMI_VERSION_HELP_IDENTITY_PROVENANCE_REQUIRES_STAGE_6_EVIDENCE",
+        "KIMI_PROMPT_OUTPUT_FRAMING_REQUIRES_STAGE_6_EVIDENCE",
+        "KIMI_PERMISSION_TOOL_MCP_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "KIMI_NONINTERACTIVE_AUTO_APPROVAL_REQUIRES_STAGE_6_EVIDENCE",
+        "KIMI_AUTH_SESSION_MODEL_REQUIRES_STAGE_6_EVIDENCE",
+        "KIMI_CANCELLATION_PROCESS_CLEANUP_REQUIRES_STAGE_6_EVIDENCE",
+        "KIMI_UPDATE_REMOVAL_REQUIRES_STAGE_6_EVIDENCE",
+        "KIMI_QUOTA_USAGE_ERROR_REQUIRES_STAGE_6_EVIDENCE",
+        "KIMI_ACP_REQUIRES_SEPARATE_STAGE_6_EVIDENCE",
+    ),
+    "copilot": (
+        "COPILOT_VERSION_HELP_IDENTITY_PROVENANCE_REQUIRES_STAGE_6_EVIDENCE",
+        "COPILOT_PROMPT_OUTPUT_FRAMING_REQUIRES_STAGE_6_EVIDENCE",
+        "COPILOT_PERMISSION_TOOL_MCP_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "COPILOT_AUTH_SESSION_MODEL_REQUIRES_STAGE_6_EVIDENCE",
+        "COPILOT_CANCELLATION_PROCESS_CLEANUP_REQUIRES_STAGE_6_EVIDENCE",
+        "COPILOT_UPDATE_REMOVAL_REQUIRES_STAGE_6_EVIDENCE",
+        "COPILOT_QUOTA_USAGE_ERROR_REQUIRES_STAGE_6_EVIDENCE",
+        "COPILOT_ACP_REQUIRES_SEPARATE_STAGE_6_EVIDENCE",
+        "COPILOT_DEDICATED_HOME_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+    ),
+    "cursor": (
+        "CURSOR_VERSION_HELP_IDENTITY_PROVENANCE_REQUIRES_STAGE_6_EVIDENCE",
+        "CURSOR_PROMPT_FORM_REQUIRES_STAGE_6_EVIDENCE",
+        "CURSOR_PROMPT_OUTPUT_FRAMING_REQUIRES_STAGE_6_EVIDENCE",
+        "CURSOR_PERMISSION_TOOL_MCP_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
+        "CURSOR_AUTH_SESSION_MODEL_REQUIRES_STAGE_6_EVIDENCE",
+        "CURSOR_CANCELLATION_PROCESS_CLEANUP_REQUIRES_STAGE_6_EVIDENCE",
+        "CURSOR_UPDATE_REMOVAL_REQUIRES_STAGE_6_EVIDENCE",
+        "CURSOR_QUOTA_USAGE_ERROR_REQUIRES_STAGE_6_EVIDENCE",
+        "CURSOR_ACP_REQUIRES_SEPARATE_STAGE_6_EVIDENCE",
+    ),
     "codebuddy": (
         "CODEBUDDY_PROTOCOL_FRAME_REQUIRES_STAGE_6_EVIDENCE",
         "CODEBUDDY_NO_TOOLS_CONFIG_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
@@ -447,8 +524,12 @@ def test_held_specs_and_plugins_are_immutable_and_minimal(provider_id):
     assert spec.id == provider_id
     assert spec.status is AdapterStatus.HELD
     assert spec.binary.executable == expected["executable"]
-    assert spec.binary.version_probe.command.argv == ("--version",)
-    assert spec.binary.feature_probe.command.argv == ("--help",)
+    assert spec.binary.version_probe.command.argv == expected.get(
+        "version_probe", ("--version",)
+    )
+    assert spec.binary.feature_probe.command.argv == expected.get(
+        "feature_probe", ("--help",)
+    )
     assert spec.prompt.fixed_argv == expected["prompt"]
     assert spec.prompt.mode is expected["mode"]
     assert spec.prompt.prompt_option == expected["prompt_option"]
@@ -626,7 +707,159 @@ def test_core_builtins_are_unchanged_by_held_extension_metadata():
     assert create("claude", bin_path="/bin/echo").name == "claude"
 
 
+@pytest.mark.parametrize("provider_id", STAGE_6_RESEARCH_PROVIDER_IDS)
+def test_stage_6_research_metadata_is_static_and_not_capture_evidence(provider_id):
+    module = _module(provider_id)
+    prefix = provider_id.upper()
+    expected_versions = {
+        "grok": "0.2.106",
+        "kimi": "0.28.1",
+        "copilot": "1.0.73",
+        "cursor": "2026.07.20-8cc9c0b",
+    }
+    sources = getattr(module, prefix + "_OFFICIAL_SOURCES")
+    target = getattr(module, prefix + "_STAGE_6_TARGET_VERSION")
+
+    assert type(sources) is tuple
+    assert sources
+    assert all(type(url) is str and url.startswith("https://") for url in sources)
+    assert type(target) is str
+    assert target == expected_versions[provider_id]
+    assert getattr(module, prefix + "_STAGE_6_EVIDENCE_CAPTURED") is False
+    assert module.ADAPTER_SPEC.status is AdapterStatus.HELD
+    assert module.PLUGIN.support_status == "held"
+    assert module.PLUGIN.capabilities == frozenset()
+    assert module.PLUGIN.server_policy.enabled is False
+
+
+@pytest.mark.parametrize("provider_id", STAGE_6_RESEARCH_PROVIDER_IDS)
+def test_researched_held_import_factory_doctor_and_models_are_ambient_free(
+    provider_id,
+):
+    root = pathlib.Path(__file__).resolve().parents[3]
+    ext_source = root / "packages" / "unified-cli-ext" / "src"
+    module_name = ENTRY_POINTS[provider_id].partition(":")[0]
+    script = r'''
+import importlib
+import os
+import pathlib
+import shutil
+import socket
+import subprocess
+import sys
+
+sys.path.insert(0, {root!r})
+sys.path.insert(0, {ext_source!r})
+from unified_cli_ext.providers.held import HeldProviderUnavailableError
+
+def forbidden(*args, **kwargs):
+    raise AssertionError("Held metadata attempted ambient access or execution")
+
+class ForbiddenEnvironment:
+    def __contains__(self, key):
+        return forbidden(key)
+    def __getitem__(self, key):
+        return forbidden(key)
+    def __iter__(self):
+        return forbidden()
+    def __len__(self):
+        return forbidden()
+    def copy(self):
+        return forbidden()
+    def get(self, key, default=None):
+        return forbidden(key, default)
+    def items(self):
+        return forbidden()
+    def keys(self):
+        return forbidden()
+
+os.environ = ForbiddenEnvironment()
+os.getenv = forbidden
+os.system = forbidden
+pathlib.Path.home = forbidden
+shutil.which = forbidden
+socket.create_connection = forbidden
+subprocess.Popen = forbidden
+subprocess.call = forbidden
+subprocess.check_call = forbidden
+subprocess.check_output = forbidden
+subprocess.run = forbidden
+
+module = importlib.import_module({module_name!r})
+assert module.PLUGIN.model_lister() == ()
+doctor = module.PLUGIN.doctor()
+assert doctor["available"] is False
+try:
+    module.PLUGIN.factory(model="ignored")
+except HeldProviderUnavailableError:
+    pass
+else:
+    raise AssertionError("Held factory did not refuse")
+'''.format(
+        root=str(root),
+        ext_source=str(ext_source),
+        module_name=module_name,
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_grok_requires_xai_identity_and_rejects_third_party_name_collision():
+    module = _module("grok")
+    assert module.GROK_OFFICIAL_PACKAGE == "@xai-official/grok"
+    assert module.GROK_REJECTED_PACKAGE_IDENTITIES == ("@vibe-kit/grok-cli",)
+    assert module.GROK_BINARY_IDENTITY_IS_VERIFIED is False
+    assert module.ADAPTER_SPEC.binary.executable == "grok"
+    assert module.GROK_XAI_BINARY_NAME_COLLISION_REQUIRES_STAGE_6_EVIDENCE is True
+    assert "GROK_DISABLE_AUTOUPDATER" in module.ADAPTER_SPEC.environment.allowed_keys
+
+
+def test_kimi_documents_auto_approval_without_claiming_safe_execution():
+    module = _module("kimi")
+    assert module.KIMI_OFFICIAL_PACKAGE == "@moonshot-ai/kimi-code"
+    assert module.KIMI_NPM_MINIMUM_NODE_VERSION == "22.19"
+    assert module.KIMI_PROMPT_USES_OS_WORKING_DIRECTORY is True
+    assert module.KIMI_TUI_LOGOUT_COMMAND == "/logout"
+    assert module.KIMI_NONINTERACTIVE_AUTO_APPROVAL_REQUIRES_STAGE_6_EVIDENCE
+    assert module.PLUGIN.capabilities == frozenset()
+
+
+def test_copilot_candidate_keeps_every_documented_containment_control():
+    module = _module("copilot")
+    fixed = module.ADAPTER_SPEC.prompt.fixed_argv
+    assert fixed == module.COPILOT_DOCUMENTED_HEADLESS_FIXED_ARGV
+    for control in (
+        "--no-custom-instructions",
+        "--no-remote",
+        "--no-remote-export",
+        "--disable-builtin-mcps",
+        "--deny-tool=write",
+        "--deny-tool=shell",
+        "--deny-tool=url",
+        "--deny-tool=memory",
+        "--output-format=text",
+    ):
+        assert control in fixed
+    assert module.ADAPTER_SPEC.environment.allowed_keys == frozenset(
+        ("COPILOT_HOME",)
+    )
+
+
 def test_cursor_records_that_stage_6_must_establish_prompt_framing():
     module = _module("cursor")
     assert module.CURSOR_PROMPT_FORM_REQUIRES_STAGE_6_EVIDENCE is True
+    assert module.CURSOR_PROMPT_COMMAND_IS_ABI_REPRESENTABLE is False
+    assert module.CURSOR_PRIMARY_EXECUTABLE == "agent"
+    assert module.CURSOR_LEGACY_EXECUTABLE == "cursor-agent"
+    assert module.CURSOR_LEGACY_ALIAS_SINCE == "2026-01-08"
+    assert module.ADAPTER_SPEC.binary.executable == "agent"
+    assert module.ADAPTER_SPEC.prompt.fixed_argv == module.CURSOR_INERT_PROMPT_PLACEHOLDER
+    assert module.CURSOR_DOCUMENTED_PRINT_OPTIONS != module.ADAPTER_SPEC.prompt.fixed_argv
+    assert "CURSOR_API_KEY" not in module.ADAPTER_SPEC.prompt.fixed_argv
     assert "--" not in module.ADAPTER_SPEC.prompt.fixed_argv
