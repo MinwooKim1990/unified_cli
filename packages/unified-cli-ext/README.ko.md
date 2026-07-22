@@ -20,6 +20,15 @@ Core 플러그인은 실행 capability를 하나도 표시하지 않고 provider
 실행할 수 없습니다. 이는 동작하는 어댑터가 아니며 Preview나 Stable로 표현해서는 안
 됩니다.
 
+Grok Build, Kimi Code CLI, GitHub Copilot CLI, Cursor Agent CLI에 대해 카탈로그는
+공식 출처 링크, 고정된 향후 lab 목표, 문서 기반 명령 후보, 남은 Stage 6 근거 관문을
+기록합니다. 이는 캡처한 provider 출력이나 설치/인증 안내가 아니라 조사 기록입니다.
+Grok의 일반적인 바이너리 이름에는 정확한 xAI 출처 증명이 필요하고, Kimi `-p`는 일반
+도구를 자동 승인하며, Copilot에는 검증된 JSONL과 완전한 MCP/home 격리가 없고, Cursor의
+위치 인자 프롬프트는 현재 ABI로 안전하게 표현할 수 없어 prompt 메타데이터가 비활성
+placeholder입니다. 네 Core 플러그인은 모두 capability를 하나도 표시하지 않고 서버 모드를
+끄며, 바이너리 탐색·ambient 환경 읽기·실행 전에 실패합니다.
+
 0.1.0에는 자격 증명, 인증 흐름, 실제 provider 호출, 유료 서비스 호출이 없습니다.
 설치만으로 vendor CLI가 설치되거나 로그인·서비스 호출·과금이 발생하지 않습니다.
 provider 바이너리와 계정은 사용자가 직접 관리합니다. 검증은 오프라인 fixture만

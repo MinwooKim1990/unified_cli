@@ -21,6 +21,17 @@ as a provisional target; the Core plugin advertises no executable capability and
 cannot construct a provider or execute a command. These are not working
 adapters and must not be presented as Preview or Stable.
 
+For Grok Build, Kimi Code CLI, GitHub Copilot CLI, and Cursor Agent CLI, the
+catalog now binds official source links, frozen future-lab targets, documented
+command candidates, and explicit remaining Stage 6 evidence gates. Those are
+research records, not captured provider output or install/auth instructions.
+Grok's generic binary name still needs exact xAI provenance; Kimi `-p`
+auto-approves normal tools; Copilot still lacks verified JSONL and complete
+MCP/home isolation; and Cursor's positional prompt cannot be represented safely
+by the current ABI, so its prompt metadata is an inert placeholder. All four
+Core plugins advertise zero capabilities, keep server mode disabled, and fail
+before resolving a binary, reading ambient environment, or executing anything.
+
 There are no bundled credentials, authentication flows, provider calls, or
 paid-service calls in this release. Installation does not install vendor CLIs,
 log in, call a service, or incur charges. Provider binaries and accounts stay

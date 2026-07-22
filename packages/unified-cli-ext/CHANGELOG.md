@@ -4,6 +4,12 @@ All notable changes to `unified-cli-ext` are documented in this file.
 
 ## [Unreleased]
 
+- Refines the inert Grok Build, Kimi Code CLI, GitHub Copilot CLI, and Cursor
+  Agent CLI catalog entries with current official identities, documented
+  command candidates, frozen future-lab targets, and explicit Stage 6 evidence
+  gates. All four remain Held with zero Core capabilities and no executable or
+  ACP path.
+
 ## [0.1.0] - 2026-07-22
 
 Initial extension-foundation release for `unified-cli` 0.5.x.
