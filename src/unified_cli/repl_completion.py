@@ -10,7 +10,7 @@ missing — the REPL then falls back to plain `input()`.
 from __future__ import annotations
 
 import unicodedata
-from typing import Optional
+from typing import Mapping, Optional, Sequence
 
 from . import models
 from .i18n import t
@@ -56,6 +56,12 @@ def cached_or_hardcoded(provider: str) -> list:
     return models._hardcoded(provider)  # type: ignore[arg-type]
 
 
+def _completion_model_snapshot(provider: str) -> tuple:
+    """Passive Core snapshot for completion/pickers; never computes context."""
+
+    return tuple(models._peek_cached_or_hardcoded(provider))  # type: ignore[arg-type]
+
+
 def warm_models_async(providers=("claude", "codex")):
     """Explicitly refresh model caches in a daemon thread.
 
@@ -96,7 +102,27 @@ def _provider_meta(provider: str) -> str:
 
 
 def arg_candidates(
-    cmd: str, provider: str, token: str, full_argument: Optional[str] = None
+    cmd: str,
+    provider: str,
+    token: str,
+    full_argument: Optional[str] = None,
+) -> list:
+    """Compatibility wrapper retaining the original public call signature."""
+
+    return _arg_candidates_from_snapshots(
+        cmd, provider, token, full_argument,
+        provider_snapshots=None, model_snapshots=None,
+    )
+
+
+def _arg_candidates_from_snapshots(
+    cmd: str,
+    provider: str,
+    token: str,
+    full_argument: Optional[str],
+    *,
+    provider_snapshots: Optional[Mapping[str, object]],
+    model_snapshots: Optional[Mapping[str, Sequence[object]]],
 ) -> list:
     """[(value, meta)] for the argument of a slash command.
 
@@ -105,8 +131,16 @@ def arg_candidates(
     - /lang     → en|ko
     """
     tok = (token or "").lower()
+    providers = list(_PROVIDERS)
+    if provider_snapshots is not None:
+        for candidate in provider_snapshots:
+            if (
+                candidate not in providers
+                and _safe_provider_id(candidate)
+            ):
+                providers.append(candidate)
     if cmd == "/provider":
-        return [(p, _provider_meta(p)) for p in _PROVIDERS if p.startswith(tok)]
+        return [(p, _provider_meta(p)) for p in providers if p.startswith(tok)]
     if cmd == "/lang":
         return [(c, "") for c in ("en", "ko") if c.startswith(tok)]
     if cmd == "/auth":
@@ -117,7 +151,7 @@ def arg_candidates(
                 (value, "") for value in ("status", "login", "logout")
                 if value.startswith(tok)
             ]
-        return [(value, "") for value in _PROVIDERS if value.startswith(tok)]
+        return [(value, "") for value in providers if value.startswith(tok)]
     if cmd == "/web":
         return [(c, "") for c in ("default", "on", "off") if c.startswith(tok)]
     if cmd == "/multiline":
@@ -156,13 +190,17 @@ def arg_candidates(
             return refresh if "--refresh".startswith(tok) else []
         # Completion must remain terminal-local and instantaneous.  Extension
         # model listing is only performed by an explicit `/model --refresh`.
-        if provider not in _PROVIDERS:
-            return []
+        if model_snapshots is None:
+            if provider not in _PROVIDERS:
+                return []
+            model_choices = cached_or_hardcoded(provider)
+        else:
+            model_choices = model_snapshots.get(provider, ())
         default_id = DEFAULT_MODELS.get(provider)  # type: ignore[arg-type]
         locked = provider == "gemini" and not gemini_enabled()
         out: list = []
         seen: set = set()
-        for m in cached_or_hardcoded(provider):
+        for m in model_choices:
             mid = getattr(m, "id", None)
             if not _safe_model_id(mid) or mid in seen:
                 continue
@@ -202,6 +240,16 @@ class UnifiedCompleter(Completer):  # type: ignore[misc]
 
     def __init__(self, current: dict):
         self.current = current
+        supplied = current.get("_completion_core_models")
+        if type(supplied) is dict:
+            self._core_model_snapshots = supplied
+        else:
+            # Snapshot Core metadata at construction, never from a completion
+            # callback.  This is cache/hardcoded-only and performs no probe.
+            self._core_model_snapshots = {
+                provider: _completion_model_snapshot(provider)
+                for provider in _PROVIDERS
+            }
 
     def get_completions(self, document, complete_event):  # noqa: D401
         text = document.text_before_cursor
@@ -217,7 +265,22 @@ class UnifiedCompleter(Completer):  # type: ignore[misc]
             return
         last = "" if (arg == "" or arg.endswith(" ")) else arg.split()[-1]
         provider = self.current.get("provider", "claude")
-        for value, meta in arg_candidates(cmd, provider, last, arg):
+        descriptors = self.current.get("loaded_extension_descriptors")
+        if type(descriptors) is not dict:
+            descriptors = {}
+        ext_models = self.current.get("loaded_extension_models")
+        if type(ext_models) is not dict:
+            ext_models = {}
+        model_snapshots = dict(self._core_model_snapshots)
+        model_snapshots.update(ext_models)
+        for value, meta in _arg_candidates_from_snapshots(
+            cmd,
+            provider,
+            last,
+            arg,
+            provider_snapshots=descriptors,
+            model_snapshots=model_snapshots,
+        ):
             yield Completion(value, start_position=-len(last), display_meta=meta)
 
 
@@ -233,6 +296,12 @@ def build_session(history_path, current: dict, *, input=None, output=None):
     from prompt_toolkit.history import FileHistory, InMemoryHistory
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.shortcuts import CompleteStyle
+
+    if type(current.get("_completion_core_models")) is not dict:
+        current["_completion_core_models"] = {
+            provider: _completion_model_snapshot(provider)
+            for provider in _PROVIDERS
+        }
 
     bindings = KeyBindings()
 
@@ -355,6 +424,18 @@ def _safe_model_id(value: object) -> bool:
     return True
 
 
+def _safe_provider_id(value: object) -> bool:
+    if type(value) is not str or not value or len(value) > 64:
+        return False
+    if not value[0].islower() or not value[0].isascii():
+        return False
+    return all(
+        (char.isascii() and (char.islower() or char.isdigit()))
+        or char in "-_"
+        for char in value
+    )
+
+
 def _safe_display_meta(value: object) -> str:
     from .event_renderer import safe_terminal_text
     return safe_terminal_text(value, max_chars=512)
@@ -402,12 +483,27 @@ def pick_model(provider: str, choices: Optional[list] = None) -> Optional[str]:
 
 
 def pick_provider() -> Optional[str]:
-    """Interactive provider selector. Returns chosen provider or None."""
+    """Interactive Core provider selector; original signature retained."""
+
+    return _pick_provider_from_snapshots(())
+
+
+def pick_provider_from_snapshots(choices: Sequence[str]) -> Optional[str]:
+    """Interactive selector for Core plus already-loaded Ext snapshots."""
+
+    return _pick_provider_from_snapshots(choices)
+
+
+def _pick_provider_from_snapshots(choices: Sequence[str]) -> Optional[str]:
     from prompt_toolkit.shortcuts import radiolist_dialog
     from .i18n import t
 
     values = []
-    for p in _PROVIDERS:
+    providers = list(_PROVIDERS)
+    for candidate in choices:
+        if candidate not in providers and _safe_provider_id(candidate):
+            providers.append(candidate)
+    for p in providers:
         label = p + (t("repl.picker.locked_suffix") if _provider_meta(p) else "")
         values.append((p, label))
     return radiolist_dialog(

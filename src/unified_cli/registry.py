@@ -446,6 +446,15 @@ def _validate_loaded_plugin(
         return None, "reserved"
     if any(prefix in RESERVED_PROVIDER_IDS for prefix in loaded.route_prefixes):
         return None, "metadata"
+    # A frozen plugin can still be corrupted through object.__setattr__ after
+    # construction.  Rebuild nested frozen metadata inside this guarded
+    # boundary so malformed retained objects become one bounded metadata error.
+    server_policy = ProviderServerPolicyV1(
+        enabled=loaded.server_policy.enabled,
+        requires_external_isolation=(
+            loaded.server_policy.requires_external_isolation
+        ),
+    )
     # Reconstruct the frozen value to re-run validation even if a custom
     # loader created or mutated an instance with object.__setattr__.
     plugin = ProviderPluginV1(
@@ -456,7 +465,7 @@ def _validate_loaded_plugin(
         doctor=loaded.doctor,
         capabilities=loaded.capabilities,
         route_prefixes=loaded.route_prefixes,
-        server_policy=loaded.server_policy,
+        server_policy=server_policy,
         abi_version=loaded.abi_version,
         support_status=loaded.support_status,
         configuration_abi_version=loaded.configuration_abi_version,
@@ -1055,6 +1064,50 @@ def _builtin_descriptors() -> list[ProviderDescriptorV1]:
     ]
 
 
+def _descriptor_from_loaded_plugin(
+    plugin: ProviderPluginV1,
+) -> ProviderDescriptorV1:
+    """Reconstruct one callback-free descriptor from validated plugin metadata.
+
+    Both explicit snapshots and registry listings pass through this helper so
+    the two views cannot drift.  The returned frozen dataclass contains only
+    Core-owned immutable values; no provider callback is retained.
+    """
+
+    policy = plugin.server_policy
+    copied_policy = (
+        None
+        if policy is None
+        else ProviderServerPolicyV1(
+            enabled=policy.enabled,
+            requires_external_isolation=policy.requires_external_isolation,
+        )
+    )
+    return ProviderDescriptorV1(
+        id=plugin.id,
+        source="extension",
+        status="loaded",
+        support_status=plugin.support_status,
+        default_model=plugin.default_model,
+        capabilities=plugin.capabilities,
+        route_prefixes=plugin.route_prefixes,
+        server_policy=copied_policy,
+    )
+
+
+def snapshot_provider_descriptor(provider_id: ProviderId) -> ProviderDescriptorV1:
+    """Load and snapshot exactly one explicitly requested extension provider.
+
+    This invokes only the matching entry-point loader and the Core metadata
+    validator.  Held providers are rejected before a descriptor is returned;
+    factory, model-lister, doctor, and launch-binder callbacks are never run.
+    """
+
+    plugin = load_provider_plugin(provider_id)
+    _require_executable_support(plugin)
+    return _descriptor_from_loaded_plugin(plugin)
+
+
 def list_providers(*, include_ext: bool = False) -> list[ProviderDescriptorV1]:
     """Return immutable descriptors; extensions are metadata-only by default.
 
@@ -1093,19 +1146,23 @@ def list_providers(*, include_ext: bool = False) -> list[ProviderDescriptorV1]:
             failed = record.error if record and record.ready.is_set() else None
         if loaded is not None:
             status = "loaded"
-            descriptors.append(ProviderDescriptorV1(
-                id=provider_id,
-                source="extension",
-                status=status,
-                support_status=loaded.support_status,
-                default_model=(
-                    None if loaded.support_status == "held"
-                    else loaded.default_model
-                ),
-                capabilities=loaded.capabilities,
-                route_prefixes=loaded.route_prefixes,
-                server_policy=loaded.server_policy,
-            ))
+            descriptor = _descriptor_from_loaded_plugin(loaded)
+            if loaded.support_status == "held":
+                # Metadata listing remains allowed for a plugin explicitly
+                # loaded through another registry API.  It must not expose an
+                # executable default while the support gate is Held.
+                descriptor = ProviderDescriptorV1(
+                    id=descriptor.id,
+                    source=descriptor.source,
+                    status=descriptor.status,
+                    support_status=descriptor.support_status,
+                    default_model=None,
+                    capabilities=descriptor.capabilities,
+                    route_prefixes=descriptor.route_prefixes,
+                    server_policy=descriptor.server_policy,
+                    error=descriptor.error,
+                )
+            descriptors.append(descriptor)
         else:
             if failed is not None and status == "discovered":
                 status, error = "broken", "load_failed"
@@ -1152,4 +1209,5 @@ __all__ = [
     "list_providers",
     "load_provider_plugin",
     "plugins_disabled",
+    "snapshot_provider_descriptor",
 ]

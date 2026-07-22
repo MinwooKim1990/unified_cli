@@ -104,9 +104,9 @@ CORE_AUTH_SPECS: Mapping[str, Mapping[str, Tuple[str, ...]]] = MappingProxyType(
 
 DEFAULT_COMMANDS: Tuple[CommandSpec, ...] = (
     CommandSpec("/help", "", "slash.desc.help", group="info"),
-    CommandSpec("/provider", "<id>", "slash.desc.provider", takes="provider", group="model"),
-    CommandSpec("/model", "[name|--refresh]", "slash.desc.model", takes="model", group="model"),
-    CommandSpec("/auth", "<status|login|logout> <provider>", "slash.desc.auth", group="model"),
+    CommandSpec("/provider", "<exact-id>", "slash.desc.provider", takes="provider", group="model"),
+    CommandSpec("/model", "[literal|--refresh]", "slash.desc.model", takes="model", group="model"),
+    CommandSpec("/auth", "<status|login|logout> <exact-id>", "slash.desc.auth", group="model"),
     CommandSpec("/doctor", "", "slash.desc.doctor", group="model"),
     CommandSpec("/status", "", "slash.desc.status", group="model"),
     CommandSpec("/settings", "", "slash.desc.settings", group="settings"),

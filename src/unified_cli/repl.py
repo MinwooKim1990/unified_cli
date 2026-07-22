@@ -33,7 +33,7 @@ from rich.text import Text
 from . import settings
 from .base import _popen_process_group_kwargs, _terminate_process_tree
 from .conversation import UnifiedConversation
-from .core import ProviderName
+from .core import ProviderId
 from .errors import UnifiedError
 from .event_renderer import EventRenderer, safe_terminal_text
 from .factory import PROVIDERS
@@ -42,7 +42,8 @@ from .models import DEFAULT_MODELS
 from .providers.gemini import gemini_enabled
 from .repl_commands import CORE_AUTH_SPECS, DEFAULT_REGISTRY, CommandSpec
 from .repl_completion import (
-    arg_candidates, build_session, has_prompt_toolkit, pick_model, pick_provider,
+    _completion_model_snapshot, arg_candidates, build_session,
+    has_prompt_toolkit, pick_model, pick_provider, pick_provider_from_snapshots,
 )
 from .repl_state import ReplState
 from .state import resolve_cwd, save_last_session
@@ -58,6 +59,38 @@ _PERMISSION_VALUES = ("provider_default", "read_only", "workspace_write")
 _EFFORT_VALUES = ("default", "low", "medium", "high", "xhigh", "max")
 _STYLE_VALUES = ("default", "friendly", "pragmatic", "none")
 _CORE_DIR_PROVIDERS = frozenset(("claude", "codex", "gemini"))
+
+
+def _valid_explicit_provider_id(value: object) -> bool:
+    from .plugin import _valid_provider_id
+
+    return _valid_provider_id(value)
+
+
+def _core_model_choices(current: dict, provider: str) -> list:
+    """Return/create a passive Core model snapshot for REPL UI surfaces."""
+
+    snapshots = current.get("_completion_core_models")
+    if type(snapshots) is not dict:
+        snapshots = {}
+        current["_completion_core_models"] = snapshots
+    choices = snapshots.get(provider)
+    if not isinstance(choices, (list, tuple)):
+        choices = _completion_model_snapshot(provider)
+        snapshots[provider] = choices
+    return list(choices)
+
+
+def _replace_core_model_choices(
+    current: dict, provider: str, choices: list,
+) -> None:
+    """Commit one explicit refresh into the dict shared by live completers."""
+
+    snapshots = current.get("_completion_core_models")
+    if type(snapshots) is not dict:
+        snapshots = {}
+        current["_completion_core_models"] = snapshots
+    snapshots[provider] = tuple(choices)
 
 
 def _private_history_path(path: Path) -> Optional[Path]:
@@ -225,13 +258,40 @@ def _write_private_json_new(path: Path, payload: object) -> None:
 
 def run_repl(
     *,
-    provider: ProviderName = "claude",
+    provider: ProviderId = "claude",
     model: Optional[str] = None,
     web_search: bool = True,
     terse: bool = False,
     cwd: Optional[str] = None,
     continue_session: bool = False,
 ) -> int:
+    if not _valid_explicit_provider_id(provider):
+        _safe_print(t("cli.provider.invalid"), style="red")
+        return 2
+    extension_descriptor = None
+    if provider not in PROVIDERS:
+        try:
+            # Resolve the exact explicit extension before any Core-only
+            # DEFAULT_MODELS indexing.  This invokes metadata loading only.
+            from .registry import snapshot_provider_descriptor
+
+            extension_descriptor = snapshot_provider_descriptor(provider)
+        except UnifiedError as exc:
+            _print_unified_error(exc)
+            return 2
+        if model is not None:
+            from .plugin import _valid_model_id as _valid_extension_model_id
+
+            if not _valid_extension_model_id(model):
+                _safe_print(t("cli.model.invalid_extension"), style="red")
+                return 2
+        if terse:
+            _safe_print(
+                t("repl.extension.terse_unsupported", provider=provider),
+                style="red",
+            )
+            return 2
+
     saved_preferences = settings.load_settings()
     # If the user asked to start on the gated provider, fall back gracefully.
     if provider == "gemini" and not gemini_enabled():
@@ -257,7 +317,12 @@ def run_repl(
     # only replaces the CLI's ordinary True default.
     if web_search and saved_preferences.web is not None:
         effective_web = saved_preferences.web
-    provider_opts: dict = {"web_search": effective_web, "cwd": effective_cwd}
+    provider_opts: dict = {"cwd": effective_cwd}
+    if provider in PROVIDERS:
+        # Keep Core's established default.  Ext never receives the Core-only
+        # web_search constructor option; explicit requests fail closed before
+        # a turn instead.
+        provider_opts["web_search"] = effective_web
     if saved_preferences.timeout is not None:
         provider_opts["timeout"] = saved_preferences.timeout
     if terse:
@@ -270,17 +335,34 @@ def run_repl(
         provider_opts=provider_opts,
     )
 
-    current = {"provider": provider, "model": model or DEFAULT_MODELS[provider]}
+    if model is not None:
+        initial_model = model
+    elif extension_descriptor is not None:
+        initial_model = extension_descriptor.default_model or "default"
+    else:
+        initial_model = DEFAULT_MODELS[provider]  # type: ignore[index]
+    current = {"provider": provider, "model": initial_model}
     pending_images: list[str] = []
-
-    if continue_session:
-        _apply_resume(
-            conv, current, provider_opts, preserve_cwd=explicit_cwd is not None
-        )
 
     repl_state = ReplState.from_legacy(
         current, provider_opts, pending_images, context_window=conv.context_window
     )
+    # Ext omits the Core-only constructor keyword, but the local state still
+    # records the explicit CLI choice so toolbar display and later Core
+    # switches retain --no-web-search accurately.
+    repl_state.web_search = effective_web
+    if extension_descriptor is not None:
+        repl_state.remember_extension_descriptor(extension_descriptor)
+    repl_state.sync_legacy(current, provider_opts)
+
+    if continue_session:
+        _apply_resume(
+            conv, current, provider_opts, preserve_cwd=explicit_cwd is not None,
+            repl_state=repl_state,
+        )
+        repl_state.provider = str(current["provider"])
+        repl_state.model = str(current["model"])
+        repl_state.cwd = str(provider_opts.get("cwd") or repl_state.cwd)
     # False can only arrive through the explicit --no-web-search CLI flag;
     # the ordinary True default remains provider-managed unless saved.web is set.
     repl_state.web_explicit = not web_search
@@ -354,6 +436,7 @@ def _apply_resume(
     provider_opts: Optional[dict] = None,
     *,
     preserve_cwd: bool = False,
+    repl_state: Optional[ReplState] = None,
 ) -> bool:
     """Load the last saved session and seed the conversation so the NEXT turn
     resumes it natively. Returns True on success.
@@ -372,6 +455,35 @@ def _apply_resume(
     if saved.provider == "gemini" and not gemini_enabled():
         _safe_print(t("repl.gemini.locked"), style="yellow")
         return False
+    if saved.provider not in PROVIDERS:
+        descriptor = None
+        if repl_state is not None:
+            descriptor = repl_state.loaded_extension_descriptors.get(saved.provider)
+        if descriptor is None:
+            try:
+                from .registry import snapshot_provider_descriptor
+
+                descriptor = snapshot_provider_descriptor(saved.provider)
+            except UnifiedError as exc:
+                _print_unified_error(exc)
+                return False
+        if "sessions" not in descriptor.capabilities:
+            _safe_print(
+                t(
+                    "repl.extension.capability_required",
+                    provider=saved.provider,
+                    capability="sessions",
+                ),
+                style="red",
+            )
+            return False
+        from .plugin import _valid_model_id as _valid_extension_model_id
+
+        if not _valid_extension_model_id(saved.model):
+            _safe_print(t("cli.model.invalid_extension"), style="red")
+            return False
+        if repl_state is not None:
+            repl_state.remember_extension_descriptor(descriptor)
 
     current["provider"] = saved.provider
     current["model"] = saved.model
@@ -406,17 +518,25 @@ def _switch_provider(
     Built-ins stay on a zero-discovery path.  Only an explicit unknown id can
     trigger extension metadata lookup and loading.
     """
+    if not _valid_explicit_provider_id(new_provider):
+        _safe_print(t("cli.provider.invalid"), style="red")
+        return False
     default_model: Optional[str] = None
     if new_provider in PROVIDERS:
         default_model = DEFAULT_MODELS[new_provider]  # type: ignore[index]
     else:
         try:
-            from .registry import extension_provider_exists, load_provider_plugin
-            if not extension_provider_exists(new_provider):
-                _safe_print(t("repl.provider.unknown", provider=new_provider), style="red")
-                return False
-            plugin = load_provider_plugin(new_provider)
-            default_model = plugin.default_model
+            descriptor = (
+                repl_state.loaded_extension_descriptors.get(new_provider)
+                if repl_state is not None else None
+            )
+            if descriptor is None:
+                from .registry import snapshot_provider_descriptor
+
+                descriptor = snapshot_provider_descriptor(new_provider)
+            default_model = descriptor.default_model
+            if repl_state is not None:
+                repl_state.remember_extension_descriptor(descriptor)
         except UnifiedError as exc:
             _print_unified_error(exc)
             return False
@@ -509,7 +629,7 @@ class _SlashContext:
         elif cmd == "/doctor":
             self._doctor()
         elif cmd == "/status":
-            _live_status()
+            _print_repl_status_snapshot(self.state, self.conv)
         elif cmd == "/settings":
             self._settings()
         elif cmd == "/style":
@@ -555,6 +675,7 @@ class _SlashContext:
             _apply_resume(
                 self.conv, self.current, self.provider_opts,
                 preserve_cwd=self.preserve_cwd,
+                repl_state=self.state,
             )
             self.state.provider = self.current["provider"]
             self.state.model = self.current["model"]
@@ -603,7 +724,11 @@ class _SlashContext:
             _switch_provider(self.current, pieces[0], self.state)
             return
         if self.use_ptk:
-            chosen = pick_provider()
+            loaded = list(self.state.loaded_extension_descriptors)
+            chosen = (
+                pick_provider_from_snapshots(loaded) if loaded
+                else pick_provider()
+            )
             if chosen:
                 _switch_provider(self.current, chosen, self.state)
         else:
@@ -613,33 +738,77 @@ class _SlashContext:
         provider = self.state.provider
         if argument == "--refresh":
             try:
-                from .models import list_models
-                choices = list_models(provider, force_refresh=True)
+                if provider in PROVIDERS:
+                    from .models import list_models
+
+                    choices = list_models(provider, force_refresh=True)
+                    _replace_core_model_choices(
+                        self.current, provider, choices,
+                    )
+                else:
+                    from .registry import list_extension_models
+
+                    # Exactly one explicit lister call.  Do not discard the
+                    # last-good snapshot unless this call fully succeeds.
+                    choices = list_extension_models(provider)
             except UnifiedError as exc:
                 _print_unified_error(exc)
                 return
             except Exception:  # noqa: BLE001 - provider/list boundary
                 _safe_print(t("repl.model.refresh_failed"), style="red")
                 return
+            if provider not in PROVIDERS:
+                self.state.replace_extension_models(provider, choices)
+                # An empty successful refresh retains the descriptor default,
+                # so display the committed snapshot rather than the raw empty
+                # callback result.
+                choices = list(self.state.extension_models(provider))
             _safe_print(t("repl.model.refreshed", count=len(choices)), style="dim")
             _print_model_list(provider, choices=choices)
             return
         if argument:
-            if not _valid_model_id(argument):
+            valid_model = _valid_model_id(argument)
+            if provider not in PROVIDERS:
+                from .plugin import _valid_model_id as _valid_extension_model_id
+
+                valid_model = _valid_extension_model_id(argument)
+            if not valid_model:
                 _safe_print(t("repl.value.invalid", name="model"), style="red")
                 return
             self.current["model"] = argument
             self.state.model = argument
-            known = {mid for mid, _ in arg_candidates("/model", provider, "")}
+            if provider in PROVIDERS:
+                known = {
+                    model.id
+                    for model in _core_model_choices(self.current, provider)
+                }
+            else:
+                known = {
+                    model.id for model in self.state.extension_models(provider)
+                }
             if known and argument not in known:
                 _safe_print(t("repl.model.unknown", model=argument), style="yellow")
             _safe_print(t("repl.model.changed", model=argument), style="dim")
             return
         if provider not in PROVIDERS:
-            _safe_print(t("repl.model.extension_hint"), style="dim")
+            choices = list(self.state.extension_models(provider))
+            if not choices:
+                _safe_print(t("repl.model.extension_hint"), style="dim")
+                return
+            if self.use_ptk:
+                chosen = pick_model(provider, choices=choices)
+                if chosen:
+                    self.current["model"] = chosen
+                    self.state.model = chosen
+                    _safe_print(t("repl.model.changed", model=chosen), style="dim")
+                else:
+                    _safe_print(t("repl.model.cancelled"), style="dim")
+            else:
+                _print_model_list(provider, choices=choices)
             return
         if self.use_ptk:
-            chosen = pick_model(provider)
+            core_choices = _core_model_choices(self.current, provider)
+            chosen = pick_model(provider, choices=core_choices)
             if chosen:
                 self.current["model"] = chosen
                 self.state.model = chosen
@@ -647,7 +816,10 @@ class _SlashContext:
             else:
                 _safe_print(t("repl.model.cancelled"), style="dim")
         else:
-            _print_model_list(provider)
+            _print_model_list(
+                provider,
+                choices=_core_model_choices(self.current, provider),
+            )
 
     def _auth(self, argument: str) -> None:
         parts = argument.split()
@@ -663,6 +835,21 @@ class _SlashContext:
                 "repl.auth.gemini.reason", "repl.auth.gemini.alt",
             )
             return
+        if provider not in PROVIDERS:
+            descriptor = self.state.loaded_extension_descriptors.get(provider)
+            if descriptor is None or "auth" not in descriptor.capabilities:
+                _unavailable(
+                    "/auth " + action + " " + provider,
+                    "repl.auth.extension.unsupported.reason",
+                    "repl.auth.extension.unsupported.alt",
+                )
+            else:
+                _unavailable(
+                    "/auth " + action + " " + provider,
+                    "repl.auth.extension.config_v1.reason",
+                    "repl.auth.extension.config_v1.alt",
+                )
+            return
         if action in {"status", "login", "logout"} and provider not in CORE_AUTH_SPECS:
             _unavailable(
                 "/auth " + action + " " + provider,
@@ -675,6 +862,31 @@ class _SlashContext:
         _run_core_auth(provider, action)
 
     def _doctor(self) -> None:
+        provider = self.state.provider
+        if provider not in PROVIDERS:
+            try:
+                from .registry import doctor_provider
+
+                # The extension return value is intentionally ignored.  Only
+                # this explicit command invokes the doctor callback, and Core
+                # renders a fixed generic outcome.
+                doctor_provider(provider)
+            except UnifiedError as exc:
+                _print_unified_error(exc)
+            except Exception:  # noqa: BLE001 - extension diagnostic boundary
+                _safe_print(
+                    t("repl.doctor.extension_failed", provider=provider),
+                    style="red",
+                )
+            else:
+                _safe_print(
+                    t("repl.doctor.extension_ok", provider=provider),
+                    style="green",
+                )
+            return
+
+        # Preserve the historical Core doctor table, but only on a Core
+        # selection. Ext diagnostics must not probe unrelated Core providers.
         from .ui import _HEALTH_STYLE, collect_states
         for state in collect_states():
             icon, color, label_key = _HEALTH_STYLE.get(state.health, ("•", "dim", None))
@@ -1159,12 +1371,18 @@ def _apply_saved_preferences(
     conv.context_window = saved.context_window
     conv.cross_provider_context = saved.cross_provider_context_enabled
     cli_web_explicit = state.web_explicit
+    provider_opts = getattr(conv, "provider_opts", None)
     if saved.web is not None and not cli_web_explicit:
         state.web_search = saved.web
-        provider_opts = getattr(conv, "provider_opts", None)
-        if type(provider_opts) is dict:
+        if type(provider_opts) is dict and state.provider in PROVIDERS:
             provider_opts["web_search"] = saved.web
     state.web_explicit = cli_web_explicit or saved.web is not None
+    if type(provider_opts) is dict:
+        if state.provider in PROVIDERS:
+            provider_opts.setdefault("web_search", state.web_search)
+        else:
+            # Never leak a Core-only tool setting into Ext construction.
+            provider_opts.pop("web_search", None)
     state.style = saved.style or "default"
     state.effort = saved.effort or "default"
     state.system_prompt = saved.system_prompt
@@ -1309,7 +1527,13 @@ def _canonical_directory(value: object) -> Optional[str]:
     return str(path) if path.is_dir() else None
 
 
-def _turn_capabilities_supported(state: ReplState, provider: str) -> bool:
+def _turn_capabilities_supported(
+    state: ReplState,
+    provider: str,
+    *,
+    images: bool = False,
+    resume: bool = False,
+) -> bool:
     """Fail closed before provider construction when a request cannot be mapped."""
     if state.permission_mode not in _PERMISSION_VALUES:
         _unavailable(
@@ -1385,6 +1609,30 @@ def _turn_capabilities_supported(state: ReplState, provider: str) -> bool:
             "/add-dir", "repl.unavail.add_dir.reason", "repl.unavail.add_dir.alt",
         )
         return False
+    if provider not in PROVIDERS and (images or resume):
+        descriptor = state.loaded_extension_descriptors.get(provider)
+        required = [
+            capability
+            for capability, needed in (("sessions", resume), ("images", images))
+            if needed
+        ]
+        missing = next(
+            (
+                capability for capability in required
+                if descriptor is None or capability not in descriptor.capabilities
+            ),
+            None,
+        )
+        if missing is not None:
+            _safe_print(
+                t(
+                    "repl.extension.capability_required",
+                    provider=provider,
+                    capability=missing,
+                ),
+                style="red",
+            )
+            return False
     return True
 
 
@@ -1739,6 +1987,66 @@ def _live_status() -> None:
         pass
 
 
+def _print_repl_status_snapshot(state: ReplState, conv: UnifiedConversation) -> None:
+    """Render process-local REPL state without probing any provider.
+
+    The global CLI status command keeps its established discovery behavior.
+    REPL `/status` is deliberately a point-in-time view of already-held state,
+    session memory, usage counters, and loaded immutable Ext metadata only.
+    """
+
+    rows = [
+        ("provider", state.provider),
+        ("model", state.model),
+        ("cwd", state.cwd),
+        ("permission", state.permission_mode),
+        (
+            "web",
+            ("on" if state.web_search else "off")
+            if state.web_explicit else "default",
+        ),
+        ("context", state.context_window),
+    ]
+    sessions = getattr(conv, "sessions", {})
+    session_id = sessions.get(state.provider) if type(sessions) is dict else None
+    rows.append(("session", "active" if session_id else "none"))
+    totals = sum(
+        aggregate.input_tokens + aggregate.output_tokens
+        for aggregate in tracker.aggregates()
+    )
+    rows.append(("tokens", totals))
+    descriptor = state.loaded_extension_descriptors.get(state.provider)
+    if descriptor is not None:
+        rows.extend((
+            ("support", descriptor.support_status),
+            (
+                "capabilities",
+                ", ".join(sorted(descriptor.capabilities)) or "none",
+            ),
+        ))
+
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column(style="cyan")
+    table.add_column()
+    for key, value in rows:
+        display = _localized_status_value(key, value)
+        table.add_row(
+            Text(t("repl.status.label." + key)),
+            Text(safe_terminal_text(display)),
+        )
+    console.print(table)
+
+
+def _localized_status_value(key: str, value: object) -> object:
+    if key == "web" and value in {"default", "on", "off"}:
+        return t("repl.settings.value." + str(value))
+    if key == "session" and value in {"active", "none"}:
+        return t("repl.status.value." + str(value))
+    if key == "capabilities" and value == "none":
+        return t("repl.status.value.none")
+    return value
+
+
 # ---------- turn execution ----------
 
 def _run_turn(
@@ -1757,7 +2065,17 @@ def _run_turn(
     provider = str(current.get("provider") or state.provider)
     state.provider = provider
     state.model = str(current.get("model") or state.model)
-    if not _turn_capabilities_supported(state, provider):
+    turns = getattr(conv, "turns", ())
+    sessions = getattr(conv, "sessions", {})
+    resuming = bool(
+        turns
+        and getattr(turns[-1], "provider", None) == provider
+        and type(sessions) is dict
+        and sessions.get(provider)
+    )
+    if not _turn_capabilities_supported(
+        state, provider, images=bool(images), resume=resuming
+    ):
         return
     _apply_provider_capabilities(state, conv)
 

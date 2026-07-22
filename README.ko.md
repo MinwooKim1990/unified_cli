@@ -19,7 +19,7 @@ pip install unified-cli
 ```
 
 여기엔 완전한 대화형 REPL(라이브 `/` 슬래시 메뉴, 모델/provider 선택기,
-라이브 `/status`)이 포함됩니다 — `prompt_toolkit` 이 코어 의존성이라 별도
+probe 없는 `/status` 스냅샷)이 포함됩니다 — `prompt_toolkit` 이 코어 의존성이라 별도
 옵션 설치가 필요 없습니다.
 
 OpenAI 호환 HTTP 서버까지 쓰려면 `server` 옵션 의존성을 함께 설치:
@@ -116,7 +116,7 @@ provider 카탈로그, 상태 의미, 활성화 전 필요한 근거는
   credential로 자동 재생하지 않음
 - **이미지 입력 멀티모달** — 3 provider 전부. Claude 는 Read 도구, Codex 는 `-i` 플래그, Gemini(`agy`) 는 `@<path>` 참조를 사용합니다. 권한 우회는 자동으로 켜지지 않습니다.
 - 히스토리 · 스트리밍 · 도구 사용 · **웹서치 기본 ON** · OpenAI 호환 HTTP 서버
-- 대화형 **REPL** (`unified-cli repl`): `/` 입력 시 라이브 슬래시 메뉴, `/model`·`/provider` 선택기(최신 모델 표시, 기본값 ★), 라이브 `/status` — `prompt_toolkit` 기반
+- 대화형 **REPL** (`unified-cli repl`): `/` 입력 시 라이브 슬래시 메뉴, `/model`·`/provider` 선택기, probe 없는 `/status` 스냅샷 — `prompt_toolkit` 기반
 - **다국어(i18n)**: 기본 영어, `--lang ko`(또는 REPL 의 `/lang ko`, 또는 `UNIFIED_CLI_LANG=ko`)로 한국어
 - 리디자인된 자동 갱신 **웹 대시보드** `/dashboard` (`/` 접속 시 자동 리다이렉트)
 - 명시적 에러 분류 (auth_expired / rate_limit / model_not_allowed / not_found / network / resource_limit / config / internal)
@@ -189,19 +189,21 @@ provider 별 처리:
 ```bash
 unified-cli repl                          # 설정된 기본 provider (설정 전 Claude)로 시작
 unified-cli repl --provider codex -m gpt-5.4-mini
+unified-cli repl --provider exact-extension-id -m vendor/family/model
 ```
 
 ```text
 [claude/haiku] > /                         # 모든 슬래시 명령 라이브 드롭다운
-[claude/haiku] > /model                    # 선택기: provider 별 최신 모델 (기본값 ★)
+[claude/haiku] > /model                    # Core cache/fallback 또는 로드된 확장 snapshot (기본값 ★)
 [claude/sonnet] > /provider                # 선택기: provider 선택 (컨텍스트 자동 주입)
-[codex/gpt-5.4-mini] > /status             # 라이브 상태 패널 (Ctrl+C → 프롬프트로 복귀)
+[codex/gpt-5.4-mini] > /status             # provider probe 없는 프로세스 로컬 스냅샷
 [codex/gpt-5.4-mini] > /lang ko            # UI 를 한국어로 전환 (저장됨)
 ```
 
-- **`/model`** (인자 없이) → provider 별 최신 모델 선택기(기본값 ★). `/model <name>` 도 그대로 동작.
-- **`/provider`** (인자 없이) → provider 선택기.
-- **`/status`** → REPL 안에서 자동 갱신되는 라이브 상태 패널.
+- **`/model`** (인자 없이) → Core는 메모리 cache/fallback, 명시적으로 불러온 확장은 descriptor 기본 모델과 마지막 성공 refresh 스냅샷만 표시. `/model <literal>`은 probe 없이 그대로 설정.
+- **`/provider <정확한-id>`** → 해당 확장 metadata 하나만 로드. 인자 없는 선택기는 Core와 이미 로드된 확장 snapshot만 표시.
+- **`/status`** → provider probe 없는 프로세스 로컬 스냅샷.
+- **`/doctor`** → Core 선택 시 기존 Core health 표만 표시. 확장 선택 시 해당 확장의 명시적 doctor만 호출하고 Core가 정한 일반 결과만 표시.
 - **`/lang en` / `/lang ko`** → UI 언어 즉시 전환 + 저장.
 
 슬래시 명령:
@@ -209,19 +211,19 @@ unified-cli repl --provider codex -m gpt-5.4-mini
 | 명령 | 동작 |
 |---|---|
 | `/help` | 명령 목록 (현재 언어로) |
-| `/model [name]` | 인자 없으면 모델 선택기, 있으면 같은 provider 에서 모델 변경 |
-| `/provider [name]` | 인자 없으면 provider 선택기, 있으면 전환 (이전 8턴 컨텍스트 자동 주입) |
-| `/status` | REPL 안 라이브 상태 패널 (Ctrl+C 로 복귀) |
+| `/model [literal\|--refresh]` | literal은 probe 없이 그대로 설정; 확장 refresh는 명시적으로만 실행 |
+| `/provider [정확한-id]` | 정확한 확장 metadata 하나만 로드; 선택기는 Core + 이미 로드된 snapshot |
+| `/status` | provider probe 없는 프로세스 로컬 상태 스냅샷 |
 | `/lang <en\|ko>` | UI 언어 전환 + 저장 |
 | `/new` | 대화 초기화 |
 | `/save` | 현재 session_id + 이어쓰기 명령 표시 |
 | `/history [N]` | 최근 N 턴 표시 |
 | `/tokens` | 누적 사용량 |
-| `/doctor` | provider 헬스 한 줄 |
+| `/doctor` | Core 선택 시 Core health 표만, 확장 선택 시 해당 확장의 명시적 doctor만 실행(임의 반환값은 표시 안 함) |
 | `/image <path>` | 다음 prompt 에 이미지 첨부 (반복 가능) |
 | `/images` | 첨부 목록 |
 | `/clear-images` | 첨부 비우기 |
-| `/exit` or Ctrl+D | 종료 (마지막 session_id 자동 저장) |
+| `/exit`, `/quit`, Ctrl+D | 종료 (마지막 session_id 자동 저장) |
 
 TTY 가 아니면(파이프 등) 같은 명령을 쓰는 평범한 `input()` 루프로 폴백합니다.
 REPL 종료 후 `unified-cli chat "..." --continue` 로도 대화가 이어집니다.

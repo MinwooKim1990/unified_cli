@@ -270,6 +270,26 @@ def _cached(provider: ProviderName) -> Optional[list[ModelInfo]]:
         return _thaw_models(items)
 
 
+def _peek_cached_or_hardcoded(provider: ProviderName) -> list[ModelInfo]:
+    """Return a passive in-memory snapshot without computing cache context.
+
+    REPL completion setup must not stat provider files, inspect PATH, or run a
+    provider finder merely to render candidates.  The newest non-expired cache
+    record already resident for this provider is safe to reuse; otherwise the
+    static hardcoded order is returned.
+    """
+
+    now = time.monotonic()
+    with _CACHE_LOCK:
+        for key in reversed(_CACHE):
+            if key[0] != provider:
+                continue
+            expires_at, items = _CACHE[key]
+            if now < expires_at:
+                return _thaw_models(items)
+    return _hardcoded(provider)
+
+
 def _clear_provider_cache_locked(provider: ProviderName) -> None:
     for key in tuple(_CACHE):
         if key[0] == provider:
