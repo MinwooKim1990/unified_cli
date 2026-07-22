@@ -100,12 +100,40 @@ jobs:
       - name: Run the complete offline Core suite
         run: python -m pytest -q
 
-      - name: Run offline performance and readiness gates
-        run: python scripts/check_performance.py
+  performance:
+    name: Pinned-reference Core release performance gate
+    needs: verify-release
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout the exact Core release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout immutable performance reference
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: performance-reference
+          persist-credentials: false
+          ref: be1478884735c862e894959944ba53e149ea4210
+
+      - name: Set up exact performance Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14.6"
+
+      - name: Install hash-locked performance dependencies
+        run: >-
+          PIP_CONFIG_FILE=/dev/null python -m pip install --isolated --no-cache-dir --require-hashes --only-binary=:all: --index-url https://pypi.org/simple -r scripts/performance-requirements.txt
+
+      - name: Run pinned-reference offline performance gate
+        run: >-
+          python scripts/check_performance.py
+          --reference-root performance-reference
 
   build:
     name: Build and verify Core wheel and sdist
-    needs: [verify-release, test]
+    needs: [verify-release, test, performance]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout the release tag

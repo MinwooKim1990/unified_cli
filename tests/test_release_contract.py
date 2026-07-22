@@ -15,6 +15,8 @@ import pytest
 ROOT = Path(__file__).parents[1]
 CORE_WORKFLOW = ROOT / ".github" / "workflows" / "publish.yml"
 EXT_WORKFLOW = ROOT / ".github" / "workflows" / "publish-ext.yml"
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+PERFORMANCE_REQUIREMENTS = ROOT / "scripts" / "performance-requirements.txt"
 RELEASE_ASSET_SCRIPT = ROOT / "scripts" / "verify_github_release_assets.py"
 _RELEASE_ASSET_SPEC = importlib.util.spec_from_file_location(
     "verify_github_release_assets", RELEASE_ASSET_SCRIPT
@@ -26,10 +28,60 @@ _RELEASE_ASSET_SPEC.loader.exec_module(verify_github_release_assets)
 
 CORE_WHEEL = "unified_cli-0.5.0-py3-none-any.whl"
 CORE_SDIST = "unified_cli-0.5.0.tar.gz"
+PERFORMANCE_REFERENCE_SHA = "be1478884735c862e894959944ba53e149ea4210"
+PERFORMANCE_INSTALL_COMMAND = (
+    "PIP_CONFIG_FILE=/dev/null python -m pip install --isolated --no-cache-dir "
+    "--require-hashes --only-binary=:all: --index-url https://pypi.org/simple "
+    "-r scripts/performance-requirements.txt"
+)
+PERFORMANCE_DEPENDENCIES = {
+    "annotated-doc": "0.0.4",
+    "annotated-types": "0.7.0",
+    "anyio": "4.14.2",
+    "click": "8.4.2",
+    "fastapi": "0.139.2",
+    "h11": "0.16.0",
+    "idna": "3.18",
+    "markdown-it-py": "4.2.0",
+    "mdurl": "0.1.2",
+    "prompt-toolkit": "3.0.52",
+    "pydantic": "2.13.4",
+    "pydantic-core": "2.46.4",
+    "pygments": "2.20.0",
+    "rich": "15.0.0",
+    "starlette": "1.3.1",
+    "typing-extensions": "4.16.0",
+    "typing-inspection": "0.4.2",
+    "uvicorn": "0.51.0",
+    "wcwidth": "0.8.2",
+}
 
 
 def _text(path):
     return path.read_text(encoding="utf-8")
+
+
+def _job_section(workflow, job_name):
+    start = workflow.index("  " + job_name + ":\n")
+    following = re.search(r"^  [a-z][a-z0-9-]*:\n", workflow[start + 1:], re.M)
+    return workflow[start:] if following is None else workflow[start:start + 1 + following.start()]
+
+
+def _assert_hash_locked_performance_dependencies(lock):
+    for name, version in PERFORMANCE_DEPENDENCIES.items():
+        pattern = (
+            r"^" + re.escape(name + "==" + version)
+            + r" \\\n    --hash=sha256:[0-9a-f]{64}(?: \\)?$"
+        )
+        assert re.search(pattern, lock, re.M), name + " must be exact and hash pinned"
+    assert lock.count("--hash=sha256:") == len(PERFORMANCE_DEPENDENCIES) + 1
+    assert ">=" not in lock and "~=" not in lock
+
+
+def _checkout_blocks(workflow):
+    for match in re.finditer(r"^        uses: actions/checkout@[^\n]+$", workflow, re.M):
+        next_step = workflow.find("\n      - name:", match.end())
+        yield workflow[match.start():] if next_step == -1 else workflow[match.start():next_step]
 
 
 def _release_asset_fixture(tmp_path):
@@ -96,6 +148,65 @@ def test_publish_workflows_require_exact_clean_main_not_ancestry_only():
         assert "workflow_dispatch" not in workflow
     assert 'core_commit="$(git rev-parse "refs/tags/v${CORE_VERSION}^{commit}")"' in ext
     assert 'test "$tag_commit" = "$core_commit"' in ext
+
+
+def test_performance_jobs_share_a_hash_locked_server_runtime():
+    lock = _text(PERFORMANCE_REQUIREMENTS)
+    _assert_hash_locked_performance_dependencies(lock)
+
+    install_commands = []
+    for workflow_path in (CI_WORKFLOW, CORE_WORKFLOW, EXT_WORKFLOW):
+        workflow = _text(workflow_path)
+        performance = _job_section(workflow, "performance")
+        assert "runs-on: ubuntu-24.04" in performance
+        assert 'python-version: "3.14.6"' in performance
+        assert "path: performance-reference" in performance
+        assert "ref: " + PERFORMANCE_REFERENCE_SHA in performance
+        assert performance.count("persist-credentials: false") == 2
+        assert "python scripts/check_performance.py" in performance
+        assert "--reference-root performance-reference" in performance
+        install = re.search(
+            r"Install hash-locked performance dependencies\n"
+            r"        run: >-\n"
+            r"          (?P<command>[^\n]+)",
+            performance,
+        )
+        assert install is not None
+        install_commands.append(install.group("command"))
+
+    assert install_commands == [PERFORMANCE_INSTALL_COMMAND] * 3
+
+    broken_lock = lock.replace("fastapi==0.139.2", "fastapi>=0.139.2", 1)
+    with pytest.raises(AssertionError):
+        _assert_hash_locked_performance_dependencies(broken_lock)
+
+
+def test_every_checkout_drops_persisted_credentials_and_ci_has_fixed_required_gate():
+    ci = _text(CI_WORKFLOW)
+    core = _text(CORE_WORKFLOW)
+    ext = _text(EXT_WORKFLOW)
+
+    for workflow in (ci, core, ext):
+        blocks = tuple(_checkout_blocks(workflow))
+        assert blocks
+        assert all("persist-credentials: false" in block for block in blocks)
+
+    required = _job_section(ci, "required-ci")
+    assert "name: Required CI gate" in required
+    assert "if: always()" in required
+    assert (
+        "needs: [test, performance, ext-test, ext-optional-extras, "
+        "ext-lab-fixture, distribution-pair]"
+    ) in required
+    for job in (
+        "test",
+        "performance",
+        "ext-test",
+        "ext-optional-extras",
+        "ext-lab-fixture",
+        "distribution-pair",
+    ):
+        assert 'test "${{ needs.' + job + '.result }}" = "success"' in required
 
 
 def test_release_artifacts_and_public_smokes_cannot_mix_core_and_ext():
@@ -319,6 +430,35 @@ def test_ci_uses_current_immutable_checkout_and_python_action_pins():
     }
 
 
+def test_performance_is_a_dedicated_exact_pinned_reference_job():
+    ci = _text(ROOT / ".github" / "workflows" / "ci.yml")
+    core = _text(CORE_WORKFLOW)
+    ext = _text(EXT_WORKFLOW)
+    reference = "be1478884735c862e894959944ba53e149ea4210"
+
+    matrix_job = ci[ci.index("  test:"):ci.index("  performance:")]
+    assert "check_performance.py" not in matrix_job
+    for workflow in (ci, core, ext):
+        performance = workflow[workflow.index("  performance:"):]
+        if "  build:" in performance:
+            performance = performance[:performance.index("  build:")]
+        elif "  test-and-build:" in performance:
+            performance = performance[:performance.index("  test-and-build:")]
+        elif "  ext-test:" in performance:
+            performance = performance[:performance.index("  ext-test:")]
+        assert "runs-on: ubuntu-24.04" in performance
+        assert 'python-version: "3.14.6"' in performance
+        assert "ref: " + reference in performance
+        assert "persist-credentials: false" in performance
+        assert "--reference-root performance-reference" in performance
+        assert PERFORMANCE_INSTALL_COMMAND in performance
+
+    core_build = core[core.index("  build:"):core.index("  publish:")]
+    assert "needs: [verify-release, test, performance]" in core_build
+    ext_build = ext[ext.index("  test-and-build:"):ext.index("  publish:")]
+    assert "needs: [verify-release, performance]" in ext_build
+
+
 def test_ci_and_runbook_preserve_the_ordered_offline_readiness_contract():
     ci = _text(ROOT / ".github" / "workflows" / "ci.yml")
     runbook = _text(ROOT / "RELEASING.md")
@@ -344,3 +484,8 @@ def test_ci_and_runbook_preserve_the_ordered_offline_readiness_contract():
     assert "Leave Core 0.5.0" in runbook
     assert "publish.yml" in runbook and "environment `pypi`" in runbook
     assert "publish-ext.yml" in runbook and "environment `pypi-ext`" in runbook
+    assert "git worktree add --detach" in runbook
+    assert "--reference-root \"$REFERENCE_ROOT\"" in runbook
+    assert "scripts/performance-requirements.txt" in runbook
+    assert "git merge-base --is-ancestor \"$REFERENCE_SHA\" origin/main" in runbook
+    assert "`Required CI gate`" in runbook

@@ -93,76 +93,123 @@ excluded. `unified-cli --version` is timed outside the process and therefore
 includes executable and interpreter startup; its implementation has a dedicated
 fast path that avoids parser construction and provider discovery.
 
-## Portable gate paired import calibration
+## Immutable same-metric reference gate
 
-The offline performance gate keeps the Stage 0 Core import and version values
-above as code baselines. A later Ubuntu Python 3.14 run at integration commit
-`be147888` showed why process startup is not a sufficient host reference:
-startup p95 was 33.687 ms while the unchanged Core import median was 108.546 ms,
-Core version median was 202.939 ms, Ext import p95 was 153.386 ms, and the
-passive Ext registry p95 was 272.861 ms. Import-heavy work had a shared host
-penalty that an interpreter-launch probe did not represent.
+The release-blocking gate keeps the Stage 0 Core anchors and policies above, but
+qualifies host overhead by executing the exact same metric from an immutable
+reference checkout. The reference is the full commit
+`be1478884735c862e894959944ba53e149ea4210`. Later changes before this gate only
+affected the old harness and its documentation; the measured Core and Ext
+source trees are identical.
 
-The gate now brackets every normalized target sample with fresh-process runs of
-an independent, generated pure-Python import DAG. The disposable package is not
-part of Core, Ext, their dependencies, or the repository source tree. It has
-three fixed profiles so the calibration unit resembles each target:
+Every retained sample, and every warmup, runs three fresh processes in this
+fixed order: `reference_before`, `candidate`, `reference_after`. For reference
+values `b_i` and `a_i`, candidate value `c_i`, and the metric's versioned anchor
+`A`, the calculation is:
 
-| Target | DAG modules | Calibration value | Versioned calibration baseline |
-| --- | ---: | --- | ---: |
-| Core import | 420 leaves | import-body time | 49.712 ms |
-| Core version | 500 leaves | end-to-end process time | 97.284 ms |
-| Passive Ext registry | 720 leaves | import-body time | 80.838 ms |
+`r_i = min(b_i, a_i)`
 
-The baselines were recorded in the same fresh-process bracket shape used by the
-gate: three warmup pairs followed by three retained before/after pairs. The six
-retained observations were 62.034500, 50.217458, 47.549583, 50.063250,
-48.242250, and 49.361459 ms for Core import; 98.078250, 96.994500, 96.614459,
-97.094333, 97.474500, and 98.390333 ms for Core version; and 80.935417,
-80.101333, 79.955083, 81.404458, 80.791958, and 80.883583 ms for the passive
-registry. Their medians, rounded to three decimals, are the values above. The
-profiles deliberately use a factor of one: their local costs match the target
-units closely enough that no multiplier can amplify a host allowance.
+`h_i = max(0, r_i - A)`
 
-Each calibration process proves the exact module origin, module count, and
-deterministic sentinel. Import canaries reject Core, Ext, or entry-point imports;
-the subprocess guard rejects provider execution; and bytecode generation is
-disabled. A failed proof or an invalid duration fails that target measurement
-and grants no credit.
+`normalized_i = max(0, c_i - h_i)`
 
-For target sample `i`, let `b_i` and `a_i` be the before and after calibration
-durations, and let `c` be the profile baseline. When both durations are at most
-`c + 50 ms`, the paired adjustment is:
+The target statistic is applied only after this per-sample normalization and is
+compared unrounded. One slow reference side cannot increase credit because the
+minimum is used. There is no ratio, multiplier, host cap, aggregate adjustment,
+or cross-metric credit: Core import references only Core import, Core version
+references only Core version, and the passive registry references only the
+passive registry. Any reference failure, origin mismatch, or proof failure
+fails the measurement closed.
 
-`h_i = min(max(0, b_i - c), max(0, a_i - c))`
+The anchors and policies are:
 
-`h_i` is also capped at 50 ms. If exactly one duration exceeds the envelope,
-that pair receives zero adjustment; if both exceed it, the target measurement
-fails as an unqualified host. The gate computes
-`normalized_i = target_i - h_i` for every sample and only then applies the
-target's median or p95 statistic. It does not subtract an aggregate calibration
-median. The Stage 0 Core policies remain
-`48.606 + max(50, 10%)` and `94.635 + max(50, 10%)`; the passive registry keeps
-its fixed 250 ms policy. Reported raw thresholds are raised only by the exact
-difference between the raw and paired-normalized target statistics.
+| Metric | Statistic / samples | Reference anchor | Policy |
+| --- | --- | ---: | ---: |
+| Core import | median / 15 | 48.606 ms | 98.606 ms |
+| Core version | median / 15 | 94.635 ms | 144.635 ms |
+| Passive Ext registry | p95 / 61 | 195.661 ms | 250.000 ms |
 
-No project metric supplies an allowance to another metric. A Core import that
-is slow but still within its own limit cannot make Core version or the passive
-registry pass. The standalone Core-sized DAG metric is also a hard readiness
-gate at 99.712 ms. The loader accepts only the explicit original
-pre-normalization v1 shape as legacy; half-migrated or unbounded normalization
-configuration fails closed.
+The registry anchor was established on 2026-07-22 in Asia/Seoul on an Apple M4
+Mac mini (Darwin 25.5.0, arm64) with CPython 3.14.3. The final sanitized harness
+ran three independent runs, each with three warmups and 61 retained candidate
+measurements while candidate and reference both pointed at the pinned source.
+The run-level candidate p95 values were 167.266000, 195.660958, and 242.742667
+ms; their median is 195.660958 ms, stored to the baseline's three-decimal
+precision as 195.661 ms. For provenance, the same runs' `reference_before` p95
+values were 176.680542, 208.317250, and 226.874375 ms; `reference_after` p95
+values were 180.929583, 209.314458, and 232.702625 ms; and paired-minimum p95
+values were 155.973250, 190.061750, and 174.057125 ms. The complete retained
+arrays were captured in the implementation session output; no older ambient
+272.861 ms, generated-workload 80.838 ms, or superseded 31-sample anchor was
+reused.
 
-## REPL first-prompt baseline: pending
+With this repository's linear percentile definition, 61-sample p95 lands
+exactly on sorted index 57 (the fourth-largest value), rather than interpolating
+the 29th and 30th values of a 31-sample set. This fixed sample count makes the
+five-percent exceedance policy less sensitive to two isolated scheduler spikes
+while preserving the p95 statistic, 250 ms policy, and fail-closed credit
+calculation. It is one 61-sample run, not an appended sample set or retry
+selection.
+
+The reference checkout is validated once, before any measured child, without a Git subprocess. Its detached
+`.git/HEAD` must equal the full pinned SHA, both package versions must be exactly
+0.5.0 and 0.1.0, and the two relevant source trees must match digest
+`7f21edae7ab640afb342261ef4092586101edc9549661e391032ce6906fc04f4`.
+The versioned `sha256-path-content-v1` digest walks
+`src/unified_cli` and
+`packages/unified-cli-ext/src/unified_cli_ext` in sorted POSIX-path order. It
+hashes `D\\0<path>\\0` for directories and
+`F\\0<path>\\0<size>\\0<bytes>` for files; bytecode/cache and egg/dist metadata
+are excluded. Symlinks, special files, path escape, wrong versions, wrong SHA,
+or digest drift fail closed.
+
+The validator captures those exact regular-file bytes into a frozen parent-memory
+manifest using descriptor-relative, no-follow opens and before/after `fstat`
+checks. Each `reference_before` and `reference_after` invocation materializes a
+new randomly named snapshot from that manifest immediately before process
+launch and removes it immediately after exit. Snapshot creation is outside the
+timer. The writable checkout and a reused reference sandbox are never exposed
+to a reference process; the before snapshot is gone while the candidate runs,
+and the after snapshot path does not yet exist.
+
+Every Python child uses `python -I -S -B`: isolated mode and `-S` prevent cwd,
+`PYTHONPATH`, user-site, and startup-hook injection, while explicit `-B` prevents
+candidate/reference bytecode writes because isolated mode ignores the analogous
+environment variable. The harness does not claim a fixed hash seed: `-I`
+intentionally ignores `PYTHONHASHSEED`, and no policy depends on hash iteration
+order. Every child cwd is a disposable empty directory, never the repository.
+
+The registry bootstrap first retains only interpreter stdlib/lib-dynload paths,
+then loads the guard by its absolute path, and only afterward adds the guard and
+selected sanitized source paths. Candidate `ssl.py`, `socket.py`, and
+`sitecustomize.py` therefore cannot shadow startup imports. It proves the exact
+single distribution inventory and derives the exact entry-point inventory from
+each already-verified `distribution.entry_points` property, avoiding the
+version-sensitive global `metadata.entry_points()` shape on Python 3.9–3.14.
+It discovers but does not import the canary descriptor and proves all project
+module origins. Ambient site packages and ignored packaging metadata cannot
+affect the measurement.
+
+Normalized candidate children also install an audit hook before candidate paths
+become importable. The hook records and rejects filesystem writes/mutations,
+subprocess execution, `fork`/`forkpty`, and `ctypes`/`_ctypes` imports. Thus a
+candidate cannot leave a watcher behind or alter a later reference snapshot;
+even a caught attempt leaves a marker and fails the metric closed.
+
+The REPL readiness metric retains its 300 ms p95 policy and now uses three
+warmups plus 31 samples. The larger fixed sample set was adopted after a local
+nine-sample run had two scheduler outliers and a 331.032 ms p95; it reduces
+single-spike sensitivity without retries, best-of-N selection, or a threshold
+increase.
+
+## REPL first-prompt readiness gate
 
 The relevant measure is wall time from invoking `unified-cli repl` in a real TTY
-to the first rendered `you>` prompt, separately for a cold and warm process.
-It is intentionally not automated in this baseline: a pipe makes the REPL choose
-its non-TTY/readline path, while the real path depends on prompt-toolkit terminal
-capabilities, user history files, and terminal rendering. A clean future harness
-should allocate a disposable pseudo-terminal, wait for the prompt marker, use an
-isolated `HOME`, and never submit a provider prompt. Until then, do not compare
-the piped startup time with interactive REPL performance.
+to the first rendered prompt in a fresh process. The harness allocates a
+disposable pseudo-terminal so prompt-toolkit takes its real interactive path,
+waits for the visible prompt marker, then submits only `/exit`. It uses an
+isolated `HOME` and never submits a provider prompt. A pipe is not an equivalent
+measurement because it selects a different non-TTY/readline path.
 
 ## Raw provider-versus-wrapper prompt latency: pending
 

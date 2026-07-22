@@ -1,6 +1,15 @@
 {
-  "baseline_id": "platform-next-stage0-ffc8a219",
+  "baseline_id": "platform-next-stage0-reference-be147888",
   "baseline_source": "docs/development/platform-next-stage0-baseline.md",
+  "reference": {
+    "digest_algorithm": "sha256-path-content-v1",
+    "sha": "be1478884735c862e894959944ba53e149ea4210",
+    "source_tree_digest": "7f21edae7ab640afb342261ef4092586101edc9549661e391032ce6906fc04f4",
+    "source_trees": [
+      "src/unified_cli",
+      "packages/unified-cli-ext/src/unified_cli_ext"
+    ]
+  },
   "metrics": {
     "calibration_process_startup": {
       "samples": 9,
@@ -11,26 +20,12 @@
       },
       "warmups": 2
     },
-    "calibration_import_workload": {
-      "baseline_milliseconds": 49.712,
-      "profile": "core_import",
-      "samples": 15,
-      "statistic": "median",
-      "threshold": {
-        "kind": "fixed",
-        "milliseconds": 99.712
-      },
-      "warmups": 3
-    },
     "core_import": {
       "baseline_milliseconds": 48.606,
       "normalization": {
-        "baseline_milliseconds": 49.712,
-        "calibration_value": "inner_ms",
-        "kind": "paired_import_bracket",
-        "max_adjustment_milliseconds": 50.0,
-        "max_calibration_milliseconds": 99.712,
-        "profile": "core_import"
+        "anchor_milliseconds": 48.606,
+        "kind": "paired_same_metric_reference",
+        "metric": "core_import"
       },
       "samples": 15,
       "statistic": "median",
@@ -44,12 +39,9 @@
     "core_version": {
       "baseline_milliseconds": 94.635,
       "normalization": {
-        "baseline_milliseconds": 97.284,
-        "calibration_value": "process_ms",
-        "kind": "paired_import_bracket",
-        "max_adjustment_milliseconds": 50.0,
-        "max_calibration_milliseconds": 147.284,
-        "profile": "core_version"
+        "anchor_milliseconds": 94.635,
+        "kind": "paired_same_metric_reference",
+        "metric": "core_version"
       },
       "samples": 15,
       "statistic": "median",
@@ -71,14 +63,11 @@
     },
     "ext_passive_registry": {
       "normalization": {
-        "baseline_milliseconds": 80.838,
-        "calibration_value": "inner_ms",
-        "kind": "paired_import_bracket",
-        "max_adjustment_milliseconds": 50.0,
-        "max_calibration_milliseconds": 130.838,
-        "profile": "ext_passive_registry"
+        "anchor_milliseconds": 195.661,
+        "kind": "paired_same_metric_reference",
+        "metric": "ext_passive_registry"
       },
-      "samples": 15,
+      "samples": 61,
       "statistic": "p95",
       "threshold": {
         "kind": "fixed",
@@ -106,13 +95,13 @@
       "warmups": 5
     },
     "repl_first_prompt": {
-      "samples": 9,
+      "samples": 31,
       "statistic": "p95",
       "threshold": {
         "kind": "fixed",
         "milliseconds": 300.0
       },
-      "warmups": 2
+      "warmups": 3
     },
     "stream_relay": {
       "samples": 31,
