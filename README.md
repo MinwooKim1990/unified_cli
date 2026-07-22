@@ -16,7 +16,7 @@ pip install unified-cli
 ```
 
 This includes the full interactive REPL (live `/` slash-menu, model/provider
-pickers, live `/status`) — `prompt_toolkit` ships as a core dependency, so no
+pickers, snapshot-only `/status`) — `prompt_toolkit` ships as a core dependency, so no
 extra is needed for it.
 
 For the OpenAI-compatible HTTP server, install the optional `server` extra:
@@ -197,8 +197,8 @@ can import**.
 - **Rich terminal UI**: `doctor` health table, `status --watch` live dashboard,
   `setup` interactive wizard, streaming spinner
 - **Interactive REPL** (`unified-cli repl`): live `/` slash-command menu,
-  `/model` and `/provider` pickers (latest models listed, default marked ★),
-  live `/status`, cross-provider switching — powered by `prompt_toolkit`
+  `/model` and `/provider` snapshot pickers (default marked ★),
+  snapshot-only `/status`, cross-provider switching — powered by `prompt_toolkit`
 - **Localized (i18n)**: English by default, Korean with `--lang ko` (or
   `/lang ko` in the REPL, or `UNIFIED_CLI_LANG=ko`)
 
@@ -294,12 +294,16 @@ unified-cli chat "continue from earlier" --resume <session_id>
 
 # Interactive REPL — type `/` for a live menu (/model & /provider pickers, /status, /lang, ...)
 unified-cli repl
+unified-cli repl --provider exact-extension-id --model vendor/family/model
 
 # Stream + web-search (both defaults)
 unified-cli chat "latest Python release?" --stream
 
 # Cheapest fast query
 unified-cli chat "quick q" -m gpt-5.3-codex-spark
+
+# Exact extension selection; --model stays literal even with slashes
+unified-cli chat "hello" --provider exact-extension-id --model vendor/family/model
 
 # Image input (works with all 3 providers — see Features above for details)
 unified-cli chat "what's in this photo?" --image cat.png -m haiku
@@ -321,9 +325,9 @@ them.
 ```text
 [claude/haiku] > hello
 [claude/haiku] > /                         # live dropdown of all slash commands
-[claude/haiku] > /model                    # picker: latest models per provider (default ★)
+[claude/haiku] > /model                    # Core cache/fallback or loaded Ext snapshot (default ★)
 [claude/sonnet] > /provider                # picker: choose a provider (context auto-injected)
-[codex/gpt-5.4-mini] > /status             # live status panel (Ctrl+C → back to prompt)
+[codex/gpt-5.4-mini] > /status             # process-local snapshot; no provider probe
 [codex/gpt-5.4-mini] > /lang ko            # switch the UI to Korean (persists)
 [codex/gpt-5.4-mini] > /image photo.png    # attach image for the next turn
 [codex/gpt-5.4-mini] > describe this
@@ -331,14 +335,21 @@ them.
 [codex/gpt-5.4-mini] > /exit               # state saved → `chat --continue` from here
 ```
 
-- **`/model`** with no argument opens a picker of each provider's latest models
-  (default marked ★) — `/model <name>` still works too.
-- **`/provider`** likewise opens a picker.
-- **`/status`** shows a live, auto-refreshing status panel inside the REPL.
+- **`/model`** with no argument opens a picker. Core uses its in-memory
+  cache/fallback; an explicitly loaded extension shows only its descriptor
+  default and last successful `/model --refresh` snapshot. `/model <literal>`
+  sets the literal model ID without probing.
+- **`/provider <exact-id>`** loads only that extension's metadata. The picker
+  shows Core plus extension descriptors already loaded in this process.
+- **`/status`** shows a process-local snapshot and never probes providers.
+- **`/doctor`** shows the existing Core health table when Core is selected. For
+  a selected extension it calls only that extension's explicit doctor and
+  renders only a Core-owned generic result.
 - **`/lang en` / `/lang ko`** switches the UI language live and persists it.
 
 Slash commands: `/help` `/model` `/provider` `/status` `/lang` `/new` `/save`
-`/history` `/tokens` `/doctor` `/image` `/images` `/clear-images` `/exit`.
+`/history` `/tokens` `/doctor` `/image` `/images` `/clear-images` `/exit`
+(`/quit` alias).
 When stdin/stdout isn't a TTY, the REPL falls back to a plain `input()` loop
 with the same commands.
 

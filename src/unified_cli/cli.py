@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+import unicodedata
 from dataclasses import asdict
 from typing import Optional
 from urllib.parse import quote
@@ -330,6 +331,41 @@ def _effective_cwd(explicit_cwd: Optional[str], saved_cwd: Optional[str]) -> str
     return resolve_cwd(os.getcwd()) or os.getcwd()
 
 
+def _valid_explicit_provider_id(value: object) -> bool:
+    """Validate an exact CLI selection without reflecting unbounded input."""
+
+    from .plugin import _valid_provider_id
+
+    return _valid_provider_id(value)
+
+
+_ROUTE_ERROR_MAX_CHARS = 1_024
+
+
+def _bounded_route_error_text(error: UnifiedError, model: str) -> str:
+    """Bound only adversarial route errors; preserve ordinary text exactly."""
+
+    text = str(error)
+    unsafe_model = len(model) > 512 or any(
+        unicodedata.category(char).startswith("C")
+        or unicodedata.category(char) in {"Zl", "Zp"}
+        for char in model
+    )
+    if not unsafe_model:
+        # Core route errors of ordinary size retain their historical bytes.
+        return text
+    rendered = []
+    for char in text[:_ROUTE_ERROR_MAX_CHARS]:
+        category = unicodedata.category(char)
+        rendered.append(
+            "�" if category.startswith("C") or category in {"Zl", "Zp"}
+            else char
+        )
+    if len(text) > _ROUTE_ERROR_MAX_CHARS:
+        rendered.append("…")
+    return "".join(rendered)
+
+
 def _print_session_panel(
     resp, resumed_from: Optional[str], latency_ms: int
 ) -> None:
@@ -355,13 +391,21 @@ def _print_session_panel(
 def _cmd_chat(args: argparse.Namespace) -> int:
     import time as _t
 
-    # Route -m flag first.
-    provider, model = (None, args.model)
-    if args.model:
+    if args.provider is not None and not _valid_explicit_provider_id(args.provider):
+        err_console.print(f"[red]{t('cli.provider.invalid')}[/red]")
+        return 2
+
+    # An explicit provider owns the model string literally, including `/`.
+    # Without it, retain the historical model-routing path byte-for-byte.
+    provider, model = (args.provider, args.model)
+    if args.provider is None and args.model:
         try:
             provider, model = route(args.model)
         except UnifiedError as e:
-            err_console.print(f"[red]{t('cli.chat.route_failed')}[/red] {escape(str(e))}")
+            route_error = _bounded_route_error_text(e, args.model)
+            err_console.print(
+                f"[red]{t('cli.chat.route_failed')}[/red] {escape(route_error)}"
+            )
             return 2
 
     # Resolve session flags (may override provider/model from state file).
@@ -381,11 +425,56 @@ def _cmd_chat(args: argparse.Namespace) -> int:
 
     provider = provider or _configured_default_provider()
 
+    images = getattr(args, "images", None) or None
+    if provider not in {"claude", "codex", "gemini"}:
+        try:
+            # Exact, support-gated metadata snapshot.  This loads no provider
+            # callback and lets capability failures stop before construction.
+            from .registry import snapshot_provider_descriptor
+
+            descriptor = snapshot_provider_descriptor(provider)
+        except UnifiedError as e:
+            err_console.print(f"[red]{escape(str(e))}[/red]")
+            return 3
+        if args.terse:
+            err_console.print(f"[red]{t('cli.chat.terse_unsupported')}[/red]")
+            return 2
+        if model is not None:
+            from .plugin import _valid_model_id
+
+            if not _valid_model_id(model):
+                err_console.print(f"[red]{t('cli.model.invalid_extension')}[/red]")
+                return 2
+        required = []
+        if session_id:
+            required.append("sessions")
+        if images:
+            required.append("images")
+        missing = next(
+            (capability for capability in required
+             if capability not in descriptor.capabilities),
+            None,
+        )
+        if missing is not None:
+            err_console.print(
+                "[red]"
+                + t(
+                    "cli.chat.capability_required",
+                    provider=provider,
+                    capability=missing,
+                )
+                + "[/red]"
+            )
+            return 2
+
     create_kwargs: dict = {
         "model": model,
-        "web_search": args.web_search,
         "cwd": effective_cwd,
     }
+    # Core historically receives this option.  Extensions never receive the
+    # Core-only web_search keyword, for either CLI flag state.
+    if provider in {"claude", "codex", "gemini"}:
+        create_kwargs["web_search"] = args.web_search
     # --terse is Claude-specific (others already default to concise replies).
     if args.terse and provider == "claude":
         create_kwargs["terse"] = True
@@ -406,7 +495,6 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         err_console.print(f"[yellow]{t('cli.chat.need_prompt')}[/yellow]")
         return 2
 
-    images = getattr(args, "images", None) or None
     t0 = _t.time()
     try:
         if args.stream:
@@ -644,7 +732,7 @@ def _prescan_lang(raw: list[str]) -> None:
             pass  # let the parser surface the invalid-choice error
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
 
     # Keep version probing automation-friendly: no parser construction, Rich
@@ -743,6 +831,8 @@ def main(argv: list[str] | None = None) -> int:
                         help=t("cli.help.chat.prompt"))
     p_chat.add_argument("-m", "--model",
                         help=t("cli.help.chat.model"))
+    p_chat.add_argument("--provider",
+                        help=t("cli.help.chat.provider"))
     p_chat.add_argument("--stream", action="store_true",
                         help=t("cli.help.chat.stream"))
     p_chat.add_argument("--no-web-search", dest="web_search",
@@ -769,8 +859,8 @@ def main(argv: list[str] | None = None) -> int:
     p_chat.set_defaults(func=_cmd_chat)
 
     p_repl = _add("repl", help=t("cli.help.repl"))
-    p_repl.add_argument("--provider", choices=["claude", "codex", "gemini"],
-                        default=None, help=t("cli.help.repl.provider"))
+    p_repl.add_argument("--provider", default=None,
+                        help=t("cli.help.repl.provider"))
     p_repl.add_argument("-m", "--model",
                         help=t("cli.help.repl.model"))
     p_repl.add_argument("--no-web-search", dest="web_search",

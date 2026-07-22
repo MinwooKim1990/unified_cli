@@ -132,6 +132,7 @@ JSON 으로 가져오려면:
 ```bash
 unified-cli repl                              # 설정된 기본 provider (변경 전 claude)
 unified-cli repl --provider codex -m gpt-5.4-mini
+unified-cli repl --provider exact-extension-id -m vendor/family/model
 unified-cli repl --no-web-search              # 웹서치 끄기
 unified-cli repl --lang ko                    # 한국어 UI
 ```
@@ -144,15 +145,15 @@ REPL 은 `prompt_toolkit` 기반(**코어 의존성**이라 `pip install unified
 | 명령 | 동작 |
 |---|---|
 | `/help` | 명령 목록 (현재 언어로) |
-| `/model [name]` | 인자 없으면 **선택기** (provider 별 최신 모델, 기본값 ★); `/model <name>` 은 같은 provider 에서 모델 변경 (멀티워드 `agy` display name 도 지원) |
-| `/provider [name]` | 인자 없으면 provider **선택기**; 어느 쪽이든 직전 8턴 컨텍스트 자동 주입 |
-| `/status` | REPL 안 라이브·자동 갱신 상태 패널 (Ctrl+C 로 프롬프트 복귀) |
+| `/model [literal\|--refresh]` | literal은 probe 없이 그대로 설정. Core 선택기는 메모리 cache/fallback, 확장은 descriptor 기본 모델과 마지막 성공 refresh snapshot만 사용. |
+| `/provider [정확한-id]` | 정확한 확장 metadata 하나만 로드. 인자 없는 선택기는 Core + 이미 로드된 확장 snapshot만 표시. |
+| `/status` | provider probe 없는 프로세스 로컬 상태/세션/사용량/descriptor 스냅샷. |
 | `/lang <en\|ko>` | UI 언어 즉시 전환 + `~/.unified-cli/settings.json` 에 저장 |
 | `/new` | 대화 초기화 |
 | `/save` | 현재 session_id + 이어쓰기 명령 표시 |
 | `/history [N]` | 최근 N 턴 표시 (기본 10) |
 | `/tokens` | 이 REPL 세션의 provider 별 누적 사용량 |
-| `/doctor` | provider 헬스 한 줄 |
+| `/doctor` | Core 선택 시 기존 Core health 표만 표시. 확장 선택 시 해당 확장의 명시적 doctor만 호출하며 임의 반환값은 표시하지 않음. |
 | `/image <path>` | 다음 prompt 에 이미지 첨부 (반복 가능) |
 | `/images` | 첨부 목록 |
 | `/clear-images` | 첨부 비우기 |

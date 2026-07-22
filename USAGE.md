@@ -141,6 +141,9 @@ unified-cli chat "hi" --no-web-search
 # read prompt from stdin (long content)
 cat error.log | unified-cli chat "diagnose this error" -m sonnet
 
+# exact extension selection; the slash-containing model ID stays literal
+unified-cli chat "hello" --provider exact-extension-id --model vendor/family/model
+
 # image input (one or many; works for all 3 providers)
 unified-cli chat "what's in this photo?" --image cat.png -m haiku
 unified-cli chat "compare these two charts" --image a.png --image b.png -m gpt-5.4-mini
@@ -151,6 +154,7 @@ unified-cli chat "compare these two charts" --image a.png --image b.png -m gpt-5
 ```bash
 unified-cli repl                              # configured default (Claude until changed)
 unified-cli repl --provider codex -m gpt-5.4-mini
+unified-cli repl --provider exact-extension-id -m vendor/family/model
 unified-cli repl --no-web-search              # disable web search
 unified-cli repl --lang ko                    # Korean UI
 ```
@@ -167,15 +171,15 @@ Inside the REPL, slash commands let you change context without restarting:
 | Command | What it does |
 |---|---|
 | `/help` | List all commands (localized to the current language) |
-| `/model [name]` | No argument → **picker** listing each provider's latest models (default marked ★); `/model <name>` switches model within the current provider (multi-word `agy` display names supported) |
-| `/provider [name]` | No argument → **picker** to choose a provider; either way the previous 8 turns are auto-injected as context |
-| `/status` | Live, auto-refreshing status panel inside the REPL (Ctrl+C returns to the prompt) |
+| `/model [literal\|--refresh]` | A literal sets the current provider's model without probing. Core's no-argument picker uses its in-memory cache/fallback; an extension uses only its descriptor default and last successful explicit refresh snapshot. |
+| `/provider [exact-id]` | An exact ID loads only that extension's metadata. The no-argument picker shows Core plus extension descriptors already loaded in this process. |
+| `/status` | Show a process-local state/session/usage/descriptor snapshot without provider probes. |
 | `/lang <en\|ko>` | Switch the UI language live and persist it to `~/.unified-cli/settings.json` |
 | `/new` | Reset the conversation (drop history) |
 | `/save` | Show current `session_id` + how to resume from CLI |
 | `/history [N]` | Show last N turns (default 10) |
 | `/tokens` | Per-provider usage aggregate for this REPL session |
-| `/doctor` | One-line health for each provider |
+| `/doctor` | With Core selected, show only the existing Core health table. With an extension selected, call only that extension's explicit doctor; arbitrary return data is never rendered. |
 | `/image <path>` | Attach an image for the next user message (repeatable) |
 | `/images` | List currently pending image attachments |
 | `/clear-images` | Drop pending attachments |

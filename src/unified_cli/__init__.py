@@ -72,6 +72,7 @@ from .registry import (
     doctor_provider,
     list_providers,
     load_provider_plugin,
+    snapshot_provider_descriptor,
 )
 from .state import SessionState, load_last_session, save_last_session
 from .usage import UsageTracker, tracker
@@ -127,5 +128,6 @@ __all__ = [
     "load_last_session",
     "route",
     "save_last_session",
+    "snapshot_provider_descriptor",
     "tracker",
 ]
