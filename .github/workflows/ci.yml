@@ -101,6 +101,17 @@ jobs:
       - name: Run Ext offline fixture suite
         run: pytest -q packages/unified-cli-ext/tests
 
+      - name: Exercise macOS libc waitid compatibility path
+        if: matrix.os == 'macos-latest' && matrix.python-version == '3.9'
+        env:
+          UNIFIED_CLI_EXT_TEST_DARWIN_LIBC_WAITID: "1"
+        run: |
+          pytest -q \
+            packages/unified-cli-ext/tests/test_process_portability.py \
+            packages/unified-cli-ext/tests/test_jsonl_jsonrpc.py \
+            packages/unified-cli-ext/tests/test_provider_adapters.py \
+            -k "darwin_libc_waitid or group_signals_never_follow_leader_reap or timeout_and_explicit_cancellation_cleanup or escaped_descendant_inherited_pipes_cannot_block_cleanup or early_close_kills_descendant_process_group or fixed_process_timeout_cancel_flood_and_term_ignore_cleanup or fixed_process_kills_descendants_and_falls_back_when_killpg_fails or fixed_process_detached_inherited_pipe_cannot_deadlock_close or post_popen_runtime_error_reaps_and_cleans_environment"
+
       - name: Verify Core and Ext imports are independent
         run: |
           python -c "import unified_cli; assert unified_cli.__version__ == '0.5.0'"

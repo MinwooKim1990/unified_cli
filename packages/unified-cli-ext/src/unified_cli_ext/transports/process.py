@@ -7,8 +7,10 @@ import selectors
 import signal
 import stat
 import subprocess
+import sys
+import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterator, Optional
@@ -42,6 +44,150 @@ class FixedProcessResult:
     returncode: int
     stdout: str
     stderr: str
+
+
+@dataclass(frozen=True)
+class _NonreapingWaitResult:
+    """Portable subset of the child status returned by ``os.waitid``."""
+
+    si_pid: int
+    si_code: int
+    si_status: int
+
+
+_NATIVE_WAITID = getattr(os, "waitid", None)
+_DARWIN_LIBC_WAITID: Optional[Callable[[int, int, int], object]] = None
+_DARWIN_LIBC_WAITID_LOCK = threading.Lock()
+
+
+def _load_darwin_libc_waitid() -> Callable[[int, int, int], object]:
+    """Lazily bind Darwin ``waitid`` when Python omits its ``os`` wrapper."""
+
+    global _DARWIN_LIBC_WAITID
+    if _DARWIN_LIBC_WAITID is not None:
+        return _DARWIN_LIBC_WAITID
+    with _DARWIN_LIBC_WAITID_LOCK:
+        if _DARWIN_LIBC_WAITID is None:
+            _DARWIN_LIBC_WAITID = _bind_darwin_libc_waitid()
+        return _DARWIN_LIBC_WAITID
+
+
+def _bind_darwin_libc_waitid() -> Callable[[int, int, int], object]:
+    """Validate the Darwin ABI and return a fully initialized binding."""
+
+    expected_constants = {
+        "P_PID": 1,
+        "WEXITED": 4,
+        "WNOHANG": 1,
+        "WNOWAIT": 32,
+        "CLD_EXITED": 1,
+        "CLD_KILLED": 2,
+        "CLD_DUMPED": 3,
+    }
+    if any(
+        getattr(os, name, None) != value
+        for name, value in expected_constants.items()
+    ):
+        raise UnsupportedPlatformError(
+            "macOS non-reaping child observation constants are incompatible"
+        )
+
+    try:
+        import ctypes
+
+        class _DarwinSigval(ctypes.Union):
+            _fields_ = (
+                ("pointer", ctypes.c_void_p),
+                ("integer", ctypes.c_int),
+            )
+
+        class _DarwinSiginfo(ctypes.Structure):
+            _fields_ = (
+                ("si_signo", ctypes.c_int),
+                ("si_errno", ctypes.c_int),
+                ("si_code", ctypes.c_int),
+                ("si_pid", ctypes.c_int),
+                ("si_uid", ctypes.c_uint),
+                ("si_status", ctypes.c_int),
+                ("si_addr", ctypes.c_void_p),
+                ("si_value", _DarwinSigval),
+                ("si_band", ctypes.c_long),
+                ("__pad", ctypes.c_ulong * 7),
+            )
+
+        expected_layout = {
+            "si_signo": 0,
+            "si_errno": 4,
+            "si_code": 8,
+            "si_pid": 12,
+            "si_uid": 16,
+            "si_status": 20,
+            "si_addr": 24,
+            "si_value": 32,
+            "si_band": 40,
+            "__pad": 48,
+        }
+        if ctypes.sizeof(_DarwinSiginfo) != 104 or any(
+            getattr(_DarwinSiginfo, name).offset != offset
+            for name, offset in expected_layout.items()
+        ):
+            raise UnsupportedPlatformError(
+                "macOS non-reaping child status layout is incompatible"
+            )
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        waitid = getattr(libc, "waitid")
+        waitid.argtypes = (
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.POINTER(_DarwinSiginfo),
+            ctypes.c_int,
+        )
+        waitid.restype = ctypes.c_int
+    except UnsupportedPlatformError:
+        raise
+    except (AttributeError, ImportError, OSError, TypeError, ValueError) as caught:
+        raise UnsupportedPlatformError(
+            "macOS libc waitid is unavailable for non-reaping child observation"
+        ) from caught
+
+    def call_waitid(idtype: int, child_id: int, options: int) -> object:
+        import errno
+
+        info = _DarwinSiginfo()
+        ctypes.set_errno(0)
+        outcome = waitid(idtype, child_id, ctypes.byref(info), options)
+        if outcome != 0:
+            error_number = ctypes.get_errno() or errno.EIO
+            if error_number == errno.EINTR:
+                raise InterruptedError(error_number, os.strerror(error_number))
+            if error_number == errno.ECHILD:
+                raise ChildProcessError(error_number, os.strerror(error_number))
+            raise OSError(error_number, os.strerror(error_number))
+        if info.si_pid == 0:
+            return None
+        status_is_valid = (
+            info.si_code == os.CLD_EXITED and 0 <= info.si_status <= 255
+        ) or (
+            info.si_code in (os.CLD_KILLED, os.CLD_DUMPED)
+            and 0 < info.si_status < signal.NSIG
+        )
+        if (
+            info.si_pid < 0
+            or info.si_signo != signal.SIGCHLD
+            or not status_is_valid
+        ):
+            raise OSError(
+                errno.EINVAL,
+                "macOS libc waitid returned malformed child status",
+            )
+        return _NonreapingWaitResult(
+            int(info.si_pid),
+            int(info.si_code),
+            int(info.si_status),
+        )
+
+    return call_waitid
 
 
 @contextmanager
@@ -104,17 +250,16 @@ def _argv(value: Sequence[str]) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _require_nonreaping_process_observation() -> None:
+def _require_nonreaping_process_observation() -> Callable[[int, int, int], object]:
     """Require the POSIX primitive used to retain a child's PID identity.
 
     ``Popen.poll()`` and ``Popen.wait()`` reap an exited child.  Reaping before
     the dedicated process group has received its final signal permits the
-    numeric PID/PGID to be reused.  Linux and macOS both expose ``waitid`` with
-    ``WNOWAIT``; fail closed instead of falling back to a reaping observation.
+    numeric PID/PGID to be reused.  Prefer Python's native ``os.waitid`` and use
+    the same Darwin libc primitive when a macOS Python omits that wrapper.
     """
 
     required = (
-        "waitid",
         "P_PID",
         "WEXITED",
         "WNOHANG",
@@ -123,10 +268,23 @@ def _require_nonreaping_process_observation() -> None:
         "CLD_KILLED",
         "CLD_DUMPED",
     )
-    if os.name != "posix" or any(getattr(os, name, None) is None for name in required):
+    if os.name != "posix" or any(
+        not isinstance(getattr(os, name, None), int) for name in required
+    ):
         raise UnsupportedPlatformError(
             "subprocess transports require POSIX non-reaping child observation"
         )
+    if _NATIVE_WAITID is not None:
+        if not callable(_NATIVE_WAITID):
+            raise UnsupportedPlatformError(
+                "subprocess transports require POSIX non-reaping child observation"
+            )
+        return _NATIVE_WAITID
+    if sys.platform == "darwin":
+        return _load_darwin_libc_waitid()
+    raise UnsupportedPlatformError(
+        "subprocess transports require POSIX non-reaping child observation"
+    )
 
 
 def _observe_process_returncode_nonreaping(
@@ -138,11 +296,11 @@ def _observe_process_returncode_nonreaping(
         # Another final-reap path already completed.  Callers must not signal a
         # process group after this point.
         return process.returncode
-    _require_nonreaping_process_observation()
+    waitid = _require_nonreaping_process_observation()
     options = os.WEXITED | os.WNOHANG | os.WNOWAIT
     while True:
         try:
-            result = os.waitid(os.P_PID, process.pid, options)
+            result = waitid(os.P_PID, process.pid, options)
             break
         except InterruptedError:
             continue
@@ -152,16 +310,33 @@ def _observe_process_returncode_nonreaping(
             raise TransportError(
                 "provider subprocess could not be observed without reaping"
             ) from caught
-    if result is None or getattr(result, "si_pid", 0) == 0:
+    if result is None:
         return None
-    if result.si_pid != process.pid:
+    try:
+        result_pid = result.si_pid
+        result_code = result.si_code
+        result_status = result.si_status
+    except AttributeError:
+        raise TransportError(
+            "provider subprocess returned a malformed non-reaping wait result"
+        ) from None
+    if any(type(value) is not int for value in (result_pid, result_code, result_status)):
+        raise TransportError(
+            "provider subprocess returned a malformed non-reaping wait result"
+        )
+    if result_pid == 0:
+        return None
+    if result_pid != process.pid:
         raise TransportError(
             "provider subprocess returned an unexpected non-reaping wait result"
         )
-    if result.si_code == os.CLD_EXITED:
-        return int(result.si_status)
-    if result.si_code in (os.CLD_KILLED, os.CLD_DUMPED):
-        return -int(result.si_status)
+    if result_code == os.CLD_EXITED and 0 <= result_status <= 255:
+        return result_status
+    if (
+        result_code in (os.CLD_KILLED, os.CLD_DUMPED)
+        and 0 < result_status < signal.NSIG
+    ):
+        return -result_status
     raise TransportError(
         "provider subprocess returned an unsupported non-reaping wait result"
     )
