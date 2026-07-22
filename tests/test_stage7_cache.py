@@ -85,6 +85,7 @@ def test_core_model_force_refresh_is_single_flight_and_failure_wakes_waiters(
 ):
     entered = threading.Event()
     release = threading.Event()
+    waiters_entered = threading.Event()
     start = threading.Barrier(8)
     calls = []
 
@@ -95,6 +96,14 @@ def test_core_model_force_refresh_is_single_flight_and_failure_wakes_waiters(
         raise RuntimeError("injected refresh failure")
 
     monkeypatch.setitem(models._LISTERS, "claude", failed_listing)
+    real_flight = models._ModelFlight
+
+    def observed_flight(*, force_refresh):
+        flight = real_flight(force_refresh=force_refresh)
+        flight.done = _ObservedEvent(flight.done, waiters_entered, expected=7)
+        return flight
+
+    monkeypatch.setattr(models, "_ModelFlight", observed_flight)
 
     def refresh():
         start.wait(timeout=2)
@@ -103,9 +112,7 @@ def test_core_model_force_refresh_is_single_flight_and_failure_wakes_waiters(
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         futures = [pool.submit(refresh) for _ in range(8)]
         assert entered.wait(1)
-        # Give the already-released barrier participants time to join the one
-        # blocked flight before allowing its owner to fail.
-        assert not release.wait(0.05)
+        assert waiters_entered.wait(2)
         release.set()
         for future in futures:
             with pytest.raises(RuntimeError, match="injected refresh failure"):
@@ -159,6 +166,7 @@ def test_core_force_refresh_fences_ordinary_flight_and_force_callers_share(
 ):
     entered = (threading.Event(), threading.Event())
     release = (threading.Event(), threading.Event())
+    forced_waiters_entered = threading.Event()
     start = threading.Barrier(8)
     lock = threading.Lock()
     calls = []
@@ -172,6 +180,17 @@ def test_core_force_refresh_fences_ordinary_flight_and_force_callers_share(
         return [ModelInfo(id="refresh-{}".format(index), provider="claude")]
 
     monkeypatch.setitem(models._LISTERS, "claude", listing)
+    real_flight = models._ModelFlight
+
+    def observed_flight(*, force_refresh):
+        flight = real_flight(force_refresh=force_refresh)
+        if force_refresh:
+            flight.done = _ObservedEvent(
+                flight.done, forced_waiters_entered, expected=7
+            )
+        return flight
+
+    monkeypatch.setattr(models, "_ModelFlight", observed_flight)
 
     def forced():
         start.wait(timeout=2)
@@ -182,7 +201,7 @@ def test_core_force_refresh_fences_ordinary_flight_and_force_callers_share(
         assert entered[0].wait(1)
         forced_calls = [pool.submit(forced) for _ in range(8)]
         assert entered[1].wait(1)
-        assert not release[1].wait(0.05)
+        assert forced_waiters_entered.wait(2)
         assert len(calls) == 2
         release[0].set()
         release[1].set()
@@ -749,6 +768,7 @@ def test_manage_same_provider_verify_is_eight_way_single_flight(
     start = threading.Barrier(8)
     entered = threading.Event()
     release = threading.Event()
+    waiters_entered = threading.Event()
     lock = threading.Lock()
     calls = []
 
@@ -762,6 +782,14 @@ def test_manage_same_provider_verify_is_eight_way_single_flight(
         return {"ok": True, "code": "ok", "output": "version"}
 
     monkeypatch.setattr(manage, "_run_verify_argv", verified)
+    real_flight = manage._ManageVerifyFlight
+
+    def observed_flight(context, *, force_refresh):
+        flight = real_flight(context, force_refresh=force_refresh)
+        flight.done = _ObservedEvent(flight.done, waiters_entered, expected=7)
+        return flight
+
+    monkeypatch.setattr(manage, "_ManageVerifyFlight", observed_flight)
     runtime = manage.ManageRuntime([str(tmp_path)])
 
     def verify():
@@ -771,7 +799,7 @@ def test_manage_same_provider_verify_is_eight_way_single_flight(
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         futures = [pool.submit(verify) for _ in range(8)]
         assert entered.wait(1)
-        assert not release.wait(0.05)
+        assert waiters_entered.wait(2)
         release.set()
         results = [future.result(timeout=2) for future in futures]
     assert calls == [
@@ -1098,8 +1126,10 @@ def test_manage_force_verify_waits_for_ordinary_then_is_eight_way_single_flight(
     version_release = threading.Event()
     ordinary_auth_entered = threading.Event()
     ordinary_auth_release = threading.Event()
+    ordinary_waiters_entered = threading.Event()
     forced_entered = threading.Event()
     forced_release = threading.Event()
+    forced_waiters_entered = threading.Event()
     start = threading.Barrier(8)
     lock = threading.Lock()
     calls = []
@@ -1124,6 +1154,21 @@ def test_manage_force_verify_waits_for_ordinary_then_is_eight_way_single_flight(
         }
 
     monkeypatch.setattr(manage, "_run_verify_argv", verified)
+    real_flight = manage._ManageVerifyFlight
+
+    def observed_flight(context, *, force_refresh):
+        flight = real_flight(context, force_refresh=force_refresh)
+        # The barrier synchronizes caller startup, not entry into either
+        # production wait. Observe both waits before releasing their owners so
+        # a slow runner cannot turn a late caller into a new force generation.
+        flight.done = _ObservedEvent(
+            flight.done,
+            forced_waiters_entered if force_refresh else ordinary_waiters_entered,
+            expected=7 if force_refresh else 8,
+        )
+        return flight
+
+    monkeypatch.setattr(manage, "_ManageVerifyFlight", observed_flight)
     runtime = manage.ManageRuntime([str(tmp_path)])
 
     def forced():
@@ -1134,6 +1179,7 @@ def test_manage_force_verify_waits_for_ordinary_then_is_eight_way_single_flight(
         ordinary = pool.submit(runtime.verify_provider, "claude")
         assert ordinary_version_entered.wait(1)
         forced_calls = [pool.submit(forced) for _ in range(8)]
+        assert ordinary_waiters_entered.wait(2)
         assert not forced_entered.wait(0.05)
         runtime.invalidate_provider_cache("claude")
         version_release.set()
@@ -1142,6 +1188,7 @@ def test_manage_force_verify_waits_for_ordinary_then_is_eight_way_single_flight(
         ordinary_auth_release.set()
         assert forced_entered.wait(1)
         assert len(calls) == 3
+        assert forced_waiters_entered.wait(2)
         forced_release.set()
         ordinary_result = ordinary.result(timeout=2)
         results = [future.result(timeout=2) for future in forced_calls]
