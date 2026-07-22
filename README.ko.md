@@ -416,6 +416,25 @@ uvicorn unified_cli.server:app --port 8000
 > proxy 뒤의 단일 신뢰 클라이언트에만 쓰세요. Bearer 토큰은 HTTPS나 사용자별 격리를
 > 제공하지 않으며 브라우저 대시보드는 로컬 사용용입니다.
 
+opt-in 관리 대시보드는 bootstrap 중 provider 검증이나 모델 로드를 실행하지 않습니다.
+각 probe는 사용자가 해당 동작을 명시적으로 요청한 뒤에만 시작됩니다. 같은 runtime
+안에서 성공한 version/auth 결과와 비어 있지 않은 model 결과는 각각
+5분/15초/1분 TTL을 사용합니다.
+같은 컨텍스트의 model cache miss는 하나의 Manage flight를 공유하며, 명시적
+invalidation과 shutdown은 Manage/Core 양쪽 model generation을 모두 fence합니다.
+ordinary verification 뒤에 들어온 force verification은 앞 요청이 끝날 때까지 기다린
+뒤 동시 force 호출끼리 하나의 새 generation을 공유하고, 서로 다른 provider는 독립적으로
+진행됩니다.
+version/auth는 `PATH`에서 선택된 정확한 실행 파일에 연결되고, Gemini 모델 결과는
+`AGY_CLI_PATH`를 포함한 Core discovery가 실제 선택한 `agy`를 fingerprint합니다.
+Claude 모델은 HTTP API, Codex 모델은 `~/.codex/models_cache.json`을 사용하므로 이 두
+모델 경로는 CLI를 실행하지 않으며 가상의 binary identity를 만들지 않습니다.
+auth/model 데이터는 해시된 HOME/provider 환경 컨텍스트로도 분리됩니다. 실행 파일
+식별 정보는 로컬 invocation/canonical target 메타데이터이지 vendor/package
+provenance는 아닙니다. verifier API에는 provider account identifier도 없으므로 외부
+프로세스가 계정을 바꾸면 짧은 auth TTL 동안 이전 상태가 보일 수 있습니다. 관찰된 실행
+파일 교체는 해당 provider의 모든 probe 레코드를 무효화합니다.
+
 > **HTTP 신뢰 경계.** 서버는 기본적으로 Claude 모델만 받습니다. 텍스트 요청은
 > Claude safe mode + 도구 없음으로, 이미지 요청은 전달된 이미지 바이트만 읽을 수
 > 있는 범위 제한 권한으로 실행합니다. Codex와 Antigravity(`agy`)는 임의 HTTP
@@ -552,6 +571,19 @@ unified-cli doctor --headless
 | Claude | `GET https://api.anthropic.com/v1/models` (`$ANTHROPIC_API_KEY` 있을 때) | 1시간 메모리 캐시 |
 | Codex | `~/.codex/models_cache.json` (Codex CLI가 5분마다 업데이트) | 파일 기준 |
 | Gemini (`agy`) | `agy models` 출력 (Antigravity CLI 가 직접 표시) | 1시간 |
+
+이 캐시는 monotonic 시계를 사용하며 import, 서버 시작, 관리 화면 bootstrap,
+REPL 시작 시에는 채워지지 않습니다. cache/flight key에는 SHA-256 context fingerprint만
+남습니다. Claude는 정규화한 credential과 proxy/TLS 입력, Codex는 canonical
+HOME/cache 파일 identity, Gemini는 opt-in/PATH/override와 수동 `agy` 메타데이터를
+반영하며 fingerprint를 만들기 위해 실행 파일을 실행하지 않습니다. 같은 context의 동시
+refresh는 한 번의 probe를 공유합니다. Context cache는 provider당 8개/전체 24개 LRU,
+active refresh는 provider당 4개/전체 12개로 제한되며 가득 차면 재시도 가능한
+`resource_limit` 오류를 반환합니다. `list_models(provider, force_refresh=True)` 또는
+`unified-cli models --refresh`로 명시적으로 갱신하고,
+`invalidate_model_cache(provider)`(인자 생략 시 모든 내장 provider)로 폐기할 수
+있습니다. 반환되는 `ModelInfo`는 복사본이므로 호출자가 수정해도 이후 결과는 바뀌지
+않습니다.
 
 `agy` 를 찾지 못하거나 호출에 실패하면 하드코딩된 주요 모델 리스트로 폴백.
 **임의 모델 ID 는 리스트에 없어도 그대로 CLI 에 전달** — allowlist 는 정보용.

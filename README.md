@@ -214,6 +214,20 @@ Override via `-m <name>`. The wrapper passes any model ID straight through to
 the underlying CLI; `unified-cli models` shows the available list as a starting
 point. For the absolute fastest interactive feel use `-m gpt-5.3-codex-spark`.
 
+Model discovery is explicit and uses a one-hour, monotonic in-process cache;
+imports, server startup, management bootstrap, and REPL startup do not populate
+it. Cache and flight keys retain only SHA-256 context fingerprints: normalized
+Claude credentials plus proxy/TLS inputs, the canonical Codex HOME/cache-file
+identity, or Gemini opt-in/PATH/override plus passive `agy` metadata. No binary
+is executed to build a fingerprint. Same-context concurrent refreshes share one
+probe. Context entries use LRU bounds of eight per provider and 24 globally;
+active refreshes are bounded to four per provider and 12 globally, with a
+retryable `resource_limit` error when full. Use
+`list_models(provider, force_refresh=True)` or `unified-cli models --refresh`
+to refresh explicitly, and `invalidate_model_cache(provider)` (or no argument
+for all built-ins) to discard cached records. Returned `ModelInfo` objects are
+copies, so caller mutation never changes later results.
+
 > **Gemini → Antigravity migration**: As of 2026, Google restricted the old
 > `gemini` CLI for individual accounts (`IneligibleTierError: ... migrate to
 > the Antigravity suite`). The `gemini` provider now wraps the **Antigravity
@@ -429,6 +443,25 @@ uvicorn unified_cli.server:app --port 8000
 > requires `Authorization: Bearer <token>`, including diagnostics. Use a TLS
 > reverse proxy and a single trusted client; a Bearer token provides neither
 > HTTPS nor per-user isolation. The browser dashboard is intended for local use.
+
+The opt-in management dashboard never verifies providers or loads models during
+bootstrap. Those probes begin only after the corresponding explicit action.
+Within that runtime, successful version/auth and non-empty model results use
+separate five-minute/15-second/one-minute TTLs. Same-context model misses share
+one Manage flight; explicit invalidation and shutdown fence both the Manage and
+Core model generations. A forced verification queued behind an ordinary one
+waits for it, after which concurrent forced callers share one new generation;
+different providers remain independent. Version/auth entries are keyed by the
+exact executable selected from `PATH`; Gemini model entries fingerprint the
+effective `agy` selected by Core discovery, including `AGY_CLI_PATH`. Claude
+models use the HTTP API and Codex models use `~/.codex/models_cache.json`, so
+those two model paths execute no CLI and have no fabricated binary identity.
+Auth and model data are additionally isolated by hashed HOME/provider-
+environment context. Executable identity is local invocation/canonical-target
+metadata, not vendor/package provenance. The verifier API also has no provider
+account identifier, so an account changed by an external process may remain
+visible for at most the short auth TTL. Observed binary replacement invalidates
+all of that provider's probe records.
 
 > **HTTP trust boundary.** By default the server accepts only Claude models,
 > using Claude safe mode with no agent tools for text requests and a scoped

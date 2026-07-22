@@ -37,7 +37,11 @@ from .base import (
 from .conversation import Turn, UnifiedConversation
 from .core import Attachment, Message, Usage
 from .errors import UnifiedError
-from .models import DEFAULT_MODELS, list_models
+from .models import (
+    DEFAULT_MODELS,
+    invalidate_model_cache as invalidate_core_model_cache,
+    list_models,
+)
 from .registry import list_providers
 from .session_manager import SessionManager, SessionRecord
 from .settings import load_settings, save_settings
@@ -57,6 +61,10 @@ MAX_ACTIVE_CHATS = 4
 MAX_MANAGE_SESSIONS = 16
 VERIFY_TIMEOUT_SECONDS = 5.0
 MAX_VERIFY_OUTPUT_BYTES = 32 * 1024
+VERIFY_VERSION_TTL_SECONDS = 300.0
+VERIFY_AUTH_TTL_SECONDS = 15.0
+PROVIDER_MODELS_TTL_SECONDS = 60.0
+MAX_PROVIDER_CACHE_ENTRIES = 64
 
 _HANDLE_RE = re.compile(r"^[a-z]+_[A-Za-z0-9_-]{16,64}$", re.ASCII)
 _DATA_IMAGE_RE = re.compile(
@@ -146,6 +154,149 @@ _VERIFY_SPECS: Dict[str, Tuple[Tuple[str, ...], ...]] = {
     # agy has no confirmed safe noninteractive auth-status command.
     "gemini": (("agy", "--version"),),
 }
+
+
+@dataclass(frozen=True)
+class _VerifyBinaryIdentity:
+    """Cheap exact identity for an explicitly selected executable path.
+
+    ManageRuntime deliberately does not claim package/vendor provenance.  The
+    record binds cache entries to the selected invocation path, canonical
+    target, link metadata, and target metadata, and those fields are re-read
+    before a cached result is served.
+    """
+
+    provider: str
+    executable: str
+    invoked_path: str
+    real_path: str
+    link_stat: Tuple[int, int, int, int, int, int, int]
+    target_stat: Tuple[int, int, int, int, int, int, int]
+
+    def current(self) -> bool:
+        current = _binary_identity_from_path(
+            self.provider, self.executable, self.invoked_path
+        )
+        return current == self
+
+
+class _ManageVerifyFlight:
+    """One same-provider/context verification shared by explicit callers."""
+
+    def __init__(self, context: object, *, force_refresh: bool) -> None:
+        self.context = context
+        self.force_refresh = force_refresh
+        self.done = threading.Event()
+        self.result: Optional[
+            Tuple[Tuple[bool, str, str], Optional[Tuple[bool, str]]]
+        ] = None
+        self.error: Optional[BaseException] = None
+        self.committed = False
+
+
+class _ManageModelFlight:
+    """One immutable model result shared within a Manage cache generation."""
+
+    def __init__(self, key: object, *, force_refresh: bool) -> None:
+        self.key = key
+        self.force_refresh = force_refresh
+        self.done = threading.Event()
+        self.result: Optional[Tuple[Tuple[object, ...], ...]] = None
+        self.error: Optional[BaseException] = None
+        self.committed = False
+
+
+def _stat_identity(value: os.stat_result) -> Tuple[int, int, int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+        value.st_mode,
+        getattr(value, "st_uid", -1),
+    )
+
+
+def _verify_binary_identity(
+    provider: str, executable: str
+) -> Optional[_VerifyBinaryIdentity]:
+    selected = shutil.which(executable, path=os.environ.get("PATH"))
+    if selected is None:
+        return None
+    return _binary_identity_from_path(provider, executable, selected)
+
+
+def _binary_identity_from_path(
+    provider: str, executable: str, selected: str
+) -> Optional[_VerifyBinaryIdentity]:
+    invoked = os.path.abspath(selected)
+    real_path = os.path.realpath(invoked)
+    try:
+        link_stat = os.lstat(invoked)
+        target_stat = os.stat(real_path)
+    except OSError:
+        return None
+    return _VerifyBinaryIdentity(
+        provider=provider,
+        executable=executable,
+        invoked_path=invoked,
+        real_path=real_path,
+        link_stat=_stat_identity(link_stat),
+        target_stat=_stat_identity(target_stat),
+    )
+
+
+def _effective_model_binary_identity(
+    provider: str,
+) -> Optional[_VerifyBinaryIdentity]:
+    """Fingerprint only an executable the corresponding Core lister executes."""
+
+    if provider != "gemini":
+        # Claude lists through the Anthropic HTTP API; Codex reads its local
+        # models_cache.json.  Neither model path executes its provider CLI.
+        return None
+    from .providers.gemini import gemini_enabled
+
+    if not gemini_enabled():
+        return None
+    from .discovery import find_agy_bin
+
+    selected = find_agy_bin()
+    if selected is None:
+        return None
+    return _binary_identity_from_path(provider, "agy", selected)
+
+
+def _environment_identity(provider: str) -> Tuple[Tuple[str, str], ...]:
+    """Return a non-secret identity for provider data inputs.
+
+    The manage verifier inherits only HOME plus locale/PATH controls; PATH is
+    represented by the executable identity above.  Model discovery additionally
+    consumes the provider-specific values listed here.  Secret values are
+    represented only by SHA-256 digests and never retained verbatim.
+    """
+
+    common = ("HOME", "PATH", "LANG", "LC_ALL", "TMPDIR", "SYSTEMROOT")
+    names = common + {
+        "claude": (
+            "ANTHROPIC_API_KEY",
+            "HTTPS_PROXY",
+            "HTTP_PROXY",
+            "NO_PROXY",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+        ),
+        "codex": (),
+        "gemini": ("AGY_CLI_PATH", "UNIFIED_CLI_ENABLE_GEMINI"),
+    }.get(provider, ())
+    result = []
+    for name in names:
+        value = os.environ.get(name, "")
+        if name == "HOME" and value:
+            value = os.path.realpath(os.path.abspath(os.path.expanduser(value)))
+        result.append((name, hashlib.sha256(value.encode("utf-8")).hexdigest()))
+    return tuple(result)
 
 
 def _urlsafe_random() -> str:
@@ -311,7 +462,19 @@ class ManageRuntime:
         self._sessions: "OrderedDict[str, BrowserSession]" = OrderedDict()
         self._active_chats: Dict[str, ActiveChat] = {}
         self._provider_active: Dict[str, str] = {}
-        self._verify_active = False
+        self._disabled = False
+        self._verify_flights: Dict[Tuple[str, int], _ManageVerifyFlight] = {}
+        self._verify_generations: Dict[str, int] = {}
+        self._model_flights: Dict[
+            Tuple[str, int, object], _ManageModelFlight
+        ] = {}
+        self._model_generations: Dict[str, int] = {}
+        self._provider_identities: Dict[
+            Tuple[str, str], Optional[_VerifyBinaryIdentity]
+        ] = {}
+        self._version_cache: "OrderedDict[object, Tuple[float, Tuple[bool, str, str]]]" = OrderedDict()
+        self._auth_cache: "OrderedDict[object, Tuple[float, Tuple[bool, str]]]" = OrderedDict()
+        self._models_cache: "OrderedDict[object, Tuple[float, Tuple[Tuple[object, ...], ...]]]" = OrderedDict()
         self._failed_bootstraps: Dict[str, Deque[float]] = {}
         self.session_manager = SessionManager()
         self.workspaces = self._prepare_workspaces(workspaces)
@@ -348,14 +511,159 @@ class ManageRuntime:
 
     def disable(self) -> None:
         with self._lock:
+            self._disabled = True
             chats = list(self._active_chats.values())
             self._active_chats.clear()
             self._provider_active.clear()
             self._sessions.clear()
+            self._provider_identities.clear()
+            for name in _VERIFY_SPECS:
+                self._verify_generations[name] = (
+                    self._verify_generations.get(name, 0) + 1
+                )
+                self._model_generations[name] = (
+                    self._model_generations.get(name, 0) + 1
+                )
+            self._version_cache.clear()
+            self._auth_cache.clear()
+            self._models_cache.clear()
+            # Lock order is always ManageRuntime -> Core model cache.  Model
+            # owners never retain the Core lock while reacquiring this lock.
+            invalidate_core_model_cache()
+            for flight in tuple(self._verify_flights.values()) + tuple(
+                self._model_flights.values()
+            ):
+                if not flight.done.is_set():
+                    if not flight.committed and flight.error is None:
+                        flight.error = ManageError(
+                            503,
+                            "manage_disabled",
+                            "The management runtime is disabled.",
+                        )
+                    flight.done.set()
+            # Owners and waiters retain their direct flight references while
+            # they unwind.  The disabled runtime itself must retain no active
+            # work registry; owner cleanup uses identity checks and remains
+            # safe when the entry has already been retired here.
+            self._verify_flights.clear()
+            self._model_flights.clear()
             self._bootstrap_digest = ""
             self._bootstrap_expires = 0.0
         for chat in chats:
             chat.cancel_event.set()
+
+    @staticmethod
+    def _cache_get(cache: OrderedDict, key: object) -> Optional[object]:
+        now = time.monotonic()
+        entry = cache.get(key)
+        if entry is None:
+            return None
+        expires_at, value = entry
+        if now >= expires_at:
+            cache.pop(key, None)
+            return None
+        cache.move_to_end(key)
+        return value
+
+    @staticmethod
+    def _cache_put(
+        cache: OrderedDict, key: object, ttl: float, value: object
+    ) -> None:
+        cache[key] = (time.monotonic() + ttl, value)
+        cache.move_to_end(key)
+        while len(cache) > MAX_PROVIDER_CACHE_ENTRIES:
+            cache.popitem(last=False)
+
+    def _owner_fence_error_locked(self, flight: object) -> Optional[BaseException]:
+        error = flight.error  # type: ignore[attr-defined]
+        if error is None and self._disabled:
+            error = ManageError(
+                503,
+                "manage_disabled",
+                "The management runtime is disabled.",
+            )
+            flight.error = error  # type: ignore[attr-defined]
+        return error
+
+    def _clear_provider_entries_locked(
+        self, provider_id: str, caches: Sequence[OrderedDict]
+    ) -> None:
+        for cache in caches:
+            for key in tuple(cache):
+                if isinstance(key, tuple) and key and key[0] == provider_id:
+                    cache.pop(key, None)
+
+    def _invalidate_verify_cache_locked(self, provider_id: str) -> None:
+        self._clear_provider_entries_locked(
+            provider_id, (self._version_cache, self._auth_cache)
+        )
+        self._verify_generations[provider_id] = (
+            self._verify_generations.get(provider_id, 0) + 1
+        )
+
+    def _invalidate_model_cache_locked(self, provider_id: str) -> None:
+        self._clear_provider_entries_locked(provider_id, (self._models_cache,))
+        self._model_generations[provider_id] = (
+            self._model_generations.get(provider_id, 0) + 1
+        )
+        # Keep this call under the Manage lock so invalidation has one visible
+        # linearization point.  Core never calls back into Manage while holding
+        # its cache lock, so the lock order cannot form a cycle.
+        invalidate_core_model_cache(provider_id)  # type: ignore[arg-type]
+
+    def _invalidate_provider_cache_locked(self, provider_id: str) -> None:
+        self._clear_provider_entries_locked(
+            provider_id,
+            (self._version_cache, self._auth_cache),
+        )
+        self._verify_generations[provider_id] = (
+            self._verify_generations.get(provider_id, 0) + 1
+        )
+        self._invalidate_model_cache_locked(provider_id)
+
+    def invalidate_provider_cache(self, provider_id: Optional[str] = None) -> None:
+        """Drop explicit verify/model probe results for one or all providers."""
+
+        if provider_id is not None and provider_id not in _VERIFY_SPECS:
+            raise ManageError(
+                403, "provider_unsupported", "Provider cache invalidation is unsupported."
+            )
+        with self._lock:
+            if provider_id is None:
+                self._version_cache.clear()
+                self._auth_cache.clear()
+                self._models_cache.clear()
+                self._provider_identities.clear()
+                invalidate_core_model_cache()
+                for name in _VERIFY_SPECS:
+                    self._verify_generations[name] = (
+                        self._verify_generations.get(name, 0) + 1
+                    )
+                    self._model_generations[name] = (
+                        self._model_generations.get(name, 0) + 1
+                    )
+            else:
+                self._invalidate_provider_cache_locked(provider_id)
+                for key in tuple(self._provider_identities):
+                    if key[1] == provider_id:
+                        self._provider_identities.pop(key, None)
+
+    def _observe_binary(
+        self,
+        scope: str,
+        provider_id: str,
+        identity: Optional[_VerifyBinaryIdentity],
+    ) -> None:
+        key = (scope, provider_id)
+        with self._lock:
+            if self._disabled:
+                return
+            if (
+                key in self._provider_identities
+                and self._provider_identities[key] != identity
+            ):
+                self._invalidate_provider_cache_locked(provider_id)
+            self._provider_identities[key] = identity
 
     def _opaque_handle(self, namespace: str, value: str) -> str:
         digest = hmac.new(
@@ -609,60 +917,415 @@ class ManageRuntime:
             rows.append(row)
         return {"providers": rows}
 
-    @staticmethod
-    def provider_models(provider_id: str) -> Dict[str, Any]:
+    def provider_models(
+        self, provider_id: str, *, force_refresh: bool = False
+    ) -> Dict[str, Any]:
         if provider_id not in {"claude", "codex", "gemini"}:
             raise ManageError(403, "provider_unsupported", "Provider models are unavailable.")
+
+        with self._lock:
+            if self._disabled:
+                raise ManageError(
+                    503, "manage_disabled", "The management runtime is disabled."
+                )
+
+        identity = _effective_model_binary_identity(provider_id)
+        self._observe_binary("models", provider_id, identity)
+        context = _environment_identity(provider_id)
+        key = (provider_id, identity, context)
+        identity_is_current = identity is None or identity.current()
+        with self._lock:
+            if self._disabled:
+                raise ManageError(
+                    503, "manage_disabled", "The management runtime is disabled."
+                )
+            if not force_refresh and identity_is_current:
+                record = self._cache_get(self._models_cache, key)
+                if record is not None:
+                    return self._models_response(provider_id, record)
+
+            generation = self._model_generations.get(provider_id, 0)
+            flight_key = (provider_id, generation, key)
+            flight = self._model_flights.get(flight_key)
+            if force_refresh and not (
+                flight is not None and flight.force_refresh
+            ):
+                # A Manage force refresh fences both its own previous flight
+                # and Core's corresponding provider flight.  Otherwise Core
+                # would legitimately coalesce with the older force probe.
+                self._invalidate_model_cache_locked(provider_id)
+                generation = self._model_generations[provider_id]
+                flight_key = (provider_id, generation, key)
+                flight = self._model_flights.get(flight_key)
+            if flight is None:
+                if len(self._model_flights) >= MAX_PROVIDER_CACHE_ENTRIES:
+                    raise ManageError(
+                        429,
+                        "models_busy",
+                        "Provider model discovery is at capacity.",
+                    )
+                flight = _ManageModelFlight(
+                    key, force_refresh=force_refresh
+                )
+                self._model_flights[flight_key] = flight
+                owner = True
+            else:
+                owner = False
+
+        if not owner:
+            flight.done.wait()
+            if flight.error is not None:
+                raise flight.error
+            assert flight.result is not None
+            return self._models_response(provider_id, flight.result)
+
         try:
-            models = list_models(provider_id)
-        except Exception:
-            raise ManageError(502, "models_unavailable", "Provider models are unavailable.") from None
+            with self._lock:
+                fence_error = self._owner_fence_error_locked(flight)
+            if fence_error is not None:
+                raise fence_error
+            fallback_fence_error = None
+            try:
+                # ManageRuntime owns the shorter UI TTL, so a miss must not be
+                # silently extended by Core's longer process cache.
+                try:
+                    models = list_models(provider_id, force_refresh=True)
+                except TypeError as error:
+                    # Preserve compatibility with downstream/test listers that
+                    # implement the historical one-argument callable shape.
+                    if "force_refresh" not in str(error):
+                        raise
+                    with self._lock:
+                        fallback_fence_error = (
+                            self._owner_fence_error_locked(flight)
+                        )
+                    if fallback_fence_error is None:
+                        models = list_models(provider_id)
+            except UnifiedError as error:
+                if error.kind == "resource_limit":
+                    raise ManageError(
+                        429,
+                        "models_busy",
+                        "Provider model discovery is busy. Retry shortly.",
+                    ) from None
+                raise ManageError(
+                    502,
+                    "models_unavailable",
+                    "Provider models are unavailable.",
+                ) from None
+            except Exception:
+                raise ManageError(
+                    502,
+                    "models_unavailable",
+                    "Provider models are unavailable.",
+                ) from None
+            if fallback_fence_error is not None:
+                raise fallback_fence_error
+
+            rows = tuple(
+                (
+                    item.id,
+                    item.display_name,
+                    bool(item.default),
+                    bool(item.deprecated),
+                    item.source,
+                )
+                for item in models[:1_000]
+                if item.provider == provider_id
+                and type(item.id) is str
+                and len(item.id) <= 512
+            )
+            current_identity = _effective_model_binary_identity(provider_id)
+            commit_error = None
+            with self._lock:
+                if flight.error is not None:
+                    commit_error = flight.error
+                elif self._disabled:
+                    commit_error = ManageError(
+                        503,
+                        "manage_disabled",
+                        "The management runtime is disabled.",
+                    )
+                    flight.error = commit_error
+                else:
+                    if (
+                        rows
+                        and self._model_generations.get(provider_id, 0) == generation
+                        and current_identity == identity
+                        and (identity is None or identity.current())
+                    ):
+                        self._cache_put(
+                            self._models_cache,
+                            key,
+                            PROVIDER_MODELS_TTL_SECONDS,
+                            rows,
+                        )
+                    flight.result = rows
+                    flight.committed = True
+            if commit_error is not None:
+                raise commit_error
+            if current_identity != identity:
+                self._observe_binary("models", provider_id, current_identity)
+            return self._models_response(provider_id, rows)
+        except BaseException as error:
+            with self._lock:
+                if flight.error is None:
+                    flight.error = error
+                public_error = flight.error
+            if public_error is error:
+                raise
+            raise public_error
+        finally:
+            with self._lock:
+                if self._model_flights.get(flight_key) is flight:
+                    self._model_flights.pop(flight_key, None)
+                flight.done.set()
+
+    @staticmethod
+    def _models_response(
+        provider_id: str, rows: Tuple[Tuple[object, ...], ...]
+    ) -> Dict[str, Any]:
         return {
             "provider": provider_id,
             "models": [
                 {
-                    "id": item.id,
-                    "display_name": item.display_name,
-                    "default": bool(item.default),
-                    "deprecated": bool(item.deprecated),
-                    "source": item.source,
+                    "id": row[0],
+                    "display_name": row[1],
+                    "default": row[2],
+                    "deprecated": row[3],
+                    "source": row[4],
                 }
-                for item in models[:1_000]
-                if item.provider == provider_id and type(item.id) is str and len(item.id) <= 512
+                for row in rows
             ],
         }
 
-    def verify_provider(self, provider_id: str) -> Dict[str, Any]:
+    def verify_provider(
+        self, provider_id: str, *, force_refresh: bool = False
+    ) -> Dict[str, Any]:
         specs = _VERIFY_SPECS.get(provider_id)
         if specs is None:
             raise ManageError(403, "verify_unsupported", "Provider verification is unsupported.")
-        with self._lock:
-            if self._verify_active:
-                raise ManageError(429, "verify_busy", "A provider verification is already running.")
-            self._verify_active = True
-        results = []
+
+        while True:
+            with self._lock:
+                if self._disabled:
+                    raise ManageError(
+                        503,
+                        "manage_disabled",
+                        "The management runtime is disabled.",
+                    )
+
+            identity = _verify_binary_identity(provider_id, specs[0][0])
+            self._observe_binary("verify", provider_id, identity)
+            context = _environment_identity(provider_id)
+            version_key = (provider_id, identity)
+            auth_key = (provider_id, identity, context)
+            version_record = None
+            auth_record = None
+            if not force_refresh and identity is not None and identity.current():
+                with self._lock:
+                    if self._disabled:
+                        raise ManageError(
+                            503,
+                            "manage_disabled",
+                            "The management runtime is disabled.",
+                        )
+                    version_record = self._cache_get(
+                        self._version_cache, version_key
+                    )
+                    if len(specs) > 1:
+                        auth_record = self._cache_get(
+                            self._auth_cache, auth_key
+                        )
+
+            need_version = version_record is None
+            need_auth = len(specs) > 1 and auth_record is None
+            if not need_version and not need_auth:
+                return self._verify_response(
+                    provider_id, version_record, auth_record
+                )
+
+            flight_context = (identity, context)
+            wait_for = None
+            with self._lock:
+                if self._disabled:
+                    raise ManageError(
+                        503,
+                        "manage_disabled",
+                        "The management runtime is disabled.",
+                    )
+                generation = self._verify_generations.get(provider_id, 0)
+                flight_key = (provider_id, generation)
+                active = next(
+                    (
+                        (key, value)
+                        for key, value in self._verify_flights.items()
+                        if key[0] == provider_id
+                    ),
+                    None,
+                )
+                if active is not None:
+                    active_key, flight = active
+                    if (
+                        active_key == flight_key
+                        and flight.context == flight_context
+                    ):
+                        if force_refresh and not flight.force_refresh:
+                            # A force caller must not consume the ordinary
+                            # result, but verification remains strictly serial.
+                            wait_for = flight
+                        else:
+                            owner = False
+                            flight_key = active_key
+                    elif not force_refresh and active_key == flight_key:
+                        raise ManageError(
+                            429,
+                            "verify_busy",
+                            "This provider already has a verification running.",
+                        )
+                    else:
+                        # The active flight belongs to a fenced generation (or
+                        # a force caller's previous context). Recompute state
+                        # only after its provider slot has been released.
+                        wait_for = flight
+                else:
+                    if force_refresh:
+                        self._invalidate_verify_cache_locked(provider_id)
+                        generation = self._verify_generations[provider_id]
+                        flight_key = (provider_id, generation)
+                        version_record = None
+                        auth_record = None
+                        need_version = True
+                        need_auth = len(specs) > 1
+                    flight = _ManageVerifyFlight(
+                        flight_context, force_refresh=force_refresh
+                    )
+                    self._verify_flights[flight_key] = flight
+                    owner = True
+
+            if wait_for is not None:
+                wait_for.done.wait()
+                with self._lock:
+                    shutdown_error = (
+                        self._owner_fence_error_locked(wait_for)
+                        if self._disabled
+                        else None
+                    )
+                if shutdown_error is not None:
+                    raise shutdown_error
+                continue
+            break
+
+        if not owner:
+            flight.done.wait()
+            if flight.error is not None:
+                raise flight.error
+            assert flight.result is not None
+            return self._verify_response(
+                provider_id, flight.result[0], flight.result[1]
+            )
+
         try:
             with tempfile.TemporaryDirectory(prefix="unified-cli-verify-") as cwd:
-                for index, argv in enumerate(specs):
-                    result = _run_verify_argv(argv, cwd)
-                    if index > 0:
-                        # Auth commands are reduced to a boolean classification;
-                        # account identifiers and provider diagnostics do not
-                        # need to cross the browser boundary.
-                        result["output"] = ""
-                    results.append({
-                        "check": "version" if index == 0 else "auth_status",
-                        **result,
-                    })
-                    if result["code"] == "missing_binary":
-                        break
+                if need_version:
+                    with self._lock:
+                        fence_error = self._owner_fence_error_locked(flight)
+                    if fence_error is not None:
+                        raise fence_error
+                    result = _run_verify_argv(specs[0], cwd)
+                    version_record = (
+                        bool(result["ok"]),
+                        str(result["code"]),
+                        str(result["output"]),
+                    )
+                if (
+                    need_auth
+                    and version_record is not None
+                    and version_record[1] != "missing_binary"
+                ):
+                    with self._lock:
+                        fence_error = self._owner_fence_error_locked(flight)
+                    if fence_error is not None:
+                        raise fence_error
+                    result = _run_verify_argv(specs[1], cwd)
+                    # Authentication output may contain an account identifier;
+                    # only the bounded boolean classification is retained.
+                    auth_record = (bool(result["ok"]), str(result["code"]))
+            current_identity = _verify_binary_identity(provider_id, specs[0][0])
+            if current_identity != identity or (
+                identity is not None and not identity.current()
+            ):
+                self._observe_binary("verify", provider_id, current_identity)
+                version_record = (False, "binary_changed", "")
+                auth_record = None
+            assert version_record is not None
+            commit_error = None
+            with self._lock:
+                commit_error = self._owner_fence_error_locked(flight)
+                if commit_error is None:
+                    if self._verify_generations.get(provider_id, 0) == generation:
+                        if identity is not None and version_record[0]:
+                            self._cache_put(
+                                self._version_cache,
+                                version_key,
+                                VERIFY_VERSION_TTL_SECONDS,
+                                version_record,
+                            )
+                        if (
+                            identity is not None
+                            and auth_record is not None
+                            and auth_record[1] in {"ok", "not_ready"}
+                        ):
+                            self._cache_put(
+                                self._auth_cache,
+                                auth_key,
+                                VERIFY_AUTH_TTL_SECONDS,
+                                auth_record,
+                            )
+                    flight.result = (version_record, auth_record)
+                    flight.committed = True
+            if commit_error is not None:
+                raise commit_error
+            return self._verify_response(
+                provider_id, version_record, auth_record
+            )
+        except BaseException as error:
+            with self._lock:
+                if flight.error is None:
+                    flight.error = error
+                public_error = flight.error
+            if public_error is error:
+                raise
+            raise public_error
         finally:
             with self._lock:
-                self._verify_active = False
-        installed = bool(results and results[0]["ok"])
+                if self._verify_flights.get(flight_key) is flight:
+                    self._verify_flights.pop(flight_key, None)
+                flight.done.set()
+
+    @staticmethod
+    def _verify_response(
+        provider_id: str,
+        version_record: Tuple[bool, str, str],
+        auth_record: Optional[Tuple[bool, str]],
+    ) -> Dict[str, Any]:
+        results = [{
+            "check": "version",
+            "ok": version_record[0],
+            "code": version_record[1],
+            "output": version_record[2],
+        }]
+        if auth_record is not None:
+            results.append({
+                "check": "auth_status",
+                "ok": auth_record[0],
+                "code": auth_record[1],
+                "output": "",
+            })
+        installed = bool(version_record[0])
         auth = "unknown"
-        if len(results) > 1:
-            auth = "authenticated" if results[1]["ok"] else "not_authenticated"
+        if auth_record is not None:
+            auth = "authenticated" if auth_record[0] else "not_authenticated"
         ready = installed and (auth == "authenticated" or provider_id == "gemini")
         return {
             "provider": provider_id,

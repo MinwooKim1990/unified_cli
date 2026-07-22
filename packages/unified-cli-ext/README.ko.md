@@ -76,6 +76,25 @@ Core 확장 ABI와 신뢰 경계는
 [provider plugin ABI](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/development/provider-plugin-abi-v1.md)를
 참고하세요.
 
+### 명시적 probe 캐시
+
+`ProviderAdapterV1`의 캐시는 처음에는 비어 있으며 호출자가 `inspect`,
+`authenticated`, `list_models`를 명시적으로 호출할 때만 채워집니다. 성공한 불변
+레코드는 monotonic 시계와 서로 다른 제한 TTL을 사용합니다. inspection은 5분,
+인증 상태는 15초, 비어 있지 않은 모델 목록은 1분입니다. 캐시 hit에서도 먼저 저렴한
+`BinaryProvenance` 메타데이터 검증을 다시 수행하며, 정확한 실행 파일이 교체되면 해당
+probe 레코드를 무효화합니다. 계정에 민감한 키에는 검증된 provider home 디렉터리의
+식별 정보와 어댑터가 선택한 환경 값의 digest도 포함됩니다. 원문 secret은 캐시 키나
+값으로 보관하지 않습니다.
+
+현재 API에는 provider가 제공하는 account identifier가 없으므로 이 캐시는
+home/environment 경계를 넘어 계정을 식별한다고 주장하지 않습니다. 외부 프로세스가
+계정을 바꾸면 짧은 auth TTL 동안 이전 상태가 보일 수 있습니다. 어댑터의 login/logout
+준비 경로는 해당 컨텍스트의 auth/model 레코드를 무효화합니다. 세 probe 메서드에서
+`force_refresh=True`를 지정하거나 `invalidate_cache()`를 호출해 명시적으로 갱신할 수
+있습니다. 예외, 취소, permission 실패는 성공 캐시 레코드로 남지 않으며 이 기능 때문에
+시작 시 plugin import나 provider probe가 실행되지 않습니다.
+
 ## 상태
 
 이 릴리스는 비활성 Held 카탈로그가 있는 기반 패키지이지 지원되는 외부 provider

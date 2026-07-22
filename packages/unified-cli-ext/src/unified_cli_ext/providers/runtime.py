@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import hashlib
 import os
 import re
 import sys
 import threading
+import time
 import unicodedata
+from collections import OrderedDict
 from dataclasses import dataclass, fields, is_dataclass
 from types import MappingProxyType
 from typing import Any, FrozenSet, Mapping, Optional, Tuple
@@ -60,6 +63,20 @@ _VERSION_RE = re.compile(
 )
 _FEATURE_RE = re.compile(r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$")
 _MAX_MODEL_ID_CHARS = 512
+INSPECTION_CACHE_TTL_SECONDS = 300.0
+AUTH_CACHE_TTL_SECONDS = 15.0
+MODEL_CACHE_TTL_SECONDS = 60.0
+MAX_ADAPTER_CACHE_ENTRIES = 128
+
+
+class _AdapterCacheFlight:
+    __slots__ = ("done", "result", "error", "force_refresh")
+
+    def __init__(self, *, force_refresh: bool) -> None:
+        self.done = threading.Event()
+        self.result = None
+        self.error = None
+        self.force_refresh = force_refresh
 
 
 def _cleanup_temporary(temporary: Any) -> None:
@@ -1113,6 +1130,11 @@ class ProviderAdapterV1:
     __slots__ = (
         "_spec",
         "_inspection_record",
+        "_cache_lock",
+        "_cache",
+        "_cache_flights",
+        "_cache_generations",
+        "_binary_identities",
     )
 
     def __init__(self, spec: ProviderAdapterSpecV1) -> None:
@@ -1125,6 +1147,11 @@ class ProviderAdapterV1:
         # security boundary, so hot paths share this canonical immutable graph.
         object.__setattr__(self, "_spec", _clone_adapter_value(spec))
         object.__setattr__(self, "_inspection_record", None)
+        object.__setattr__(self, "_cache_lock", threading.RLock())
+        object.__setattr__(self, "_cache", OrderedDict())
+        object.__setattr__(self, "_cache_flights", {})
+        object.__setattr__(self, "_cache_generations", {})
+        object.__setattr__(self, "_binary_identities", OrderedDict())
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError("provider adapter facade is read-only")
@@ -1145,7 +1172,201 @@ class ProviderAdapterV1:
     def resolve_binary(self, path: str) -> BinaryProvenance:
         """Fingerprint one explicitly supplied path without executing it."""
 
-        return _regular_binary(path, self.spec.binary.executable)
+        binary = _regular_binary(path, self.spec.binary.executable)
+        self._observe_binary(binary)
+        return binary
+
+    @staticmethod
+    def _binary_cache_identity(binary: BinaryProvenance) -> Tuple[Any, ...]:
+        return (
+            binary.invoked_path,
+            binary.real_path,
+            binary.sha256,
+            binary.device,
+            binary.inode,
+            binary.size,
+            binary.mtime_ns,
+            binary.mode,
+            binary.owner,
+            binary.parent_chain,
+            None
+            if binary.interpreter is None
+            else _identity_record(binary.interpreter),
+            binary.ctime_ns,
+        )
+
+    def _observe_binary(self, binary: BinaryProvenance) -> Tuple[Any, ...]:
+        binary.verify(self.spec.binary.executable)
+        identity = self._binary_cache_identity(binary)
+        path = binary.invoked_path
+        with self._cache_lock:
+            previous = self._binary_identities.get(path)
+            if previous is not None and previous != identity:
+                for key in self._cache_keys_locked():
+                    if len(key) > 1 and key[1][1][0] == path:
+                        self._invalidate_cache_key_locked(key)
+            self._binary_identities[path] = identity
+            self._binary_identities.move_to_end(path)
+            while len(self._binary_identities) > MAX_ADAPTER_CACHE_ENTRIES:
+                self._binary_identities.popitem(last=False)
+        return identity
+
+    def _cache_context(
+        self,
+        binary: BinaryProvenance,
+        provider_env: Optional[Mapping[str, str]],
+        provider_home: Optional[str],
+    ) -> Tuple[Any, ...]:
+        identity = self._observe_binary(binary)
+        selected = self._selected_environment(provider_env)
+        environment_identity = tuple(
+            (
+                name,
+                hashlib.sha256(value.encode("utf-8")).hexdigest(),
+            )
+            for name, value in sorted(selected.items())
+        )
+        home_identity = None
+        if provider_home is not None:
+            home = private_persistent_home(provider_home)
+            try:
+                home_stat = os.stat(home)
+            except OSError:
+                raise ConfigurationError("provider home is unavailable") from None
+            home_identity = (
+                home,
+                home_stat.st_dev,
+                home_stat.st_ino,
+                home_stat.st_mode,
+                getattr(home_stat, "st_uid", -1),
+                home_stat.st_ctime_ns,
+            )
+        return (self.spec.id, identity, home_identity, environment_identity)
+
+    def _cache_keys_locked(self) -> set:
+        return set(self._cache).union(
+            flight_key[0] for flight_key in self._cache_flights
+        )
+
+    def _invalidate_cache_key_locked(self, key: Tuple[Any, ...]) -> None:
+        self._cache.pop(key, None)
+        if any(flight_key[0] == key for flight_key in self._cache_flights):
+            self._cache_generations[key] = (
+                self._cache_generations.get(key, 0) + 1
+            )
+        else:
+            self._cache_generations.pop(key, None)
+
+    def _cache_call(
+        self,
+        operation: str,
+        context: Tuple[Any, ...],
+        ttl: float,
+        loader: Any,
+        *,
+        force_refresh: bool,
+        cacheable: bool,
+        should_cache: Optional[Any] = None,
+    ) -> Any:
+        if not cacheable:
+            return loader()
+        key = (operation, context)
+        now = time.monotonic()
+        with self._cache_lock:
+            generation = self._cache_generations.get(key, 0)
+            flight_key = (key, generation)
+            flight = self._cache_flights.get(flight_key)
+
+            if force_refresh and not (
+                flight is not None and flight.force_refresh
+            ):
+                generation += 1
+                self._cache_generations[key] = generation
+                self._cache.pop(key, None)
+                flight_key = (key, generation)
+                flight = self._cache_flights.get(flight_key)
+
+            if not force_refresh:
+                entry = self._cache.get(key)
+                if entry is not None:
+                    expires_at, value = entry
+                    if now < expires_at:
+                        self._cache.move_to_end(key)
+                        return value
+                    self._cache.pop(key, None)
+            if flight is None:
+                if len(self._cache_flights) >= MAX_ADAPTER_CACHE_ENTRIES:
+                    raise TransportError("provider probe cache is at capacity")
+                flight = _AdapterCacheFlight(force_refresh=force_refresh)
+                self._cache_flights[flight_key] = flight
+                owner = True
+            else:
+                owner = False
+
+        if not owner:
+            flight.done.wait()
+            if flight.error is not None:
+                raise flight.error
+            return flight.result
+
+        try:
+            result = loader()
+            with self._cache_lock:
+                retain = should_cache is None or bool(should_cache(result))
+                if (
+                    retain
+                    and self._cache_generations.get(key, 0) == generation
+                ):
+                    self._cache[key] = (time.monotonic() + ttl, result)
+                    self._cache.move_to_end(key)
+                    while len(self._cache) > MAX_ADAPTER_CACHE_ENTRIES:
+                        evicted, _value = self._cache.popitem(last=False)
+                        if not any(
+                            active_key[0] == evicted
+                            for active_key in self._cache_flights
+                        ):
+                            self._cache_generations.pop(evicted, None)
+                flight.result = result
+            return result
+        except BaseException as error:
+            with self._cache_lock:
+                flight.error = error
+            raise
+        finally:
+            with self._cache_lock:
+                if self._cache_flights.get(flight_key) is flight:
+                    self._cache_flights.pop(flight_key, None)
+                if (
+                    key not in self._cache
+                    and not any(
+                        active_key[0] == key
+                        for active_key in self._cache_flights
+                    )
+                ):
+                    self._cache_generations.pop(key, None)
+                flight.done.set()
+
+    def invalidate_cache(self, operation: Optional[str] = None) -> None:
+        """Invalidate immutable probe records without executing a provider."""
+
+        if operation not in (None, "inspect", "authenticated", "models"):
+            raise ConfigurationError("provider cache operation is invalid")
+        with self._cache_lock:
+            for key in self._cache_keys_locked():
+                if operation is None or key[0] == operation:
+                    self._invalidate_cache_key_locked(key)
+
+    def _invalidate_account_cache(
+        self,
+        binary: BinaryProvenance,
+        provider_env: Optional[Mapping[str, str]],
+        provider_home: Optional[str],
+    ) -> None:
+        context = self._cache_context(binary, provider_env, provider_home)
+        with self._cache_lock:
+            for operation in ("authenticated", "models"):
+                key = (operation, context)
+                self._invalidate_cache_key_locked(key)
 
     def _ensure_usable(self) -> None:
         if self.spec.status is AdapterStatus.HELD:
@@ -1157,7 +1378,8 @@ class ProviderAdapterV1:
         """Require the exact inspection object issued by this adapter."""
 
         self._ensure_usable()
-        issued_record = self._inspection_record
+        with self._cache_lock:
+            issued_record = self._inspection_record
         if (
             type(inspection) is not AdapterInspectionV1
             or issued_record is None
@@ -1381,6 +1603,61 @@ class ProviderAdapterV1:
         provider_env: Optional[Mapping[str, str]] = None,
         provider_home: Optional[str] = None,
         cancellation: Optional[CancellationToken] = None,
+        force_refresh: bool = False,
+    ) -> AdapterInspectionV1:
+        """Run or reuse explicit version/features probes for one exact binary."""
+
+        context = self._cache_context(binary, provider_env, provider_home)
+
+        def load() -> Tuple[Any, ...]:
+            inspected = self._inspect_uncached(
+                binary,
+                provider_env=provider_env,
+                provider_home=provider_home,
+                cancellation=cancellation,
+            )
+            return self._inspection_issuance_record(
+                binary, inspected.version, inspected.features
+            )
+
+        record = self._cache_call(
+            "inspect",
+            context,
+            INSPECTION_CACHE_TTL_SECONDS,
+            load,
+            force_refresh=force_refresh,
+            cacheable=cancellation is None,
+        )
+        try:
+            return self._activate_inspection(
+                record,
+                context=context if cancellation is None else None,
+            )
+        except ConfigurationError:
+            # A hostile caller can bypass the frozen inspection boundary with
+            # ``object.__setattr__`` and thereby corrupt the shared cached
+            # issuance record.  Retire that generation and issue one fresh
+            # record.  Uncached cancellation-aware probes have no cached state
+            # to recover, so preserve their original failure.
+            if cancellation is not None:
+                raise
+            refreshed = self._cache_call(
+                "inspect",
+                context,
+                INSPECTION_CACHE_TTL_SECONDS,
+                load,
+                force_refresh=True,
+                cacheable=True,
+            )
+            return self._activate_inspection(refreshed, context=context)
+
+    def _inspect_uncached(
+        self,
+        binary: BinaryProvenance,
+        *,
+        provider_env: Optional[Mapping[str, str]] = None,
+        provider_home: Optional[str] = None,
+        cancellation: Optional[CancellationToken] = None,
     ) -> AdapterInspectionV1:
         """Run the explicit version and feature probes for one binary."""
 
@@ -1491,7 +1768,23 @@ class ProviderAdapterV1:
             binary=binary,
             abi_version=self.spec.abi_version,
         )
-        object.__setattr__(self, "_inspection_record", (
+        return inspection
+
+    def _inspection_issuance_record(
+        self,
+        binary: BinaryProvenance,
+        version: str,
+        features: FrozenSet[str],
+    ) -> Tuple[Any, ...]:
+        binary.verify(self.spec.binary.executable)
+        inspection = AdapterInspectionV1(
+            id=self.spec.id,
+            version=version,
+            features=features,
+            binary=binary,
+            abi_version=self.spec.abi_version,
+        )
+        return (
             inspection,
             inspection.id,
             inspection.version,
@@ -1518,8 +1811,54 @@ class ProviderAdapterV1:
                 ctime_ns=inspection.binary.ctime_ns,
             ),
             inspection.abi_version,
-        ))
-        return inspection
+        )
+
+    def _activate_inspection(
+        self,
+        record: Tuple[Any, ...],
+        *,
+        context: Optional[Tuple[Any, ...]],
+    ) -> AdapterInspectionV1:
+        while True:
+            if type(record) is not tuple or len(record) != 7:
+                raise ConfigurationError("adapter inspection cache is invalid")
+            inspection = record[0]
+            if (
+                type(inspection) is not AdapterInspectionV1
+                or type(inspection.id) is not str
+                or type(inspection.version) is not str
+                or type(inspection.features) is not frozenset
+                or type(inspection.binary) is not BinaryProvenance
+                or type(inspection.abi_version) is not int
+                or inspection.id != record[1]
+                or inspection.version != record[2]
+                or inspection.features != record[3]
+                or inspection.binary is not record[4]
+                or inspection.binary != record[5]
+                or inspection.abi_version != record[6]
+                or inspection.id != self.spec.id
+                or inspection.abi_version != self.spec.abi_version
+            ):
+                raise ConfigurationError("adapter inspection cache is invalid")
+            inspection.binary.verify(self.spec.binary.executable)
+            with self._cache_lock:
+                current = (
+                    None
+                    if context is None
+                    else self._cache.get(("inspect", context))
+                )
+                if (
+                    current is not None
+                    and time.monotonic() < current[0]
+                    and current[1] is not record
+                ):
+                    # An older caller can finish after a replacement force
+                    # refresh.  Return the current issuance instead of letting
+                    # that stale completion retire the newer usable object.
+                    record = current[1]
+                    continue
+                object.__setattr__(self, "_inspection_record", record)
+                return inspection
 
     def doctor_provider(
         self,
@@ -1553,6 +1892,36 @@ class ProviderAdapterV1:
         provider_env: Optional[Mapping[str, str]] = None,
         provider_home: Optional[str] = None,
         cancellation: Optional[CancellationToken] = None,
+        force_refresh: bool = False,
+    ) -> Tuple[str, ...]:
+        binary = self._require_inspection(inspection)
+        context = self._cache_context(binary, provider_env, provider_home)
+
+        def load() -> Tuple[str, ...]:
+            return self._list_models_uncached(
+                inspection,
+                provider_env=provider_env,
+                provider_home=provider_home,
+                cancellation=cancellation,
+            )
+
+        return self._cache_call(
+            "models",
+            context,
+            MODEL_CACHE_TTL_SECONDS,
+            load,
+            force_refresh=force_refresh,
+            cacheable=cancellation is None,
+            should_cache=bool,
+        )
+
+    def _list_models_uncached(
+        self,
+        inspection: AdapterInspectionV1,
+        *,
+        provider_env: Optional[Mapping[str, str]] = None,
+        provider_home: Optional[str] = None,
+        cancellation: Optional[CancellationToken] = None,
     ) -> Tuple[str, ...]:
         binary = self._require_inspection(inspection)
         if self.spec.models is None:
@@ -1573,6 +1942,35 @@ class ProviderAdapterV1:
         return models
 
     def authenticated(
+        self,
+        inspection: AdapterInspectionV1,
+        *,
+        provider_env: Optional[Mapping[str, str]] = None,
+        provider_home: Optional[str] = None,
+        cancellation: Optional[CancellationToken] = None,
+        force_refresh: bool = False,
+    ) -> bool:
+        binary = self._require_inspection(inspection)
+        context = self._cache_context(binary, provider_env, provider_home)
+
+        def load() -> bool:
+            return self._authenticated_uncached(
+                inspection,
+                provider_env=provider_env,
+                provider_home=provider_home,
+                cancellation=cancellation,
+            )
+
+        return self._cache_call(
+            "authenticated",
+            context,
+            AUTH_CACHE_TTL_SECONDS,
+            load,
+            force_refresh=force_refresh,
+            cacheable=cancellation is None,
+        )
+
+    def _authenticated_uncached(
         self,
         inspection: AdapterInspectionV1,
         *,
@@ -1651,6 +2049,8 @@ class ProviderAdapterV1:
     ) -> InteractiveAuthSessionV1:
         if self.spec.auth is None:
             raise ConfigurationError("provider adapter has no authentication specification")
+        binary = self._require_inspection(inspection)
+        self._invalidate_account_cache(binary, provider_env, provider_home)
         return self._prepare_auth_command(
             inspection,
             self.spec.auth.login_command,
@@ -1669,6 +2069,8 @@ class ProviderAdapterV1:
     ) -> InteractiveAuthSessionV1:
         if self.spec.auth is None or self.spec.auth.logout_command is None:
             raise ConfigurationError("provider adapter has no logout command")
+        binary = self._require_inspection(inspection)
+        self._invalidate_account_cache(binary, provider_env, provider_home)
         return self._prepare_auth_command(
             inspection,
             self.spec.auth.logout_command,

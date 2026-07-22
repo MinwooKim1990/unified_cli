@@ -1,5 +1,6 @@
 import asyncio
 import builtins
+import concurrent.futures
 import errno
 import json
 import os
@@ -3069,15 +3070,18 @@ def test_held_adapter_cannot_build_or_open(adapter_binary):
         held.build_prompt(binary, "hello", {"model": "fixture-small"})
     with pytest.raises(ConfigurationError, match="held"):
         held.open_transport(inspection, "hello", {"model": "fixture-small"})
-def test_new_inspection_retires_previous_record(adapter_binary):
+def test_cached_inspection_is_shared_and_force_refresh_retires_it(adapter_binary):
     adapter = ProviderAdapterV1(adapter_spec())
     binary = adapter.resolve_binary(adapter_binary)
     first = adapter.inspect(binary)
     second = adapter.inspect(binary)
 
+    assert first is second
+    assert adapter.doctor_provider(first) is True
+    refreshed = adapter.inspect(binary, force_refresh=True)
     with pytest.raises(ConfigurationError, match="inspection"):
         adapter.doctor_provider(first)
-    assert adapter.doctor_provider(second) is True
+    assert adapter.doctor_provider(refreshed) is True
     assert not hasattr(adapter, "_inspections")
 
 
@@ -3115,3 +3119,372 @@ assert "unified_cli.plugin" not in sys.modules
         stderr=subprocess.PIPE,
         text=True,
     )
+
+
+def test_adapter_probe_cache_hit_force_expiry_invalidation_and_immutable(
+    adapter_binary, monkeypatch,
+):
+    runtime_module = __import__(
+        "unified_cli_ext.providers.runtime", fromlist=["unused"]
+    )
+    real_run = ProviderAdapterV1._run_probe
+    probes = []
+
+    def counted(self, binary, probe, **kwargs):
+        probes.append(probe)
+        return real_run(self, binary, probe, **kwargs)
+
+    monkeypatch.setattr(ProviderAdapterV1, "_run_probe", counted)
+    adapter = ProviderAdapterV1(adapter_spec())
+    assert not adapter._cache
+    binary = adapter.resolve_binary(adapter_binary)
+
+    first = adapter.inspect(binary)
+    assert len(probes) == 2
+    second = adapter.inspect(binary)
+    assert len(probes) == 2
+    assert second is first
+    inspection = adapter.inspect(binary, force_refresh=True)
+    assert len(probes) == 4
+
+    models = adapter.list_models(inspection)
+    assert models == ("fixture-small", "fixture-large")
+    assert adapter.list_models(inspection) == models
+    assert len(probes) == 5
+    with pytest.raises(TypeError):
+        models[0] = "mutated"
+
+    adapter.list_models(inspection, force_refresh=True)
+    assert len(probes) == 6
+    adapter.invalidate_cache("models")
+    adapter.list_models(inspection)
+    assert len(probes) == 7
+
+    with adapter._cache_lock:
+        for key, (_expires_at, value) in tuple(adapter._cache.items()):
+            if key[0] == "models":
+                adapter._cache[key] = (runtime_module.time.monotonic() - 1, value)
+    adapter.list_models(inspection)
+    assert len(probes) == 8
+
+    wall = [10_000.0]
+    monkeypatch.setattr(runtime_module.time, "time", lambda: wall[0])
+    adapter.list_models(inspection)
+    wall[0] = -10_000.0
+    adapter.list_models(inspection)
+    assert len(probes) == 8
+
+
+def test_adapter_model_cache_single_flight_owner_failure_wakes_waiters(
+    adapter_binary, monkeypatch,
+):
+    adapter = ProviderAdapterV1(adapter_spec())
+    inspection = adapter.inspect(adapter.resolve_binary(adapter_binary))
+    real_run = ProviderAdapterV1._run_probe
+    entered = threading.Event()
+    release = threading.Event()
+    start = threading.Barrier(8)
+    calls = []
+
+    def failed(self, binary, probe, **kwargs):
+        if probe is self.spec.models.probe:
+            calls.append(True)
+            entered.set()
+            assert release.wait(2)
+            raise RuntimeError("injected model probe failure")
+        return real_run(self, binary, probe, **kwargs)
+
+    monkeypatch.setattr(ProviderAdapterV1, "_run_probe", failed)
+
+    def listing():
+        start.wait(timeout=2)
+        return adapter.list_models(inspection, force_refresh=True)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(listing) for _ in range(8)]
+        assert entered.wait(1)
+        assert not release.wait(0.05)
+        release.set()
+        for future in futures:
+            with pytest.raises(RuntimeError, match="injected model probe failure"):
+                future.result(timeout=2)
+    assert len(calls) == 1
+
+    monkeypatch.setattr(ProviderAdapterV1, "_run_probe", real_run)
+    assert adapter.list_models(inspection) == ("fixture-small", "fixture-large")
+
+
+def test_adapter_inspect_force_refresh_is_eight_way_usable_single_flight(
+    adapter_binary, monkeypatch,
+):
+    adapter = ProviderAdapterV1(adapter_spec())
+    binary = adapter.resolve_binary(adapter_binary)
+    real_run = ProviderAdapterV1._run_probe
+    start = threading.Barrier(8)
+    entered = threading.Event()
+    release = threading.Event()
+    lock = threading.Lock()
+    calls = []
+
+    def counted(self, binary_value, probe, **kwargs):
+        with lock:
+            calls.append(probe)
+            first = len(calls) == 1
+        if first:
+            entered.set()
+            assert release.wait(2)
+        return real_run(self, binary_value, probe, **kwargs)
+
+    monkeypatch.setattr(ProviderAdapterV1, "_run_probe", counted)
+
+    def inspect():
+        start.wait(timeout=2)
+        return adapter.inspect(binary, force_refresh=True)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(inspect) for _ in range(8)]
+        assert entered.wait(1)
+        assert not release.wait(0.05)
+        release.set()
+        inspections = [future.result(timeout=3) for future in futures]
+    assert len(calls) == 2
+    assert all(value is inspections[0] for value in inspections)
+    assert adapter.doctor_provider(inspections[0]) is True
+
+
+def test_stale_inspect_completion_cannot_retire_force_refreshed_inspection(
+    adapter_binary, monkeypatch,
+):
+    adapter = ProviderAdapterV1(adapter_spec())
+    binary = adapter.resolve_binary(adapter_binary)
+    original = adapter.inspect(binary)
+    real_activate = ProviderAdapterV1._activate_inspection
+    entered = threading.Event()
+    release = threading.Event()
+    lock = threading.Lock()
+    delay_next = [True]
+
+    def delayed(self, record, *, context):
+        with lock:
+            should_delay = delay_next[0]
+            delay_next[0] = False
+        if should_delay:
+            entered.set()
+            assert release.wait(2)
+        return real_activate(self, record, context=context)
+
+    monkeypatch.setattr(ProviderAdapterV1, "_activate_inspection", delayed)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        stale = pool.submit(adapter.inspect, binary)
+        assert entered.wait(1)
+        refreshed = adapter.inspect(binary, force_refresh=True)
+        assert refreshed is not original
+        release.set()
+        assert stale.result(timeout=2) is refreshed
+    assert adapter.doctor_provider(refreshed) is True
+
+
+def test_cancellation_aware_inspect_does_not_reuse_existing_cached_record(
+    adapter_binary, monkeypatch,
+):
+    adapter = ProviderAdapterV1(adapter_spec())
+    binary = adapter.resolve_binary(adapter_binary)
+    cached = adapter.inspect(binary)
+    cancellation = CancellationToken()
+
+    def inspected(self, binary_value, **kwargs):
+        assert self is adapter
+        assert binary_value is binary
+        assert kwargs["cancellation"] is cancellation
+        return AdapterInspectionV1(
+            id=cached.id,
+            version="2.4.2",
+            features=cached.features,
+            binary=binary,
+            abi_version=cached.abi_version,
+        )
+
+    monkeypatch.setattr(ProviderAdapterV1, "_inspect_uncached", inspected)
+    refreshed = adapter.inspect(binary, cancellation=cancellation)
+    assert refreshed is not cached
+    assert refreshed.version == "2.4.2"
+    assert adapter.doctor_provider(refreshed) is True
+
+
+def test_adapter_invalidation_fences_old_model_flight_and_cleanup(
+    adapter_binary, monkeypatch,
+):
+    adapter = ProviderAdapterV1(adapter_spec())
+    inspection = adapter.inspect(adapter.resolve_binary(adapter_binary))
+    entered = (threading.Event(), threading.Event())
+    release = (threading.Event(), threading.Event())
+    lock = threading.Lock()
+    calls = []
+
+    def listing(self, inspection_value, **_kwargs):
+        assert inspection_value is inspection
+        with lock:
+            index = len(calls)
+            calls.append(index)
+        entered[index].set()
+        assert release[index].wait(2)
+        return ("generation-{}".format(index),)
+
+    monkeypatch.setattr(ProviderAdapterV1, "_list_models_uncached", listing)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        old = pool.submit(adapter.list_models, inspection)
+        assert entered[0].wait(1)
+        adapter.invalidate_cache("models")
+        replacement = pool.submit(adapter.list_models, inspection)
+        assert entered[1].wait(1)
+        joined = pool.submit(adapter.list_models, inspection)
+        release[0].set()
+        assert old.result(timeout=1) == ("generation-0",)
+        assert not replacement.done()
+        release[1].set()
+        assert replacement.result(timeout=1) == ("generation-1",)
+        assert joined.result(timeout=1) == ("generation-1",)
+    assert len(calls) == 2
+    assert adapter.list_models(inspection) == ("generation-1",)
+
+
+def test_adapter_force_refresh_fences_ordinary_flight_and_force_callers_share(
+    adapter_binary, monkeypatch,
+):
+    adapter = ProviderAdapterV1(adapter_spec())
+    inspection = adapter.inspect(adapter.resolve_binary(adapter_binary))
+    entered = (threading.Event(), threading.Event())
+    release = (threading.Event(), threading.Event())
+    start = threading.Barrier(8)
+    lock = threading.Lock()
+    calls = []
+
+    def listing(self, inspection_value, **_kwargs):
+        assert inspection_value is inspection
+        with lock:
+            index = len(calls)
+            calls.append(index)
+        entered[index].set()
+        assert release[index].wait(2)
+        return ("refresh-{}".format(index),)
+
+    monkeypatch.setattr(ProviderAdapterV1, "_list_models_uncached", listing)
+
+    def forced():
+        start.wait(timeout=2)
+        return adapter.list_models(inspection, force_refresh=True)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=9) as pool:
+        old = pool.submit(adapter.list_models, inspection)
+        assert entered[0].wait(1)
+        forced_calls = [pool.submit(forced) for _ in range(8)]
+        assert entered[1].wait(1)
+        assert not release[1].wait(0.05)
+        assert len(calls) == 2
+        release[0].set()
+        release[1].set()
+        assert old.result(timeout=1) == ("refresh-0",)
+        assert {
+            future.result(timeout=1) for future in forced_calls
+        } == {("refresh-1",)}
+    assert adapter.list_models(inspection) == ("refresh-1",)
+
+
+def test_adapter_empty_model_results_are_not_cached(adapter_binary, monkeypatch):
+    adapter = ProviderAdapterV1(adapter_spec())
+    inspection = adapter.inspect(adapter.resolve_binary(adapter_binary))
+    calls = []
+
+    def listing(self, inspection_value, **_kwargs):
+        assert inspection_value is inspection
+        calls.append(True)
+        return () if len(calls) == 1 else ("available",)
+
+    monkeypatch.setattr(ProviderAdapterV1, "_list_models_uncached", listing)
+    assert adapter.list_models(inspection) == ()
+    assert adapter.list_models(inspection) == ("available",)
+    assert len(calls) == 2
+
+
+def test_adapter_auth_cache_isolated_by_home_and_selected_environment(
+    adapter_binary, tmp_path, monkeypatch,
+):
+    adapter = ProviderAdapterV1(adapter_spec())
+    inspection = adapter.inspect(adapter.resolve_binary(adapter_binary))
+    real_run = ProviderAdapterV1._run_probe
+    calls = []
+
+    def counted(self, binary, probe, **kwargs):
+        if probe is self.spec.auth.status_probe:
+            calls.append(True)
+        return real_run(self, binary, probe, **kwargs)
+
+    monkeypatch.setattr(ProviderAdapterV1, "_run_probe", counted)
+    first_home = str(tmp_path / "first-home")
+    second_home = str(tmp_path / "second-home")
+    assert adapter.authenticated(
+        inspection,
+        provider_home=first_home,
+        provider_env={"FIXTURE_AUTH": "ready", "IGNORED_SECRET": "one"},
+    ) is True
+    assert adapter.authenticated(
+        inspection,
+        provider_home=first_home,
+        provider_env={"FIXTURE_AUTH": "ready", "IGNORED_SECRET": "two"},
+    ) is True
+    assert len(calls) == 1
+    assert adapter.authenticated(
+        inspection,
+        provider_home=second_home,
+        provider_env={"FIXTURE_AUTH": "ready"},
+    ) is True
+    assert adapter.authenticated(
+        inspection,
+        provider_home=first_home,
+        provider_env={},
+    ) is False
+    assert len(calls) == 3
+
+
+def test_adapter_binary_replacement_rejects_old_and_drops_probe_cache(
+    adapter_binary,
+):
+    adapter = ProviderAdapterV1(adapter_spec())
+    binary = adapter.resolve_binary(adapter_binary)
+    inspection = adapter.inspect(binary)
+    adapter.list_models(inspection)
+    assert any(key[0] == "models" for key in adapter._cache)
+
+    with open(adapter_binary, "ab") as stream:
+        stream.write(b"\n# stage7 replacement\n")
+    with pytest.raises(ConfigurationError, match="provenance changed"):
+        adapter.list_models(inspection)
+
+    replacement = adapter.resolve_binary(adapter_binary)
+    assert not any(key[0] == "models" for key in adapter._cache)
+    replacement_inspection = adapter.inspect(replacement)
+    assert adapter.list_models(replacement_inspection) == (
+        "fixture-small", "fixture-large"
+    )
+
+
+def test_adapter_auth_paths_invalidate_cached_account_state(
+    adapter_binary, tmp_path,
+):
+    adapter = ProviderAdapterV1(adapter_spec())
+    inspection = adapter.inspect(adapter.resolve_binary(adapter_binary))
+    provider_home = str(tmp_path / "provider-home")
+    assert adapter.authenticated(inspection, provider_home=provider_home) is False
+    assert adapter.authenticated(inspection, provider_home=provider_home) is False
+
+    login, _ = run_auth_tty(
+        adapter.prepare_auth_login(inspection, provider_home=provider_home)
+    )
+    assert login == 0
+    assert adapter.authenticated(inspection, provider_home=provider_home) is True
+
+    logout, _ = run_auth_tty(
+        adapter.prepare_auth_logout(inspection, provider_home=provider_home)
+    )
+    assert logout == 0
+    assert adapter.authenticated(inspection, provider_home=provider_home) is False
