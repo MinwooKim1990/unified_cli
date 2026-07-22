@@ -82,12 +82,12 @@ BASE_ENV = (
     "PYTHON_SHA256=c08bc65a81971c1dd5783182826503369466c7e67374d1646519adf05207b684",
 )
 ACTUAL_CONTAINER_ENV = (
-    "XDG_CONFIG_HOME=/home/lab/.config",
-    "XDG_DATA_HOME=/home/lab/.local/share",
     "HOME=/home/lab",
     "PATH=/usr/bin:/bin",
     "TMPDIR=/tmp",
     "XDG_CACHE_HOME=/home/lab/.cache",
+    "XDG_CONFIG_HOME=/home/lab/.config",
+    "XDG_DATA_HOME=/home/lab/.local/share",
 ) + BASE_ENV
 
 
@@ -199,18 +199,17 @@ class RealModelRunner:
                 "Cmd": ["idle"],
                 "Entrypoint": [GUEST_EXECUTABLE],
                 "Env": list(ACTUAL_CONTAINER_ENV),
-                "ExposedPorts": {},
                 "Image": self.builder.spec.base_image,
                 "Labels": dict(resource.labels),
                 "User": CONTAINER_USER,
-                "Volumes": {},
+                "Volumes": None,
                 "WorkingDir": "/workspace",
             },
             "HostConfig": {
-                "Binds": [],
-                "CapAdd": [],
+                "Binds": None,
+                "CapAdd": None,
                 "CapDrop": ["ALL"],
-                "DeviceRequests": [],
+                "DeviceRequests": None,
                 "Devices": [],
                 "Init": True,
                 "Memory": MEMORY_BYTES,
@@ -234,11 +233,20 @@ class RealModelRunner:
                 "SecurityOpt": ["no-new-privileges=true"],
                 "Tmpfs": dict(TMPFS_OPTIONS),
                 "Ulimits": [{"Hard": 1024, "Name": "nofile", "Soft": 1024}],
-                "VolumesFrom": [],
+                "VolumesFrom": None,
             },
             "Id": container_id,
             "Image": self.builder.spec.base_image,
-            "Mounts": [],
+            "Mounts": [
+                {
+                    "Destination": self.builder.bind_mount[1],
+                    "Mode": "",
+                    "Propagation": "rprivate",
+                    "RW": False,
+                    "Source": self.builder.bind_mount[0],
+                    "Type": "bind",
+                }
+            ],
             "Name": "/" + resource.name,
             "NetworkSettings": {"Ports": {}},
         }
@@ -1362,6 +1370,191 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
             ResourceRole.CONTAINER,
             json.dumps([record]),
         )
+
+    def test_actual_engine_container_inspect_shape_is_modeled(self):
+        record = self.runner._container_record(CONTAINER_ID)
+
+        self.assertNotIn("ExposedPorts", record["Config"])
+        self.assertIsNone(record["Config"]["Volumes"])
+        for key in ("Binds", "CapAdd", "DeviceRequests", "VolumesFrom"):
+            with self.subTest(key=key):
+                self.assertIsNone(record["HostConfig"][key])
+        self.assertEqual(
+            record["HostConfig"]["SecurityOpt"],
+            ["no-new-privileges=true"],
+        )
+        self.assertEqual(
+            record["Mounts"],
+            [
+                {
+                    "Destination": self.builder.bind_mount[1],
+                    "Mode": "",
+                    "Propagation": "rprivate",
+                    "RW": False,
+                    "Source": self.builder.bind_mount[0],
+                    "Type": "bind",
+                }
+            ],
+        )
+
+    def test_container_exposed_ports_accepts_only_empty_engine_shapes(self):
+        self.builder.validate_base_image(base_payload(self.profile))
+        baseline = self.runner._container_record(CONTAINER_ID)
+
+        self.builder.validate_inspect(
+            ResourceRole.CONTAINER,
+            json.dumps([baseline]),
+        )
+        for exposed_ports in (None, {}):
+            with self.subTest(accepted=exposed_ports):
+                record = json.loads(json.dumps(baseline))
+                record["Config"]["ExposedPorts"] = exposed_ports
+                self.builder.validate_inspect(
+                    ResourceRole.CONTAINER,
+                    json.dumps([record]),
+                )
+        for exposed_ports in (
+            {"8080/tcp": {}},
+            [],
+            "",
+            0,
+            False,
+        ):
+            with self.subTest(rejected=exposed_ports):
+                record = json.loads(json.dumps(baseline))
+                record["Config"]["ExposedPorts"] = exposed_ports
+                with self.assertRaisesRegex(
+                    InvariantRefusalError, "inspect policy drift"
+                ):
+                    self.builder.validate_inspect(
+                        ResourceRole.CONTAINER,
+                        json.dumps([record]),
+                    )
+
+    def test_container_config_still_requires_every_other_policy_field(self):
+        self.builder.validate_base_image(base_payload(self.profile))
+        baseline = self.runner._container_record(CONTAINER_ID)
+
+        for key in (
+            "Cmd",
+            "Entrypoint",
+            "Env",
+            "Image",
+            "Labels",
+            "User",
+            "Volumes",
+            "WorkingDir",
+        ):
+            with self.subTest(key=key):
+                record = json.loads(json.dumps(baseline))
+                del record["Config"][key]
+                with self.assertRaisesRegex(
+                    InvariantRefusalError, "inspect policy drift"
+                ):
+                    self.builder.validate_inspect(
+                        ResourceRole.CONTAINER,
+                        json.dumps([record]),
+                    )
+
+    def test_container_top_level_bind_is_required_exactly_once(self):
+        self.builder.validate_base_image(base_payload(self.profile))
+        baseline = self.runner._container_record(CONTAINER_ID)
+        variants = {}
+
+        missing = json.loads(json.dumps(baseline))
+        missing["Mounts"] = []
+        variants["missing"] = missing
+        omitted = json.loads(json.dumps(baseline))
+        del omitted["Mounts"]
+        variants["omitted"] = omitted
+        duplicate = json.loads(json.dumps(baseline))
+        duplicate["Mounts"].append(dict(duplicate["Mounts"][0]))
+        variants["duplicate"] = duplicate
+        wrong_source = json.loads(json.dumps(baseline))
+        wrong_source["Mounts"][0]["Source"] = "/private/wrong-source"
+        variants["wrong_source"] = wrong_source
+        wrong_destination = json.loads(json.dumps(baseline))
+        wrong_destination["Mounts"][0]["Destination"] = "/wrong-destination"
+        variants["wrong_destination"] = wrong_destination
+        writable = json.loads(json.dumps(baseline))
+        writable["Mounts"][0]["RW"] = True
+        variants["writable"] = writable
+        shared = json.loads(json.dumps(baseline))
+        shared["Mounts"][0]["Propagation"] = "rshared"
+        variants["shared"] = shared
+        missing_mode = json.loads(json.dumps(baseline))
+        del missing_mode["Mounts"][0]["Mode"]
+        variants["missing_mode"] = missing_mode
+        nonempty_mode = json.loads(json.dumps(baseline))
+        nonempty_mode["Mounts"][0]["Mode"] = "ro"
+        variants["nonempty_mode"] = nonempty_mode
+        unexpected_key = json.loads(json.dumps(baseline))
+        unexpected_key["Mounts"][0]["Name"] = "unexpected"
+        variants["unexpected_key"] = unexpected_key
+
+        for name, record in variants.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    InvariantRefusalError, "inspect policy drift"
+                ):
+                    self.builder.validate_inspect(
+                        ResourceRole.CONTAINER,
+                        json.dumps([record]),
+                    )
+
+    def test_container_host_bind_drift_and_duplication_are_refused(self):
+        self.builder.validate_base_image(base_payload(self.profile))
+        baseline = self.runner._container_record(CONTAINER_ID)
+        variants = {}
+
+        missing = json.loads(json.dumps(baseline))
+        missing["HostConfig"]["Mounts"] = []
+        variants["missing"] = missing
+        omitted = json.loads(json.dumps(baseline))
+        del omitted["HostConfig"]["Mounts"]
+        variants["omitted"] = omitted
+        duplicate = json.loads(json.dumps(baseline))
+        duplicate["HostConfig"]["Mounts"].append(
+            json.loads(json.dumps(duplicate["HostConfig"]["Mounts"][0]))
+        )
+        variants["duplicate"] = duplicate
+        wrong_source = json.loads(json.dumps(baseline))
+        wrong_source["HostConfig"]["Mounts"][0]["Source"] = (
+            "/private/wrong-source"
+        )
+        variants["wrong_source"] = wrong_source
+        writable = json.loads(json.dumps(baseline))
+        writable["HostConfig"]["Mounts"][0]["ReadOnly"] = False
+        variants["writable"] = writable
+        shared = json.loads(json.dumps(baseline))
+        shared["HostConfig"]["Mounts"][0]["BindOptions"]["Propagation"] = (
+            "rshared"
+        )
+        variants["shared"] = shared
+        missing_target = json.loads(json.dumps(baseline))
+        del missing_target["HostConfig"]["Mounts"][0]["Target"]
+        variants["missing_target"] = missing_target
+        unexpected_key = json.loads(json.dumps(baseline))
+        unexpected_key["HostConfig"]["Mounts"][0]["Consistency"] = "default"
+        variants["unexpected_key"] = unexpected_key
+        missing_bind_option = json.loads(json.dumps(baseline))
+        missing_bind_option["HostConfig"]["Mounts"][0]["BindOptions"] = {}
+        variants["missing_bind_option"] = missing_bind_option
+        extra_bind_option = json.loads(json.dumps(baseline))
+        extra_bind_option["HostConfig"]["Mounts"][0]["BindOptions"][
+            "NonRecursive"
+        ] = False
+        variants["extra_bind_option"] = extra_bind_option
+
+        for name, record in variants.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    InvariantRefusalError, "inspect policy drift"
+                ):
+                    self.builder.validate_inspect(
+                        ResourceRole.CONTAINER,
+                        json.dumps([record]),
+                    )
 
     def test_fixed_environment_overrides_same_named_base_values(self):
         payload = json.loads(base_payload(self.profile))

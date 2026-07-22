@@ -1726,8 +1726,18 @@ def _validate_container_record(
         if bind_mount is not None and mount.get("Type") == "bind":
             source, target = bind_mount
             if (
-                mount.get("Source") != source
+                set(mount)
+                != {
+                    "Type",
+                    "Source",
+                    "Destination",
+                    "Mode",
+                    "RW",
+                    "Propagation",
+                }
+                or mount.get("Source") != source
                 or mount.get("Destination") != target
+                or mount.get("Mode") != ""
                 or mount.get("RW") is not False
                 or mount.get("Propagation") != "rprivate"
             ):
@@ -1751,10 +1761,7 @@ def _validate_container_record(
         set(TMPFS_OPTIONS),
     ):
         raise InvariantRefusalError("inspect policy drift")
-    if bind_mount is not None and tuple(observed_bind_mounts) not in (
-        (),
-        (bind_mount,),
-    ):
+    if bind_mount is not None and tuple(observed_bind_mounts) != (bind_mount,):
         raise InvariantRefusalError("inspect policy drift")
 
     observed_environment = _parse_env_mapping(config["Env"])
@@ -1781,15 +1788,13 @@ def _validate_container_record(
             mount = _dict(mount_value)
             options = _dict(mount.get("BindOptions", {}))
             if (
-                mount.get("Type") != "bind"
+                set(mount)
+                != {"Type", "Source", "Target", "ReadOnly", "BindOptions"}
+                or mount.get("Type") != "bind"
                 or mount.get("Source") != bind_mount[0]
                 or mount.get("Target") != bind_mount[1]
                 or mount.get("ReadOnly") is not True
-                or options.get("Propagation") != "rprivate"
-                or any(
-                    key != "Propagation" and value not in (False, None, "")
-                    for key, value in options.items()
-                )
+                or options != {"Propagation": "rprivate"}
             ):
                 raise InvariantRefusalError("inspect policy drift")
             host_mounts.append((mount["Source"], mount["Target"]))
@@ -1803,7 +1808,7 @@ def _validate_container_record(
         config["WorkingDir"],
         tuple(_list(config["Entrypoint"])),
         tuple(_list(config["Cmd"])),
-        _empty_dict(config["ExposedPorts"]),
+        _empty_dict(config.get("ExposedPorts")),
         _empty_dict(config["Volumes"]),
         host["ReadonlyRootfs"],
         tuple(_list(host["CapDrop"])),
