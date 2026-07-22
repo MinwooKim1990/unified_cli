@@ -2,6 +2,11 @@
 
 All notable changes to `unified-cli-ext` are documented in this file.
 
+## Unreleased
+
+- Adds a lazy macOS libc compatibility path for non-reaping child observation
+  when the running Python does not expose `os.waitid`.
+
 ## 0.1.0 — 2026-07-20
 
 Initial extension-foundation release for `unified-cli` 0.5.x.
