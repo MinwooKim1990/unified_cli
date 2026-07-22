@@ -283,11 +283,11 @@ def test_public_pypi_smokes_ignore_private_indexes_links_and_no_index_config():
 
 def test_actions_are_commit_pinned_and_context_values_enter_shell_via_env():
     expected_actions = {
-        "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
-        "actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
         "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
         "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
-        "pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b",
+        "pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247",
     }
     for path in (CORE_WORKFLOW, EXT_WORKFLOW):
         workflow = _text(path)
@@ -314,8 +314,8 @@ def test_ci_uses_current_immutable_checkout_and_python_action_pins():
     ci = _text(ROOT / ".github" / "workflows" / "ci.yml")
     uses = set(re.findall(r"^\s*uses:\s*([^\s]+)", ci, flags=re.MULTILINE))
     assert uses == {
-        "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
-        "actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
     }
 
 
