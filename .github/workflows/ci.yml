@@ -32,10 +32,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -50,6 +50,10 @@ jobs:
       # ONLY the offline/unit test suite here — no live provider calls.
       - name: Run tests
         run: pytest -q
+
+      - name: Run offline performance and readiness gates
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.14'
+        run: python scripts/check_performance.py
 
       - name: Build sdist and wheel
         run: python -m build
@@ -81,10 +85,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -128,10 +132,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -163,10 +167,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -182,10 +186,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.14"
 
@@ -213,6 +217,9 @@ jobs:
 
           checks = (
               ("core", "tests/test_distribution_pair.py"),
+              ("core", "tests/test_performance_contract.py"),
+              ("core", "tests/test_release_artifacts.py"),
+              ("core", "tests/test_release_contract.py"),
               ("ext", "tests/test_ext_provider_support_docs.py"),
           )
           for distribution, suffix in checks:
@@ -236,6 +243,15 @@ jobs:
       - name: Check metadata and wheel path separation
         run: |
           python -m twine check dist/core/* dist/ext/*
+          python scripts/verify_release_artifacts.py dist/core \
+            --name unified-cli --version 0.5.0 \
+            --package-root unified_cli --forbid-package-root unified_cli_ext \
+            --requires-dist "rich>=13" \
+            --requires-dist "prompt-toolkit>=3.0.43"
+          python scripts/verify_release_artifacts.py dist/ext \
+            --name unified-cli-ext --version 0.1.0 \
+            --package-root unified_cli_ext --forbid-package-root unified_cli \
+            --requires-dist "unified-cli>=0.5,<0.6"
           python scripts/verify_distribution_pair.py \
             dist/core/*.whl dist/ext/*.whl \
             --core-version 0.5.0 --ext-version 0.1.0
@@ -268,10 +284,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.11"
 

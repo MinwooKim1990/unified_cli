@@ -7,8 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-22
+
+### Added
+
+- A versioned provider-extension ABI and lazy entry-point registry. Core keeps
+  Claude, Codex, and Gemini as its only built-in defaults; installed extension
+  metadata is enumerated passively and extension code loads only after an
+  explicit provider request.
+- A local-only management API and dashboard bootstrap with one-time secrets,
+  host-only sessions, origin-scoped CSRF proof, bounded chat relay, explicit
+  provider verification, and no implicit model/provider probes.
+- Durable, security-reviewed REPL state and richer slash-command workflows,
+  including settings, session indexing, prompt/history controls, and bounded
+  local exports.
+- A deterministic offline performance/readiness gate covering Core and Ext
+  imports, version startup, passive registry enumeration, real-PTY first prompt,
+  management bootstrap, bounded relay, and fixture-only wrapper overhead.
+
 ### Changed
 
+- Provider subprocess ownership, cancellation, process-tree cleanup, output
+  limits, and concurrent stream isolation are hardened across synchronous and
+  asynchronous paths.
 - Provider turns now retry only clearly pre-turn transient network failures or
   transient HTTP 429 responses, with bounded `Retry-After` handling,
   exponential backoff with jitter, strict attempt/delay caps, and
@@ -18,6 +39,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are never retried. The wrapper no longer changes to an inherited API key and
   replays a failed OAuth turn; recovery hints direct users to login or to make a
   new, explicitly metered Python request via `extra_env`.
+- Core and `unified-cli-ext` are built and verified as separate distributions;
+  Ext 0.1.x requires the released Core 0.5.x compatibility line.
+- Release automation now requires immutable version tags at the exact current
+  `main` commit, validates wheel/sdist filenames, roots, RECORD integrity,
+  SHA-256 member hashes, file/directory hierarchy, the complete default-runtime
+  dependency set, optional-extra markers, and Core/Ext dependency boundaries.
+  The Ext gate also re-downloads the final Core GitHub Release, requires exact
+  asset sizes and SHA-256 digests, and revalidates both artifact bytes before
+  publishing.
+
+### Security
+
+- Core fast paths do not import optional provider packages, enumerate entry
+  points, inspect real provider installations, inherit credential variables, or
+  contact a network service.
+- Offline readiness checks record and fail caught extension-entry-point imports
+  or provider subprocess attempts; only the repository fixture executable is
+  permitted during the wrapper-overhead comparison.
+- Management mode remains loopback-only and browser chat stays restricted to
+  audited Core mappings; extension server access is denied by default.
 
 ## [0.4.0] - 2026-07-14
 
@@ -258,7 +299,8 @@ Initial public release.
   `gemini-3.5-flash` continue to route to it. Note: `agy` headless output is
   plain text and does **not** report token usage.
 
-[Unreleased]: https://github.com/MinwooKim1990/unified_cli/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/MinwooKim1990/unified_cli/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/MinwooKim1990/unified_cli/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/MinwooKim1990/unified_cli/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/MinwooKim1990/unified_cli/compare/v0.1.1...v0.2.0

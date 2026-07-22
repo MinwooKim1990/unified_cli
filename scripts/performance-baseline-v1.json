@@ -1,0 +1,93 @@
+{
+  "baseline_id": "platform-next-stage0-ffc8a219",
+  "baseline_source": "docs/development/platform-next-stage0-baseline.md",
+  "metrics": {
+    "calibration_process_startup": {
+      "samples": 9,
+      "statistic": "p95",
+      "threshold": {
+        "kind": "fixed",
+        "milliseconds": 250.0
+      },
+      "warmups": 2
+    },
+    "core_import": {
+      "baseline_milliseconds": 48.606,
+      "samples": 15,
+      "statistic": "median",
+      "threshold": {
+        "absolute_slack_milliseconds": 50.0,
+        "kind": "baseline_regression",
+        "relative_slack": 0.1
+      },
+      "warmups": 3
+    },
+    "core_version": {
+      "baseline_milliseconds": 94.635,
+      "samples": 15,
+      "statistic": "median",
+      "threshold": {
+        "absolute_slack_milliseconds": 50.0,
+        "kind": "baseline_regression",
+        "relative_slack": 0.1
+      },
+      "warmups": 3
+    },
+    "ext_import": {
+      "samples": 15,
+      "statistic": "p95",
+      "threshold": {
+        "kind": "fixed",
+        "milliseconds": 250.0
+      },
+      "warmups": 3
+    },
+    "ext_passive_registry": {
+      "samples": 15,
+      "statistic": "p95",
+      "threshold": {
+        "kind": "fixed",
+        "milliseconds": 250.0
+      },
+      "warmups": 3
+    },
+    "fake_cli_wrapper_overhead": {
+      "samples": 21,
+      "statistic": "median",
+      "threshold": {
+        "absolute_slack_milliseconds": 50.0,
+        "kind": "raw_overhead",
+        "relative_slack": 0.1
+      },
+      "warmups": 3
+    },
+    "manage_bootstrap": {
+      "samples": 31,
+      "statistic": "p95",
+      "threshold": {
+        "kind": "fixed",
+        "milliseconds": 100.0
+      },
+      "warmups": 5
+    },
+    "repl_first_prompt": {
+      "samples": 9,
+      "statistic": "p95",
+      "threshold": {
+        "kind": "fixed",
+        "milliseconds": 300.0
+      },
+      "warmups": 2
+    },
+    "stream_relay": {
+      "samples": 31,
+      "statistic": "p95",
+      "threshold": {
+        "kind": "fixed",
+        "milliseconds": 10.0
+      },
+      "warmups": 5
+    }
+  },
+  "schema_version": 1
+}

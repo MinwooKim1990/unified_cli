@@ -2,17 +2,16 @@
 
 All notable changes to `unified-cli-ext` are documented in this file.
 
-## Unreleased
+## [Unreleased]
 
-- Adds a lazy macOS libc compatibility path for non-reaping child observation
-  when the running Python does not expose `os.waitid`.
-
-## 0.1.0 — 2026-07-20
+## [0.1.0] - 2026-07-22
 
 Initial extension-foundation release for `unified-cli` 0.5.x.
 
 - Adds bounded JSONL, JSON-RPC, HTTP/SSE, process, normalization, permission,
   tool-correlation, and optional MCP/ACP runtime contracts.
+- Adds a lazy macOS libc compatibility path for non-reaping child observation
+  when the running Python does not expose `os.waitid`.
 - Adds a caller-factory-free ACP 0.11 text-turn transport with fixed process
   ownership, cancellation, output limits, deterministic cleanup, and exact
   notification/response event ordering.
@@ -30,3 +29,13 @@ Initial extension-foundation release for `unified-cli` 0.5.x.
 - Keeps extension identifiers explicit and lazy. Installing Ext does not change
   Core defaults or the Core server allowlist, handle provider credentials, or
   call a provider service.
+- Ships independently from the exact same source commit as Core 0.5.0, after
+  Core is available from PyPI. The Ext release verifies both published Core and
+  Ext versions, the exact default-runtime dependency set, and archive integrity.
+  Before Ext testing begins it also downloads the final Core GitHub Release,
+  verifies the exact asset set, sizes, SHA-256 digests, and artifact bytes, then
+  revalidates both Core archives. Its mandatory `ext-v0.1.0` GitHub Release is
+  created with the verified Ext wheel and sdist attached.
+
+[Unreleased]: https://github.com/MinwooKim1990/unified_cli/compare/ext-v0.1.0...HEAD
+[0.1.0]: https://github.com/MinwooKim1990/unified_cli/releases/tag/ext-v0.1.0
