@@ -93,27 +93,65 @@ excluded. `unified-cli --version` is timed outside the process and therefore
 includes executable and interpreter startup; its implementation has a dedicated
 fast path that avoids parser construction and provider discovery.
 
-## Portable gate host references
+## Portable gate paired import calibration
 
 The offline performance gate keeps the Stage 0 Core import and version values
-above as its code baselines. On 2026-07-22, three sequential runs of the gate at
-integration commit `bd616c2` recorded process-startup p95 values of 30.605,
-29.130, and 30.355 ms and Ext import p95 values of 53.486, 50.740, and 52.066
-ms. The medians of those run-level statistics, 30.355 and 52.066 ms, are the
-versioned host references in `scripts/performance-baseline-v1.json`.
+above as code baselines. A later Ubuntu Python 3.14 run at integration commit
+`be147888` showed why process startup is not a sufficient host reference:
+startup p95 was 33.687 ms while the unchanged Core import median was 108.546 ms,
+Core version median was 202.939 ms, Ext import p95 was 153.386 ms, and the
+passive Ext registry p95 was 272.861 ms. Import-heavy work had a shared host
+penalty that an interpreter-launch probe did not represent.
 
-For a reference metric `r`, the gate computes only its positive host delta,
-`d(r) = max(0, observed(r) - baseline(r))`. Core version uses the sum of the
-process-startup and Core-import deltas. The passive Ext registry uses the
-minimum of the Core- and Ext-import deltas, so a regression in only one import
-path cannot enlarge its allowance. A target passes when
-`observed(target) - host_adjustment <= policy_threshold`; the JSON result keeps
-the effective raw threshold and reports the adjustment, normalized observation,
-policy threshold, and per-reference deltas under `details.host_normalization`.
+The gate now brackets every normalized target sample with fresh-process runs of
+an independent, generated pure-Python import DAG. The disposable package is not
+part of Core, Ext, their dependencies, or the repository source tree. It has
+three fixed profiles so the calibration unit resembles each target:
 
-Every reference remains an independent hard gate. Host normalization therefore
-removes shared platform cost without turning a slow reference or target into an
-automatic pass.
+| Target | DAG modules | Calibration value | Versioned calibration baseline |
+| --- | ---: | --- | ---: |
+| Core import | 420 leaves | import-body time | 49.712 ms |
+| Core version | 500 leaves | end-to-end process time | 97.284 ms |
+| Passive Ext registry | 720 leaves | import-body time | 80.838 ms |
+
+The baselines were recorded in the same fresh-process bracket shape used by the
+gate: three warmup pairs followed by three retained before/after pairs. The six
+retained observations were 62.034500, 50.217458, 47.549583, 50.063250,
+48.242250, and 49.361459 ms for Core import; 98.078250, 96.994500, 96.614459,
+97.094333, 97.474500, and 98.390333 ms for Core version; and 80.935417,
+80.101333, 79.955083, 81.404458, 80.791958, and 80.883583 ms for the passive
+registry. Their medians, rounded to three decimals, are the values above. The
+profiles deliberately use a factor of one: their local costs match the target
+units closely enough that no multiplier can amplify a host allowance.
+
+Each calibration process proves the exact module origin, module count, and
+deterministic sentinel. Import canaries reject Core, Ext, or entry-point imports;
+the subprocess guard rejects provider execution; and bytecode generation is
+disabled. A failed proof or an invalid duration fails that target measurement
+and grants no credit.
+
+For target sample `i`, let `b_i` and `a_i` be the before and after calibration
+durations, and let `c` be the profile baseline. When both durations are at most
+`c + 50 ms`, the paired adjustment is:
+
+`h_i = min(max(0, b_i - c), max(0, a_i - c))`
+
+`h_i` is also capped at 50 ms. If exactly one duration exceeds the envelope,
+that pair receives zero adjustment; if both exceed it, the target measurement
+fails as an unqualified host. The gate computes
+`normalized_i = target_i - h_i` for every sample and only then applies the
+target's median or p95 statistic. It does not subtract an aggregate calibration
+median. The Stage 0 Core policies remain
+`48.606 + max(50, 10%)` and `94.635 + max(50, 10%)`; the passive registry keeps
+its fixed 250 ms policy. Reported raw thresholds are raised only by the exact
+difference between the raw and paired-normalized target statistics.
+
+No project metric supplies an allowance to another metric. A Core import that
+is slow but still within its own limit cannot make Core version or the passive
+registry pass. The standalone Core-sized DAG metric is also a hard readiness
+gate at 99.712 ms. The loader accepts only the explicit original
+pre-normalization v1 shape as legacy; half-migrated or unbounded normalization
+configuration fails closed.
 
 ## REPL first-prompt baseline: pending
 

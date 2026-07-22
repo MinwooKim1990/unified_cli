@@ -35,6 +35,7 @@ CORE_VERSION = "0.5.0"
 EXT_VERSION = "0.1.0"
 _METRIC_NAMES = (
     "calibration_process_startup",
+    "calibration_import_workload",
     "core_import",
     "core_version",
     "ext_import",
@@ -44,13 +45,25 @@ _METRIC_NAMES = (
     "repl_first_prompt",
     "stream_relay",
 )
-_REFERENCE_BASELINE_METRICS = frozenset({
-    "calibration_process_startup",
-    "core_import",
-    "core_version",
-    "ext_import",
+_LEGACY_METRIC_NAMES = tuple(
+    name for name in _METRIC_NAMES
+    if name != "calibration_import_workload"
+)
+_NORMALIZED_METRICS = frozenset({
+    "core_import", "core_version", "ext_passive_registry",
 })
-_NORMALIZED_METRICS = frozenset({"core_version", "ext_passive_registry"})
+_CALIBRATION_PROFILE_MODULES = {
+    "core_import": 420,
+    "core_version": 500,
+    "ext_passive_registry": 720,
+}
+_CALIBRATION_VALUE_BY_TARGET = {
+    "core_import": "inner_ms",
+    "core_version": "process_ms",
+    "ext_passive_registry": "inner_ms",
+}
+_CALIBRATION_PACKAGE = "_unified_perf_import_calibration_v1"
+_CALIBRATION_SENTINEL_MODULUS = 1_000_000_007
 _CREDENTIAL_MARKERS = (
     "API_KEY",
     "ACCESS_TOKEN",
@@ -104,21 +117,26 @@ def load_config(path: Path) -> Dict[str, Any]:
     if type(data["baseline_source"]) is not str or not data["baseline_source"].strip():
         raise PerformanceConfigError("performance baseline source is invalid")
     metrics = data["metrics"]
-    if type(metrics) is not dict or tuple(sorted(metrics)) != tuple(sorted(_METRIC_NAMES)):
+    if type(metrics) is not dict:
         raise PerformanceConfigError("performance baseline metric set is incomplete")
+    metric_names = frozenset(metrics)
+    legacy = metric_names == frozenset(_LEGACY_METRIC_NAMES)
+    if not legacy and metric_names != frozenset(_METRIC_NAMES):
+        raise PerformanceConfigError("performance baseline metric set is incomplete")
+
     for name in _METRIC_NAMES:
+        if name not in metrics:
+            continue
         metric = metrics[name]
         required = {"samples", "statistic", "threshold", "warmups"}
         allowed = set(required)
-        if name in _REFERENCE_BASELINE_METRICS:
+        if name in {"core_import", "core_version"}:
             allowed.add("baseline_milliseconds")
-        if name in _NORMALIZED_METRICS:
+        if not legacy and name == "calibration_import_workload":
+            allowed.update({"baseline_milliseconds", "profile"})
+        if not legacy and name in _NORMALIZED_METRICS:
             allowed.add("normalization")
-        if (
-            type(metric) is not dict
-            or not required.issubset(metric)
-            or not set(metric).issubset(allowed)
-        ):
+        if type(metric) is not dict or set(metric) != allowed:
             raise PerformanceConfigError(name + " has an invalid shape")
         if type(metric["samples"]) is not int or not 3 <= metric["samples"] <= 101:
             raise PerformanceConfigError(name + " sample count is invalid")
@@ -157,50 +175,61 @@ def load_config(path: Path) -> Dict[str, Any]:
             raise PerformanceConfigError(name + " baseline is missing")
         if "baseline_milliseconds" in metric:
             _exact_number(metric["baseline_milliseconds"], name + " baseline")
-        if "normalization" in metric:
+
+        if legacy:
+            continue
+        if name == "calibration_import_workload":
+            if kind != "fixed":
+                raise PerformanceConfigError(name + " threshold must be fixed")
+            if metric["profile"] != "core_import":
+                raise PerformanceConfigError(name + " profile is invalid")
+            if float(threshold["milliseconds"]) != (
+                float(metric["baseline_milliseconds"]) + 50.0
+            ):
+                raise PerformanceConfigError(name + " validity envelope is invalid")
+        if name in _NORMALIZED_METRICS:
             normalization = metric["normalization"]
             if type(normalization) is not dict or set(normalization) != {
-                "combine", "kind", "references",
+                "baseline_milliseconds",
+                "calibration_value",
+                "kind",
+                "max_adjustment_milliseconds",
+                "max_calibration_milliseconds",
+                "profile",
             }:
                 raise PerformanceConfigError(name + " normalization is invalid")
-            if (
-                type(normalization["kind"]) is not str
-                or normalization["kind"] != "positive_baseline_delta"
-            ):
+            if normalization["kind"] != "paired_import_bracket":
                 raise PerformanceConfigError(name + " normalization kind is unsupported")
-            if (
-                type(normalization["combine"]) is not str
-                or normalization["combine"] not in {"minimum", "sum"}
-            ):
-                raise PerformanceConfigError(name + " normalization combine is invalid")
-            references = normalization["references"]
-            if (
-                type(references) is not list
-                or not references
-                or any(
-                    type(reference) is not str
-                    or reference not in _REFERENCE_BASELINE_METRICS
-                    or reference == name
-                    for reference in references
-                )
-                or len(references) != len(set(references))
-            ):
-                raise PerformanceConfigError(name + " normalization references are invalid")
-    for name in _NORMALIZED_METRICS:
-        normalization = metrics[name].get("normalization")
-        if normalization is None:
-            continue
-        if any(
-            "baseline_milliseconds" not in metrics[reference]
-            for reference in normalization["references"]
+            if normalization["profile"] != name:
+                raise PerformanceConfigError(name + " normalization profile is invalid")
+            if normalization["calibration_value"] != _CALIBRATION_VALUE_BY_TARGET[name]:
+                raise PerformanceConfigError(name + " calibration value is invalid")
+            baseline = _exact_number(
+                normalization["baseline_milliseconds"],
+                name + " calibration baseline",
+            )
+            maximum = _exact_number(
+                normalization["max_calibration_milliseconds"],
+                name + " calibration maximum",
+            )
+            adjustment = _exact_number(
+                normalization["max_adjustment_milliseconds"],
+                name + " maximum adjustment",
+            )
+            if maximum != baseline + 50.0 or adjustment != 50.0:
+                raise PerformanceConfigError(name + " calibration envelope is invalid")
+    if not legacy:
+        calibration = metrics["calibration_import_workload"]
+        core_normalization = metrics["core_import"]["normalization"]
+        if (
+            calibration["baseline_milliseconds"]
+            != core_normalization["baseline_milliseconds"]
+            or calibration["threshold"]["milliseconds"]
+            != core_normalization["max_calibration_milliseconds"]
         ):
-            raise PerformanceConfigError(name + " normalization baseline is missing")
-        target_index = _METRIC_NAMES.index(name)
-        if any(
-            _METRIC_NAMES.index(reference) >= target_index
-            for reference in normalization["references"]
-        ):
-            raise PerformanceConfigError(name + " normalization reference order is invalid")
+            raise PerformanceConfigError(
+                "standalone import calibration does not match Core normalization"
+            )
     return data
 
 
@@ -252,9 +281,7 @@ def summarize(
     *,
     raw_median: Optional[float] = None,
     details: Optional[Mapping[str, Any]] = None,
-    normalization_references: Optional[
-        Mapping[str, Tuple[float, float]]
-    ] = None,
+    normalization_adjustments: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
     if len(samples) != metric["samples"] or any(
         not math.isfinite(value) or value < 0 for value in samples
@@ -269,37 +296,39 @@ def summarize(
     normalization_details: Optional[Dict[str, Any]] = None
     normalization = metric.get("normalization")
     if normalization is not None:
-        if normalization_references is None:
-            raise MeasurementError("host normalization references are missing")
-        deltas: Dict[str, float] = {}
-        for name in normalization["references"]:
-            try:
-                reference_observed, reference_baseline = normalization_references[name]
-            except KeyError as exc:
-                raise MeasurementError(
-                    "host normalization reference is unavailable"
-                ) from exc
-            if not all(
-                math.isfinite(value) and value >= 0
-                for value in (reference_observed, reference_baseline)
-            ):
-                raise MeasurementError("host normalization reference is invalid")
-            deltas[name] = max(0.0, reference_observed - reference_baseline)
-        if normalization["combine"] == "sum":
-            adjustment = sum(deltas.values())
-        else:
-            adjustment = min(deltas.values())
-        if not math.isfinite(adjustment):
-            raise MeasurementError("host normalization adjustment is invalid")
+        if (
+            normalization_adjustments is None
+            or len(normalization_adjustments) != len(samples)
+            or any(
+                not math.isfinite(value)
+                or value < 0
+                or value > normalization["max_adjustment_milliseconds"]
+                for value in normalization_adjustments
+            )
+        ):
+            raise MeasurementError("paired host normalization is invalid")
+        normalized_samples = [
+            max(0.0, sample - delta)
+            for sample, delta in zip(samples, normalization_adjustments)
+        ]
+        normalized_observed = _observed(normalized_samples, metric)
+        adjustment = observed - normalized_observed
+        if not math.isfinite(adjustment) or adjustment < 0:
+            raise MeasurementError("paired host normalization is invalid")
         normalization_details = {
             "adjustment_ms": _rounded(adjustment),
             "kind": normalization["kind"],
-            "normalized_observed_ms": _rounded(observed - adjustment),
+            "normalized_observed_ms": _rounded(normalized_observed),
+            "normalized_samples_ms": [
+                _rounded(value) for value in normalized_samples
+            ],
+            "paired_adjustments_ms": [
+                _rounded(value) for value in normalization_adjustments
+            ],
             "policy_threshold_ms": _rounded(policy_limit),
-            "reference_deltas_ms": {
-                name: _rounded(value) for name, value in deltas.items()
-            },
         }
+    elif normalization_adjustments is not None:
+        raise MeasurementError("unexpected host normalization adjustments")
     limit = policy_limit + adjustment
     if not math.isfinite(limit):
         raise MeasurementError("host-normalized threshold is invalid")
@@ -377,6 +406,10 @@ sys.addaudithook(_audit)
 
 class _ImportCanary(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
+        forbidden_core = (
+            os.environ.get("UNIFIED_PERF_FORBID_CORE_IMPORTS") == "1"
+            and (fullname == "unified_cli" or fullname.startswith("unified_cli."))
+        )
         forbidden_ext = (
             os.environ.get("UNIFIED_PERF_FORBID_EXT_IMPORTS") == "1"
             and (fullname == "unified_cli_ext" or fullname.startswith("unified_cli_ext."))
@@ -385,7 +418,7 @@ class _ImportCanary(importlib.abc.MetaPathFinder):
             os.environ.get("UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS") == "1"
             and fullname == "performance_canary"
         )
-        if forbidden_ext or forbidden_entrypoint:
+        if forbidden_core or forbidden_ext or forbidden_entrypoint:
             _mark("import", fullname)
         return None
 
@@ -410,6 +443,69 @@ sys.meta_path.insert(0, _ImportCanary())
     return marker
 
 
+def _calibration_sentinels() -> Dict[int, int]:
+    sentinels: Dict[int, int] = {}
+    for index in range(max(_CALIBRATION_PROFILE_MODULES.values())):
+        payload_total = sum(
+            ((index + 3) * (item + 5)) % 997 for item in range(96)
+        )
+        sentinels[index] = (payload_total + index) % _CALIBRATION_SENTINEL_MODULUS
+    return sentinels
+
+
+def _calibration_profile_sentinel(profile: str) -> int:
+    count = _CALIBRATION_PROFILE_MODULES[profile]
+    sentinels = _calibration_sentinels()
+    return sum(sentinels[index] for index in range(count)) % (
+        _CALIBRATION_SENTINEL_MODULUS
+    )
+
+
+def _write_import_calibration(directory: Path) -> None:
+    """Create a disposable pure-Python import DAG with deterministic sentinels."""
+    package = directory / _CALIBRATION_PACKAGE
+    package.mkdir(mode=0o700)
+    package.joinpath("__init__.py").write_text(
+        "WORKLOAD_VERSION = 1\n", encoding="utf-8",
+    )
+    sentinels = _calibration_sentinels()
+    for index, sentinel in sentinels.items():
+        source = f'''\
+_PAYLOAD = tuple((({index} + 3) * (item + 5)) % 997 for item in range(96))
+
+class CalibrationNode:
+    __slots__ = ("value",)
+    def __init__(self, value):
+        self.value = value
+
+def fold_payload():
+    return sum(_PAYLOAD)
+
+SENTINEL = (
+    fold_payload() + {index}
+) % {_CALIBRATION_SENTINEL_MODULUS}
+assert SENTINEL == {sentinel}
+'''
+        package.joinpath(f"leaf_{index:03d}.py").write_text(
+            source, encoding="utf-8",
+        )
+    for profile, count in _CALIBRATION_PROFILE_MODULES.items():
+        names = [f"leaf_{index:03d}" for index in range(count)]
+        imports = "\n".join(f"    {name}," for name in names)
+        values = "\n".join(f"    {name}.SENTINEL," for name in names)
+        expected = _calibration_profile_sentinel(profile)
+        package.joinpath(f"profile_{profile}.py").write_text(f'''\
+from . import (
+{imports}
+)
+
+SENTINEL = sum((
+{values}
+)) % {_CALIBRATION_SENTINEL_MODULUS}
+assert SENTINEL == {expected}
+''', encoding="utf-8")
+
+
 @contextmanager
 def isolated_environment(root: Path = ROOT) -> Iterator[Tuple[Dict[str, str], Path, Path]]:
     """Yield an allowlisted environment, import marker, and fixture path."""
@@ -420,9 +516,11 @@ def isolated_environment(root: Path = ROOT) -> Iterator[Tuple[Dict[str, str], Pa
         binaries = base / "bin"
         guard = base / "guard"
         workspace = base / "workspace"
-        for directory in (home, tmp, binaries, guard, workspace):
+        calibration = base / "import-calibration"
+        for directory in (home, tmp, binaries, guard, workspace, calibration):
             directory.mkdir(mode=0o700)
         marker = _write_guard(guard)
+        _write_import_calibration(calibration)
         source = root / "tests" / "fixtures" / "core_provider_cli.py"
         fixture = binaries / "fixture-provider-cli"
         payload = source.read_text(encoding="utf-8")
@@ -452,6 +550,8 @@ def isolated_environment(root: Path = ROOT) -> Iterator[Tuple[Dict[str, str], Pa
             "UNIFIED_CLI_DISABLE_PLUGINS": "1",
             "UNIFIED_CLI_LANG": "en",
             "UNIFIED_PERF_GUARD_MARKER": str(marker),
+            "UNIFIED_PERF_IMPORT_CALIBRATION_ROOT": str(calibration),
+            "UNIFIED_PERF_REPOSITORY_ROOT": str(root.resolve()),
             "XDG_CACHE_HOME": str(home / ".cache"),
             "XDG_CONFIG_HOME": str(home / ".config"),
             "XDG_DATA_HOME": str(home / ".local" / "share"),
@@ -467,12 +567,13 @@ def _run(
     *,
     timeout: float = 10.0,
     input_bytes: Optional[bytes] = None,
+    cwd: Optional[Path] = None,
 ) -> Tuple[float, bytes]:
     start = time.perf_counter_ns()
     try:
         completed = subprocess.run(
             list(argv),
-            cwd=str(ROOT),
+            cwd=str(ROOT if cwd is None else cwd),
             env=dict(env),
             input=input_bytes,
             stdin=subprocess.DEVNULL if input_bytes is None else None,
@@ -534,9 +635,233 @@ def _measure_calibration(metric: Mapping[str, Any], env: Mapping[str, str]) -> L
     return _repeat_process((sys.executable, "-c", "pass"), env, metric)
 
 
-def _measure_core_import(
+def _import_calibration_once(
+    env: Mapping[str, str], marker: Path, *, profile: str, value_name: str,
+) -> float:
+    count = _CALIBRATION_PROFILE_MODULES[profile]
+    module_name = _CALIBRATION_PACKAGE + ".profile_" + profile
+    expected_sentinel = _calibration_profile_sentinel(profile)
+    child_env = dict(env)
+    calibration_root = os.path.realpath(
+        env["UNIFIED_PERF_IMPORT_CALIBRATION_ROOT"]
+    )
+    child_env["PYTHONPATH"] = os.pathsep.join((
+        os.path.realpath(marker.parent),
+        calibration_root,
+    ))
+    child_env["UNIFIED_PERF_CALIBRATION_MODULE"] = module_name
+    child_env["UNIFIED_PERF_CALIBRATION_MODULE_COUNT"] = str(count + 2)
+    child_env["UNIFIED_PERF_CALIBRATION_SENTINEL"] = str(expected_sentinel)
+    child_env["UNIFIED_PERF_FORBID_CORE_IMPORTS"] = "1"
+    child_env["UNIFIED_PERF_FORBID_EXT_IMPORTS"] = "1"
+    child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
+    child_env["UNIFIED_PERF_FORBID_SUBPROCESSES"] = "1"
+    code = r'''
+import importlib
+import importlib.util
+import json
+import os
+import sys
+import time
+
+root = os.path.realpath(os.environ["UNIFIED_PERF_IMPORT_CALIBRATION_ROOT"])
+repository_root = os.path.realpath(os.environ["UNIFIED_PERF_REPOSITORY_ROOT"])
+module_name = os.environ["UNIFIED_PERF_CALIBRATION_MODULE"]
+expected_count = int(os.environ["UNIFIED_PERF_CALIBRATION_MODULE_COUNT"])
+expected_sentinel = int(os.environ["UNIFIED_PERF_CALIBRATION_SENTINEL"])
+
+def is_within(parent, candidate):
+    try:
+        return os.path.commonpath((parent, candidate)) == parent
+    except ValueError:
+        return False
+
+base_prefix = os.path.realpath(sys.base_prefix)
+safe_paths = [root]
+for entry in sys.path:
+    candidate = os.path.realpath(entry or os.getcwd())
+    parts = set(os.path.normpath(candidate).split(os.sep))
+    if candidate == root or is_within(root, candidate):
+        continue
+    if not is_within(base_prefix, candidate):
+        continue
+    if "site-packages" in parts or "dist-packages" in parts:
+        continue
+    if candidate not in safe_paths:
+        safe_paths.append(candidate)
+sys.path[:] = safe_paths
+assert not any(is_within(repository_root, path) for path in sys.path)
+spec = importlib.util.find_spec(module_name)
+assert spec is not None and spec.origin is not None
+assert os.path.commonpath((root, os.path.realpath(spec.origin))) == root
+start = time.perf_counter_ns()
+module = importlib.import_module(module_name)
+inner_ms = (time.perf_counter_ns() - start) / 1e6
+loaded = {
+    name: item for name, item in sys.modules.items()
+    if name == "_unified_perf_import_calibration_v1"
+    or name.startswith("_unified_perf_import_calibration_v1.")
+}
+assert len(loaded) == expected_count
+for item in loaded.values():
+    origin = getattr(item, "__file__", None)
+    assert origin is not None
+    assert os.path.commonpath((root, os.path.realpath(origin))) == root
+assert module.SENTINEL == expected_sentinel
+print(json.dumps({
+    "inner_ms": inner_ms,
+    "module_count": len(loaded),
+    "origin": os.path.realpath(module.__file__),
+    "search_paths": list(sys.path),
+    "sentinel": module.SENTINEL,
+}, sort_keys=True, separators=(",", ":")))
+'''
+    elapsed, payload = _run(
+        (sys.executable, "-c", code),
+        child_env,
+        cwd=Path(calibration_root),
+    )
+    result = _json_output(payload)
+    if type(result) is not dict or set(result) != {
+        "inner_ms", "module_count", "origin", "search_paths", "sentinel",
+    }:
+        raise MeasurementError("import calibration returned malformed proof")
+    root = os.path.realpath(env["UNIFIED_PERF_IMPORT_CALIBRATION_ROOT"])
+    repository_root = os.path.realpath(env["UNIFIED_PERF_REPOSITORY_ROOT"])
+    search_paths = result["search_paths"]
+    try:
+        origin_is_local = os.path.commonpath((
+            root, os.path.realpath(str(result["origin"])),
+        )) == root
+    except (OSError, ValueError):
+        origin_is_local = False
+    if (
+        type(result["module_count"]) is not int
+        or result["module_count"] != count + 2
+        or type(result["sentinel"]) is not int
+        or result["sentinel"] != expected_sentinel
+        or type(search_paths) is not list
+        or not search_paths
+        or any(type(path) is not str for path in search_paths)
+        or not origin_is_local
+    ):
+        raise MeasurementError("import calibration proof did not match its fixture")
+    resolved_search_paths = [os.path.realpath(path) for path in search_paths]
+    try:
+        repository_visible = any(
+            os.path.commonpath((repository_root, path)) == repository_root
+            for path in resolved_search_paths
+        )
+    except ValueError:
+        repository_visible = True
+    if (
+        root not in resolved_search_paths
+        or repository_visible
+        or any(
+            "site-packages" in set(os.path.normpath(path).split(os.sep))
+            or "dist-packages" in set(os.path.normpath(path).split(os.sep))
+            for path in resolved_search_paths
+        )
+    ):
+        raise MeasurementError("import calibration search path is not isolated")
+    inner = result["inner_ms"]
+    if type(inner) not in (int, float) or not math.isfinite(inner) or inner < 0:
+        raise MeasurementError("import calibration returned an invalid duration")
+    _assert_guard_marker_clear(marker)
+    return float(inner) if value_name == "inner_ms" else elapsed
+
+
+def _measure_import_calibration(
     metric: Mapping[str, Any], env: Mapping[str, str], marker: Path,
 ) -> List[float]:
+    """Measure the standalone Core-sized synthetic import readiness gate."""
+    samples: List[float] = []
+    for index in range(metric["warmups"] + metric["samples"]):
+        value = _import_calibration_once(
+            env, marker, profile=metric["profile"], value_name="inner_ms",
+        )
+        if index >= metric["warmups"]:
+            samples.append(value)
+    return samples
+
+
+def _paired_adjustment(
+    before: float, after: float, normalization: Mapping[str, Any],
+) -> float:
+    maximum = float(normalization["max_calibration_milliseconds"])
+    if any(
+        not math.isfinite(value) or value < 0
+        for value in (before, after)
+    ):
+        raise MeasurementError("import calibration duration is invalid")
+    outside = (before > maximum, after > maximum)
+    if all(outside):
+        raise MeasurementError("import calibration is outside its validity envelope")
+    if any(outside):
+        return 0.0
+    baseline = float(normalization["baseline_milliseconds"])
+    adjustment = min(max(0.0, before - baseline), max(0.0, after - baseline))
+    if adjustment > float(normalization["max_adjustment_milliseconds"]):
+        raise MeasurementError("import calibration adjustment exceeds its envelope")
+    return adjustment
+
+
+def _repeat_process_bracketed(
+    argv: Sequence[str],
+    env: Mapping[str, str],
+    marker: Path,
+    metric: Mapping[str, Any],
+    *,
+    inner_float: bool = False,
+    validate: Optional[Any] = None,
+) -> Tuple[List[float], List[float], Dict[str, Any]]:
+    normalization = metric["normalization"]
+    samples: List[float] = []
+    adjustments: List[float] = []
+    before_samples: List[float] = []
+    after_samples: List[float] = []
+    total = metric["warmups"] + metric["samples"]
+    for index in range(total):
+        before = _import_calibration_once(
+            env,
+            marker,
+            profile=normalization["profile"],
+            value_name=normalization["calibration_value"],
+        )
+        elapsed, payload = _run(argv, env)
+        value = _float_output(payload) if inner_float else elapsed
+        if validate is not None:
+            validate(payload)
+        after = _import_calibration_once(
+            env,
+            marker,
+            profile=normalization["profile"],
+            value_name=normalization["calibration_value"],
+        )
+        adjustment = _paired_adjustment(before, after, normalization)
+        if index >= metric["warmups"]:
+            samples.append(value)
+            adjustments.append(adjustment)
+            before_samples.append(before)
+            after_samples.append(after)
+    return samples, adjustments, {
+        "import_calibration": {
+            "after_ms": [_rounded(value) for value in after_samples],
+            "before_ms": [_rounded(value) for value in before_samples],
+            "calibration_value": normalization["calibration_value"],
+            "max_calibration_ms": _rounded(
+                normalization["max_calibration_milliseconds"]
+            ),
+            "profile": normalization["profile"],
+        },
+    }
+
+
+def _measure_core_import(
+    metric: Mapping[str, Any], env: Mapping[str, str], marker: Path,
+) -> Tuple[
+    List[float], Optional[float], Optional[Dict[str, Any]], Optional[List[float]],
+]:
     child_env = dict(env)
     child_env["UNIFIED_PERF_FORBID_EXT_IMPORTS"] = "1"
     child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
@@ -546,16 +871,29 @@ def _measure_core_import(
         "elapsed=(time.perf_counter_ns()-start)/1e6; "
         "assert unified_cli.__version__=='" + CORE_VERSION + "'; print(elapsed)"
     )
-    samples = _repeat_process(
-        (sys.executable, "-c", code), child_env, metric, inner_float=True,
-    )
+    if "normalization" in metric:
+        samples, adjustments, details = _repeat_process_bracketed(
+            (sys.executable, "-c", code),
+            child_env,
+            marker,
+            metric,
+            inner_float=True,
+        )
+    else:
+        samples = _repeat_process(
+            (sys.executable, "-c", code), child_env, metric, inner_float=True,
+        )
+        adjustments = None
+        details = None
     _assert_guard_marker_clear(marker)
-    return samples
+    return samples, None, details, adjustments
 
 
 def _measure_core_version(
     metric: Mapping[str, Any], env: Mapping[str, str], marker: Path,
-) -> List[float]:
+) -> Tuple[
+    List[float], Optional[float], Optional[Dict[str, Any]], Optional[List[float]],
+]:
     child_env = dict(env)
     child_env["UNIFIED_PERF_FORBID_EXT_IMPORTS"] = "1"
     child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
@@ -565,14 +903,25 @@ def _measure_core_version(
         if payload.decode("ascii", "strict").strip() != CORE_VERSION:
             raise MeasurementError("Core version fast path returned the wrong version")
 
-    samples = _repeat_process(
-        (sys.executable, "-m", "unified_cli.cli", "--version"),
-        child_env,
-        metric,
-        validate=validate,
-    )
+    if "normalization" in metric:
+        samples, adjustments, details = _repeat_process_bracketed(
+            (sys.executable, "-m", "unified_cli.cli", "--version"),
+            child_env,
+            marker,
+            metric,
+            validate=validate,
+        )
+    else:
+        samples = _repeat_process(
+            (sys.executable, "-m", "unified_cli.cli", "--version"),
+            child_env,
+            metric,
+            validate=validate,
+        )
+        adjustments = None
+        details = None
     _assert_guard_marker_clear(marker)
-    return samples
+    return samples, None, details, adjustments
 
 
 def _measure_ext_import(
@@ -595,7 +944,9 @@ def _measure_ext_import(
 
 def _measure_ext_registry(
     metric: Mapping[str, Any], env: Mapping[str, str], marker: Path,
-) -> List[float]:
+) -> Tuple[
+    List[float], Optional[float], Optional[Dict[str, Any]], Optional[List[float]],
+]:
     child_env = dict(env)
     child_env["UNIFIED_CLI_DISABLE_PLUGINS"] = "0"
     child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
@@ -611,11 +962,22 @@ descriptors = list_providers(include_ext=True)
 assert any(item.id == "performance-canary" and item.status == "discovered" for item in descriptors)
 print((time.perf_counter_ns() - start) / 1e6)
 '''
-    samples = _repeat_process(
-        (sys.executable, "-c", code), child_env, metric, inner_float=True,
-    )
+    if "normalization" in metric:
+        samples, adjustments, details = _repeat_process_bracketed(
+            (sys.executable, "-c", code),
+            child_env,
+            marker,
+            metric,
+            inner_float=True,
+        )
+    else:
+        samples = _repeat_process(
+            (sys.executable, "-c", code), child_env, metric, inner_float=True,
+        )
+        adjustments = None
+        details = None
     _assert_guard_marker_clear(marker)
-    return samples
+    return samples, None, details, adjustments
 
 
 def _measure_manage_bootstrap(
@@ -884,64 +1246,65 @@ def _measure_repl(
 def run_checks(config: Mapping[str, Any], root: Path = ROOT) -> Dict[str, Any]:
     metrics = config["metrics"]
     results: Dict[str, Any] = {}
-    observations: Dict[str, float] = {}
     with isolated_environment(root) as (env, marker, fixture):
         workspace = Path(env["HOME"]).parent / "workspace"
-        runners = (
+        runners = [
             ("calibration_process_startup", lambda: (
-                _measure_calibration(metrics["calibration_process_startup"], env), None, None
+                _measure_calibration(metrics["calibration_process_startup"], env),
+                None, None, None,
             )),
-            ("core_import", lambda: (
-                _measure_core_import(metrics["core_import"], env, marker), None, None
+        ]
+        if "calibration_import_workload" in metrics:
+            runners.append(("calibration_import_workload", lambda: (
+                _measure_import_calibration(
+                    metrics["calibration_import_workload"], env, marker,
+                ),
+                None, None, None,
+            )))
+        runners.extend((
+            ("core_import", lambda: _measure_core_import(
+                metrics["core_import"], env, marker,
             )),
-            ("core_version", lambda: (
-                _measure_core_version(metrics["core_version"], env, marker), None, None
+            ("core_version", lambda: _measure_core_version(
+                metrics["core_version"], env, marker,
             )),
             ("ext_import", lambda: (
-                _measure_ext_import(metrics["ext_import"], env, marker), None, None
+                _measure_ext_import(metrics["ext_import"], env, marker),
+                None, None, None,
             )),
-            ("ext_passive_registry", lambda: (
-                _measure_ext_registry(metrics["ext_passive_registry"], env, marker), None, None
+            ("ext_passive_registry", lambda: _measure_ext_registry(
+                metrics["ext_passive_registry"], env, marker,
             )),
-            ("fake_cli_wrapper_overhead", lambda: _measure_fake_overhead(
-                metrics["fake_cli_wrapper_overhead"], env, fixture, marker
+            ("fake_cli_wrapper_overhead", lambda: (
+                *_measure_fake_overhead(
+                    metrics["fake_cli_wrapper_overhead"], env, fixture, marker
+                ),
+                None,
             )),
             ("manage_bootstrap", lambda: (
                 _measure_manage_bootstrap(
                     metrics["manage_bootstrap"], env, workspace, marker
-                ), None, None
+                ), None, None, None,
             )),
             ("repl_first_prompt", lambda: (
-                _measure_repl(metrics["repl_first_prompt"], env, marker), None, None
+                _measure_repl(metrics["repl_first_prompt"], env, marker),
+                None, None, None,
             )),
             ("stream_relay", lambda: (
-                _measure_stream_relay(metrics["stream_relay"], env, marker), None, None
+                _measure_stream_relay(metrics["stream_relay"], env, marker),
+                None, None, None,
             )),
-        )
+        ))
         for name, runner in runners:
             try:
-                samples, raw_median, details = runner()
-                normalization_references = None
-                normalization = metrics[name].get("normalization")
-                if normalization is not None:
-                    normalization_references = {}
-                    for reference in normalization["references"]:
-                        if reference not in observations:
-                            raise MeasurementError(
-                                "host normalization reference was not measured"
-                            )
-                        normalization_references[reference] = (
-                            observations[reference],
-                            float(metrics[reference]["baseline_milliseconds"]),
-                        )
+                samples, raw_median, details, adjustments = runner()
                 results[name] = summarize(
                     samples,
                     metrics[name],
                     raw_median=raw_median,
                     details=details,
-                    normalization_references=normalization_references,
+                    normalization_adjustments=adjustments,
                 )
-                observations[name] = _observed(samples, metrics[name])
             except (MeasurementError, OSError, ValueError) as exc:
                 results[name] = {
                     "error": "measurement_failed",
