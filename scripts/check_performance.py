@@ -377,9 +377,46 @@ import os
 import socket
 import ssl
 import sys
+import _thread
+
+try:
+    import fcntl as _fcntl
+except ImportError:
+    _fcntl = None
 
 _real_socket = socket.socket
 _writing_marker = False
+_marker_path = os.environ.get("UNIFIED_PERF_GUARD_MARKER")
+_forbid_mutations = os.environ.get("UNIFIED_PERF_FORBID_MUTATIONS") == "1"
+_forbid_ctypes = os.environ.get("UNIFIED_PERF_FORBID_CTYPES") == "1"
+_forbid_native_process_control = (
+    os.environ.get("UNIFIED_PERF_FORBID_NATIVE_PROCESS_CONTROL") == "1"
+)
+_forbid_subprocesses = os.environ.get("UNIFIED_PERF_FORBID_SUBPROCESSES") == "1"
+_forbid_core_imports = os.environ.get("UNIFIED_PERF_FORBID_CORE_IMPORTS") == "1"
+_forbid_ext_imports = os.environ.get("UNIFIED_PERF_FORBID_EXT_IMPORTS") == "1"
+_forbid_entrypoint_imports = (
+    os.environ.get("UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS") == "1"
+)
+_process_scope = os.environ.get("UNIFIED_PERF_PROCESS_SCOPE")
+_allowed_executable = os.environ.get("UNIFIED_PERF_ALLOWED_EXECUTABLE")
+if _allowed_executable:
+    _allowed_executable = os.path.realpath(_allowed_executable)
+_writable_roots = tuple(
+    os.path.realpath(item)
+    for item in os.environ.get("UNIFIED_PERF_WRITABLE_ROOTS", "").split(os.pathsep)
+    if item
+)
+_native_process_symbols = {
+    "__syscall", "_Fork", "clearenv", "clone", "clone3", "dlsym",
+    "execl", "execle", "execlp", "execv", "execve", "execvp", "execvpe",
+    "fork", "popen", "posix_spawn", "posix_spawnp", "prctl", "putenv", "setenv",
+    "setpgid", "setpgrp", "setsid", "syscall", "system", "unsetenv", "vfork",
+}
+_write_flags = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC
+if hasattr(os, "O_TMPFILE"):
+    _write_flags |= os.O_TMPFILE
+_open_dir_fds = {}
 
 def _offline(*args, **kwargs):
     raise RuntimeError("network disabled by performance harness")
@@ -396,68 +433,319 @@ ssl.wrap_socket = _offline
 
 def _mark(kind, detail):
     global _writing_marker
-    marker = os.environ.get("UNIFIED_PERF_GUARD_MARKER")
-    if marker and not _writing_marker:
+    if _marker_path and not _writing_marker:
         _writing_marker = True
         try:
-            with open(marker, "a", encoding="utf-8") as handle:
+            with open(_marker_path, "a", encoding="utf-8") as handle:
                 handle.write(kind + ":" + os.path.basename(str(detail)) + "\\n")
         except OSError:
             pass
         finally:
             _writing_marker = False
 
-def _mutation_detail(event, args):
+def _fd_path(fd):
+    if type(fd) is not int or fd < 0:
+        return None
+    if _fcntl is not None and hasattr(_fcntl, "F_GETPATH"):
+        try:
+            raw = _fcntl.fcntl(fd, _fcntl.F_GETPATH, bytes(1024))
+            value = os.fsdecode(raw.split(b"\\0", 1)[0])
+            if value:
+                return os.path.realpath(value)
+        except (OSError, TypeError, ValueError):
+            pass
+    for root in ("/proc/self/fd", "/dev/fd"):
+        try:
+            value = os.readlink(os.path.join(root, str(fd)))
+        except OSError:
+            continue
+        if os.path.isabs(value):
+            return os.path.realpath(value)
+    return None
+
+def _resolve_mutation_path(path, dir_fd=None):
+    if type(path) is int:
+        return _fd_path(path)
+    try:
+        value = os.fsdecode(os.fspath(path))
+    except (TypeError, ValueError):
+        return None
+    if os.path.isabs(value):
+        return os.path.realpath(value)
+    if dir_fd not in (None, -1):
+        root = _fd_path(dir_fd)
+        if root is None:
+            return None
+        value = os.path.join(root, value)
+    return os.path.realpath(value)
+
+def _current_open_dir_fd():
+    stack = _open_dir_fds.get(_thread.get_ident())
+    return stack[-1] if stack else None
+
+def _mutation_details(event, args):
     if event == "open":
         path = args[0] if args else "unknown"
         mode = args[1] if len(args) > 1 else None
         flags = args[2] if len(args) > 2 else 0
-        write_flags = (
-            os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC
-        )
-        if hasattr(os, "O_TMPFILE"):
-            write_flags |= os.O_TMPFILE
         writes = (
             isinstance(mode, str) and any(char in mode for char in "wax+")
-        ) or (isinstance(flags, int) and bool(flags & write_flags))
+        ) or (isinstance(flags, int) and bool(flags & _write_flags))
         if writes:
-            return path
-        return None
-    mutation_events = {
-        "os.chdir", "os.chflags", "os.chmod", "os.chown", "os.fchdir",
-        "os.lchflags", "os.link", "os.mkdir", "os.mknod", "os.remove",
-        "os.removexattr", "os.rename", "os.replace", "os.rmdir",
-        "os.setxattr", "os.symlink", "os.truncate", "os.unlink", "os.utime",
+            return ((path, _current_open_dir_fd()),)
+        return ()
+    single_path_events = {
+        "os.chflags": None, "os.chmod": 2, "os.chown": 3,
+        "os.lchflags": None, "os.mkdir": 2, "os.mknod": 3,
+        "os.remove": 1, "os.removexattr": None, "os.rmdir": 1,
+        "os.setxattr": None, "os.truncate": None, "os.unlink": 1,
+        "os.utime": 3,
     }
-    if event in mutation_events:
-        return args[0] if args else "unknown"
+    if event in {"os.link", "os.rename", "os.replace"}:
+        return (
+            (args[0], args[2] if len(args) > 2 else None),
+            (args[1], args[3] if len(args) > 3 else None),
+        ) if len(args) > 1 else (("unknown", None),)
+    if event == "os.symlink":
+        return ((args[1], args[2] if len(args) > 2 else None),) if len(args) > 1 else (("unknown", None),)
+    if event not in single_path_events:
+        return ()
+    dir_index = single_path_events[event]
+    dir_fd = args[dir_index] if dir_index is not None and len(args) > dir_index else None
+    return ((args[0], dir_fd),) if args else (("unknown", None),)
+
+def _mutation_allowed(path, dir_fd=None):
+    resolved = _resolve_mutation_path(path, dir_fd)
+    if resolved is None:
+        return False
+    if resolved == os.path.realpath(os.devnull):
+        return True
+    for root in _writable_roots:
+        try:
+            if os.path.commonpath((root, resolved)) == root:
+                return True
+        except ValueError:
+            continue
+    return False
+
+_real_open = os.open
+
+def _guarded_open(path, flags, mode=0o777, *, dir_fd=None):
+    thread_id = _thread.get_ident()
+    stack = _open_dir_fds.setdefault(thread_id, [])
+    stack.append(dir_fd)
+    try:
+        if (
+            _forbid_mutations
+            and isinstance(flags, int)
+            and flags & _write_flags
+            and not _mutation_allowed(path, dir_fd)
+        ):
+            _mark("mutation", path)
+            raise RuntimeError("filesystem mutation disabled by performance harness")
+        return _real_open(path, flags, mode, dir_fd=dir_fd)
+    finally:
+        stack.pop()
+        if not stack:
+            _open_dir_fds.pop(thread_id, None)
+
+os.open = _guarded_open
+try:
+    import posix as _posix
+except ImportError:
+    _posix = None
+if _posix is not None:
+    _posix.open = _guarded_open
+
+def _launch_environment(event, args):
+    if event == "subprocess.Popen":
+        return args[3] if len(args) > 3 else None
+    if event in {"os.exec", "os.posix_spawn", "os.posix_spawnp"}:
+        return args[2] if len(args) > 2 else None
+    if event == "os.spawn":
+        return args[3] if len(args) > 3 else None
     return None
+
+def _scope_is_preserved(event, args):
+    environment = _launch_environment(event, args)
+    if environment is None:
+        environment = os.environ
+    try:
+        return (
+            _process_scope is not None
+            and environment.get("UNIFIED_PERF_PROCESS_SCOPE") == _process_scope
+        )
+    except AttributeError:
+        return False
+
+def _normalized_executable(value):
+    try:
+        return os.path.realpath(os.fsdecode(os.fspath(value)))
+    except (TypeError, ValueError):
+        return None
+
+def _fork_exec_scope_is_preserved(environment):
+    if environment is None:
+        return (
+            _process_scope is not None
+            and os.environ.get("UNIFIED_PERF_PROCESS_SCOPE") == _process_scope
+        )
+    try:
+        expected = os.fsencode(_process_scope) if _process_scope is not None else None
+        values = []
+        for item in environment:
+            name, separator, value = os.fsencode(item).partition(b"=")
+            if separator and name == b"UNIFIED_PERF_PROCESS_SCOPE":
+                values.append(value)
+        return expected is not None and values == [expected]
+    except (TypeError, ValueError):
+        return False
+
+def _guard_fork_exec(args):
+    executable_list = args[1] if len(args) > 1 else ()
+    try:
+        executables = tuple(executable_list)
+    except TypeError:
+        executables = ()
+    executable = executables[0] if executables else "unknown"
+    if not (
+        _allowed_executable
+        and len(executables) == 1
+        and _normalized_executable(executable) == _allowed_executable
+    ):
+        _mark("subprocess", executable)
+        raise RuntimeError("provider subprocess disabled by performance harness")
+    environment = args[5] if len(args) > 5 else ()
+    if not _fork_exec_scope_is_preserved(environment):
+        _mark("process-scope", executable)
+        raise RuntimeError("process scope removal disabled by performance harness")
+
+try:
+    import _posixsubprocess as _guarded_posixsubprocess
+except ImportError:
+    _guarded_posixsubprocess = None
+_posixsubprocess_origin = None
+if _guarded_posixsubprocess is not None:
+    _posixsubprocess_spec = getattr(_guarded_posixsubprocess, "__spec__", None)
+    _posixsubprocess_origin_value = getattr(
+        _posixsubprocess_spec, "origin", None,
+    )
+    if _posixsubprocess_origin_value not in (None, "built-in", "frozen"):
+        try:
+            _posixsubprocess_origin = os.path.realpath(
+                os.fsdecode(os.fspath(_posixsubprocess_origin_value))
+            )
+        except (TypeError, ValueError):
+            pass
+    _real_fork_exec = _guarded_posixsubprocess.fork_exec
+
+    def _guarded_fork_exec(*args, **kwargs):
+        if _forbid_subprocesses:
+            _guard_fork_exec(args)
+        return _real_fork_exec(*args, **kwargs)
+
+    _guarded_posixsubprocess.fork_exec = _guarded_fork_exec
+    _loaded_subprocess = sys.modules.get("subprocess")
+    if getattr(_loaded_subprocess, "_fork_exec", None) is _real_fork_exec:
+        _loaded_subprocess._fork_exec = _guarded_fork_exec
+
+def _is_posixsubprocess_module(name, origin=None):
+    try:
+        fullname = os.fsdecode(os.fspath(name))
+    except (TypeError, ValueError):
+        return False
+    if fullname.rpartition(".")[2] == "_posixsubprocess":
+        return True
+    if _posixsubprocess_origin is None or origin is None:
+        return False
+    try:
+        return os.path.realpath(os.fsdecode(os.fspath(origin))) == (
+            _posixsubprocess_origin
+        )
+    except (TypeError, ValueError):
+        return False
+
+def _block_process_control(*args, **kwargs):
+    _mark("process-scope", "session-control")
+    raise RuntimeError("process scope escape disabled by performance harness")
+
+if _forbid_native_process_control:
+    import posix as _posix
+    for _module in (os, _posix):
+        for _name in ("setpgid", "setpgrp", "setsid"):
+            if hasattr(_module, _name):
+                setattr(_module, _name, _block_process_control)
 
 def _audit(event, args):
     if _writing_marker:
         return
-    if os.environ.get("UNIFIED_PERF_FORBID_MUTATIONS") == "1":
-        detail = _mutation_detail(event, args)
-        if detail is not None:
-            _mark("mutation", detail)
-            raise RuntimeError("filesystem mutation disabled by performance harness")
+    if (
+        _forbid_subprocesses
+        and event == "import"
+        and args
+        and _is_posixsubprocess_module(
+            args[0], args[1] if len(args) > 1 else None,
+        )
+    ):
+        _mark("import", args[0])
+        raise RuntimeError(
+            "process launch module reload disabled by performance harness"
+        )
+    if _forbid_mutations:
+        for detail, dir_fd in _mutation_details(event, args):
+            if not _mutation_allowed(detail, dir_fd):
+                _mark("mutation", detail)
+                raise RuntimeError("filesystem mutation disabled by performance harness")
         if event in {"os.fork", "os.forkpty"}:
             _mark("fork", event)
             raise RuntimeError("fork disabled by performance harness")
-        if event == "import" and args and args[0] in {"ctypes", "_ctypes"}:
-            _mark("import", args[0])
-            raise RuntimeError("native audit bypass disabled by performance harness")
-    if os.environ.get("UNIFIED_PERF_FORBID_SUBPROCESSES") == "1":
+        if event in {"socket.bind", "socket.connect"}:
+            address = args[1] if len(args) > 1 else "unknown"
+            _mark("socket", address)
+            raise RuntimeError("AF_UNIX endpoint disabled by performance harness")
+    if (
+        _forbid_ctypes
+        and event == "import"
+        and args
+        and args[0] in {"ctypes", "_ctypes"}
+    ):
+        _mark("import", args[0])
+        raise RuntimeError("native access disabled by performance harness")
+    if _forbid_native_process_control:
+        if event == "import" and args and args[0] in {"cffi", "_cffi_backend"}:
+            _mark("native-process", args[0])
+            raise RuntimeError("native process control disabled by performance harness")
+        if event in {"ctypes.dlsym", "ctypes.dlsym/handle"} and args:
+            symbol = str(args[-1])
+            if symbol in _native_process_symbols:
+                _mark("native-process", symbol)
+                raise RuntimeError(
+                    "native process control disabled by performance harness"
+                )
+    if _forbid_subprocesses:
         if event == "subprocess.Popen":
             executable = args[0] if args else "unknown"
         elif event in {
-            "os.exec", "os.posix_spawn", "os.spawn", "os.system", "pty.spawn",
+            "os.exec", "os.posix_spawn", "os.posix_spawnp", "os.spawn",
+            "os.system", "pty.spawn",
         }:
-            executable = args[0] if args else "unknown"
+            executable_index = 1 if event == "os.spawn" else 0
+            executable = (
+                args[executable_index]
+                if len(args) > executable_index
+                else "unknown"
+            )
         else:
             return
-        allowed = os.environ.get("UNIFIED_PERF_ALLOWED_EXECUTABLE")
-        if allowed and os.path.realpath(str(executable)) == os.path.realpath(allowed):
+        if (
+            _allowed_executable
+            and _normalized_executable(executable) == _allowed_executable
+        ):
+            if not _scope_is_preserved(event, args):
+                _mark("process-scope", executable)
+                raise RuntimeError(
+                    "process scope removal disabled by performance harness"
+                )
             return
         _mark("subprocess", executable)
         raise RuntimeError("provider subprocess disabled by performance harness")
@@ -466,16 +754,21 @@ sys.addaudithook(_audit)
 
 class _ImportCanary(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
+        if _forbid_subprocesses and _is_posixsubprocess_module(fullname):
+            _mark("import", fullname)
+            raise RuntimeError(
+                "process launch module reload disabled by performance harness"
+            )
         forbidden_core = (
-            os.environ.get("UNIFIED_PERF_FORBID_CORE_IMPORTS") == "1"
+            _forbid_core_imports
             and (fullname == "unified_cli" or fullname.startswith("unified_cli."))
         )
         forbidden_ext = (
-            os.environ.get("UNIFIED_PERF_FORBID_EXT_IMPORTS") == "1"
+            _forbid_ext_imports
             and (fullname == "unified_cli_ext" or fullname.startswith("unified_cli_ext."))
         )
         forbidden_entrypoint = (
-            os.environ.get("UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS") == "1"
+            _forbid_entrypoint_imports
             and fullname == "performance_canary"
         )
         if forbidden_core or forbidden_ext or forbidden_entrypoint:
@@ -501,6 +794,119 @@ sys.meta_path.insert(0, _ImportCanary())
         encoding="utf-8",
     )
     return marker
+
+
+_PROTECTED_PATHS_ENV = "UNIFIED_PERF_PROTECTED_PATHS"
+_PROCESS_SCOPE_ENV = "UNIFIED_PERF_PROCESS_SCOPE"
+
+
+def _protected_path_digest(
+    path: Path, *, ignore_guard_marker: bool = False,
+) -> str:
+    """Hash one parent-owned sandbox path without following aliases."""
+    root = path.absolute()
+    digest = hashlib.sha256()
+
+    def visit(current: Path, relative: str) -> None:
+        try:
+            metadata = current.lstat()
+        except OSError as exc:
+            raise MeasurementError("performance sandbox integrity check failed") from exc
+        mode = stat.S_IMODE(metadata.st_mode)
+        stamp = metadata.st_mtime_ns
+        if stat.S_ISDIR(metadata.st_mode):
+            digest.update(
+                b"D\0" + relative.encode("utf-8") + b"\0"
+                + str(mode).encode("ascii") + b"\0"
+            )
+            try:
+                children = sorted(os.scandir(current), key=lambda item: item.name)
+            except OSError as exc:
+                raise MeasurementError(
+                    "performance sandbox integrity check failed"
+                ) from exc
+            for child in children:
+                if (
+                    ignore_guard_marker
+                    and relative == "."
+                    and child.name == "forbidden-startup-attempted"
+                ):
+                    continue
+                child_relative = child.name if relative == "." else (
+                    relative + "/" + child.name
+                )
+                visit(Path(child.path), child_relative)
+            return
+        if not stat.S_ISREG(metadata.st_mode):
+            raise MeasurementError("performance sandbox integrity check failed")
+        digest.update(
+            b"F\0" + relative.encode("utf-8") + b"\0"
+            + str(mode).encode("ascii") + b"\0"
+            + str(stamp).encode("ascii") + b"\0"
+            + str(metadata.st_size).encode("ascii") + b"\0"
+        )
+        try:
+            with current.open("rb") as handle:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+        except OSError as exc:
+            raise MeasurementError("performance sandbox integrity check failed") from exc
+
+    visit(root, ".")
+    return digest.hexdigest()
+
+
+def _protect_environment_path(
+    env: Mapping[str, str], label: str, path: Path, *, guard: bool = False,
+) -> Dict[str, str]:
+    child = dict(env)
+    try:
+        protections = json.loads(child.get(_PROTECTED_PATHS_ENV, "[]"))
+    except json.JSONDecodeError as exc:
+        raise MeasurementError("performance sandbox integrity metadata is invalid") from exc
+    if type(protections) is not list:
+        raise MeasurementError("performance sandbox integrity metadata is invalid")
+    resolved = str(path.absolute())
+    for item in protections:
+        if type(item) is not list or len(item) != 4:
+            raise MeasurementError("performance sandbox integrity metadata is invalid")
+        if item[1] == resolved:
+            return child
+    protections.append([
+        label,
+        resolved,
+        _protected_path_digest(path, ignore_guard_marker=guard),
+        guard,
+    ])
+    child[_PROTECTED_PATHS_ENV] = json.dumps(protections, separators=(",", ":"))
+    return child
+
+
+def _assert_environment_integrity(env: Mapping[str, str]) -> None:
+    try:
+        protections = json.loads(env.get(_PROTECTED_PATHS_ENV, ""))
+    except json.JSONDecodeError as exc:
+        raise MeasurementError("performance sandbox integrity metadata is invalid") from exc
+    if type(protections) is not list or not protections:
+        raise MeasurementError("performance sandbox integrity metadata is invalid")
+    for item in protections:
+        if (
+            type(item) is not list
+            or len(item) != 4
+            or type(item[0]) is not str
+            or type(item[1]) is not str
+            or type(item[2]) is not str
+            or type(item[3]) is not bool
+        ):
+            raise MeasurementError("performance sandbox integrity metadata is invalid")
+        actual = _protected_path_digest(
+            Path(item[1]), ignore_guard_marker=item[3],
+        )
+        if actual != item[2]:
+            raise MeasurementError("performance sandbox integrity check failed")
 
 
 def _excluded_source_path(path: Path) -> bool:
@@ -901,14 +1307,212 @@ def isolated_environment(root: Path = ROOT) -> Iterator[Tuple[Dict[str, str], Pa
             "UNIFIED_PERF_GUARD_MARKER": str(marker),
             "UNIFIED_PERF_GUARD_ROOT": str(guard),
             "UNIFIED_PERF_RUNTIME_PATHS": os.pathsep.join(runtime_paths),
+            "UNIFIED_PERF_WRITABLE_ROOTS": os.pathsep.join(
+                str(path) for path in (home, tmp, workspace)
+            ),
             "UNIFIED_PERF_WORKSPACE": str(workspace),
             "XDG_CACHE_HOME": str(home / ".cache"),
             "XDG_CONFIG_HOME": str(home / ".config"),
             "XDG_DATA_HOME": str(home / ".local" / "share"),
         }
+        env = _protect_environment_path(env, "guard", guard, guard=True)
+        env = _protect_environment_path(env, "fixture", fixture)
         if any(_is_credential_name(name) for name in env):
             raise MeasurementError("isolated environment contains a credential-like name")
+        _verify_process_scope_inspection(env)
         yield env, marker, fixture
+
+
+def _record_parent_guard_violation(
+    env: Mapping[str, str], kind: str, detail: str,
+) -> None:
+    marker = env.get("UNIFIED_PERF_GUARD_MARKER")
+    if not marker:
+        return
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(marker, flags, 0o600)
+        try:
+            os.write(fd, (kind + ":" + detail + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _linux_process_scope_pids(
+    scope: str, proc_root: Path = Path("/proc"),
+) -> List[int]:
+    marker = (_PROCESS_SCOPE_ENV + "=" + scope).encode("ascii")
+    matches: List[int] = []
+    try:
+        entries = os.scandir(proc_root)
+    except OSError as exc:
+        raise MeasurementError("isolated process scope inspection failed") from exc
+    with entries:
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid in {0, 1, os.getpid()}:
+                continue
+            try:
+                payload = (Path(entry.path) / "environ").read_bytes()
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+            except OSError as exc:
+                raise MeasurementError(
+                    "isolated process scope inspection failed"
+                ) from exc
+            if marker in payload.split(b"\0"):
+                matches.append(pid)
+    return matches
+
+
+def _darwin_process_scope_pids(scope: str) -> List[int]:
+    # ``KERN_PROCARGS2`` exposes the environment installed at exec, so an
+    # ordinary ``unsetenv`` cannot make an already-created process disappear
+    # from this parent-owned scope inventory.
+    import ctypes
+    import ctypes.util
+
+    try:
+        libproc = ctypes.CDLL(
+            ctypes.util.find_library("proc") or "/usr/lib/libproc.dylib",
+            use_errno=True,
+        )
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError as exc:
+        raise MeasurementError("isolated process scope inspection failed") from exc
+    libproc.proc_listallpids.argtypes = (ctypes.c_void_p, ctypes.c_int)
+    libproc.proc_listallpids.restype = ctypes.c_int
+    libc.sysctl.argtypes = (
+        ctypes.POINTER(ctypes.c_int), ctypes.c_uint,
+        ctypes.c_void_p, ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_void_p, ctypes.c_size_t,
+    )
+    libc.sysctl.restype = ctypes.c_int
+
+    capacity = max(64, libproc.proc_listallpids(None, 0) + 64)
+    pids = (ctypes.c_int * capacity)()
+    count = libproc.proc_listallpids(pids, ctypes.sizeof(pids))
+    if count < 0:
+        raise MeasurementError("isolated process scope inspection failed")
+    marker = (_PROCESS_SCOPE_ENV + "=" + scope).encode("ascii")
+    matches: List[int] = []
+    for pid in pids[:min(count, capacity)]:
+        if pid in {0, 1, os.getpid()}:
+            continue
+        mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2
+        size = ctypes.c_size_t(0)
+        if libc.sysctl(mib, 3, None, ctypes.byref(size), None, 0) != 0:
+            continue
+        if size.value <= 0:
+            continue
+        buffer = ctypes.create_string_buffer(size.value)
+        if libc.sysctl(
+            mib, 3, buffer, ctypes.byref(size), None, 0,
+        ) != 0:
+            continue
+        payload = buffer.raw[:size.value]
+        if marker in payload.split(b"\0"):
+            matches.append(pid)
+    return matches
+
+
+def _process_scope_pids(scope: str) -> List[int]:
+    if sys.platform.startswith("linux"):
+        return _linux_process_scope_pids(scope)
+    if sys.platform == "darwin":
+        return _darwin_process_scope_pids(scope)
+    return []
+
+
+def _verify_process_scope_inspection(env: Mapping[str, str]) -> None:
+    """Fail before measurement if the host cannot inventory a scoped child."""
+    if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
+        return
+    scope = os.urandom(16).hex()
+    child_env = dict(env)
+    child_env[_PROCESS_SCOPE_ENV] = scope
+    process: Optional[subprocess.Popen] = None
+    verified = False
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-I", "-S", "-B", "-c", "import time; time.sleep(5)"],
+            cwd=env["UNIFIED_PERF_EMPTY_CWD"],
+            env=child_env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if process.pid in _process_scope_pids(scope):
+                verified = True
+                break
+            if process.poll() is not None:
+                break
+            time.sleep(0.01)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise MeasurementError("isolated process scope inspection failed") from exc
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+    if not verified:
+        raise MeasurementError("isolated process scope inspection failed")
+
+
+def _kill_process_scope(
+    scope: str, process: Optional[subprocess.Popen] = None,
+) -> bool:
+    """Stop every live process carrying this invocation's inherited scope."""
+    found = False
+    deadline = time.monotonic() + 2.0
+    while True:
+        pids = _process_scope_pids(scope)
+        if process is not None and process.poll() is not None:
+            pids = [pid for pid in pids if pid != process.pid]
+        if not pids:
+            return found
+        found = True
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError as exc:
+                raise MeasurementError(
+                    "isolated process scope cleanup failed"
+                ) from exc
+        if process is not None and process.pid in pids:
+            try:
+                process.wait(timeout=0.1)
+            except subprocess.TimeoutExpired:
+                pass
+        if time.monotonic() >= deadline:
+            raise MeasurementError("isolated process scope cleanup failed")
+        time.sleep(0.01)
+
+
+def _kill_process_group(process: subprocess.Popen) -> bool:
+    """Kill the isolated process group, including descendants after leader exit."""
+    if os.name != "posix":
+        if process.poll() is None:
+            process.kill()
+            return True
+        return False
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return False
+    except OSError as exc:
+        raise MeasurementError("isolated process group cleanup failed") from exc
+    return True
 
 
 def _run(
@@ -919,25 +1523,66 @@ def _run(
     input_bytes: Optional[bytes] = None,
     cwd: Optional[Path] = None,
 ) -> Tuple[float, bytes]:
+    _assert_environment_integrity(env)
+    child_env = dict(env)
+    process_scope = os.urandom(16).hex()
+    child_env[_PROCESS_SCOPE_ENV] = process_scope
+    child_env["UNIFIED_PERF_FORBID_NATIVE_PROCESS_CONTROL"] = "1"
+    child_env["UNIFIED_PERF_FORBID_MUTATIONS"] = "1"
+    child_env["UNIFIED_PERF_FORBID_SUBPROCESSES"] = "1"
     start = time.perf_counter_ns()
+    process: Optional[subprocess.Popen] = None
+    payload = b""
+    failure: Optional[BaseException] = None
+    group_was_present = False
+    scope_was_present = False
+    measured_end: Optional[int] = None
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             list(argv),
             cwd=str(Path(env["UNIFIED_PERF_EMPTY_CWD"]) if cwd is None else cwd),
-            env=dict(env),
-            input=input_bytes,
-            stdin=subprocess.DEVNULL if input_bytes is None else None,
+            env=child_env,
+            stdin=subprocess.DEVNULL if input_bytes is None else subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            timeout=timeout,
-            check=False,
+            start_new_session=True,
         )
+        payload, _ = process.communicate(input=input_bytes, timeout=timeout)
+        measured_end = time.perf_counter_ns()
     except (OSError, subprocess.SubprocessError) as exc:
-        raise MeasurementError("isolated subprocess did not complete") from exc
-    elapsed = (time.perf_counter_ns() - start) / 1_000_000.0
-    if completed.returncode != 0:
+        failure = exc
+    finally:
+        if process is not None:
+            try:
+                group_was_present = _kill_process_group(process)
+                scope_was_present = _kill_process_scope(process_scope, process)
+                if process.poll() is None:
+                    process.communicate(timeout=2.0)
+            except (OSError, subprocess.SubprocessError, MeasurementError) as exc:
+                if failure is None:
+                    failure = exc
+        integrity_failure: Optional[MeasurementError] = None
+        try:
+            _assert_environment_integrity(env)
+        except MeasurementError as exc:
+            integrity_failure = exc
+        if group_was_present or scope_was_present:
+            detail = "process-scope" if scope_was_present else "process-group"
+            _record_parent_guard_violation(env, "descendant", detail)
+        if integrity_failure is not None:
+            raise integrity_failure
+    if failure is not None:
+        if isinstance(failure, MeasurementError):
+            raise failure
+        raise MeasurementError("isolated subprocess did not complete") from failure
+    if group_was_present or scope_was_present:
+        raise MeasurementError("isolated subprocess left a descendant process")
+    if process is None or process.returncode != 0:
         raise MeasurementError("isolated subprocess returned a failure status")
-    return elapsed, completed.stdout
+    if measured_end is None:
+        raise MeasurementError("isolated subprocess did not record its duration")
+    elapsed = (measured_end - start) / 1_000_000.0
+    return elapsed, payload
 
 
 def _float_output(payload: bytes) -> float:
@@ -1013,6 +1658,9 @@ assert _perf_guard_spec is not None and _perf_guard_spec.loader is not None
 _perf_guard_module = _perf_importlib_util.module_from_spec(_perf_guard_spec)
 _perf_sys.modules[_perf_guard_spec.name] = _perf_guard_module
 _perf_guard_spec.loader.exec_module(_perf_guard_module)
+del _perf_sys.modules[_perf_guard_spec.name]
+del _perf_guard_module
+del _perf_guard_spec
 
 _perf_sources = [
     _perf_os.path.realpath(item)
@@ -1090,7 +1738,11 @@ def _environment_for_source_paths(
     child["UNIFIED_PERF_DESIGNATED_CORE_ROOT"] = str(core_root)
     child["UNIFIED_PERF_DESIGNATED_EXT_ROOT"] = str(ext_root)
     child["UNIFIED_PERF_GUARD_ROOT"] = str(guard)
+    child["UNIFIED_PERF_FORBID_MUTATIONS"] = "1"
+    child["UNIFIED_PERF_FORBID_SUBPROCESSES"] = "1"
     child.pop("PYTHONPATH", None)
+    for index, path in enumerate((core_root, ext_root)):
+        child = _protect_environment_path(child, "source-" + str(index), path)
     return child
 
 
@@ -1108,6 +1760,22 @@ def _source_environment(
     if sanitized_root is not None:
         child["UNIFIED_PERF_SANITIZED_ROOT"] = str(sanitized_root)
     return child
+
+
+def _materialize_candidate_environments(
+    manifest: SourceManifest, env: Mapping[str, str], destination: Path,
+) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Use the parent-captured bytes for every candidate measurement."""
+    source = _materialize_manifest(manifest, destination / "candidate-source")
+    registry_source = _materialize_manifest(
+        manifest, destination / "candidate-registry-source", registry=True,
+    )
+    candidate = _source_environment(env, source)
+    registry = _source_environment(
+        env, source, sanitized_root=registry_source,
+    )
+    registry["UNIFIED_PERF_REGISTRY_BOOTSTRAP"] = "1"
+    return candidate, registry
 
 
 _ORIGIN_PROOF = r'''
@@ -1204,6 +1872,7 @@ def _measure_core_import(
         child_env = dict(env)
         child_env["UNIFIED_PERF_FORBID_EXT_IMPORTS"] = "1"
         child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
+        child_env["UNIFIED_PERF_FORBID_CTYPES"] = "1"
         child_env["UNIFIED_PERF_FORBID_MUTATIONS"] = "1"
         child_env["UNIFIED_PERF_FORBID_SUBPROCESSES"] = "1"
         code = r'''
@@ -1246,6 +1915,7 @@ def _measure_core_version(
         child_env = dict(env)
         child_env["UNIFIED_PERF_FORBID_EXT_IMPORTS"] = "1"
         child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
+        child_env["UNIFIED_PERF_FORBID_CTYPES"] = "1"
         child_env["UNIFIED_PERF_FORBID_MUTATIONS"] = "1"
         child_env["UNIFIED_PERF_FORBID_SUBPROCESSES"] = "1"
         code = r'''
@@ -1287,6 +1957,8 @@ def _measure_ext_import(
 ) -> List[float]:
     child_env = dict(env)
     child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
+    child_env["UNIFIED_PERF_FORBID_CTYPES"] = "1"
+    child_env["UNIFIED_PERF_FORBID_MUTATIONS"] = "1"
     child_env["UNIFIED_PERF_FORBID_SUBPROCESSES"] = "1"
     code = (
         "import time; start=time.perf_counter_ns(); import unified_cli_ext; "
@@ -1310,6 +1982,7 @@ def _measure_ext_registry(
         child_env = dict(env)
         child_env["UNIFIED_CLI_DISABLE_PLUGINS"] = "0"
         child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
+        child_env["UNIFIED_PERF_FORBID_CTYPES"] = "1"
         child_env["UNIFIED_PERF_FORBID_MUTATIONS"] = "1"
         child_env["UNIFIED_PERF_FORBID_SUBPROCESSES"] = "1"
         child_env["UNIFIED_PERF_REGISTRY_BOOTSTRAP"] = "1"
@@ -1556,15 +2229,23 @@ print(json.dumps({"raw": raw_samples, "wrapper": wrapper_samples}, separators=("
 
 
 def _pty_prompt_once(env: Mapping[str, str], marker: Path) -> float:
+    _assert_environment_integrity(env)
     child_env = dict(env)
+    process_scope = os.urandom(16).hex()
+    child_env[_PROCESS_SCOPE_ENV] = process_scope
     child_env["UNIFIED_PERF_FORBID_EXT_IMPORTS"] = "1"
     child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
+    child_env["UNIFIED_PERF_FORBID_NATIVE_PROCESS_CONTROL"] = "1"
+    child_env["UNIFIED_PERF_FORBID_MUTATIONS"] = "1"
     child_env["UNIFIED_PERF_FORBID_SUBPROCESSES"] = "1"
     master_fd, slave_fd = pty.openpty()
     process: Optional[subprocess.Popen] = None
     start = time.perf_counter_ns()
     output = bytearray()
     found_at: Optional[float] = None
+    completed_cleanly = False
+    descendant_found = False
+    scope_process_found = False
     try:
         repl_code = r'''
 import runpy
@@ -1616,18 +2297,24 @@ runpy.run_module("unified_cli.cli", run_name="__main__")
             process.wait(timeout=2.0)
         if process.returncode != 0:
             raise MeasurementError("REPL did not exit cleanly after the first prompt")
+        completed_cleanly = True
     except (OSError, subprocess.SubprocessError) as exc:
         raise MeasurementError("real PTY measurement failed") from exc
     finally:
-        if process is not None and process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
+        if process is not None:
+            leader_running = process.poll() is None
+            descendant_found = _kill_process_group(process)
+            scope_process_found = _kill_process_scope(process_scope, process)
+            if leader_running and process.poll() is None:
+                process.wait()
         if slave_fd >= 0:
             os.close(slave_fd)
         os.close(master_fd)
+        _assert_environment_integrity(env)
+    if completed_cleanly and (descendant_found or scope_process_found):
+        detail = "process-scope" if scope_process_found else "process-group"
+        _record_parent_guard_violation(child_env, "descendant", detail)
+        raise MeasurementError("REPL left a descendant process")
     _assert_guard_marker_clear(marker)
     return found_at
 
@@ -1654,16 +2341,11 @@ def run_checks(
     with isolated_environment(root) as (env, marker, fixture):
         environment_root = Path(env["HOME"]).parent
         workspace = environment_root / "workspace"
-        candidate_registry_root = _materialize_manifest(
-            candidate_manifest,
-            environment_root / "candidate-registry-source",
-            registry=True,
+        candidate_env, candidate_registry_env = (
+            _materialize_candidate_environments(
+                candidate_manifest, env, environment_root,
+            )
         )
-        candidate_env = _source_environment(env, root)
-        candidate_registry_env = _source_environment(
-            env, root, sanitized_root=candidate_registry_root,
-        )
-        candidate_registry_env["UNIFIED_PERF_REGISTRY_BOOTSTRAP"] = "1"
         runners = [
             ("calibration_process_startup", lambda: (
                 _measure_calibration(

@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -55,6 +56,21 @@ def _reference_copy(
     (root / ".git").mkdir()
     (root / ".git" / "HEAD").write_text(sha + "\n", encoding="ascii")
     return root
+
+
+def _append_ext_candidate(candidate: Path, payload: str) -> None:
+    target = (
+        candidate
+        / "packages"
+        / "unified-cli-ext"
+        / "src"
+        / "unified_cli_ext"
+        / "__init__.py"
+    )
+    target.write_text(
+        target.read_text(encoding="utf-8") + "\n" + payload,
+        encoding="utf-8",
+    )
 
 
 def test_baseline_pins_reference_digest_anchors_and_exact_policies():
@@ -549,6 +565,50 @@ def test_all_python_children_use_B_and_do_not_create_bytecode(tmp_path):
         assert not marker.exists()
 
 
+def test_candidate_metrics_use_captured_sources_not_live_or_sibling_shadows(tmp_path):
+    candidate = _reference_copy(tmp_path, name="candidate")
+    sentinel = tmp_path / "candidate-shadow-executed"
+    shadow = candidate / "src" / "rich"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text(
+        "from pathlib import Path\n"
+        "import os\n"
+        "Path(os.environ['SHADOW_SENTINEL']).write_text('executed')\n",
+        encoding="utf-8",
+    )
+    manifest = check_performance._read_source_manifest(candidate)
+    live_init = candidate / "src" / "unified_cli" / "__init__.py"
+    live_init.write_text("raise RuntimeError('live checkout was reused')\n")
+
+    with check_performance.isolated_environment(ROOT) as (env, marker, _fixture):
+        environment_root = Path(env["HOME"]).parent
+        candidate_env, registry_env = (
+            check_performance._materialize_candidate_environments(
+                manifest, env, environment_root,
+            )
+        )
+        candidate_env["SHADOW_SENTINEL"] = str(sentinel)
+        source_root = Path(candidate_env["UNIFIED_PERF_DESIGNATED_CORE_ROOT"])
+        assert source_root == (
+            environment_root / "candidate-source" / "src"
+        ).resolve()
+        assert not (source_root / "rich").exists()
+        assert Path(registry_env["UNIFIED_PERF_SANITIZED_ROOT"]) == (
+            environment_root / "candidate-registry-source"
+        ).resolve()
+        _, payload = check_performance._run(
+            check_performance._python_argv(
+                "\nimport unified_cli\n"
+                "import unified_cli.cli\n"
+                "print(unified_cli.__version__)\n"
+            ),
+            candidate_env,
+        )
+        assert payload.decode("ascii").strip() == check_performance.CORE_VERSION
+        assert not sentinel.exists()
+        assert not marker.exists()
+
+
 def test_general_bootstrap_uses_empty_cwd_and_defeats_candidate_shadow_modules(
     tmp_path,
 ):
@@ -698,6 +758,434 @@ def test_entrypoint_and_provider_subprocess_canaries_are_preserved():
         )
 
 
+@pytest.mark.parametrize("tampering", ("remove", "replace"))
+def test_allowed_provider_cannot_tamper_with_the_inherited_process_scope(
+    tampering,
+):
+    with check_performance.isolated_environment(ROOT) as (env, marker, fixture):
+        child = check_performance._source_environment(env, ROOT)
+        child["UNIFIED_PERF_ALLOWED_EXECUTABLE"] = str(fixture)
+        statement = (
+            "environment.pop('UNIFIED_PERF_PROCESS_SCOPE')"
+            if tampering == "remove"
+            else "environment['UNIFIED_PERF_PROCESS_SCOPE'] = 'replacement'"
+        )
+        code = f'''
+import os
+import subprocess
+
+environment = os.environ.copy()
+{statement}
+try:
+    subprocess.run([{str(fixture)!r}, "-p", "scope probe"], env=environment)
+except RuntimeError:
+    pass
+'''
+        check_performance._run(check_performance._python_argv(code), child)
+        assert marker.read_text(encoding="utf-8").startswith("process-scope:")
+
+
+@pytest.mark.parametrize(
+    ("attack", "marker_kind"),
+    (("executable", "subprocess:"), ("scope", "process-scope:")),
+)
+def test_direct_posixsubprocess_launch_obeys_executable_and_scope_policy(
+    attack, marker_kind,
+):
+    pytest.importorskip("_posixsubprocess")
+    with check_performance.isolated_environment(ROOT) as (env, marker, fixture):
+        child = check_performance._source_environment(env, ROOT)
+        child["UNIFIED_PERF_ALLOWED_EXECUTABLE"] = str(fixture)
+        child["FAKE_PROVIDER"] = "claude"
+        code = f'''
+import _posixsubprocess
+import os
+
+if {attack!r} == "executable":
+    executables = (os.fsencode("/forbidden-provider"),)
+    environment = None
+else:
+    executables = (os.fsencode({str(fixture)!r}),)
+    environment = [
+        os.fsencode(key) + b"=" + os.fsencode(value)
+        for key, value in os.environ.items()
+        if key != "UNIFIED_PERF_PROCESS_SCOPE"
+    ]
+try:
+    _posixsubprocess.fork_exec(
+        [executables[0]], executables, True, (), None, environment,
+    )
+except RuntimeError:
+    pass
+else:
+    raise AssertionError("direct low-level launch was not blocked")
+'''
+        check_performance._run(check_performance._python_argv(code), child)
+        assert marker.read_text(encoding="utf-8").startswith(marker_kind)
+
+
+def test_guarded_posixsubprocess_preserves_normal_allowed_popen():
+    pytest.importorskip("_posixsubprocess")
+    with check_performance.isolated_environment(ROOT) as (env, marker, fixture):
+        child = check_performance._source_environment(env, ROOT)
+        child["UNIFIED_PERF_ALLOWED_EXECUTABLE"] = str(fixture)
+        child["FAKE_PROVIDER"] = "claude"
+        code = f'''
+import os
+import subprocess
+
+completed = subprocess.run(
+    [{str(fixture)!r}, "-p", "scope probe"],
+    env=os.environ.copy(),
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    preexec_fn=lambda: None,
+)
+assert completed.returncode == 0
+'''
+        check_performance._run(check_performance._python_argv(code), child)
+        assert not marker.exists()
+
+
+@pytest.mark.parametrize("load_path", ("reload", "alternate-loader"))
+def test_posixsubprocess_module_reload_consistency(load_path):
+    pytest.importorskip("_posixsubprocess")
+    with check_performance.isolated_environment(ROOT) as (env, marker, fixture):
+        child = check_performance._source_environment(env, ROOT)
+        child["UNIFIED_PERF_ALLOWED_EXECUTABLE"] = str(fixture)
+        code = f'''
+import importlib
+import importlib.machinery
+import importlib.util
+import os
+import _posixsubprocess
+
+def assert_checked(fork_exec):
+    executable = os.fsencode("/forbidden-provider")
+    try:
+        fork_exec([executable], (executable,), True, (), None, None)
+    except RuntimeError:
+        return
+    except TypeError as exc:
+        raise AssertionError("unchecked fork_exec callable was exposed") from exc
+    raise AssertionError("unchecked fork_exec callable was exposed")
+
+if {load_path!r} == "reload":
+    try:
+        reloaded = importlib.reload(_posixsubprocess)
+    except RuntimeError:
+        pass
+    else:
+        assert_checked(reloaded.fork_exec)
+else:
+    spec = importlib.machinery.PathFinder.find_spec("_posixsubprocess")
+    if spec is not None and spec.loader is not None:
+        try:
+            alternate = importlib.util.module_from_spec(spec)
+            if alternate is not _posixsubprocess:
+                spec.loader.exec_module(alternate)
+        except RuntimeError:
+            pass
+        except (ImportError, TypeError):
+            pass
+        else:
+            assert_checked(alternate.fork_exec)
+'''
+        check_performance._run(check_performance._python_argv(code), child)
+        if marker.exists():
+            assert marker.read_text(encoding="utf-8").startswith("import:")
+
+
+@pytest.mark.skipif(not hasattr(os, "setsid"), reason="setsid is unavailable")
+def test_guard_prevents_a_measured_child_from_leaving_its_process_scope():
+    with check_performance.isolated_environment(ROOT) as (env, marker, _fixture):
+        child = check_performance._source_environment(env, ROOT)
+        check_performance._run(check_performance._python_argv((
+            "import os\n"
+            "try: os.setsid()\n"
+            "except RuntimeError: pass\n"
+        )), child)
+        assert marker.read_text(encoding="utf-8") == (
+            "process-scope:session-control\n"
+        )
+
+
+def test_native_environment_scope_removal_is_blocked_without_banning_ctypes():
+    with check_performance.isolated_environment(ROOT) as (env, marker, _fixture):
+        child = check_performance._source_environment(env, ROOT)
+        check_performance._run(check_performance._python_argv((
+            "import ctypes\n"
+            "try: ctypes.CDLL(None).unsetenv\n"
+            "except RuntimeError: pass\n"
+        )), child)
+        assert marker.read_text(encoding="utf-8") == (
+            "native-process:unsetenv\n"
+        )
+
+
+@pytest.mark.parametrize("operation", ("write", "rename"))
+def test_ext_import_cannot_replace_shared_guard_even_after_env_tampering(
+    tmp_path, operation,
+):
+    candidate = _reference_copy(tmp_path, name="candidate-" + operation)
+    if operation == "write":
+        attack = (
+            "target = os.path.join(os.environ['UNIFIED_PERF_GUARD_ROOT'], "
+            "'sitecustomize.py')\n"
+            "try:\n"
+            "    open(target, 'w').write('raise RuntimeError(\"compromised\")\\n')\n"
+            "except RuntimeError:\n"
+            "    pass\n"
+        )
+    else:
+        attack = (
+            "target = os.path.join(os.environ['UNIFIED_PERF_GUARD_ROOT'], "
+            "'sitecustomize.py')\n"
+            "try:\n"
+            "    os.rename(target, target + '.disabled')\n"
+            "except RuntimeError:\n"
+            "    pass\n"
+        )
+    _append_ext_candidate(
+        candidate,
+        "import os\n"
+        "os.environ.pop('UNIFIED_PERF_FORBID_MUTATIONS', None)\n"
+        "os.environ.pop('UNIFIED_PERF_GUARD_MARKER', None)\n"
+        + attack,
+    )
+    metric = _short(check_performance.load_config(
+        check_performance.DEFAULT_BASELINE
+    )["metrics"]["ext_import"], samples=1)
+
+    with check_performance.isolated_environment(ROOT) as (env, marker, _fixture):
+        child = check_performance._source_environment(env, candidate)
+        guard = Path(env["UNIFIED_PERF_GUARD_ROOT"]) / "sitecustomize.py"
+        original = guard.read_bytes()
+        with pytest.raises(check_performance.MeasurementError, match="forbidden action"):
+            check_performance._measure_ext_import(metric, child, marker)
+        assert marker.read_text(encoding="utf-8").startswith("mutation:")
+        assert guard.read_bytes() == original
+        assert not Path(str(guard) + ".disabled").exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork is unavailable")
+def test_ext_import_cannot_fork_even_after_env_tampering(tmp_path):
+    candidate = _reference_copy(tmp_path, name="candidate-fork")
+    _append_ext_candidate(
+        candidate,
+        "import os\n"
+        "os.environ.pop('UNIFIED_PERF_FORBID_MUTATIONS', None)\n"
+        "try:\n"
+        "    os.fork()\n"
+        "except RuntimeError:\n"
+        "    pass\n",
+    )
+    metric = _short(check_performance.load_config(
+        check_performance.DEFAULT_BASELINE
+    )["metrics"]["ext_import"], samples=1)
+    with check_performance.isolated_environment(ROOT) as (env, marker, _fixture):
+        child = check_performance._source_environment(env, candidate)
+        with pytest.raises(check_performance.MeasurementError, match="forbidden action"):
+            check_performance._measure_ext_import(metric, child, marker)
+        assert marker.read_text(encoding="utf-8").startswith("fork:os.fork")
+
+
+def test_ext_import_cannot_leave_an_af_unix_endpoint(tmp_path):
+    candidate = _reference_copy(tmp_path, name="candidate-unix-socket")
+    _append_ext_candidate(
+        candidate,
+        "import os\n"
+        "import socket\n"
+        "endpoint = os.path.join(os.environ['TMPDIR'], 'candidate.sock')\n"
+        "channel = socket.socket(socket.AF_UNIX)\n"
+        "try:\n"
+        "    channel.bind(endpoint)\n"
+        "except RuntimeError:\n"
+        "    pass\n"
+        "finally:\n"
+        "    channel.close()\n",
+    )
+    metric = _short(check_performance.load_config(
+        check_performance.DEFAULT_BASELINE
+    )["metrics"]["ext_import"], samples=1)
+    with check_performance.isolated_environment(ROOT) as (env, marker, _fixture):
+        child = check_performance._source_environment(env, candidate)
+        endpoint = Path(env["TMPDIR"]) / "candidate.sock"
+        with pytest.raises(check_performance.MeasurementError, match="forbidden action"):
+            check_performance._measure_ext_import(metric, child, marker)
+        assert marker.read_text(encoding="utf-8").startswith("socket:candidate.sock")
+        assert not endpoint.exists()
+
+
+def test_guard_integrity_preflight_blocks_the_next_reference_child(tmp_path):
+    reference = _reference_copy(tmp_path, name="reference-integrity")
+    manifest = check_performance._validate_reference_manifest(
+        reference,
+        expected_sha=check_performance.REFERENCE_SHA,
+        expected_digest=check_performance.source_tree_digest(reference),
+    )
+    sentinel = tmp_path / "compromised-guard-executed"
+    with check_performance.isolated_environment(ROOT) as (env, _marker, _fixture):
+        guard = Path(env["UNIFIED_PERF_GUARD_ROOT"]) / "sitecustomize.py"
+        guard.write_text(
+            "from pathlib import Path\n"
+            "import os\n"
+            "Path(os.environ['GUARD_SENTINEL']).write_text('executed')\n",
+            encoding="utf-8",
+        )
+
+        def reference_once(child):
+            probe = dict(child)
+            probe["GUARD_SENTINEL"] = str(sentinel)
+            check_performance._run(
+                check_performance._python_argv("\nimport unified_cli\n"), probe,
+            )
+            return 1.0
+
+        with pytest.raises(check_performance.MeasurementError, match="integrity"):
+            check_performance._fresh_reference_once(manifest, env, reference_once)
+        assert not sentinel.exists()
+
+
+def test_ext_import_normal_measurement_shape_is_preserved():
+    metric = _short(check_performance.load_config(
+        check_performance.DEFAULT_BASELINE
+    )["metrics"]["ext_import"], samples=2)
+    with check_performance.isolated_environment(ROOT) as (env, marker, _fixture):
+        candidate = check_performance._source_environment(env, ROOT)
+        samples = check_performance._measure_ext_import(metric, candidate, marker)
+        assert len(samples) == 2
+        assert all(value >= 0 for value in samples)
+        assert not marker.exists()
+
+
+def test_candidate_can_write_only_to_disposable_state_roots_and_devnull():
+    with check_performance.isolated_environment(ROOT) as (env, marker, _fixture):
+        child = check_performance._source_environment(env, ROOT)
+        _, payload = check_performance._run(
+            check_performance._python_argv(r'''
+import os
+from pathlib import Path
+
+for key in ("HOME", "TMPDIR", "UNIFIED_PERF_WORKSPACE"):
+    target = Path(os.environ[key]) / (key.lower() + ".state")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("ok", encoding="utf-8")
+directory_fd = os.open(os.environ["HOME"], os.O_RDONLY)
+try:
+    file_fd = os.open(
+        "dir-fd.state", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600,
+        dir_fd=directory_fd,
+    )
+    os.close(file_fd)
+finally:
+    os.close(directory_fd)
+with open(os.devnull, "wb") as handle:
+    handle.write(b"ok")
+print("ok")
+'''),
+            child,
+        )
+        assert payload == b"ok\n"
+        assert not marker.exists()
+
+
+@pytest.mark.parametrize("protected", ("guard", "fixture"))
+def test_candidate_cannot_temporarily_rename_protected_path_via_directory_fd(
+    protected,
+):
+    with check_performance.isolated_environment(ROOT) as (env, marker, fixture):
+        target = (
+            Path(env["UNIFIED_PERF_GUARD_ROOT"]) / "sitecustomize.py"
+            if protected == "guard"
+            else fixture
+        )
+        original = target.read_bytes()
+        child = check_performance._source_environment(env, ROOT)
+        child["ATTACK_PARENT"] = str(target.parent)
+        child["ATTACK_NAME"] = target.name
+        check_performance._run(
+            check_performance._python_argv(r'''
+import os
+
+os.chdir(os.environ["HOME"])
+directory_fd = os.open(os.environ["ATTACK_PARENT"], os.O_RDONLY)
+name = os.environ["ATTACK_NAME"]
+held = name + ".held"
+try:
+    try:
+        os.rename(
+            name, held, src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+        )
+    except RuntimeError:
+        pass
+    else:
+        os.rename(
+            held, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd,
+        )
+finally:
+    os.close(directory_fd)
+'''),
+            child,
+        )
+        assert marker.read_text(encoding="utf-8").startswith("mutation:")
+        assert target.read_bytes() == original
+        assert not target.with_name(target.name + ".held").exists()
+
+
+@pytest.mark.parametrize("protected", ("guard", "fixture"))
+def test_candidate_cannot_temporarily_write_protected_path_via_directory_fd(
+    protected,
+):
+    with check_performance.isolated_environment(ROOT) as (env, marker, fixture):
+        target = (
+            Path(env["UNIFIED_PERF_GUARD_ROOT"]) / "sitecustomize.py"
+            if protected == "guard"
+            else fixture
+        )
+        original = target.read_bytes()
+        child = check_performance._source_environment(env, ROOT)
+        child["ATTACK_PARENT"] = str(target.parent)
+        child["ATTACK_NAME"] = target.name
+        child["ATTACK_ORIGINAL"] = original.hex()
+        check_performance._run(
+            check_performance._python_argv(r'''
+import os
+
+os.chdir(os.environ["HOME"])
+directory_fd = os.open(os.environ["ATTACK_PARENT"], os.O_RDONLY)
+name = os.environ["ATTACK_NAME"]
+try:
+    try:
+        file_fd = os.open(
+            name, os.O_WRONLY | os.O_TRUNC, dir_fd=directory_fd,
+        )
+    except RuntimeError:
+        pass
+    else:
+        try:
+            os.write(file_fd, b"changed")
+        finally:
+            os.close(file_fd)
+        original = bytes.fromhex(os.environ["ATTACK_ORIGINAL"])
+        file_fd = os.open(
+            name, os.O_WRONLY | os.O_TRUNC, dir_fd=directory_fd,
+        )
+        try:
+            while original:
+                original = original[os.write(file_fd, original):]
+        finally:
+            os.close(file_fd)
+finally:
+    os.close(directory_fd)
+'''),
+            child,
+        )
+        assert marker.read_text(encoding="utf-8").startswith("mutation:")
+        assert target.read_bytes() == original
+
+
 def test_candidate_after_cannot_mutate_verified_reference_or_trigger_future_snapshot(
     tmp_path, monkeypatch,
 ):
@@ -788,7 +1276,7 @@ def test_candidate_cannot_fork_watcher_for_future_reference_snapshot(
 def test_candidate_mutation_guard_fails_closed_on_ctypes_audit_bypass():
     with check_performance.isolated_environment(ROOT) as (env, marker, _fixture):
         child = check_performance._source_environment(env, ROOT)
-        child["UNIFIED_PERF_FORBID_MUTATIONS"] = "1"
+        child["UNIFIED_PERF_FORBID_CTYPES"] = "1"
         check_performance._run(
             check_performance._python_argv(
                 "\ntry:\n import ctypes\nexcept RuntimeError:\n pass\n"
@@ -810,6 +1298,267 @@ def test_candidate_mutation_guard_blocks_forkpty():
             child,
         )
         assert marker.read_text(encoding="utf-8").startswith("fork:os.forkpty")
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork is unavailable")
+def test_run_cleans_the_process_group_after_the_direct_child_exits():
+    with check_performance.isolated_environment(ROOT) as (env, marker, _fixture):
+        pid_file = Path(env["TMPDIR"]) / "descendant.pid"
+        completed_file = Path(env["TMPDIR"]) / "descendant.completed"
+        code = f'''
+import os
+import time
+from pathlib import Path
+
+pid_file = Path({str(pid_file)!r})
+completed_file = Path({str(completed_file)!r})
+child = os.fork()
+if child == 0:
+    pid_file.write_text(str(os.getpid()), encoding="ascii")
+    os.close(1)
+    os.close(2)
+    time.sleep(0.5)
+    completed_file.write_text("still-running", encoding="ascii")
+    os._exit(0)
+while not pid_file.exists():
+    time.sleep(0.005)
+os._exit(0)
+'''
+        with pytest.raises(
+            check_performance.MeasurementError, match="left a descendant process",
+        ):
+            check_performance._run(
+                (sys.executable, "-I", "-S", "-B", "-c", code), env,
+            )
+        assert marker.read_text(encoding="utf-8") == (
+            "descendant:process-group\n"
+        )
+        assert pid_file.read_text(encoding="ascii").isdigit()
+        time.sleep(0.7)
+        assert not completed_file.exists()
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork is unavailable")
+def test_run_cleans_a_descendant_that_escapes_the_initial_session():
+    with check_performance.isolated_environment(ROOT) as (env, marker, _fixture):
+        pid_file = Path(env["TMPDIR"]) / "escaped-descendant.pid"
+        completed_file = Path(env["TMPDIR"]) / "escaped-descendant.completed"
+        code = f'''
+import os
+import time
+from pathlib import Path
+
+pid_file = Path({str(pid_file)!r})
+completed_file = Path({str(completed_file)!r})
+child = os.fork()
+if child == 0:
+    os.setsid()
+    pid_file.write_text(str(os.getpid()), encoding="ascii")
+    os.close(1)
+    os.close(2)
+    time.sleep(0.5)
+    completed_file.write_text("still-running", encoding="ascii")
+    os._exit(0)
+while not pid_file.exists():
+    time.sleep(0.005)
+os._exit(0)
+'''
+        with pytest.raises(
+            check_performance.MeasurementError, match="left a descendant process",
+        ):
+            check_performance._run(
+                (sys.executable, "-I", "-S", "-B", "-c", code), env,
+            )
+        assert marker.read_text(encoding="utf-8") == (
+            "descendant:process-scope\n"
+        )
+        assert pid_file.read_text(encoding="ascii").isdigit()
+        time.sleep(0.7)
+        assert not completed_file.exists()
+
+
+@pytest.mark.skipif(
+    not (sys.platform.startswith("linux") or sys.platform == "darwin"),
+    reason="process-scope inventory is only required on macOS and Linux",
+)
+def test_process_scope_inventory_capability_failure_is_fail_closed(monkeypatch):
+    def unavailable(_scope):
+        raise check_performance.MeasurementError(
+            "isolated process scope inspection failed"
+        )
+
+    monkeypatch.setattr(check_performance, "_process_scope_pids", unavailable)
+    with pytest.raises(
+        check_performance.MeasurementError, match="scope inspection failed",
+    ):
+        with check_performance.isolated_environment(ROOT):
+            pass
+
+
+def test_runtime_process_scope_inspection_failure_is_not_silently_ignored(
+    monkeypatch,
+):
+    with check_performance.isolated_environment(ROOT) as (env, _marker, _fixture):
+        def unavailable(_scope):
+            raise check_performance.MeasurementError(
+                "isolated process scope inspection failed"
+            )
+
+        monkeypatch.setattr(check_performance, "_process_scope_pids", unavailable)
+        with pytest.raises(
+            check_performance.MeasurementError, match="scope inspection failed",
+        ):
+            check_performance._run(
+                (sys.executable, "-I", "-S", "-B", "-c", "pass"), env,
+            )
+
+
+def test_linux_process_scope_inventory_matches_only_the_exact_inherited_id(
+    tmp_path,
+):
+    proc_root = tmp_path / "proc"
+    proc_root.mkdir()
+    expected = proc_root / "41001"
+    other = proc_root / "41002"
+    expected.mkdir()
+    other.mkdir()
+    (expected / "environ").write_bytes(
+        b"A=1\0UNIFIED_PERF_PROCESS_SCOPE=expected\0"
+    )
+    (other / "environ").write_bytes(
+        b"UNIFIED_PERF_PROCESS_SCOPE=expected-suffix\0"
+    )
+    assert check_performance._linux_process_scope_pids(
+        "expected", proc_root,
+    ) == [41001]
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected"), (("darwin", [41]), ("linux", [42])),
+)
+def test_process_scope_inventory_routes_for_macos_and_linux(
+    monkeypatch, platform, expected,
+):
+    monkeypatch.setattr(check_performance.sys, "platform", platform)
+    monkeypatch.setattr(
+        check_performance, "_darwin_process_scope_pids", lambda _scope: [41],
+    )
+    monkeypatch.setattr(
+        check_performance, "_linux_process_scope_pids", lambda _scope: [42],
+    )
+    assert check_performance._process_scope_pids("scope") == expected
+
+
+def test_run_timer_excludes_parent_integrity_recheck(monkeypatch):
+    real_check = check_performance._assert_environment_integrity
+    checks = 0
+
+    def delayed_check(env):
+        nonlocal checks
+        checks += 1
+        real_check(env)
+        if checks == 2:
+            time.sleep(0.05)
+
+    monkeypatch.setattr(
+        check_performance, "_assert_environment_integrity", delayed_check,
+    )
+    with check_performance.isolated_environment(ROOT) as (env, _marker, _fixture):
+        child = check_performance._source_environment(env, ROOT)
+        outer_start = time.perf_counter_ns()
+        elapsed, _ = check_performance._run(
+            check_performance._python_argv("\npass\n"), child,
+        )
+        outer_elapsed = (time.perf_counter_ns() - outer_start) / 1_000_000.0
+    assert checks == 2
+    assert outer_elapsed - elapsed >= 40.0
+
+
+def test_run_forwards_explicit_input_bytes():
+    code = "import sys; sys.stdout.buffer.write(sys.stdin.buffer.read())"
+    with check_performance.isolated_environment(ROOT) as (env, _marker, _fixture):
+        _elapsed, payload = check_performance._run(
+            (sys.executable, "-I", "-S", "-B", "-c", code),
+            env,
+            input_bytes=b"hello\n",
+        )
+    assert payload == b"hello\n"
+
+
+def test_pty_checks_protected_candidate_before_launch():
+    manifest = check_performance._read_source_manifest(ROOT)
+    with check_performance.isolated_environment(ROOT) as (env, marker, _fixture):
+        candidate, _ = check_performance._materialize_candidate_environments(
+            manifest, env, Path(env["HOME"]).parent,
+        )
+        target = (
+            Path(candidate["UNIFIED_PERF_DESIGNATED_EXT_ROOT"])
+            / "unified_cli_ext"
+            / "__init__.py"
+        )
+        target.write_text(
+            target.read_text(encoding="utf-8") + "\n# changed after capture\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(check_performance.MeasurementError, match="integrity"):
+            check_performance._pty_prompt_once(candidate, marker)
+        assert not marker.exists()
+
+
+def test_normal_repl_and_stream_relay_measurements_are_preserved():
+    config = check_performance.load_config(check_performance.DEFAULT_BASELINE)
+    stream_metric = _short(config["metrics"]["stream_relay"], samples=1)
+    with check_performance.isolated_environment(ROOT) as (env, marker, _fixture):
+        candidate = check_performance._source_environment(env, ROOT)
+        prompt_elapsed = check_performance._pty_prompt_once(candidate, marker)
+        stream_samples = check_performance._measure_stream_relay(
+            stream_metric, candidate, marker,
+        )
+        assert prompt_elapsed >= 0
+        assert len(stream_samples) == 1
+        assert stream_samples[0] >= 0
+        assert not marker.exists()
+
+
+def test_run_checks_wires_every_candidate_metric_to_captured_sources(
+    tmp_path, monkeypatch,
+):
+    candidate = _reference_copy(tmp_path, name="candidate-run")
+    fixture_source = ROOT / "tests" / "fixtures" / "core_provider_cli.py"
+    fixture_target = candidate / "tests" / "fixtures" / fixture_source.name
+    fixture_target.parent.mkdir(parents=True)
+    shutil.copy2(fixture_source, fixture_target)
+    reference = _reference_copy(tmp_path, name="reference-run")
+    config = copy.deepcopy(check_performance.load_config(
+        check_performance.DEFAULT_BASELINE
+    ))
+    for metric in config["metrics"].values():
+        metric["samples"] = 1
+        metric["warmups"] = 0
+
+    real_reader = check_performance._read_source_manifest
+    changed = False
+
+    def capture_then_change_live_source(root):
+        nonlocal changed
+        manifest = real_reader(root)
+        if Path(root).resolve() == candidate.resolve() and not changed:
+            changed = True
+            live_init = candidate / "src" / "unified_cli" / "__init__.py"
+            live_init.write_text(
+                "raise RuntimeError('live source was reused')\n", encoding="utf-8",
+            )
+            _append_ext_candidate(
+                candidate, "raise RuntimeError('live ext source was reused')\n",
+            )
+        return manifest
+
+    monkeypatch.setattr(
+        check_performance, "_read_source_manifest", capture_then_change_live_source,
+    )
+    report = check_performance.run_checks(config, reference, root=candidate)
+    assert changed
+    assert all("error" not in result for result in report["results"].values())
 
 
 def test_json_report_shape_is_stable_and_contains_no_source_paths():
