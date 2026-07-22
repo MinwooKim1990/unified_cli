@@ -68,6 +68,7 @@ def test_browser_harness_uses_isolated_fixtures_and_coverage_projects():
     assert "manage.list_models = _unexpected_provider_probe" in fixture
     assert "manage.subprocess.Popen = _unexpected_provider_probe" in fixture
     assert "EntryPoint.load = _unexpected_provider_probe" in fixture
+    assert '"UNIFIED_CLI_DISABLE_PLUGINS": "1"' in fixture
     assert "readReadyLine" in spec and "waitForExit" in spec
     assert "#bootstrap=${encodeURIComponent(bootstrapToken)}" in spec
     assert "axe.run(document)" in spec

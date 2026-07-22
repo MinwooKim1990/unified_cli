@@ -18,6 +18,7 @@ os.environ.update({
     "HOME": str(TEST_HOME),
     "XDG_CONFIG_HOME": str(TEST_HOME / "config"),
     "XDG_CACHE_HOME": str(TEST_HOME / "cache"),
+    "UNIFIED_CLI_DISABLE_PLUGINS": "1",
 })
 sys.path.insert(0, str(ROOT / "src"))
 
