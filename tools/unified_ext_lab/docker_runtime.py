@@ -6,9 +6,8 @@ import json
 import math
 import os
 import re
-import shutil
 import stat
-import tempfile
+import sys
 from types import MappingProxyType
 from typing import Dict, Mapping, Optional, Tuple, Union
 
@@ -22,6 +21,7 @@ from .docker import (
     DockerOperation,
     GuestAction,
     LockedContextSnapshot,
+    _parse_env_mapping,
     snapshot_image_context,
     validate_inspect,
 )
@@ -66,10 +66,386 @@ _BUILDX_VERSION_RE = re.compile(
 _LOCAL_IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _MAX_TIMEOUT_SECONDS = 3600.0
+_GUEST_DIRECTORY = os.path.dirname(GUEST_EXECUTABLE)
+_SNAPSHOT_GUEST_PARTS = ("rootfs", "opt", "unified-ext-lab")
+_DERIVED_SNAPSHOT_NAME = "runtime-snapshot"
+# Darwin's sys/fcntl.h defines O_SYMLINK with this stable value. Python 3.9
+# does not expose the constant even though the kernel supports the flag.
+_DARWIN_O_SYMLINK = 0x00200000
 
-# Identity binding and exact argv are unit-tested. Promotion still requires an
-# actual-Docker E2E gate for the copied Docker CLI and copied Buildx companion.
-COPIED_CLI_BUILDX_E2E_REQUIRED = True
+# Container-only conformance never loads Buildx. This compatibility constant
+# remains exported for callers that audited the former build-based design.
+COPIED_CLI_BUILDX_E2E_REQUIRED = False
+
+
+def _directory_identity(metadata: os.stat_result) -> Tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+    )
+
+
+def _require_private_directory(metadata: os.stat_result, description: str) -> None:
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or (hasattr(os, "geteuid") and metadata.st_uid != os.geteuid())
+    ):
+        raise InvariantRefusalError("unsafe " + description)
+
+
+def _synchronize_private_directory(path: str, description: str) -> None:
+    """Synchronize one private directory through a no-follow descriptor."""
+
+    try:
+        expected = os.lstat(path)
+        _require_private_directory(expected, description)
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except InvariantRefusalError:
+        raise
+    except OSError as error:
+        raise InvariantRefusalError(
+            description + " cannot be synchronized"
+        ) from error
+    try:
+        if _directory_identity(os.fstat(descriptor)) != _directory_identity(expected):
+            raise InvariantRefusalError(
+                description + " changed during synchronization"
+            )
+        os.fsync(descriptor)
+    except InvariantRefusalError:
+        raise
+    except OSError as error:
+        raise InvariantRefusalError(
+            description + " cannot be synchronized"
+        ) from error
+    finally:
+        os.close(descriptor)
+
+
+def _require_removed_directory_descriptor(
+    descriptor: int,
+    expected_path: str,
+) -> None:
+    """Prove that rmdir unlinked the directory pinned by ``descriptor``."""
+
+    try:
+        metadata = os.fstat(descriptor)
+    except OSError as error:
+        raise InvariantRefusalError(
+            "derived snapshot changed during removal"
+        ) from error
+    if metadata.st_nlink == 0:
+        return
+    if sys.platform == "darwin":
+        try:
+            import fcntl
+
+            value = fcntl.fcntl(
+                descriptor,
+                fcntl.F_GETPATH,
+                b"\0" * 1024,
+            )
+            descriptor_path = os.fsdecode(value.split(b"\0", 1)[0])
+        except (AttributeError, OSError, ValueError) as error:
+            raise InvariantRefusalError(
+                "derived snapshot removal cannot be proven"
+            ) from error
+        if descriptor_path == expected_path and not os.path.lexists(expected_path):
+            return
+    elif sys.platform.startswith("linux"):
+        try:
+            descriptor_path = os.readlink("/proc/self/fd/{}".format(descriptor))
+        except OSError as error:
+            raise InvariantRefusalError(
+                "derived snapshot removal cannot be proven"
+            ) from error
+        if (
+            descriptor_path == expected_path + " (deleted)"
+            and not os.path.lexists(expected_path)
+        ):
+            return
+    raise InvariantRefusalError("derived snapshot changed during removal")
+
+
+def _open_nondirectory_at(
+    parent: int,
+    name: str,
+    expected: os.stat_result,
+) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    if stat.S_ISLNK(expected.st_mode):
+        if sys.platform == "darwin":
+            flags |= getattr(os, "O_SYMLINK", _DARWIN_O_SYMLINK)
+        elif sys.platform.startswith("linux") and hasattr(os, "O_PATH"):
+            flags |= os.O_PATH | getattr(os, "O_NOFOLLOW", 0)
+        else:
+            raise InvariantRefusalError(
+                "derived snapshot entry cannot be pinned"
+            )
+    else:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=parent)
+    except OSError as error:
+        raise InvariantRefusalError(
+            "derived snapshot changed during removal"
+        ) from error
+    try:
+        opened = os.fstat(descriptor)
+    except OSError as error:
+        os.close(descriptor)
+        raise InvariantRefusalError(
+            "derived snapshot changed during removal"
+        ) from error
+    if _directory_identity(opened) != _directory_identity(expected):
+        os.close(descriptor)
+        raise InvariantRefusalError("derived snapshot changed during removal")
+    return descriptor
+
+
+def _require_unlinked_descriptor(
+    descriptor: int,
+    original_links: int,
+) -> None:
+    try:
+        current_links = os.fstat(descriptor).st_nlink
+    except OSError as error:
+        raise InvariantRefusalError(
+            "derived snapshot changed during removal"
+        ) from error
+    if original_links < 1 or current_links != original_links - 1:
+        raise InvariantRefusalError("derived snapshot changed during removal")
+
+
+class DerivedSnapshotResource:
+    """One state-derived private snapshot with no persisted path input."""
+
+    def __init__(self, path: str) -> None:
+        if (
+            type(path) is not str
+            or not os.path.isabs(path)
+            or os.path.normpath(path) != path
+            or os.path.realpath(path) != path
+            or os.path.basename(path) != _DERIVED_SNAPSHOT_NAME
+        ):
+            raise UsageStateError("invalid derived snapshot path")
+        parent = os.path.dirname(path)
+        try:
+            parent_info = os.lstat(parent)
+        except OSError as error:
+            raise InvariantRefusalError("derived snapshot parent is unavailable") from error
+        _require_private_directory(parent_info, "derived snapshot parent")
+        self.path = path
+        self._parent = parent
+        self._name = _DERIVED_SNAPSHOT_NAME
+
+    def create(self) -> None:
+        if os.path.lexists(self.path):
+            raise InvariantRefusalError("derived snapshot already exists")
+        try:
+            os.mkdir(self.path, 0o700)
+            os.chmod(self.path, 0o700)
+            metadata = os.lstat(self.path)
+        except OSError as error:
+            raise InvariantRefusalError("derived snapshot cannot be created") from error
+        _require_private_directory(metadata, "derived snapshot")
+        # First commit the new directory's mode and metadata, then its entry in
+        # the durable state directory. snapshot_image_context() resynchronizes
+        # this root after populating its complete tree.
+        _synchronize_private_directory(self.path, "derived snapshot")
+        _synchronize_private_directory(self._parent, "derived snapshot parent")
+
+    def present(self) -> bool:
+        try:
+            metadata = os.lstat(self.path)
+        except FileNotFoundError:
+            return False
+        except OSError as error:
+            raise InvariantRefusalError("derived snapshot cannot be inspected") from error
+        _require_private_directory(metadata, "derived snapshot")
+        return True
+
+    @staticmethod
+    def _open_directory_at(parent: int, name: str, expected: os.stat_result) -> int:
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=parent,
+            )
+        except OSError as error:
+            raise InvariantRefusalError("derived snapshot changed during removal") from error
+        opened = os.fstat(descriptor)
+        if _directory_identity(opened) != _directory_identity(expected):
+            os.close(descriptor)
+            raise InvariantRefusalError("derived snapshot changed during removal")
+        return descriptor
+
+    @classmethod
+    def _remove_contents(
+        cls,
+        descriptor: int,
+        device: int,
+        expected_path: str,
+    ) -> None:
+        try:
+            names = os.listdir(descriptor)
+        except OSError as error:
+            raise InvariantRefusalError("derived snapshot cannot be enumerated") from error
+        for name in names:
+            if type(name) is not str or not name or name in (".", "..") or "/" in name:
+                raise InvariantRefusalError("invalid derived snapshot entry")
+            try:
+                metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            except OSError as error:
+                raise InvariantRefusalError("derived snapshot changed during removal") from error
+            if stat.S_ISDIR(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode):
+                if metadata.st_dev != device:
+                    raise InvariantRefusalError("derived snapshot crosses a filesystem")
+                child = cls._open_directory_at(descriptor, name, metadata)
+                try:
+                    child_path = os.path.join(expected_path, name)
+                    cls._remove_contents(child, device, child_path)
+                    try:
+                        current = os.stat(
+                            name,
+                            dir_fd=descriptor,
+                            follow_symlinks=False,
+                        )
+                    except OSError as error:
+                        raise InvariantRefusalError(
+                            "derived snapshot changed during removal"
+                        ) from error
+                    if _directory_identity(current) != _directory_identity(metadata):
+                        raise InvariantRefusalError(
+                            "derived snapshot changed during removal"
+                        )
+                    try:
+                        os.rmdir(name, dir_fd=descriptor)
+                    except OSError as error:
+                        raise InvariantRefusalError(
+                            "derived snapshot changed during removal"
+                        ) from error
+                    _require_removed_directory_descriptor(child, child_path)
+                finally:
+                    os.close(child)
+            else:
+                if not (
+                    stat.S_ISREG(metadata.st_mode)
+                    or stat.S_ISLNK(metadata.st_mode)
+                ):
+                    raise InvariantRefusalError(
+                        "unsupported derived snapshot entry"
+                    )
+                child = _open_nondirectory_at(descriptor, name, metadata)
+                try:
+                    try:
+                        current = os.stat(
+                            name,
+                            dir_fd=descriptor,
+                            follow_symlinks=False,
+                        )
+                    except OSError as error:
+                        raise InvariantRefusalError(
+                            "derived snapshot changed during removal"
+                        ) from error
+                    if _directory_identity(current) != _directory_identity(metadata):
+                        raise InvariantRefusalError(
+                            "derived snapshot changed during removal"
+                        )
+                    try:
+                        os.unlink(name, dir_fd=descriptor)
+                    except OSError as error:
+                        raise InvariantRefusalError(
+                            "derived snapshot changed during removal"
+                        ) from error
+                    _require_unlinked_descriptor(child, metadata.st_nlink)
+                finally:
+                    os.close(child)
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            raise InvariantRefusalError("derived snapshot cannot be synchronized") from error
+
+    def remove(self) -> bool:
+        try:
+            parent_info = os.lstat(self._parent)
+        except OSError as error:
+            raise InvariantRefusalError("derived snapshot parent is unavailable") from error
+        _require_private_directory(parent_info, "derived snapshot parent")
+        try:
+            parent = os.open(
+                self._parent,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+        except OSError as error:
+            raise InvariantRefusalError(
+                "derived snapshot parent changed"
+            ) from error
+        try:
+            try:
+                opened_parent = os.fstat(parent)
+            except OSError as error:
+                raise InvariantRefusalError(
+                    "derived snapshot parent changed"
+                ) from error
+            if _directory_identity(opened_parent) != _directory_identity(parent_info):
+                raise InvariantRefusalError("derived snapshot parent changed")
+            try:
+                metadata = os.stat(self._name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+            except OSError as error:
+                raise InvariantRefusalError("derived snapshot cannot be inspected") from error
+            _require_private_directory(metadata, "derived snapshot")
+            child = self._open_directory_at(parent, self._name, metadata)
+            try:
+                self._remove_contents(child, metadata.st_dev, self.path)
+                try:
+                    current = os.stat(
+                        self._name,
+                        dir_fd=parent,
+                        follow_symlinks=False,
+                    )
+                except OSError as error:
+                    raise InvariantRefusalError(
+                        "derived snapshot changed during removal"
+                    ) from error
+                if _directory_identity(current) != _directory_identity(metadata):
+                    raise InvariantRefusalError(
+                        "derived snapshot changed during removal"
+                    )
+                os.rmdir(self._name, dir_fd=parent)
+                _require_removed_directory_descriptor(child, self.path)
+                os.fsync(parent)
+            except InvariantRefusalError:
+                raise
+            except OSError as error:
+                raise InvariantRefusalError(
+                    "derived snapshot cannot be removed"
+                ) from error
+            finally:
+                os.close(child)
+            return True
+        finally:
+            os.close(parent)
 
 
 def _safe_candidate(path: str, description: str) -> Optional[str]:
@@ -229,6 +605,13 @@ def validate_locked_base_inspect(
         or record.get("Architecture") != profile.architecture
     ):
         raise InvariantRefusalError("locked base image or platform drift")
+    config = record.get("Config")
+    if type(config) is not dict:
+        raise InvariantRefusalError("locked base environment drift")
+    try:
+        _parse_env_mapping(config.get("Env"))
+    except InvariantRefusalError as error:
+        raise InvariantRefusalError("locked base environment drift") from error
     return MappingProxyType(record)
 
 
@@ -236,7 +619,8 @@ class _RealDockerIdentityCommands:
     """Shared cleanup/list grammar for one deterministic resource plan."""
 
     uses_resource_ids = True
-    cleanup_roles = (ResourceRole.CONTAINER, ResourceRole.IMAGE)
+    resource_id_roles = (ResourceRole.CONTAINER, ResourceRole.IMAGE)
+    cleanup_roles = (ResourceRole.CONTAINER,)
     create_volume_roles: Tuple[ResourceRole, ...] = ()
 
     def __init__(self, spec: Union[DockerLabSpec, DockerCleanupSpec]) -> None:
@@ -261,8 +645,14 @@ class _RealDockerIdentityCommands:
             noun = "image"
         elif role is ResourceRole.CONTAINER:
             noun = "container"
+        elif role in (
+            ResourceRole.WORKSPACE,
+            ResourceRole.AUTH,
+            ResourceRole.TOOL,
+        ):
+            noun = "volume"
         else:
-            raise UsageStateError("real-Docker volumes are not managed")
+            raise UsageStateError("real-Docker resource role is not managed")
         target = (
             self._spec.resource(role).name
             if resource_id is None
@@ -273,11 +663,20 @@ class _RealDockerIdentityCommands:
     def list_owned(self, role: ResourceRole) -> Tuple[str, ...]:
         if role is ResourceRole.IMAGE:
             noun = "image"
+            all_flag = ("--all",)
         elif role is ResourceRole.CONTAINER:
             noun = "container"
+            all_flag = ("--all",)
+        elif role in (
+            ResourceRole.WORKSPACE,
+            ResourceRole.AUTH,
+            ResourceRole.TOOL,
+        ):
+            noun = "volume"
+            all_flag = ()
         else:
-            raise UsageStateError("real-Docker volumes are not managed")
-        return self.prefix + (noun, "ls", "--all", "--quiet") + _label_args(
+            raise UsageStateError("real-Docker resource role is not managed")
+        return self.prefix + (noun, "ls") + all_flag + ("--quiet",) + _label_args(
             self._spec.resource(role)
         )
 
@@ -289,12 +688,20 @@ class _RealDockerIdentityCommands:
         elif role is ResourceRole.CONTAINER:
             noun = "container"
             selector = "name=" + resource.name
+        elif role in (
+            ResourceRole.WORKSPACE,
+            ResourceRole.AUTH,
+            ResourceRole.TOOL,
+        ):
+            noun = "volume"
+            selector = "name=" + resource.name
         else:
-            raise UsageStateError("real-Docker volumes are not managed")
+            raise UsageStateError("real-Docker resource role is not managed")
+        all_flag = ("--all",) if role in self.resource_id_roles else ()
         return self.prefix + (
             noun,
             "ls",
-            "--all",
+        ) + all_flag + (
             "--quiet",
             "--filter",
             selector,
@@ -364,9 +771,18 @@ class _RealDockerIdentityCommands:
             _resource_id(ResourceRole.IMAGE, resource_id),
         )
 
+    def remove_volume(self, role: ResourceRole) -> Tuple[str, ...]:
+        if role not in (
+            ResourceRole.WORKSPACE,
+            ResourceRole.AUTH,
+            ResourceRole.TOOL,
+        ):
+            raise UsageStateError("role is not a managed volume")
+        return self.prefix + ("volume", "rm", self._spec.resource(role).name)
+
     def _validate_identity_inspect(
         self, role: ResourceRole, payload: object
-    ) -> str:
+    ) -> Optional[str]:
         record = _inspect_record(payload, "managed resource inspect response")
         resource = self._spec.resource(role)
         if role is ResourceRole.IMAGE:
@@ -387,16 +803,27 @@ class _RealDockerIdentityCommands:
                 or record.get("Name") != "/" + resource.name
             ):
                 raise InvariantRefusalError("managed container identity drift")
+        elif role in (
+            ResourceRole.WORKSPACE,
+            ResourceRole.AUTH,
+            ResourceRole.TOOL,
+        ):
+            resource_id = None
+            if (
+                record.get("Name") != resource.name
+                or record.get("Labels") != dict(resource.labels)
+            ):
+                raise InvariantRefusalError("managed volume identity drift")
         else:
-            raise UsageStateError("real-Docker volumes are not managed")
+            raise UsageStateError("real-Docker resource role is not managed")
         return resource_id
 
-    def validate_inspect(self, role: ResourceRole, payload: object) -> str:
+    def validate_inspect(self, role: ResourceRole, payload: object) -> Optional[str]:
         return self._validate_identity_inspect(role, payload)
 
     def validate_cleanup_inspect(
         self, role: ResourceRole, payload: object
-    ) -> str:
+    ) -> Optional[str]:
         """Validate conservative name-and-label discovery without durable ID."""
 
         return self._validate_identity_inspect(role, payload)
@@ -426,9 +853,11 @@ class _RealDockerIdentityCommands:
 
 
 class RealDockerCommandBuilder(_RealDockerIdentityCommands):
-    """Forward-run grammar bound to a local base ID and private snapshot."""
+    """Container-only grammar bound to a local base ID and private snapshot."""
 
+    builds_image = False
     cleanup_only = False
+    planned_roles = (ResourceRole.CONTAINER,)
 
     def __init__(self, spec: DockerLabSpec, profile: RealDockerProfile) -> None:
         if type(spec) is not DockerLabSpec or type(profile) is not RealDockerProfile:
@@ -443,37 +872,80 @@ class RealDockerCommandBuilder(_RealDockerIdentityCommands):
         super().__init__(spec)
         self._profile = profile
         self._base = DockerCommandBuilder(spec)
+        self._expected_container_env: Optional[Tuple[str, ...]] = None
+        source = os.path.join(spec.context, *_SNAPSHOT_GUEST_PARTS)
+        if (
+            os.path.realpath(source) != source
+            or not os.path.isdir(source)
+            or _GUEST_DIRECTORY != "/opt/unified-ext-lab"
+        ):
+            raise InvariantRefusalError("real-Docker snapshot bind is invalid")
+        self._bind_mount = (source, _GUEST_DIRECTORY)
+
+    @property
+    def bind_mount(self) -> Tuple[str, str]:
+        return self._bind_mount
 
     def inspect_base_image(self) -> Tuple[str, ...]:
-        return self.prefix + ("image", "inspect", self._spec.base_image)
+        return self.prefix + ("image", "inspect", self._profile.base_reference)
 
     def validate_base_image(self, payload: object) -> str:
         record = validate_locked_base_inspect(
             self._profile, payload, expected_id=self._spec.base_image
         )
+        base_environment = _parse_env_mapping(record["Config"]["Env"])
+        fixed_environment = _parse_env_mapping(list(FIXED_ENV))
+        base_environment.update(fixed_environment)
+        expected = tuple(
+            "{}={}".format(name, value)
+            for name, value in base_environment.items()
+        )
+        if (
+            self._expected_container_env is not None
+            and _parse_env_mapping(list(self._expected_container_env))
+            != _parse_env_mapping(list(expected))
+        ):
+            raise InvariantRefusalError("locked base environment drift")
+        self._expected_container_env = expected
         return _resource_id(ResourceRole.IMAGE, record["Id"])
 
     def build_image(self) -> Tuple[str, ...]:
-        argv = self._base.build_image()
-        return self.prefix + (
-            "build",
-            "--platform",
-            self._profile.platform,
-        ) + argv[2:]
+        raise UsageStateError("real-Docker conformance does not build images")
 
     def create_volume(self, role: ResourceRole) -> Tuple[str, ...]:
         raise UsageStateError("real-Docker named volumes are forbidden")
 
     def create_container(self) -> Tuple[str, ...]:
-        argv = self._base.create_container()
+        # The bind source is a private, hash-locked snapshot. Revalidate it at
+        # the last command-construction point before exposing it to Docker.
+        self._base.validate_context()
+        argv = list(self._base.create_container())
+        if argv[:3] != [self._spec.docker_executable, "container", "create"]:
+            raise InvariantRefusalError("real-Docker container grammar drift")
+        if argv[-2:] != [self._spec.image.name, "idle"]:
+            raise InvariantRefusalError("real-Docker container image grammar drift")
+        argv[-2] = self._spec.base_image
+        try:
+            insertion = argv.index("--env")
+        except ValueError as error:
+            raise InvariantRefusalError("real-Docker container grammar drift") from error
+        source, target = self._bind_mount
+        argv[insertion:insertion] = [
+            "--mount",
+            "type=bind,src={},dst={},readonly,bind-propagation=rprivate".format(
+                source, target
+            ),
+        ]
         return self.prefix + (
             "container",
             "create",
+            "--pull=never",
             "--platform",
             self._profile.platform,
-        ) + argv[3:]
+        ) + tuple(argv[3:])
 
     def start_container(self, resource_id: str) -> Tuple[str, ...]:
+        self._base.validate_context()
         return self.prefix + (
             "container",
             "start",
@@ -486,9 +958,10 @@ class RealDockerCommandBuilder(_RealDockerIdentityCommands):
         resource_id: str,
         extra: Tuple[str, ...] = (),
     ) -> Tuple[str, ...]:
+        # Every guest command executes code through the live read-only bind.
+        # Revalidate the complete private snapshot immediately beforehand.
+        self._base.validate_context()
         if action is GuestAction.INSTALL:
-            # Revalidate the private snapshot fixture immediately before the
-            # guest is allowed to copy its image-baked counterpart.
             self._base.exec_guest(action)
         return super().exec_guest(action, resource_id, extra)
 
@@ -496,7 +969,21 @@ class RealDockerCommandBuilder(_RealDockerIdentityCommands):
         raise UsageStateError("real-Docker named volumes are forbidden")
 
     def validate_inspect(self, role: ResourceRole, payload: object) -> str:
-        validate_inspect(self._spec, role, payload)
+        if role is ResourceRole.CONTAINER:
+            if self._expected_container_env is None:
+                raise InvariantRefusalError(
+                    "locked base environment is not bound"
+                )
+            validate_inspect(
+                self._spec,
+                role,
+                payload,
+                container_image=self._spec.base_image,
+                bind_mount=self._bind_mount,
+                container_env=self._expected_container_env,
+            )
+        else:
+            validate_inspect(self._spec, role, payload)
         resource_id = super().validate_inspect(role, payload)
         if role is ResourceRole.IMAGE:
             record = _inspect_record(payload, "managed image inspect response")
@@ -514,7 +1001,6 @@ class RealDockerCommandBuilder(_RealDockerIdentityCommands):
 
         commands = [
             (self.inspect_base_image(), DockerOperation.INSPECT_BASE_IMAGE),
-            (self.build_image(), DockerOperation.BUILD_IMAGE),
             (self.create_container(), DockerOperation.CREATE_CONTAINER),
         ]
         for role in self.cleanup_roles:
@@ -551,10 +1037,22 @@ class RealDockerCleanupCommandBuilder(_RealDockerIdentityCommands):
         if type(spec) is not DockerCleanupSpec:
             raise UsageStateError("invalid real-Docker cleanup spec")
         super().__init__(spec)
+        self.cleanup_roles = spec.managed_roles
+        self.planned_roles = (
+            (
+                ResourceRole.IMAGE,
+                ResourceRole.CONTAINER,
+                ResourceRole.WORKSPACE,
+                ResourceRole.AUTH,
+                ResourceRole.TOOL,
+            )
+            if ResourceRole.IMAGE in spec.managed_roles
+            else (ResourceRole.CONTAINER,)
+        )
 
 
 class RealDockerRuntime:
-    """Own one copied Docker CLI and, for forward runs, one copied Buildx."""
+    """Run container-only conformance from a local locked base and snapshot."""
 
     def __init__(
         self,
@@ -594,19 +1092,15 @@ class RealDockerRuntime:
         self._local_base_id: Optional[str] = None
         self._snapshot_root: Optional[str] = None
         self._snapshot: Optional[LockedContextSnapshot] = None
+        self._snapshot_resource: Optional[DerivedSnapshotResource] = None
 
     @classmethod
     def discover(cls) -> "RealDockerRuntime":
         profile = load_real_docker_profile()
         profile.require_routable()
         executable = discover_docker_executable()
-        buildx = discover_buildx_executable()
         runner = SubprocessRunner(executable)
         try:
-            bind = getattr(runner, "bind_docker_buildx", None)
-            if not callable(bind):
-                raise InvariantRefusalError("Docker runner cannot bind Buildx")
-            bind(buildx)
             return cls(executable, runner, profile)
         except BaseException:
             runner.close()
@@ -631,21 +1125,14 @@ class RealDockerRuntime:
         self.close()
 
     def close(self) -> None:
-        snapshot_error = None
-        if self._snapshot_root is not None:
-            try:
-                shutil.rmtree(self._snapshot_root)
-            except FileNotFoundError:
-                pass
-            except BaseException as error:  # pragma: no cover - OS fault path.
-                snapshot_error = error
-            self._snapshot_root = None
-            self._snapshot = None
+        # The lifecycle owns removal of a derived snapshot. Closing the client
+        # must not make a leaked execution resource invisible to recovery.
+        self._snapshot_root = None
+        self._snapshot = None
+        self._snapshot_resource = None
         close = getattr(self.runner, "close", None)
         if callable(close):
             close()
-        if snapshot_error is not None:
-            raise InvariantRefusalError("private context cleanup failed") from snapshot_error
 
     @property
     def prefix(self) -> Tuple[str, ...]:
@@ -712,38 +1199,35 @@ class RealDockerRuntime:
         record = validate_locked_base_inspect(self.profile, result.stdout)
         return _resource_id(ResourceRole.IMAGE, record["Id"])
 
-    def _capture_snapshot(self) -> None:
-        if self._snapshot_root is not None:
-            shutil.rmtree(self._snapshot_root)
-            self._snapshot_root = None
-            self._snapshot = None
-        created = tempfile.mkdtemp(prefix="unified-ext-lab-context-")
-        root = os.path.realpath(created)
-        try:
-            os.chmod(root, 0o700)
-            snapshot = snapshot_image_context(root)
-        except BaseException as error:
-            try:
-                shutil.rmtree(root)
-            except FileNotFoundError:
-                pass
-            except BaseException as cleanup_error:
-                if hasattr(error, "add_note"):
-                    error.add_note(
-                        "private snapshot root cleanup failed: "
-                        + type(cleanup_error).__name__
-                    )
-            raise
+    def capture_snapshot(self, root: str) -> None:
+        if self.cleanup_only or self._local_base_id is None:
+            raise UsageStateError("real-Docker preflight is required")
+        if self._snapshot_root is not None or self._snapshot_resource is not None:
+            raise UsageStateError("real-Docker snapshot is already bound")
+        resource = DerivedSnapshotResource(root)
+        resource.create()
+        self._snapshot_resource = resource
         self._snapshot_root = root
-        self._snapshot = snapshot
+        self._snapshot = snapshot_image_context(root)
+
+    def bind_snapshot_for_cleanup(self, root: str) -> None:
+        if not self.cleanup_only:
+            raise UsageStateError("cleanup snapshot binding requires cleanup mode")
+        if self._snapshot_resource is not None:
+            raise UsageStateError("cleanup snapshot is already bound")
+        self._snapshot_resource = DerivedSnapshotResource(root)
+
+    @property
+    def snapshot_resource(self) -> DerivedSnapshotResource:
+        if self._snapshot_resource is None:
+            raise UsageStateError("real-Docker snapshot is unavailable")
+        return self._snapshot_resource
 
     def preflight(self) -> None:
         self.probe_daemon()
         if self.cleanup_only:
             return
-        self.probe_buildx()
         self._local_base_id = self.require_local_base()
-        self._capture_snapshot()
 
     def prepare_base(self, *, allow_network: bool) -> None:
         if self.cleanup_only:

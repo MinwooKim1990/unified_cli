@@ -34,12 +34,27 @@ from tools.unified_ext_lab.real_cli import _lifecycle, main
 from tools.unified_ext_lab.state import (
     REAL_DOCKER_EXECUTION_PROFILE,
     LabStateStore,
+    PlannedResource,
     StatePhase,
 )
 
 
 _FAKE_IMAGE_ID = "sha256:" + "a" * 64
 _FAKE_CONTAINER_ID = "b" * 64
+
+
+class _FakeSnapshotResource:
+    """Filesystem-backed snapshot sentinel for CLI orchestration tests."""
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path)
+
+    def present(self) -> bool:
+        return self.path.is_dir() and not self.path.is_symlink()
+
+    def remove(self) -> None:
+        if self.present():
+            self.path.rmdir()
 
 
 class _IdentityFakeRunner(FakeRunner):
@@ -108,7 +123,9 @@ class _FakeIdentityCommands:
     """ID-bound command facade over the offline fixture command grammar."""
 
     uses_resource_ids = True
-    cleanup_roles = (ResourceRole.CONTAINER, ResourceRole.IMAGE)
+    builds_image = False
+    planned_roles = (ResourceRole.CONTAINER,)
+    cleanup_roles = (ResourceRole.CONTAINER,)
     create_volume_roles = ()
 
     def __init__(self, spec: DockerLabSpec) -> None:
@@ -191,6 +208,7 @@ class _FakeRuntime:
         self.close_error = close_error
         self.calls = []
         self.closed = False
+        self._snapshot_resource = None
 
     def preflight(self) -> None:
         self.calls.append("preflight")
@@ -204,6 +222,22 @@ class _FakeRuntime:
         self.calls.append("probe_daemon")
         if self.probe_error is not None:
             raise self.probe_error
+
+    def capture_snapshot(self, path: str) -> None:
+        self.calls.append("capture_snapshot")
+        resource = _FakeSnapshotResource(path)
+        resource.path.mkdir(mode=0o700)
+        self._snapshot_resource = resource
+
+    def bind_snapshot_for_cleanup(self, path: str) -> None:
+        self.calls.append("bind_snapshot_for_cleanup")
+        self._snapshot_resource = _FakeSnapshotResource(path)
+
+    @property
+    def snapshot_resource(self):
+        if self._snapshot_resource is None:
+            raise UsageStateError("runtime snapshot is unavailable")
+        return self._snapshot_resource
 
     def spec(self, identity) -> DockerLabSpec:
         self.calls.append("spec")
@@ -296,15 +330,23 @@ class RealDockerCliTests(unittest.TestCase):
         store = LabStateStore(namespace, REAL_DOCKER_EXECUTION_PROFILE)
         runtime = _FakeRuntime()
         identity = LabIdentity("real-lab", "synthetic", "2" * 32)
+        with store.locked(identity.lab_id) as locked:
+            locked.create_initial(
+                identity.provider_id,
+                identity.ownership_token,
+                (
+                    PlannedResource.from_value(
+                        identity.resource(ResourceRole.CONTAINER)
+                    ),
+                ),
+                {"runtime_snapshot_bound": False},
+            )
+        runtime.capture_snapshot(
+            str(namespace / identity.lab_id / "runtime-snapshot")
+        )
         lifecycle = _lifecycle(runtime, store, identity)
+        lifecycle.bind_runtime_snapshot_intent()
         if phase is StatePhase.NEW:
-            with store.locked(identity.lab_id) as locked:
-                locked.create_initial(
-                    identity.provider_id,
-                    identity.ownership_token,
-                    lifecycle._planned_resources(),
-                    artifact_evidence=lifecycle._artifact_from_spec().to_dict(),
-                )
             return runtime
         lifecycle.create()
         if phase is StatePhase.CREATED:
@@ -595,7 +637,13 @@ class RealDockerCliTests(unittest.TestCase):
         self.assertFalse(self.output.exists())
         self.assertEqual(
             recovery.calls,
-            ["probe_daemon", "cleanup_spec", "commands", "close"],
+            [
+                "probe_daemon",
+                "bind_snapshot_for_cleanup",
+                "cleanup_spec",
+                "commands",
+                "close",
+            ],
         )
         flattened = "\n".join("\0".join(command) for command in recovery.runner.commands)
         self.assertNotIn("\0build\0", flattened)
@@ -631,6 +679,95 @@ class RealDockerCliTests(unittest.TestCase):
         self.assertEqual(state_path.read_bytes(), before)
         self.assertEqual(unavailable.calls, ["probe_daemon", "close"])
         self.assertFalse(self.output.exists())
+
+    def test_sigkill_after_snapshot_before_artifact_bind_is_recoverable(self) -> None:
+        class ExitAfterSnapshot(_FakeRuntime):
+            def capture_snapshot(inner_self, path: str) -> None:
+                super(ExitAfterSnapshot, inner_self).capture_snapshot(path)
+                raise SystemExit(137)
+
+        abrupt = ExitAfterSnapshot()
+        code, stdout, stderr = self.run_main(
+            *self.run_arguments(), runtime_factory=lambda: abrupt
+        )
+        self.assertEqual((code, stdout, stderr), (137, "", ""))
+        snapshot = (
+            self.state_root
+            / REAL_DOCKER_EXECUTION_PROFILE
+            / "real-lab"
+            / "runtime-snapshot"
+        )
+        self.assertTrue(snapshot.is_dir())
+        with LabStateStore(
+            self.state_root / REAL_DOCKER_EXECUTION_PROFILE,
+            REAL_DOCKER_EXECUTION_PROFILE,
+        ).locked("real-lab") as locked:
+            state = locked.load()
+        self.assertEqual(state.phase, StatePhase.NEW)
+        self.assertEqual(
+            dict(state.baseline_equalities), {"runtime_snapshot_bound": False}
+        )
+
+        recovery = _FakeRuntime(abrupt.runner)
+        code, stdout, stderr = self.run_main(
+            *self.recover_arguments(),
+            "--json",
+            cleanup_runtime_factory=lambda: recovery,
+        )
+        self.assertEqual(code, 7)
+        self.assertEqual(json.loads(stdout)["phase"], "DIRTY")
+        self.assertEqual(stderr, "error: cleanup incomplete\n")
+        self.assertFalse(snapshot.exists())
+        flattened = "\n".join(
+            "\0".join(command) for command in recovery.runner.commands
+        )
+        self.assertNotIn("\0build\0", flattened)
+        self.assertNotIn("\0create\0", flattened)
+        self.assertNotIn("\0start\0", flattened)
+
+    def test_sigkill_after_artifact_bind_before_create_is_recoverable(self) -> None:
+        abrupt = _FakeRuntime()
+        with mock.patch.object(
+            FixtureLifecycle, "create", side_effect=SystemExit(137)
+        ):
+            code, stdout, stderr = self.run_main(
+                *self.run_arguments(), runtime_factory=lambda: abrupt
+            )
+        self.assertEqual((code, stdout, stderr), (137, "", ""))
+        snapshot = (
+            self.state_root
+            / REAL_DOCKER_EXECUTION_PROFILE
+            / "real-lab"
+            / "runtime-snapshot"
+        )
+        self.assertTrue(snapshot.is_dir())
+        with LabStateStore(
+            self.state_root / REAL_DOCKER_EXECUTION_PROFILE,
+            REAL_DOCKER_EXECUTION_PROFILE,
+        ).locked("real-lab") as locked:
+            state = locked.load()
+        self.assertEqual(state.phase, StatePhase.NEW)
+        self.assertEqual(
+            dict(state.baseline_equalities), {"runtime_snapshot_bound": True}
+        )
+        self.assertEqual(state.artifact_evidence["version"], "1.0.0")
+
+        recovery = _FakeRuntime(abrupt.runner)
+        code, stdout, stderr = self.run_main(
+            *self.recover_arguments(),
+            "--json",
+            cleanup_runtime_factory=lambda: recovery,
+        )
+        self.assertEqual(code, 7)
+        self.assertEqual(json.loads(stdout)["phase"], "DIRTY")
+        self.assertEqual(stderr, "error: cleanup incomplete\n")
+        self.assertFalse(snapshot.exists())
+        flattened = "\n".join(
+            "\0".join(command) for command in recovery.runner.commands
+        )
+        self.assertNotIn("\0build\0", flattened)
+        self.assertNotIn("\0create\0", flattened)
+        self.assertNotIn("\0start\0", flattened)
 
     def test_explicit_recovery_converts_every_stable_forward_phase_without_reexecution(self) -> None:
         for phase in (
@@ -703,7 +840,7 @@ class RealDockerCliTests(unittest.TestCase):
         flattened = "\n".join(
             "\0".join(command) for command in runtime.runner.commands
         )
-        self.assertEqual(flattened.count("\0build\0"), 1)
+        self.assertEqual(flattened.count("\0build\0"), 0)
         self.assertNotIn("\0install", flattened)
 
     def test_status_does_not_discover_or_probe_runtime(self) -> None:

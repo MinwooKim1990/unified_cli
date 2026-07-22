@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import PurePosixPath
 from types import MappingProxyType
-from typing import Dict, Mapping, Sequence, Tuple
+from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 from .errors import InvariantRefusalError, UsageStateError
 from .model import LabIdentity, LabResource, LabResourceSet, ResourceRole
@@ -52,7 +52,7 @@ TMPFS_OPTIONS = MappingProxyType(
             "rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=65532,gid=65532"
         ),
         CONTAINER_TOOL: (
-            "rw,nosuid,nodev,size=16m,mode=0700,uid=65532,gid=65532"
+            "rw,nosuid,nodev,noexec,size=16m,mode=0700,uid=65532,gid=65532"
         ),
     }
 )
@@ -79,6 +79,7 @@ _BASE_REFERENCE_RE = re.compile(
 )
 _LOCAL_IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _CHECKSUM_RE = re.compile(r"^[0-9a-f]{64}$")
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _FIXTURE_RELATIVE_PATH = os.path.join(
     "rootfs", "opt", "unified-ext-lab", "fixtures", "fake-provider"
 )
@@ -442,6 +443,7 @@ class DockerCleanupSpec:
     resources: LabResourceSet
     docker_executable: str
     ephemeral_storage: bool = True
+    managed_roles: Tuple[ResourceRole, ...] = (ResourceRole.CONTAINER,)
 
     def __post_init__(self) -> None:
         if type(self.identity) is not LabIdentity:
@@ -485,6 +487,17 @@ class DockerCleanupSpec:
             raise InvariantRefusalError(
                 "real-Docker cleanup requires ephemeral storage"
             )
+        if self.managed_roles not in (
+            (ResourceRole.CONTAINER,),
+            (
+                ResourceRole.CONTAINER,
+                ResourceRole.AUTH,
+                ResourceRole.TOOL,
+                ResourceRole.WORKSPACE,
+                ResourceRole.IMAGE,
+            ),
+        ):
+            raise InvariantRefusalError("Docker cleanup managed-role drift")
 
     @classmethod
     def from_persisted(
@@ -506,9 +519,24 @@ class DockerCleanupSpec:
                 ResourceRole.TOOL,
             )
         )
-        if len(planned_resources) != len(resource_tuple):
+        if len(planned_resources) == 1:
+            expected_resources = (resource_tuple[1],)
+            managed_roles = (ResourceRole.CONTAINER,)
+        elif len(planned_resources) == len(resource_tuple):
+            # Legacy Stage 6B state can own a per-run image and three named
+            # volumes in addition to the container. Preserve the established
+            # dependency-safe cleanup order without ever managing the base.
+            expected_resources = resource_tuple
+            managed_roles = (
+                ResourceRole.CONTAINER,
+                ResourceRole.AUTH,
+                ResourceRole.TOOL,
+                ResourceRole.WORKSPACE,
+                ResourceRole.IMAGE,
+            )
+        else:
             raise InvariantRefusalError("persisted Docker cleanup plan drift")
-        for persisted, expected in zip(planned_resources, resource_tuple):
+        for persisted, expected in zip(planned_resources, expected_resources):
             if isinstance(persisted, Mapping):
                 if set(persisted) != {"role", "name", "labels"}:
                     raise InvariantRefusalError(
@@ -536,6 +564,7 @@ class DockerCleanupSpec:
             image=resource_tuple[0],
             resources=resources,
             docker_executable=docker_executable,
+            managed_roles=managed_roles,
         )
 
     def resource(self, role: ResourceRole) -> LabResource:
@@ -869,6 +898,44 @@ def _write_private_file(path: str, payload: bytes, mode: int) -> None:
         os.close(descriptor)
 
 
+def _synchronize_directory(path: str, description: str) -> None:
+    """Synchronize one pinned directory without retaining sibling FDs."""
+
+    try:
+        expected = os.lstat(path)
+        if stat.S_ISLNK(expected.st_mode) or not stat.S_ISDIR(expected.st_mode):
+            raise InvariantRefusalError(description + " is unsafe")
+        descriptor = os.open(
+            path,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except InvariantRefusalError:
+        raise
+    except OSError as error:
+        raise InvariantRefusalError(
+            description + " cannot be synchronized"
+        ) from error
+    try:
+        if _exact_stat_identity(os.fstat(descriptor)) != _exact_stat_identity(
+            expected
+        ):
+            raise InvariantRefusalError(
+                description + " changed during synchronization"
+            )
+        os.fsync(descriptor)
+    except InvariantRefusalError:
+        raise
+    except OSError as error:
+        raise InvariantRefusalError(
+            description + " cannot be synchronized"
+        ) from error
+    finally:
+        os.close(descriptor)
+
+
 def snapshot_image_context(
     private_parent: str,
     *,
@@ -954,6 +1021,22 @@ def snapshot_image_context(
             != fixture_sha256
         ):
             raise InvariantRefusalError("snapshot fixture checksum drift")
+        # Every file is fsynced by _write_private_file. Commit directory
+        # entries bottom-up, opening and closing one directory at a time, then
+        # commit image-context and its sibling lock in the private parent.
+        for relative in sorted(
+            inventory.directory_modes,
+            key=lambda item: (item.count(os.sep), item),
+            reverse=True,
+        ):
+            _synchronize_directory(
+                os.path.join(snapshot_context, relative),
+                "private context snapshot directory",
+            )
+        _synchronize_directory(
+            snapshot_context, "private context snapshot directory"
+        )
+        _synchronize_directory(private_parent, "private snapshot parent")
         return LockedContextSnapshot(
             context=snapshot_context,
             context_lock=snapshot_lock,
@@ -1020,6 +1103,7 @@ def _file_sha256(path: str, description: str = "fixture artifact") -> str:
 class DockerCommandBuilder:
     """Build only the finite Docker command set used by one exact lab."""
 
+    builds_image = True
     uses_resource_ids = False
     cleanup_roles = (
         ResourceRole.CONTAINER,
@@ -1043,15 +1127,20 @@ class DockerCommandBuilder:
     def spec(self) -> DockerLabSpec:
         return self._spec
 
-    def build_image(self) -> Tuple[str, ...]:
-        # Revalidate immediately before the runner receives the original
-        # context path. The lock digest itself was captured in DockerLabSpec.
+    def validate_context(self) -> None:
+        """Revalidate the locked context immediately before it is exposed."""
+
         _validate_image_context(
             self._spec.context,
             self._spec.context_lock,
             self._spec.context_lock_sha256,
             private_snapshot=self._spec.context_is_snapshot,
         )
+
+    def build_image(self) -> Tuple[str, ...]:
+        # Revalidate immediately before the runner receives the original
+        # context path. The lock digest itself was captured in DockerLabSpec.
+        self.validate_context()
         image = self._spec.image
         dockerfile = os.path.join(self._spec.context, "Dockerfile")
         return (
@@ -1431,6 +1520,30 @@ def _empty_list(value: object) -> Sequence[object]:
     return _list(value)
 
 
+def _parse_env_mapping(value: object) -> Dict[str, str]:
+    """Parse Docker inspect Env without losing duplicate-name evidence."""
+
+    entries = _list(value)
+    environment: Dict[str, str] = {}
+    for entry in entries:
+        if (
+            type(entry) is not str
+            or "\n" in entry
+            or "\r" in entry
+            or "\x00" in entry
+        ):
+            raise InvariantRefusalError("inspect policy drift")
+        name, separator, entry_value = entry.partition("=")
+        if (
+            not separator
+            or _ENV_NAME_RE.fullmatch(name) is None
+            or name in environment
+        ):
+            raise InvariantRefusalError("inspect policy drift")
+        environment[name] = entry_value
+    return environment
+
+
 def _expected_mounts(spec: DockerLabSpec) -> Tuple[Tuple[object, ...], ...]:
     if spec.ephemeral_storage:
         return ()
@@ -1445,11 +1558,35 @@ def _expected_mounts(spec: DockerLabSpec) -> Tuple[Tuple[object, ...], ...]:
     )
 
 
-def validate_inspect(spec: DockerLabSpec, role: ResourceRole, payload: object) -> None:
+def validate_inspect(
+    spec: DockerLabSpec,
+    role: ResourceRole,
+    payload: object,
+    *,
+    container_image: Optional[str] = None,
+    bind_mount: Optional[Tuple[str, str]] = None,
+    container_env: Optional[Tuple[str, ...]] = None,
+) -> None:
     """Reject malformed JSON or any drift from the managed security policy."""
 
     if type(spec) is not DockerLabSpec:
         raise UsageStateError("invalid Docker lab spec")
+    if container_image is not None and (
+        type(container_image) is not str or not container_image
+    ):
+        raise UsageStateError("invalid expected container image")
+    if bind_mount is not None and (
+        type(bind_mount) is not tuple
+        or len(bind_mount) != 2
+        or any(type(value) is not str or not value for value in bind_mount)
+        or not os.path.isabs(bind_mount[0])
+        or os.path.realpath(bind_mount[0]) != bind_mount[0]
+        or not os.path.isabs(bind_mount[1])
+        or bind_mount[1] == "/"
+    ):
+        raise UsageStateError("invalid expected container bind mount")
+    if container_env is not None and type(container_env) is not tuple:
+        raise UsageStateError("invalid expected container environment")
     normalized = _role(role)
     if type(payload) is bytes:
         try:
@@ -1472,7 +1609,14 @@ def validate_inspect(spec: DockerLabSpec, role: ResourceRole, payload: object) -
     resource = spec.resource(normalized)
     try:
         if normalized is ResourceRole.CONTAINER:
-            _validate_container_record(spec, resource, record)
+            _validate_container_record(
+                spec,
+                resource,
+                record,
+                container_image=container_image,
+                bind_mount=bind_mount,
+                container_env=FIXED_ENV if container_env is None else container_env,
+            )
         elif normalized is ResourceRole.IMAGE:
             _validate_image_record(resource, record)
         elif normalized in VOLUME_TARGETS:
@@ -1561,16 +1705,45 @@ def _validate_volume_record(resource: LabResource, record: Dict[str, object]) ->
 
 
 def _validate_container_record(
-    spec: DockerLabSpec, resource: LabResource, record: Dict[str, object]
+    spec: DockerLabSpec,
+    resource: LabResource,
+    record: Dict[str, object],
+    *,
+    container_image: Optional[str],
+    bind_mount: Optional[Tuple[str, str]],
+    container_env: Tuple[str, ...],
 ) -> None:
     config = _dict(record["Config"])
     host = _dict(record["HostConfig"])
     network = _dict(record["NetworkSettings"])
+    if container_image is not None and record.get("Image") != container_image:
+        raise InvariantRefusalError("inspect policy drift")
     mounts = []
+    observed_bind_mounts = []
     tmpfs_mount_destinations = set()
     for mount_value in _list(record["Mounts"]):
         mount = _dict(mount_value)
-        if spec.ephemeral_storage:
+        if bind_mount is not None and mount.get("Type") == "bind":
+            source, target = bind_mount
+            if (
+                set(mount)
+                != {
+                    "Type",
+                    "Source",
+                    "Destination",
+                    "Mode",
+                    "RW",
+                    "Propagation",
+                }
+                or mount.get("Source") != source
+                or mount.get("Destination") != target
+                or mount.get("Mode") != ""
+                or mount.get("RW") is not False
+                or mount.get("Propagation") != "rprivate"
+            ):
+                raise InvariantRefusalError("inspect policy drift")
+            observed_bind_mounts.append((source, target))
+        elif spec.ephemeral_storage:
             if (
                 mount.get("Type") != "tmpfs"
                 or mount.get("Source", "") != ""
@@ -1588,6 +1761,20 @@ def _validate_container_record(
         set(TMPFS_OPTIONS),
     ):
         raise InvariantRefusalError("inspect policy drift")
+    if bind_mount is not None and tuple(observed_bind_mounts) != (bind_mount,):
+        raise InvariantRefusalError("inspect policy drift")
+
+    observed_environment = _parse_env_mapping(config["Env"])
+    expected_environment = _parse_env_mapping(list(container_env))
+    security_options = _list(host["SecurityOpt"])
+    if (
+        len(security_options) != 1
+        or type(security_options[0]) is not str
+        or security_options[0]
+        not in ("no-new-privileges=true", "no-new-privileges:true")
+    ):
+        raise InvariantRefusalError("inspect policy drift")
+
     ulimits = []
     for limit_value in _list(host["Ulimits"]):
         limit = _dict(limit_value)
@@ -1595,20 +1782,37 @@ def _validate_container_record(
     binds = host["Binds"]
     if binds is None:
         binds = []
+    host_mounts = []
+    if bind_mount is not None:
+        for mount_value in _list(host.get("Mounts", [])):
+            mount = _dict(mount_value)
+            options = _dict(mount.get("BindOptions", {}))
+            if (
+                set(mount)
+                != {"Type", "Source", "Target", "ReadOnly", "BindOptions"}
+                or mount.get("Type") != "bind"
+                or mount.get("Source") != bind_mount[0]
+                or mount.get("Target") != bind_mount[1]
+                or mount.get("ReadOnly") is not True
+                or options != {"Propagation": "rprivate"}
+            ):
+                raise InvariantRefusalError("inspect policy drift")
+            host_mounts.append((mount["Source"], mount["Target"]))
+
     observed = (
         record["Name"],
         _labels(config["Labels"]),
         config["User"],
         config["Image"],
-        tuple(_list(config["Env"])),
+        observed_environment,
         config["WorkingDir"],
         tuple(_list(config["Entrypoint"])),
         tuple(_list(config["Cmd"])),
-        _empty_dict(config["ExposedPorts"]),
+        _empty_dict(config.get("ExposedPorts")),
         _empty_dict(config["Volumes"]),
         host["ReadonlyRootfs"],
         tuple(_list(host["CapDrop"])),
-        tuple(_list(host["SecurityOpt"])),
+        True,
         host["NetworkMode"],
         host["Init"],
         host["PidsLimit"],
@@ -1619,6 +1823,7 @@ def _validate_container_record(
         host["Privileged"],
         tuple(_empty_list(host["CapAdd"])),
         tuple(_empty_list(binds)),
+        tuple(host_mounts),
         tuple(_empty_list(host["VolumesFrom"])),
         tuple(_empty_list(host["Devices"])),
         tuple(_empty_list(host["DeviceRequests"])),
@@ -1631,8 +1836,8 @@ def _validate_container_record(
         "/" + resource.name,
         dict(resource.labels),
         CONTAINER_USER,
-        spec.image.name,
-        FIXED_ENV,
+        spec.image.name if container_image is None else container_image,
+        expected_environment,
         CONTAINER_WORKSPACE,
         (GUEST_EXECUTABLE,),
         ("idle",),
@@ -1640,7 +1845,7 @@ def _validate_container_record(
         {},
         True,
         ("ALL",),
-        ("no-new-privileges:true",),
+        True,
         "none",
         True,
         128,
@@ -1651,6 +1856,7 @@ def _validate_container_record(
         False,
         (),
         (),
+        () if bind_mount is None else (bind_mount,),
         (),
         (),
         (),

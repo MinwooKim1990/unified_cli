@@ -77,7 +77,9 @@ def _test() -> int:
         "XDG_DATA_HOME": "/home/lab/.local/share",
     }
     completed = subprocess.run(
-        [TOOL, "protocol-check"],
+        # Keep the writable tool tmpfs non-executable. The fixture is locked
+        # Python source, so invoke it through the immutable base interpreter.
+        [sys.executable, TOOL, "protocol-check"],
         cwd=WORKSPACE,
         env=environment,
         stdin=subprocess.DEVNULL,

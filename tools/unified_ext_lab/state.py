@@ -462,6 +462,8 @@ _LEGACY_SYNTHETIC_ARTIFACT = MappingProxyType(
         "sha256": "50e7754c2a4cc5fb074d640eef253f5a9b61288dcbe8074887e2cc2c728edc66",
     }
 )
+_UNBOUND_RUNTIME_SNAPSHOT = MappingProxyType({"runtime_snapshot_bound": False})
+_BOUND_RUNTIME_SNAPSHOT = MappingProxyType({"runtime_snapshot_bound": True})
 _DRAFT_KEYS = frozenset(
     (
         "evidence_kind",
@@ -999,6 +1001,26 @@ class LabState:
         if self.tainted:
             return self
         return replace(self, revision=self.revision + 1, tainted=True)
+
+    def bind_runtime_snapshot(self, artifact_evidence: object) -> "LabState":
+        """Bind validated fixture identity to a pre-created real-Docker intent."""
+
+        if (
+            self.execution_profile != REAL_DOCKER_EXECUTION_PROFILE
+            or self.phase is not StatePhase.NEW
+            or dict(self.baseline_equalities) != dict(_UNBOUND_RUNTIME_SNAPSHOT)
+            or self.created_roles
+            or self.removed_roles
+            or self.resource_ids
+        ):
+            raise UsageStateError("runtime snapshot intent cannot be bound")
+        artifact = _validate_artifact_evidence(artifact_evidence)
+        return replace(
+            self,
+            revision=self.revision + 1,
+            artifact_evidence=artifact,
+            baseline_equalities=_BOUND_RUNTIME_SNAPSHOT,
+        )
 
     def record_owned_role(self, role: Union[ResourceRole, str]) -> "LabState":
         """Durably record one validated owned resource during create/cleanup.
@@ -2804,6 +2826,21 @@ class LockedLabStateStore:
         updated = current.mark_tainted()
         if updated is not current:
             self._write(updated)
+        return updated
+
+    def bind_runtime_snapshot(
+        self,
+        expected: Union[StatePhase, str],
+        artifact_evidence: object,
+    ) -> LabState:
+        """Atomically bind a validated derived snapshot while state is NEW."""
+
+        self._require_active()
+        current = self.load()
+        if current.phase is not _phase(expected):
+            raise UsageStateError("state phase changed")
+        updated = current.bind_runtime_snapshot(artifact_evidence)
+        self._write(updated)
         return updated
 
     def record_owned_role(

@@ -24,7 +24,7 @@
     },
     "rootfs/opt/unified-ext-lab/guest.py": {
       "mode": "0755",
-      "sha256": "2b16af2cc129e8be8f19cdc1bde5de400d1dedc0d27b78228fd651aca7503ed6"
+      "sha256": "8b01a0f15ae40fb4a94b548052886d2b159cc041ab7ad1b5b0f69a4ae244c2c1"
     },
     "rootfs/opt/unified-ext-lab/tool/.volume-owner": {
       "mode": "0644",

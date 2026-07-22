@@ -149,6 +149,7 @@ class FixtureLifecycle:
         execution_profile: str = FIXTURE_EXECUTION_PROFILE,
         executor_kind: str = "fake_docker",
         command_builder: Optional[object] = None,
+        runtime_snapshot: Optional[object] = None,
     ) -> None:
         if type(store) is not LabStateStore:
             raise UsageStateError("invalid lifecycle state store")
@@ -191,13 +192,29 @@ class FixtureLifecycle:
             raise UsageStateError("invalid lifecycle resource-id policy") from error
         if type(uses_resource_ids) is not bool:
             raise UsageStateError("invalid lifecycle resource-id policy")
+        try:
+            builds_image = getattr(commands, "builds_image", True)
+        except Exception as error:
+            raise UsageStateError("invalid lifecycle command policy") from error
+        if type(builds_image) is not bool:
+            raise UsageStateError("invalid lifecycle command policy")
         expected_resource_ids = execution_profile == REAL_DOCKER_EXECUTION_PROFILE
         if uses_resource_ids is not expected_resource_ids:
             raise InvariantRefusalError("lifecycle command builder profile mismatch")
+        if execution_profile == REAL_DOCKER_EXECUTION_PROFILE and (
+            runtime_snapshot is None
+            or not callable(getattr(runtime_snapshot, "remove", None))
+            or not callable(getattr(runtime_snapshot, "present", None))
+        ):
+            raise InvariantRefusalError("real-Docker snapshot resource is unavailable")
+        if execution_profile != REAL_DOCKER_EXECUTION_PROFILE and runtime_snapshot is not None:
+            raise InvariantRefusalError("fixture lifecycle cannot own a runtime snapshot")
         self._store = store
         self._spec = spec
         self._runner = runner
         self._commands = commands
+        self._builds_image = builds_image
+        self._runtime_snapshot = runtime_snapshot
         required_commands = (
             "exec_guest",
             "inspect",
@@ -209,11 +226,12 @@ class FixtureLifecycle:
         )
         if type(spec) is DockerLabSpec:
             required_commands += (
-                "build_image",
                 "create_container",
                 "inspect_base_image",
                 "start_container",
             )
+            if builds_image:
+                required_commands += ("build_image",)
             if getattr(self._commands, "create_volume_roles", ()):
                 required_commands += ("create_volume", "remove_volume")
         if uses_resource_ids:
@@ -288,9 +306,18 @@ class FixtureLifecycle:
         return result
 
     def _planned_resources(self) -> Tuple[PlannedResource, ...]:
+        roles = getattr(self._commands, "planned_roles", None)
+        if roles is not None and (
+            type(roles) is not tuple
+            or not roles
+            or any(not isinstance(role, ResourceRole) for role in roles)
+            or len(set(roles)) != len(roles)
+        ):
+            raise UsageStateError("invalid lifecycle planned-resource roles")
         return tuple(
             PlannedResource.from_value(resource)
             for resource in self._spec.resources.resources
+            if roles is None or resource.role in roles
         )
 
     def _cleanup_roles(self) -> Tuple[ResourceRole, ...]:
@@ -332,6 +359,18 @@ class FixtureLifecycle:
             raise UsageStateError("invalid lifecycle resource-id policy")
         return value
 
+    def _uses_resource_id(self, role: ResourceRole) -> bool:
+        if not self._uses_resource_ids():
+            return False
+        roles = getattr(self._commands, "resource_id_roles", self._cleanup_roles())
+        if (
+            type(roles) is not tuple
+            or any(not isinstance(item, ResourceRole) for item in roles)
+            or len(set(roles)) != len(roles)
+        ):
+            raise UsageStateError("invalid lifecycle resource-id roles")
+        return role in roles
+
     def _require_forward_spec(self) -> DockerLabSpec:
         if type(self._spec) is not DockerLabSpec:
             raise UsageStateError("forward lifecycle action is unavailable during cleanup")
@@ -362,7 +401,7 @@ class FixtureLifecycle:
         expected_id: Optional[str] = None,
     ) -> Optional[str]:
         if expected_id is not None:
-            if not cleanup or not self._uses_resource_ids():
+            if not cleanup or not self._uses_resource_id(role):
                 raise UsageStateError("exact-id inspect is cleanup-only")
             result = self._execute(self._commands.inspect(role, expected_id))
             validator = getattr(
@@ -387,7 +426,7 @@ class FixtureLifecycle:
             validator = getattr(self._commands, "validate_inspect", None)
         if callable(validator):
             resource_id = validator(role, result.stdout)
-            if self._uses_resource_ids() and type(resource_id) is not str:
+            if self._uses_resource_id(role) and type(resource_id) is not str:
                 raise InvariantRefusalError(
                     "inspect did not return immutable resource id"
                 )
@@ -399,7 +438,7 @@ class FixtureLifecycle:
     def _resource_target(
         self, state: LabState, role: ResourceRole, observed_id: Optional[str] = None
     ) -> Optional[str]:
-        if not self._uses_resource_ids():
+        if not self._uses_resource_id(role):
             return None
         recorded = state.resource_ids.get(role.value)
         if recorded is not None and observed_id is not None and recorded != observed_id:
@@ -415,7 +454,7 @@ class FixtureLifecycle:
         action: GuestAction,
         observed_id: Optional[str] = None,
     ) -> Tuple[str, ...]:
-        if self._uses_resource_ids():
+        if self._uses_resource_id(ResourceRole.CONTAINER):
             target = self._resource_target(
                 state, ResourceRole.CONTAINER, observed_id
             )
@@ -456,7 +495,7 @@ class FixtureLifecycle:
     def _wait_for_workspace_ready(self, state: LabState) -> None:
         """Wait for PID 1's fixed workspace marker before any guest work."""
 
-        if not self._uses_resource_ids():
+        if not self._uses_resource_id(ResourceRole.CONTAINER):
             return
         deadline = self._readiness_now() + _READINESS_TIMEOUT_SECONDS
         while True:
@@ -493,7 +532,7 @@ class FixtureLifecycle:
         return owned
 
     def _identity_present(self, state: LabState, role: ResourceRole) -> bool:
-        if not self._uses_resource_ids():
+        if not self._uses_resource_id(role):
             return False
         resource_id = state.resource_ids.get(role.value)
         if resource_id is None:
@@ -535,7 +574,9 @@ class FixtureLifecycle:
         if not self._uses_resource_ids() or state.pending_step != "create":
             return False
         return any(
-            role.value not in state.resource_ids for role in self._cleanup_roles()
+            role.value not in state.resource_ids
+            for role in self._cleanup_roles()
+            if self._uses_resource_id(role)
         )
 
     def _persist_mutation_hold(self, locked: object, state: LabState) -> LabState:
@@ -603,55 +644,93 @@ class FixtureLifecycle:
             self._require_identity(state)
             return state
 
+    def bind_runtime_snapshot_intent(self) -> LabState:
+        """Atomically bind validated snapshot artifact identity to NEW state."""
+
+        spec = self._require_forward_spec()
+        if (
+            self._execution_profile != REAL_DOCKER_EXECUTION_PROFILE
+            or self._runtime_snapshot is None
+            or not self._runtime_snapshot.present()
+        ):
+            raise UsageStateError("runtime snapshot intent is unavailable")
+        artifact = self._artifact_from_spec().to_dict()
+        with self._store.locked(spec.identity.lab_id) as locked:
+            state = locked.load()
+            self._require_identity(state)
+            return locked.bind_runtime_snapshot(StatePhase.NEW, artifact)
+
     def create(
         self, baseline_equalities: Optional[Mapping[str, bool]] = None
     ) -> LabState:
         spec = self._require_forward_spec()
         identity = self._spec.identity
-        with self._store.locked(identity.lab_id) as locked:
-            state = locked.create_initial(
-                identity.provider_id,
-                identity.ownership_token,
-                self._planned_resources(),
-                baseline_equalities,
-                artifact_evidence=self._artifact_from_spec().to_dict(),
+        if self._execution_profile == REAL_DOCKER_EXECUTION_PROFILE:
+            if baseline_equalities is not None:
+                raise UsageStateError("real-Docker baselines are fixed")
+            expected_baselines = {"runtime_snapshot_bound": True}
+        else:
+            expected_baselines = (
+                {} if baseline_equalities is None else dict(baseline_equalities)
             )
+        with self._store.locked(identity.lab_id) as locked:
+            artifact = self._artifact_from_spec().to_dict()
+            try:
+                state = locked.load()
+            except FileNotFoundError:
+                if self._execution_profile == REAL_DOCKER_EXECUTION_PROFILE:
+                    raise UsageStateError("real-Docker lifecycle intent is unavailable")
+                state = locked.create_initial(
+                    identity.provider_id,
+                    identity.ownership_token,
+                    self._planned_resources(),
+                    baseline_equalities,
+                    artifact_evidence=artifact,
+                )
+            else:
+                if (
+                    state.phase is not StatePhase.NEW
+                    or dict(state.artifact_evidence) != artifact
+                    or dict(state.baseline_equalities) != expected_baselines
+                ):
+                    raise UsageStateError("pre-created lifecycle intent is invalid")
             self._require_identity(state)
             pending = locked.transition(StatePhase.NEW, StatePhase.CREATE_PENDING)
             started = self._now()
             unresolved_mutation = False
             try:
+                for role in self._cleanup_roles():
+                    self._require_absent(role)
                 base = self._execute(self._commands.inspect_base_image())
                 base_validator = getattr(self._commands, "validate_base_image", None)
                 if callable(base_validator):
                     base_validator(base.stdout)
                 else:
                     validate_base_image_inspect(spec, base.stdout)
-                for role in self._cleanup_roles():
-                    self._require_absent(role)
-                unresolved_mutation = self._uses_resource_ids()
-                self._execute(self._commands.build_image())
-                image_id = self._inspect(ResourceRole.IMAGE)
-                if self._uses_resource_ids():
-                    pending = locked.record_resource_id(
-                        StatePhase.CREATE_PENDING,
-                        ResourceRole.IMAGE,
-                        image_id,
+                if self._builds_image:
+                    unresolved_mutation = self._uses_resource_id(ResourceRole.IMAGE)
+                    self._execute(self._commands.build_image())
+                    image_id = self._inspect(ResourceRole.IMAGE)
+                    if self._uses_resource_id(ResourceRole.IMAGE):
+                        pending = locked.record_resource_id(
+                            StatePhase.CREATE_PENDING,
+                            ResourceRole.IMAGE,
+                            image_id,
+                        )
+                    pending = locked.record_owned_role(
+                        StatePhase.CREATE_PENDING, ResourceRole.IMAGE
                     )
-                pending = locked.record_owned_role(
-                    StatePhase.CREATE_PENDING, ResourceRole.IMAGE
-                )
-                unresolved_mutation = False
+                    unresolved_mutation = False
                 for role in self._create_volume_roles():
                     self._execute(self._commands.create_volume(role))
                     self._inspect(role)
                     pending = locked.record_owned_role(
                         StatePhase.CREATE_PENDING, role
                     )
-                unresolved_mutation = self._uses_resource_ids()
+                unresolved_mutation = self._uses_resource_id(ResourceRole.CONTAINER)
                 self._execute(self._commands.create_container())
                 container_id = self._inspect(ResourceRole.CONTAINER)
-                if self._uses_resource_ids():
+                if self._uses_resource_id(ResourceRole.CONTAINER):
                     pending = locked.record_resource_id(
                         StatePhase.CREATE_PENDING,
                         ResourceRole.CONTAINER,
@@ -661,7 +740,7 @@ class FixtureLifecycle:
                     StatePhase.CREATE_PENDING, ResourceRole.CONTAINER
                 )
                 unresolved_mutation = False
-                if self._uses_resource_ids():
+                if self._uses_resource_id(ResourceRole.CONTAINER):
                     target = self._resource_target(
                         pending, ResourceRole.CONTAINER, container_id
                     )
@@ -823,7 +902,10 @@ class FixtureLifecycle:
                 recorded_id = pending.resource_ids.get(
                     ResourceRole.CONTAINER.value
                 )
-                if self._uses_resource_ids() and recorded_id is not None:
+                if (
+                    self._uses_resource_id(ResourceRole.CONTAINER)
+                    and recorded_id is not None
+                ):
                     present = self._identity_present(
                         pending, ResourceRole.CONTAINER
                     )
@@ -878,7 +960,7 @@ class FixtureLifecycle:
             failed = False
             for role in self._cleanup_roles():
                 recorded_id = pending.resource_ids.get(role.value)
-                if self._uses_resource_ids() and recorded_id is not None:
+                if self._uses_resource_id(role) and recorded_id is not None:
                     try:
                         observed_id = self._inspect(
                             role,
@@ -920,7 +1002,7 @@ class FixtureLifecycle:
                         continue
                 if not present:
                     if (
-                        self._uses_resource_ids()
+                        self._uses_resource_id(role)
                         and recorded_id is None
                         and role.value in pending.created_roles
                     ):
@@ -942,7 +1024,7 @@ class FixtureLifecycle:
                 if recorded_id is None:
                     try:
                         observed_id = self._inspect(role, cleanup=True)
-                        if self._uses_resource_ids():
+                        if self._uses_resource_id(role):
                             pending = locked.record_resource_id(
                                 StatePhase.DESTROY_PENDING,
                                 role,
@@ -958,7 +1040,7 @@ class FixtureLifecycle:
                 role_failed = False
                 if role is ResourceRole.CONTAINER:
                     try:
-                        if self._uses_resource_ids():
+                        if self._uses_resource_id(role):
                             self._execute(self._commands.stop_container(target))
                         else:
                             self._execute(self._commands.stop_container())
@@ -966,7 +1048,7 @@ class FixtureLifecycle:
                         role_failed = True
                     command = (
                         self._commands.remove_container(target)
-                        if self._uses_resource_ids()
+                        if self._uses_resource_id(role)
                         else self._commands.remove_container()
                     )
                 elif role in (
@@ -978,7 +1060,7 @@ class FixtureLifecycle:
                 elif role is ResourceRole.IMAGE:
                     command = (
                         self._commands.remove_image(target)
-                        if self._uses_resource_ids()
+                        if self._uses_resource_id(role)
                         else self._commands.remove_image()
                     )
                 else:  # pragma: no cover - the cleanup role tuple is closed.
@@ -994,6 +1076,16 @@ class FixtureLifecycle:
                         StatePhase.DESTROY_PENDING, role
                     )
                 if role_failed:
+                    failed = True
+            if not failed and self._runtime_snapshot is not None:
+                try:
+                    self._runtime_snapshot.remove()
+                except LabError:
+                    # A failed identity proof can mean the derived snapshot was
+                    # moved away from its deterministic name.  Preserve that
+                    # uncertainty as an irreversible hold so a later retry
+                    # cannot mistake name absence for complete cleanup.
+                    pending = locked.mark_tainted(StatePhase.DESTROY_PENDING)
                     failed = True
             if failed:
                 error = RunnerFailureError("one or more exact removals failed")
@@ -1032,11 +1124,18 @@ class FixtureLifecycle:
                     role_remaining = self._owned_count(role)
                     if (
                         not role_remaining
-                        and self._uses_resource_ids()
+                        and self._uses_resource_id(role)
                         and self._identity_present(pending, role)
                     ):
                         role_remaining = 1
                     remaining += role_remaining
+                except LabError:
+                    failed = True
+                    remaining += 1
+            if self._runtime_snapshot is not None:
+                try:
+                    if self._runtime_snapshot.present():
+                        remaining += 1
                 except LabError:
                     failed = True
                     remaining += 1
