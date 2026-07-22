@@ -65,8 +65,23 @@ elif mode == "--features-json":
             "features": ["auth", "chat", "models", "sessions"],
         }
     )
+elif mode == "--bridge-features":
+    emit(
+        {
+            "provider": identity,
+            "features": [
+                "chat",
+                "stream",
+                "sessions",
+                "tools",
+                "reasoning_summaries",
+            ],
+        }
+    )
 elif mode == "--doctor-json":
     emit({"provider": identity, "ok": True})
+elif mode == "--doctor-false-json":
+    emit({"provider": identity, "ok": False})
 elif mode == "--models-json":
     emit({"provider": identity, "models": ["fixture-small", "fixture-large"]})
 elif mode == "--auth-json":
@@ -117,6 +132,115 @@ elif mode == "chat":
             ),
         }
     )
+elif mode == "bridge-plain":
+    prompt = sys.stdin.read() if not sys.argv[2:] else sys.argv[-1]
+    sys.stdout.write("plain:{}".format(prompt))
+elif mode == "bridge-json":
+    prompt = sys.stdin.read() if not sys.argv[2:] else sys.argv[-1]
+    emit(
+        {
+            "answer": "json:{}".format(prompt),
+            "session": "json-session",
+            "input_tokens": 3,
+            "output_tokens": 5,
+        }
+    )
+elif mode == "bridge-jsonl":
+    prompt = sys.argv[-1]
+    requested_session = None
+    if "--session" in sys.argv:
+        requested_session = sys.argv[sys.argv.index("--session") + 1]
+    session = requested_session or "stream-session"
+    if prompt.startswith("malformed"):
+        sys.stdout.write("{not-json}\n")
+        sys.stdout.flush()
+    elif prompt.startswith("flood"):
+        for index in range(64):
+            emit({"kind": "delta", "value": str(index)})
+    elif prompt.startswith("unknown"):
+        emit({"kind": "unknown", "secret": prompt})
+    elif prompt.startswith("mapper-failure"):
+        emit({"kind": "mapper-failure", "secret": prompt})
+    elif prompt.startswith("error-secret"):
+        emit({"kind": "error", "message": prompt, "code": prompt})
+        emit({"kind": "done"})
+    elif prompt.startswith("error-after"):
+        emit({"kind": "error", "message": "failed", "code": "failed"})
+        emit({"kind": "delta", "value": "must-not-follow-error"})
+        emit({"kind": "done"})
+    elif prompt.startswith("clean-eof"):
+        emit({"kind": "final", "value": "clean eof"})
+    elif prompt.startswith("unclean-eof"):
+        emit({"kind": "final", "value": "unclean eof"})
+        raise SystemExit(9)
+    elif prompt.startswith("session-mismatch"):
+        emit({"kind": "session", "id": "different-session"})
+        emit({"kind": "done"})
+    elif prompt.startswith("duplicate-session-same"):
+        emit({"kind": "session", "id": session})
+        emit({"kind": "session", "id": session})
+        emit({"kind": "done"})
+    elif prompt.startswith("duplicate-session-conflict"):
+        emit({"kind": "session", "id": session})
+        emit({"kind": "session", "id": "conflicting-session"})
+        emit({"kind": "done"})
+    elif prompt.startswith("missing-session"):
+        emit({"kind": "final", "value": "missing session"})
+        emit({"kind": "done"})
+    elif prompt.startswith("model-echo"):
+        selected_model = sys.argv[sys.argv.index("--model") + 1]
+        emit({"kind": "final", "value": selected_model})
+        emit({"kind": "done"})
+    elif prompt.startswith("text-after-final"):
+        emit({"kind": "final", "value": "final"})
+        emit({"kind": "delta", "value": "late"})
+        emit({"kind": "done"})
+    elif prompt.startswith("unfinished-tool"):
+        emit({"kind": "tool-start", "id": "tool-1", "name": "lookup"})
+        emit({"kind": "done"})
+    elif prompt.startswith("hang:"):
+        pid_file = Path(prompt.split(":", 1)[1])
+        pid_file.write_text(str(os.getpid()), encoding="utf-8")
+        emit({"kind": "partial", "value": "waiting"})
+        time.sleep(30)
+    elif prompt.startswith("descendant:"):
+        pid_file = Path(prompt.split(":", 1)[1])
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+            ],
+            shell=False,
+        )
+        pid_file.write_text(
+            "{} {}".format(os.getpid(), child.pid), encoding="utf-8"
+        )
+        emit({"kind": "partial", "value": "spawned"})
+        time.sleep(30)
+    else:
+        emit({"kind": "session", "id": session})
+        emit({"kind": "partial", "value": "Hel"})
+        emit({"kind": "partial", "value": "Hello"})
+        emit(
+            {
+                "kind": "tool-start",
+                "id": "tool-1",
+                "name": "lookup",
+                "arguments": {"query": ["safe", {"page": 1}]},
+            }
+        )
+        emit({"kind": "tool-progress", "id": "tool-1", "value": 0.5})
+        emit(
+            {
+                "kind": "tool-result",
+                "id": "tool-1",
+                "result": {"ok": True, "items": [1, 2]},
+            }
+        )
+        emit({"kind": "final", "value": "Hello"})
+        emit({"kind": "usage", "input": 7, "output": 11, "cached": 2})
+        emit({"kind": "done"})
 elif mode == "--process-hang":
     Path(sys.argv[2]).write_text(str(os.getpid()), encoding="utf-8")
     time.sleep(30)

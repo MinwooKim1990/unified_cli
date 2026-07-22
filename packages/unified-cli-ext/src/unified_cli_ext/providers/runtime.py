@@ -54,6 +54,7 @@ from .contract import (
     TransportKind,
     describe_adapter,
 )
+from .installation import InstallationReceiptV1, VerifiedLaunchV1
 
 
 _VERSION_RE = re.compile(
@@ -270,6 +271,8 @@ def _regular_binary(path: str, executable_name: str) -> "BinaryProvenance":
             else _identity_from_record(_identity_record(identity.interpreter))
         ),
         ctime_ns=identity.ctime_ns,
+        launch_prefix=(real_path,),
+        launch_identities=(identity,),
     )
 
 
@@ -295,21 +298,83 @@ class BinaryProvenance:
     parent_chain: Tuple[Tuple[str, int, int, int, int], ...] = ()
     interpreter: Optional[ExecutableIdentity] = None
     ctime_ns: int = -1
+    launch_prefix: Tuple[str, ...] = ()
+    launch_identities: Tuple[ExecutableIdentity, ...] = ()
+    installation_receipt: Optional[InstallationReceiptV1] = None
+    verified_launch: Optional[VerifiedLaunchV1] = None
+
+    @property
+    def argv_prefix(self) -> Tuple[str, ...]:
+        """Return the receipt-bound launch prefix, never caller argv."""
+
+        return self.launch_prefix or (self.real_path,)
+
+    @property
+    def launch_target(self) -> str:
+        """Return the provider launcher/script entry in ``argv_prefix``."""
+
+        return self.argv_prefix[-1]
+
+    def spawn_identities(self) -> Tuple[ExecutableIdentity, ...]:
+        """Return immutable identities for every runtime-owned argv prefix."""
+
+        if self.launch_identities:
+            return tuple(
+                _identity_from_record(_identity_record(identity))
+                for identity in self.launch_identities
+            )
+        return (self.executable_identity(),)
 
     def verify(self, executable_name: str) -> None:
-        if (
-            type(executable_name) is not str
-            or self.invoked_path != self.real_path
-            or not os.path.isabs(self.real_path)
-            or os.path.normpath(self.real_path) != self.real_path
-            or os.path.realpath(self.real_path) != self.real_path
-            or os.path.basename(self.real_path) != executable_name
-        ):
-            raise ConfigurationError("provider binary provenance changed")
+        receipt = self.installation_receipt
+        verified = self.verified_launch
+        if receipt is None:
+            if (
+                verified is not None
+                or type(executable_name) is not str
+                or self.invoked_path != self.real_path
+                or not os.path.isabs(self.real_path)
+                or os.path.normpath(self.real_path) != self.real_path
+                or os.path.realpath(self.real_path) != self.real_path
+                or os.path.basename(self.real_path) != executable_name
+                or self.argv_prefix != (self.real_path,)
+                or self.spawn_identities() != (self.executable_identity(),)
+            ):
+                raise ConfigurationError("provider binary provenance changed")
+        else:
+            if (
+                type(receipt) is not InstallationReceiptV1
+                or type(verified) is not VerifiedLaunchV1
+                or type(executable_name) is not str
+                or receipt.executable_basename != executable_name
+                or receipt.invoked_launcher_path != self.invoked_path
+            ):
+                raise ConfigurationError("provider installation receipt changed")
+            try:
+                current = receipt.verify()
+            except ConfigurationError:
+                raise ConfigurationError(
+                    "provider installation receipt changed"
+                ) from None
+            if (
+                current != verified
+                or current.argv_prefix != self.argv_prefix
+                or current.argv_prefix[0] != self.real_path
+                or current.executable_identity != self.executable_identity()
+                or current.launch_identities != self.spawn_identities()
+            ):
+                raise ConfigurationError("provider installation receipt changed")
         try:
+            for identity in self.spawn_identities():
+                identity.verify_metadata()
             self.executable_identity().verify_metadata()
         except ConfigurationError:
-            raise ConfigurationError("provider binary provenance changed") from None
+            message = (
+                "provider binary provenance changed"
+                if receipt is None
+                else "provider installation receipt changed"
+            )
+            raise ConfigurationError(message) from None
 
     def executable_identity(self) -> ExecutableIdentity:
         return ExecutableIdentity(
@@ -427,6 +492,7 @@ class OpenedProcessTransportV1:
         "_kind",
         "_invocation",
         "_binary_identity",
+        "_launch_identities",
         "_provider_env",
         "_allowed_provider_env",
         "_provider_home",
@@ -449,15 +515,26 @@ class OpenedProcessTransportV1:
         limits: Any,
         cancellation: Optional[CancellationToken],
         cwd: str,
+        launch_identities: Optional[Tuple[ExecutableIdentity, ...]] = None,
     ) -> None:
         invocation_copy = _invocation_from_record(_invocation_record(invocation))
         identity_copy = _identity_from_record(_identity_record(binary_identity))
+        supplied_launch_identities = (
+            (binary_identity,)
+            if launch_identities is None
+            else launch_identities
+        )
+        launch_identity_copies = tuple(
+            _identity_from_record(_identity_record(identity))
+            for identity in supplied_launch_identities
+        )
         environment_copy = MappingProxyType(dict(provider_env))
         allowed_copy = tuple(allowed_provider_env)
         limits_copy = _limits_from_record(_limits_record(limits))
         object.__setattr__(self, "_kind", kind)
         object.__setattr__(self, "_invocation", invocation_copy)
         object.__setattr__(self, "_binary_identity", identity_copy)
+        object.__setattr__(self, "_launch_identities", launch_identity_copies)
         object.__setattr__(self, "_provider_env", environment_copy)
         object.__setattr__(self, "_allowed_provider_env", allowed_copy)
         object.__setattr__(self, "_provider_home", provider_home)
@@ -479,6 +556,7 @@ class OpenedProcessTransportV1:
                 _limits_record(limits_copy),
                 cancellation,
                 cwd,
+                tuple(_identity_record(identity) for identity in launch_identity_copies),
                 id(state_lock),
             ),
         )
@@ -507,6 +585,10 @@ class OpenedProcessTransportV1:
                 _limits_record(self._limits),
                 self._cancellation,
                 self._cwd,
+                tuple(
+                    _identity_record(identity)
+                    for identity in self._launch_identities
+                ),
             )
         except BaseException:
             raise ConfigurationError(
@@ -515,7 +597,7 @@ class OpenedProcessTransportV1:
         if (
             current != self._issued_state[:-1]
             or self._cancellation is not self._issued_state[7]
-            or id(self._state_lock) != self._issued_state[9]
+            or id(self._state_lock) != self._issued_state[10]
         ):
             raise ConfigurationError(
                 "provider transport handle state changed after issuance"
@@ -542,6 +624,10 @@ class OpenedProcessTransportV1:
                     limits=limits.transport_limits(),
                     cancellation=self._issued_state[7],
                     executable_identity=identity,
+                    launch_identities=tuple(
+                        _identity_from_record(record)
+                        for record in self._issued_state[9]
+                    ),
                 )
             finally:
                 object.__setattr__(self, "_run_state", "used")
@@ -1176,11 +1262,64 @@ class ProviderAdapterV1:
         self._observe_binary(binary)
         return binary
 
+    def resolve_installation(
+        self, receipt: InstallationReceiptV1
+    ) -> BinaryProvenance:
+        """Bind a verified direct or npm installation to this adapter.
+
+        The caller supplies the complete receipt object, never a launch tuple.
+        Verification re-checks direct-file or npm manifest/symlink identity and
+        issues the only multi-element prefix accepted by the runtime.
+        """
+
+        self._ensure_usable()
+        if type(receipt) is not InstallationReceiptV1:
+            raise ConfigurationError(
+                "provider launch requires an InstallationReceiptV1"
+            )
+        if (
+            receipt.provider_id != self.spec.id
+            or receipt.executable_basename != self.spec.binary.executable
+        ):
+            raise ConfigurationError(
+                "provider installation receipt does not match adapter metadata"
+            )
+        verified = receipt.verify()
+        if type(verified) is not VerifiedLaunchV1:
+            raise ConfigurationError("provider installation verification failed")
+        identity = verified.executable_identity
+        binary = BinaryProvenance(
+            invoked_path=receipt.invoked_launcher_path,
+            real_path=identity.path,
+            sha256=identity.sha256,
+            device=identity.device,
+            inode=identity.inode,
+            size=identity.size,
+            mtime_ns=identity.mtime_ns,
+            mode=identity.mode,
+            owner=identity.owner,
+            parent_chain=identity.parent_chain,
+            interpreter=(
+                None
+                if identity.interpreter is None
+                else _identity_from_record(_identity_record(identity.interpreter))
+            ),
+            ctime_ns=identity.ctime_ns,
+            launch_prefix=verified.argv_prefix,
+            launch_identities=verified.launch_identities,
+            installation_receipt=receipt,
+            verified_launch=verified,
+        )
+        self._observe_binary(binary)
+        return binary
+
     @staticmethod
     def _binary_cache_identity(binary: BinaryProvenance) -> Tuple[Any, ...]:
         return (
             binary.invoked_path,
             binary.real_path,
+            binary.argv_prefix,
+            tuple(_identity_record(identity) for identity in binary.spawn_identities()),
             binary.sha256,
             binary.device,
             binary.inode,
@@ -1193,6 +1332,8 @@ class ProviderAdapterV1:
             if binary.interpreter is None
             else _identity_record(binary.interpreter),
             binary.ctime_ns,
+            binary.installation_receipt,
+            binary.verified_launch,
         )
 
     def _observe_binary(self, binary: BinaryProvenance) -> Tuple[Any, ...]:
@@ -1407,6 +1548,27 @@ class ProviderAdapterV1:
     ) -> Mapping[str, str]:
         return self.spec.environment.select(provider_env)
 
+    def _fixed_command_argv(
+        self, binary: BinaryProvenance, command: FixedCommandSpec
+    ) -> Tuple[str, ...]:
+        binary.verify(self.spec.binary.executable)
+        built = command.build(binary.launch_target)
+        return binary.argv_prefix + built[1:]
+
+    def _prompt_invocation(
+        self,
+        binary: BinaryProvenance,
+        prompt: str,
+        values: Optional[Mapping[str, str]],
+    ) -> BuiltPromptInvocation:
+        binary.verify(self.spec.binary.executable)
+        built = self.spec.prompt.build(binary.launch_target, prompt, values)
+        return BuiltPromptInvocation(
+            argv=binary.argv_prefix + built.argv[1:],
+            stdin_text=built.stdin_text,
+            protocol_text=built.protocol_text,
+        )
+
     @staticmethod
     def _plain_record(text: str, probe: PlainTextProbeSpec) -> Mapping[str, Any]:
         lines = tuple(
@@ -1501,7 +1663,7 @@ class ProviderAdapterV1:
             workspace = os.path.realpath(workspace)
             if isinstance(probe, JsonProbeSpec) and probe.format is ProbeFormat.JSONL:
                 process = JsonlProcess(
-                    probe.command.build(binary.real_path),
+                    self._fixed_command_argv(binary, probe.command),
                     timeout=probe.command.limits.timeout_seconds,
                     cwd=workspace,
                     provider_env=selected,
@@ -1510,6 +1672,7 @@ class ProviderAdapterV1:
                     limits=probe.command.limits.transport_limits(),
                     cancellation=cancellation,
                     executable_identity=binary.executable_identity(),
+                    launch_identities=binary.spawn_identities(),
                 )
                 messages = []
                 with process:
@@ -1522,7 +1685,7 @@ class ProviderAdapterV1:
                 result = messages[0]
             else:
                 fixed = run_fixed_process(
-                    probe.command.build(binary.real_path),
+                    self._fixed_command_argv(binary, probe.command),
                     timeout=probe.command.limits.timeout_seconds,
                     cwd=workspace,
                     provider_env=selected,
@@ -1531,6 +1694,7 @@ class ProviderAdapterV1:
                     limits=probe.command.limits.transport_limits(),
                     cancellation=cancellation,
                     executable_identity=binary.executable_identity(),
+                    launch_identities=binary.spawn_identities(),
                 )
                 if isinstance(probe, ExitStatusProbeSpec):
                     if fixed.returncode != probe.expected_status:
@@ -1809,6 +1973,10 @@ class ProviderAdapterV1:
                     )
                 ),
                 ctime_ns=inspection.binary.ctime_ns,
+                launch_prefix=inspection.binary.argv_prefix,
+                launch_identities=inspection.binary.spawn_identities(),
+                installation_receipt=inspection.binary.installation_receipt,
+                verified_launch=inspection.binary.verified_launch,
             ),
             inspection.abi_version,
         )
@@ -2022,7 +2190,7 @@ class ProviderAdapterV1:
             workspace = os.path.realpath(workspace)
             workspace = validated_workspace(workspace)
             session = InteractiveAuthSessionV1(
-                command.build(binary.real_path),
+                self._fixed_command_argv(binary, command),
                 binary.executable_identity(),
                 selected,
                 tuple(self.spec.environment.allowed_keys),
@@ -2125,7 +2293,7 @@ class ProviderAdapterV1:
     ) -> BuiltPromptInvocation:
         self._ensure_usable()
         binary.verify(self.spec.binary.executable)
-        return self.spec.prompt.build(binary.real_path, prompt, values)
+        return self._prompt_invocation(binary, prompt, values)
 
     def open_transport(
         self,
@@ -2137,11 +2305,23 @@ class ProviderAdapterV1:
         provider_env: Optional[Mapping[str, str]] = None,
         provider_home: Optional[str] = None,
         cancellation: Optional[CancellationToken] = None,
+        limits: Optional[OperationLimits] = None,
     ) -> Any:
         """Dispatch from declared transport metadata to a safe concrete boundary."""
 
         binary = self._require_inspection(inspection)
         workspace = validated_workspace(cwd)
+        operation_limits = self.spec.prompt.limits if limits is None else limits
+        if type(operation_limits) is not OperationLimits:
+            raise ConfigurationError("prompt runtime limits must be OperationLimits")
+        declared_limits = self.spec.prompt.limits
+        if (
+            operation_limits.timeout_seconds > declared_limits.timeout_seconds
+            or operation_limits.max_stdout_bytes > declared_limits.max_stdout_bytes
+            or operation_limits.max_stderr_bytes > declared_limits.max_stderr_bytes
+            or operation_limits.max_events > declared_limits.max_events
+        ):
+            raise ConfigurationError("prompt runtime limits exceed adapter metadata")
         kind = self.spec.transport
         if kind is TransportKind.ACP:
             raise ConfigurationError(
@@ -2151,7 +2331,7 @@ class ProviderAdapterV1:
             raise ConfigurationError(
                 "HTTP provider execution is not implemented: ABI v1 has no provider-owned daemon lifecycle"
             )
-        invocation = self.spec.prompt.build(binary.real_path, prompt, values)
+        invocation = self._prompt_invocation(binary, prompt, values)
         selected = self._selected_environment(provider_env)
         allowed = tuple(self.spec.environment.allowed_keys)
         identity = binary.executable_identity()
@@ -2164,21 +2344,23 @@ class ProviderAdapterV1:
                 selected,
                 allowed,
                 provider_home,
-                self.spec.prompt.limits,
+                operation_limits,
                 cancellation,
                 workspace,
+                launch_identities=binary.spawn_identities(),
             )
 
         if kind in (TransportKind.JSONL, TransportKind.JSON_RPC):
             common = dict(
-                timeout=self.spec.prompt.limits.timeout_seconds,
+                timeout=operation_limits.timeout_seconds,
                 cwd=workspace,
                 provider_env=selected,
                 allowed_provider_env=allowed,
                 persistent_home=provider_home,
-                limits=self.spec.prompt.limits.transport_limits(),
+                limits=operation_limits.transport_limits(),
                 cancellation=cancellation,
                 executable_identity=identity,
+                launch_identities=binary.spawn_identities(),
             )
             if kind is TransportKind.JSONL:
                 transport = JsonlProcess(invocation.argv, **common)

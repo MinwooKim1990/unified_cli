@@ -31,7 +31,10 @@ from .security import (
     ExecutableIdentity,
     IsolatedEnvironment,
     TransportLimits,
+    _guarded_spawn_argv,
     _require_executable_identity_argv,
+    _validated_launch_identities,
+    _verify_launch_identities,
     redact_diagnostics,
     strict_json_loads,
     validated_workspace,
@@ -80,6 +83,7 @@ class JsonlProcess:
         limits: TransportLimits = TransportLimits(),
         cancellation: Optional[CancellationToken] = None,
         persistent_home: Optional[str] = None,
+        launch_identities: Optional[tuple[ExecutableIdentity, ...]] = None,
     ) -> None:
         if isinstance(argv, (str, bytes)) or not isinstance(argv, Sequence):
             raise ConfigurationError("subprocess argv must be a nonempty string sequence")
@@ -126,6 +130,9 @@ class JsonlProcess:
             raise ConfigurationError("executable_identity must be ExecutableIdentity")
         _require_executable_identity_argv(self.argv[0], executable_identity)
         self._executable_identity = executable_identity
+        self._launch_identities = _validated_launch_identities(
+            self.argv, executable_identity, launch_identities
+        )
         self._environment = IsolatedEnvironment(
             provider_env,
             allowed_provider_keys=allowed_provider_env,
@@ -207,13 +214,13 @@ class JsonlProcess:
                 self.argv[0], self._executable_identity
             )
             assert self._executable_identity is not None
-            self._executable_identity.verify()
+            _verify_launch_identities(self._launch_identities)
             if self._cwd_pin is not None:
                 self._cwd_pin.verify()
             environment.verify_for_spawn()
             self._check_start_checkpoint()
             spawned = subprocess.Popen(
-                list(self.argv),
+                _guarded_spawn_argv(self.argv, self._launch_identities),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -231,7 +238,7 @@ class JsonlProcess:
             if self._cwd_pin is not None:
                 self._cwd_pin.verify()
             environment.verify_after_spawn()
-            self._executable_identity.verify_metadata()
+            _verify_launch_identities(self._launch_identities)
             self._check_start_checkpoint()
             self._started = time.monotonic()
             stdout_thread = threading.Thread(

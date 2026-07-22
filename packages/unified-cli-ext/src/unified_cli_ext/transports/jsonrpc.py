@@ -124,6 +124,7 @@ class JsonRpcProcessClient:
         limits: TransportLimits = TransportLimits(),
         cancellation: Optional[CancellationToken] = None,
         persistent_home: Optional[str] = None,
+        launch_identities: Optional[tuple[ExecutableIdentity, ...]] = None,
     ) -> None:
         handlers: Dict[str, Callable[[Any], Any]] = {}
         try:
@@ -157,6 +158,7 @@ class JsonRpcProcessClient:
             cancellation=cancellation,
             persistent_home=persistent_home,
             executable_identity=executable_identity,
+            launch_identities=launch_identities,
         )
         self._next_id = 1
         self._pending = set()

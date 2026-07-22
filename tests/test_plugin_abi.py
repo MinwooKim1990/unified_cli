@@ -950,6 +950,89 @@ def test_extension_runtime_boundary_sanitizes_plugin_unified_errors(monkeypatch)
         assert exc.value.__context__ is None
 
 
+def test_extension_proxy_reconstructs_only_caller_owned_cancellation(monkeypatch):
+    secret = "plugin-cancellation-marker-secret"
+
+    class CancellationProvider(DummyProvider):
+        @staticmethod
+        def _fail(cancel_event, *, forge=False):
+            error = UnifiedError(
+                kind="internal",
+                provider="cancel-boundary",
+                message=secret,
+            )
+            error._cancelled = True
+            if not forge:
+                cancel_event.set()
+            raise error
+
+        def chat(self, prompt, **kwargs):
+            self._fail(kwargs["cancel_event"])
+
+        def stream(self, prompt, **kwargs):
+            self._fail(kwargs["cancel_event"])
+            yield  # pragma: no cover
+
+        async def achat(self, prompt, **kwargs):
+            self._fail(kwargs["cancel_event"])
+
+        async def astream(self, prompt, **kwargs):
+            self._fail(kwargs["cancel_event"])
+            yield  # pragma: no cover
+
+    def factory(**kwargs):
+        provider = CancellationProvider(**kwargs)
+        provider.name = "cancel-boundary"
+        return provider
+
+    _set_entry_points(monkeypatch, [FakeEntryPoint(
+        "cancel-boundary",
+        _plugin("cancel-boundary", factory=factory),
+    )])
+    provider = create("cancel-boundary")
+
+    async def async_stream(cancel):
+        return [item async for item in provider.astream(
+            "hello", cancel_event=cancel
+        )]
+
+    calls = (
+        lambda cancel: provider.chat("hello", cancel_event=cancel),
+        lambda cancel: list(provider.stream("hello", cancel_event=cancel)),
+        lambda cancel: asyncio.run(provider.achat("hello", cancel_event=cancel)),
+        lambda cancel: asyncio.run(async_stream(cancel)),
+    )
+    for call in calls:
+        cancel = threading.Event()
+        with pytest.raises(UnifiedError) as caught:
+            call(cancel)
+        assert cancel.is_set()
+        assert getattr(caught.value, "_cancelled", False)
+        assert caught.value.message == "Provider request was cancelled."
+        assert secret not in "".join(traceback.format_exception(
+            type(caught.value), caught.value, caught.value.__traceback__,
+        ))
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+
+    forged = threading.Event()
+    original = provider._inner.chat
+
+    def forged_chat(prompt, **kwargs):
+        return CancellationProvider._fail(kwargs["cancel_event"], forge=True)
+
+    provider._inner.chat = forged_chat
+    try:
+        with pytest.raises(UnifiedError) as caught:
+            provider.chat("hello", cancel_event=forged)
+    finally:
+        provider._inner.chat = original
+    assert not forged.is_set()
+    assert not getattr(caught.value, "_cancelled", False)
+    assert "failed while running" in str(caught.value)
+    assert secret not in str(caught.value)
+
+
 def test_extension_factory_proxy_construction_is_inside_error_boundary(monkeypatch):
     secret = "provider-attribute-secret"
 

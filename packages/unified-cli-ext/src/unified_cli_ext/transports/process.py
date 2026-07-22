@@ -30,7 +30,10 @@ from .security import (
     ExecutableIdentity,
     IsolatedEnvironment,
     TransportLimits,
+    _guarded_spawn_argv,
     _require_executable_identity_argv,
+    _validated_launch_identities,
+    _verify_launch_identities,
     redact_diagnostics,
     validated_workspace,
     validate_positive_timeout,
@@ -593,6 +596,7 @@ def run_fixed_process(
     persistent_home: Optional[str] = None,
     limits: TransportLimits = TransportLimits(),
     cancellation: Optional[CancellationToken] = None,
+    launch_identities: Optional[tuple[ExecutableIdentity, ...]] = None,
 ) -> FixedProcessResult:
     """Execute exactly one argv with ``shell=False`` and bounded I/O.
 
@@ -616,6 +620,9 @@ def run_fixed_process(
     if type(executable_identity) is not ExecutableIdentity:
         raise ConfigurationError("executable_identity must be ExecutableIdentity")
     _require_executable_identity_argv(clean_argv[0], executable_identity)
+    complete_identities = _validated_launch_identities(
+        clean_argv, executable_identity, launch_identities
+    )
     if cwd is None:
         raise ConfigurationError("subprocess cwd must be an explicit provider workspace")
     clean_cwd = validated_workspace(cwd)
@@ -641,7 +648,7 @@ def run_fixed_process(
     with DirectoryPin(clean_cwd) as cwd_pin:
         with _managed_environment(environment):
             token.raise_if_cancelled()
-            identity_before.verify()
+            _verify_launch_identities(complete_identities)
             cwd_pin.verify()
             environment.verify_for_spawn()
             token.raise_if_cancelled()
@@ -651,7 +658,7 @@ def run_fixed_process(
             selector = None
             try:
                 process = subprocess.Popen(
-                    list(clean_argv),
+                    _guarded_spawn_argv(clean_argv, complete_identities),
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -666,7 +673,7 @@ def run_fixed_process(
             try:
                 cwd_pin.verify()
                 environment.verify_after_spawn()
-                identity_before.verify_metadata()
+                _verify_launch_identities(complete_identities)
                 try:
                     assert process.stdin is not None
                     assert process.stdout is not None and process.stderr is not None
