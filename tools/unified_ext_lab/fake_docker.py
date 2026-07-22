@@ -312,7 +312,25 @@ class FakeRunner:
                 },
             },
             "Mounts": mounts,
-            "NetworkSettings": {"Ports": {}},
+            "NetworkSettings": {
+                "Ports": {},
+                "Networks": {
+                    "none": {
+                        "Aliases": None,
+                        "DNSNames": None,
+                        "DriverOpts": None,
+                        "Gateway": "",
+                        "GlobalIPv6Address": "",
+                        "GlobalIPv6PrefixLen": 0,
+                        "IPAddress": "",
+                        "IPAMConfig": None,
+                        "IPPrefixLen": 0,
+                        "IPv6Gateway": "",
+                        "Links": None,
+                        "MacAddress": "",
+                    }
+                },
+            },
         }
         return "synthetic-container-id\n"
 

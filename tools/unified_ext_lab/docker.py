@@ -83,10 +83,14 @@ _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _FIXTURE_RELATIVE_PATH = os.path.join(
     "rootfs", "opt", "unified-ext-lab", "fixtures", "fake-provider"
 )
+_PROVIDER_GUEST_RELATIVE_PATH = os.path.join(
+    "rootfs", "opt", "unified-ext-lab", "provider_guest.py"
+)
 _EXPECTED_CONTEXT_FILES = {
     "Dockerfile",
     os.path.join("rootfs", "home", "lab", ".volume-owner"),
     os.path.join("rootfs", "opt", "unified-ext-lab", "guest.py"),
+    _PROVIDER_GUEST_RELATIVE_PATH,
     _FIXTURE_RELATIVE_PATH,
     os.path.join(
         "rootfs", "opt", "unified-ext-lab", "tool", ".volume-owner"
@@ -1059,6 +1063,85 @@ def snapshot_image_context(
         raise
 
 
+def load_snapshot_image_context(
+    private_parent: str,
+    *,
+    context_lock: str = CONTEXT_LOCK,
+    fixture_lock: str = FIXTURE_LOCK,
+) -> LockedContextSnapshot:
+    """Validate and load an existing private snapshot without creating files.
+
+    Forward-process restarts use this path.  It validates the deterministic
+    parent namespace, the persisted lock identity, the complete inventory,
+    every mode/hash/owner check, and the fixture cross-lock before returning a
+    value.  Callers must not publish any runtime state until this returns.
+    """
+
+    if (
+        type(private_parent) is not str
+        or not os.path.isabs(private_parent)
+        or os.path.normpath(private_parent) != private_parent
+        or os.path.realpath(private_parent) != private_parent
+    ):
+        raise UsageStateError("private snapshot parent must be absolute and canonical")
+    try:
+        parent_info = os.lstat(private_parent)
+        entries = set(os.listdir(private_parent))
+    except OSError as error:
+        raise InvariantRefusalError("private snapshot parent is unavailable") from error
+    if (
+        stat.S_ISLNK(parent_info.st_mode)
+        or not stat.S_ISDIR(parent_info.st_mode)
+        or stat.S_IMODE(parent_info.st_mode) != 0o700
+        or parent_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or (hasattr(os, "geteuid") and parent_info.st_uid != os.geteuid())
+        or entries
+        != {".snapshot-identity", "image-context", "image-context.lock.json"}
+    ):
+        raise InvariantRefusalError("private snapshot parent is unsafe")
+
+    snapshot_context = os.path.join(private_parent, "image-context")
+    snapshot_lock = os.path.join(private_parent, "image-context.lock.json")
+    expected_lock_sha256 = _file_sha256(context_lock, "image context lock")
+    lock_info = os.lstat(snapshot_lock)
+    if stat.S_IMODE(lock_info.st_mode) != 0o600:
+        raise InvariantRefusalError("private snapshot lock mode drift")
+    if _file_sha256(snapshot_lock, "private snapshot lock") != expected_lock_sha256:
+        raise InvariantRefusalError("private snapshot lock identity drift")
+
+    _validate_image_context(
+        snapshot_context,
+        snapshot_lock,
+        expected_lock_sha256,
+        private_snapshot=True,
+    )
+    fixture_version, fixture_sha256 = _fixture_lock_identity(fixture_lock)
+    inventory = _context_inventory(snapshot_lock, expected_lock_sha256)
+    fixture_record = inventory.file_records.get(_FIXTURE_RELATIVE_PATH)
+    if (
+        fixture_record is None
+        or fixture_record[1] != fixture_sha256
+        or _file_sha256(
+            os.path.join(snapshot_context, _FIXTURE_RELATIVE_PATH),
+            "snapshot fixture",
+        )
+        != fixture_sha256
+    ):
+        raise InvariantRefusalError("snapshot fixture identity drift")
+
+    # Detect a parent replacement that occurred after the inventory walk.
+    final_parent = os.lstat(private_parent)
+    if _exact_stat_identity(final_parent) != _exact_stat_identity(parent_info):
+        raise InvariantRefusalError("private snapshot parent changed during load")
+    return LockedContextSnapshot(
+        context=snapshot_context,
+        context_lock=snapshot_lock,
+        context_lock_sha256=expected_lock_sha256,
+        fixture_version=fixture_version,
+        fixture_sha256=fixture_sha256,
+    )
+
+
 def _role(value: object) -> ResourceRole:
     if isinstance(value, ResourceRole):
         return value
@@ -1910,6 +1993,7 @@ __all__ = [
     "VOLUME_TARGETS",
     "classify_docker_argv",
     "snapshot_image_context",
+    "load_snapshot_image_context",
     "validate_base_image_inspect",
     "validate_inspect",
 ]

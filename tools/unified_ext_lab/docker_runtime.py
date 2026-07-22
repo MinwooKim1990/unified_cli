@@ -24,6 +24,7 @@ from .docker import (
     _parse_env_mapping,
     snapshot_image_context,
     validate_inspect,
+    _write_private_file,
 )
 from .errors import (
     InvariantRefusalError,
@@ -69,6 +70,8 @@ _MAX_TIMEOUT_SECONDS = 3600.0
 _GUEST_DIRECTORY = os.path.dirname(GUEST_EXECUTABLE)
 _SNAPSHOT_GUEST_PARTS = ("rootfs", "opt", "unified-ext-lab")
 _DERIVED_SNAPSHOT_NAME = "runtime-snapshot"
+_SNAPSHOT_IDENTITY_FILE = ".snapshot-identity"
+_SNAPSHOT_IDENTITY_LINK = "runtime-snapshot.identity"
 # Darwin's sys/fcntl.h defines O_SYMLINK with this stable value. Python 3.9
 # does not expose the constant even though the kernel supports the flag.
 _DARWIN_O_SYMLINK = 0x00200000
@@ -231,6 +234,8 @@ def _require_unlinked_descriptor(
 class DerivedSnapshotResource:
     """One state-derived private snapshot with no persisted path input."""
 
+    tracks_removal_state = True
+
     def __init__(self, path: str) -> None:
         if (
             type(path) is not str
@@ -249,6 +254,153 @@ class DerivedSnapshotResource:
         self.path = path
         self._parent = parent
         self._name = _DERIVED_SNAPSHOT_NAME
+        self._identity_file = os.path.join(path, _SNAPSHOT_IDENTITY_FILE)
+        self._identity_link = os.path.join(parent, _SNAPSHOT_IDENTITY_LINK)
+
+    @staticmethod
+    def _identity_payload(path: str, expected_links: int) -> Tuple[os.stat_result, bytes]:
+        try:
+            before = os.lstat(path)
+        except OSError as error:
+            raise InvariantRefusalError("runtime snapshot identity is unavailable") from error
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or stat.S_ISLNK(before.st_mode)
+            or stat.S_IMODE(before.st_mode) != 0o600
+            or before.st_nlink != expected_links
+            or before.st_size != 64
+            or (hasattr(os, "geteuid") and before.st_uid != os.geteuid())
+        ):
+            raise InvariantRefusalError("runtime snapshot identity drift")
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+        except OSError as error:
+            raise InvariantRefusalError("runtime snapshot identity is unavailable") from error
+        try:
+            opened = os.fstat(descriptor)
+            payload = os.read(descriptor, 65)
+            after = os.fstat(descriptor)
+            named = os.lstat(path)
+        except OSError as error:
+            raise InvariantRefusalError("runtime snapshot identity changed") from error
+        finally:
+            os.close(descriptor)
+        if (
+            _directory_identity(before) != _directory_identity(opened)
+            or _directory_identity(opened) != _directory_identity(after)
+            or _directory_identity(after) != _directory_identity(named)
+            or after.st_nlink != expected_links
+            or len(payload) != 64
+            or any(character not in b"0123456789abcdef" for character in payload)
+        ):
+            raise InvariantRefusalError("runtime snapshot identity changed")
+        return after, payload
+
+    def seal_identity(self) -> None:
+        """Create a same-inode marker pair after snapshot capture succeeds."""
+
+        if not self.present():
+            raise InvariantRefusalError("runtime snapshot cannot be identified")
+        if os.path.lexists(self._identity_file) or os.path.lexists(self._identity_link):
+            raise InvariantRefusalError("runtime snapshot identity already exists")
+        payload = os.urandom(32).hex().encode("ascii")
+        _write_private_file(self._identity_file, payload, 0o600)
+        try:
+            os.link(
+                self._identity_file,
+                self._identity_link,
+                follow_symlinks=False,
+            )
+            _synchronize_private_directory(self.path, "derived snapshot")
+            _synchronize_private_directory(
+                self._parent, "derived snapshot parent"
+            )
+            self.validate_identity()
+        except BaseException:
+            try:
+                if os.path.lexists(self._identity_link):
+                    os.unlink(self._identity_link)
+                if os.path.lexists(self._identity_file):
+                    os.unlink(self._identity_file)
+            except OSError:
+                pass
+            raise
+
+    def validate_identity(self) -> None:
+        internal, internal_payload = self._identity_payload(
+            self._identity_file, 2
+        )
+        external, external_payload = self._identity_payload(
+            self._identity_link, 2
+        )
+        if (
+            _directory_identity(internal) != _directory_identity(external)
+            or internal_payload != external_payload
+        ):
+            raise InvariantRefusalError("runtime snapshot identity mismatch")
+
+    def _validate_removal_tombstone(self) -> os.stat_result:
+        if os.path.lexists(self.path):
+            raise InvariantRefusalError("runtime snapshot still exists")
+        metadata, _payload = self._identity_payload(self._identity_link, 1)
+        return metadata
+
+    def finalize_removal(self) -> None:
+        """Remove only the exact one-link identity tombstone after state commit."""
+
+        expected = self._validate_removal_tombstone()
+        parent_info = os.lstat(self._parent)
+        _require_private_directory(parent_info, "derived snapshot parent")
+        parent = os.open(
+            self._parent,
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+        try:
+            if _directory_identity(os.fstat(parent)) != _directory_identity(
+                parent_info
+            ):
+                raise InvariantRefusalError(
+                    "derived snapshot parent changed"
+                )
+            metadata = os.stat(
+                _SNAPSHOT_IDENTITY_LINK,
+                dir_fd=parent,
+                follow_symlinks=False,
+            )
+            if _directory_identity(metadata) != _directory_identity(expected):
+                raise InvariantRefusalError(
+                    "runtime snapshot identity tombstone changed"
+                )
+            child = _open_nondirectory_at(
+                parent, _SNAPSHOT_IDENTITY_LINK, metadata
+            )
+            try:
+                os.unlink(_SNAPSHOT_IDENTITY_LINK, dir_fd=parent)
+                _require_unlinked_descriptor(child, 1)
+                os.fsync(parent)
+            finally:
+                os.close(child)
+        except InvariantRefusalError:
+            raise
+        except OSError as error:
+            raise InvariantRefusalError(
+                "runtime snapshot identity tombstone cannot be removed"
+            ) from error
+        finally:
+            os.close(parent)
+
+    def removal_finalized(self) -> bool:
+        return not os.path.lexists(self.path) and not os.path.lexists(
+            self._identity_link
+        )
 
     def create(self) -> None:
         if os.path.lexists(self.path):
@@ -446,6 +598,36 @@ class DerivedSnapshotResource:
             return True
         finally:
             os.close(parent)
+
+    def remove_for_cleanup(
+        self,
+        *,
+        reconcile_absent: bool,
+        identity_required: bool = False,
+    ) -> bool:
+        """Remove exactly this path or reconcile one interrupted prior remove.
+
+        A missing canonical name is accepted only when durable state says a
+        destroy mutation was previously interrupted.  First-attempt absence
+        therefore remains an unexplained move/removal and is refused.
+        """
+
+        if type(reconcile_absent) is not bool or type(identity_required) is not bool:
+            raise UsageStateError("invalid snapshot removal reconciliation")
+        if identity_required:
+            if os.path.lexists(self.path):
+                self.validate_identity()
+            else:
+                self._validate_removal_tombstone()
+                if not reconcile_absent:
+                    raise InvariantRefusalError(
+                        "derived snapshot disappeared before removal"
+                    )
+                return False
+        removed = self.remove()
+        if not removed and not reconcile_absent:
+            raise InvariantRefusalError("derived snapshot disappeared before removal")
+        return removed
 
 
 def _safe_candidate(path: str, description: str) -> Optional[str]:
