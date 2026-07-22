@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import threading
 from pathlib import Path
@@ -19,6 +20,7 @@ pytest.importorskip("httpx")
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from starlette.requests import ClientDisconnect
 
 from unified_cli import server
 from unified_cli.conversation import UnifiedConversation
@@ -40,13 +42,13 @@ def _response(text: str = "ok") -> Response:
 def _clean_server(monkeypatch):
     monkeypatch.setenv("UNIFIED_CLI_ALLOW_EXTERNAL_BIND", "1")
     monkeypatch.setenv("UNIFIED_CLI_SERVER_AUTH_TOKEN", _TEST_SERVER_AUTH_TOKEN)
+    server._release_all_conversation_leases()
     with server._CONVS_LOCK:
         server.CONVS.clear()
-        server._ACTIVE_TURNS = 0
     yield
+    server._release_all_conversation_leases()
     with server._CONVS_LOCK:
         server.CONVS.clear()
-        server._ACTIVE_TURNS = 0
 
 
 @pytest.fixture
@@ -499,7 +501,159 @@ def test_same_conversation_is_rejected_while_first_turn_active(monkeypatch):
     worker.join(timeout=5)
     assert not errors
     assert server._ACTIVE_TURNS == 0
+    assert server._ACTIVE_PROVIDER_TURNS == {}
     assert not server.CONVS["shared"].active
+
+
+def test_same_provider_is_rejected_across_different_users(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocking_send(self, prompt, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return _response()
+
+    monkeypatch.setattr(server.UnifiedConversation, "send", blocking_send)
+    first = server.ChatRequest(
+        model="haiku", messages=[{"role": "user", "content": "one"}],
+        user="first-user",
+    )
+    second = server.ChatRequest(
+        model="sonnet", messages=[{"role": "user", "content": "two"}],
+        user="second-user",
+    )
+    worker = threading.Thread(target=server.chat_completions, args=(first,))
+    worker.start()
+    assert entered.wait(3)
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            server.chat_completions(second)
+        assert exc_info.value.status_code == 429
+        assert exc_info.value.detail["code"] == "provider_busy"
+        assert exc_info.value.headers == {"Retry-After": "1"}
+        assert server._ACTIVE_TURNS == 1
+        assert server._ACTIVE_PROVIDER_TURNS == {"claude": 1}
+        assert "second-user" not in server.CONVS
+    finally:
+        release.set()
+        worker.join(timeout=5)
+
+
+def test_different_providers_can_run_within_global_ceiling(monkeypatch):
+    monkeypatch.setenv("UNIFIED_CLI_SERVER_ALLOW_AGENTIC_PROVIDERS", "1")
+    entered = {"claude": threading.Event(), "codex": threading.Event()}
+    release = threading.Event()
+    errors: list[BaseException] = []
+
+    def blocking_send(self, prompt, **kwargs):
+        provider = kwargs["provider"]
+        entered[provider].set()
+        assert release.wait(5)
+        return _response()
+
+    def request(model, user):
+        try:
+            server.chat_completions(server.ChatRequest(
+                model=model,
+                messages=[{"role": "user", "content": "hi"}],
+                user=user,
+            ))
+        except BaseException as exc:  # pragma: no cover - assertion aid
+            errors.append(exc)
+
+    monkeypatch.setattr(server.UnifiedConversation, "send", blocking_send)
+    workers = [
+        threading.Thread(target=request, args=("haiku", "claude-user")),
+        threading.Thread(target=request, args=("gpt-5.4-mini", "codex-user")),
+    ]
+    for worker in workers:
+        worker.start()
+    assert entered["claude"].wait(3)
+    assert entered["codex"].wait(3)
+    assert server._ACTIVE_TURNS == 2
+    assert server._ACTIVE_PROVIDER_TURNS == {"claude": 1, "codex": 1}
+    release.set()
+    for worker in workers:
+        worker.join(timeout=5)
+    assert not errors
+    assert server._ACTIVE_TURNS == 0
+    assert server._ACTIVE_PROVIDER_TURNS == {}
+
+
+def test_provider_alias_and_failed_acquisitions_do_not_consume_slots(monkeypatch):
+    gemini = server._acquire_conversation("gemini-user", "gemini")
+    try:
+        with pytest.raises(HTTPException) as alias_busy:
+            server._acquire_conversation("agy-user", "agy")
+        assert alias_busy.value.status_code == 429
+        assert alias_busy.value.detail["code"] == "provider_busy"
+        assert server._ACTIVE_TURNS == 1
+        assert server._ACTIVE_PROVIDER_TURNS == {"gemini": 1}
+        assert "agy-user" not in server.CONVS
+    finally:
+        gemini.release()
+
+    monkeypatch.setattr(server, "_MAX_ACTIVE_TURNS", 1)
+    claude = server._acquire_conversation("claude-user", "claude")
+    try:
+        with pytest.raises(HTTPException) as global_busy:
+            server._acquire_conversation("codex-user", "codex")
+        assert global_busy.value.status_code == 429
+        assert global_busy.value.detail["code"] == "server_busy"
+        assert server._ACTIVE_TURNS == 1
+        assert server._ACTIVE_PROVIDER_TURNS == {"claude": 1}
+        assert "codex-user" not in server.CONVS
+    finally:
+        claude.release()
+
+
+def test_same_provider_acquisition_race_has_one_winner():
+    worker_count = 24
+    start = threading.Barrier(worker_count)
+    finished_attempt = threading.Condition()
+    release = threading.Event()
+    leases: list[server._ConversationLease] = []
+    errors: list[HTTPException] = []
+    attempt_count = 0
+
+    def compete(index):
+        nonlocal attempt_count
+        start.wait()
+        try:
+            lease = server._acquire_conversation(f"race-{index}", "claude")
+        except HTTPException as exc:
+            with finished_attempt:
+                errors.append(exc)
+                attempt_count += 1
+                finished_attempt.notify_all()
+            return
+        with finished_attempt:
+            leases.append(lease)
+            attempt_count += 1
+            finished_attempt.notify_all()
+        assert release.wait(5)
+        lease.release()
+
+    workers = [threading.Thread(target=compete, args=(index,))
+               for index in range(worker_count)]
+    for worker in workers:
+        worker.start()
+    with finished_attempt:
+        assert finished_attempt.wait_for(
+            lambda: attempt_count == worker_count, timeout=5)
+    assert len(leases) == 1
+    assert len(errors) == worker_count - 1
+    assert all(error.status_code == 429 for error in errors)
+    assert all(error.detail["code"] == "provider_busy" for error in errors)
+    assert server._ACTIVE_TURNS == 1
+    assert server._ACTIVE_PROVIDER_TURNS == {"claude": 1}
+    release.set()
+    for worker in workers:
+        worker.join(timeout=5)
+    leases[0].release()  # idempotent after the winning worker released it
+    assert server._ACTIVE_TURNS == 0
+    assert server._ACTIVE_PROVIDER_TURNS == {}
 
 
 def test_active_conversation_is_never_lru_evicted(monkeypatch):
@@ -507,7 +661,7 @@ def test_active_conversation_is_never_lru_evicted(monkeypatch):
     lease = server._acquire_conversation("active")
     try:
         with pytest.raises(HTTPException) as exc_info:
-            server._acquire_conversation("new")
+            server._acquire_conversation("new", "codex")
         assert exc_info.value.status_code == 503
         assert "active" in server.CONVS
         assert "new" not in server.CONVS
@@ -536,6 +690,368 @@ def test_stream_response_limit_closes_upstream_and_marks_length(client, monkeypa
     assert '"finish_reason": "length"' in response.text
     assert "data: [DONE]" in response.text
     assert closed.is_set()
+    assert server._ACTIVE_TURNS == 0
+    assert server._ACTIVE_PROVIDER_TURNS == {}
+
+
+def test_nonstream_response_limit_releases_provider(client, monkeypatch):
+    monkeypatch.setattr(server, "_MAX_RESPONSE_CHARS", 3)
+    monkeypatch.setattr(
+        server.UnifiedConversation, "send",
+        lambda *_args, **_kwargs: _response("abcdef"),
+    )
+    response = client.post("/v1/chat/completions", json={
+        "model": "haiku",
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "abc"
+    assert response.json()["choices"][0]["finish_reason"] == "length"
+    assert server._ACTIVE_TURNS == 0
+    assert server._ACTIVE_PROVIDER_TURNS == {}
+
+
+def test_stream_provider_error_releases_provider(client, monkeypatch):
+    def failed_stream(self, prompt, **kwargs):
+        yield Message(
+            kind="error", provider="claude", error="provider failed",
+        )
+
+    monkeypatch.setattr(server.UnifiedConversation, "stream", failed_stream)
+    response = client.post("/v1/chat/completions", json={
+        "model": "haiku",
+        "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert response.status_code == 200
+    assert '"code": "upstream_error"' in response.text
+    assert server._ACTIVE_TURNS == 0
+    assert server._ACTIVE_PROVIDER_TURNS == {}
+
+
+def test_uniterated_stream_response_releases_provider_on_abandonment(monkeypatch):
+    monkeypatch.setattr(
+        server.UnifiedConversation,
+        "stream",
+        lambda *_args, **_kwargs: pytest.fail("stream must not be iterated"),
+    )
+    response = server.chat_completions(server.ChatRequest(
+        model="haiku",
+        stream=True,
+        messages=[{"role": "user", "content": "hi"}],
+        user="abandoned",
+    ))
+    assert server._ACTIVE_PROVIDER_TURNS == {"claude": 1}
+    del response
+    gc.collect()
+    assert server._ACTIVE_TURNS == 0
+    assert server._ACTIVE_PROVIDER_TURNS == {}
+    assert not server.CONVS["abandoned"].active
+
+
+def test_stream_task_cancellation_cleans_up_before_provider_release(monkeypatch):
+    cleaned = threading.Event()
+
+    def endless_stream(self, prompt, **kwargs):
+        try:
+            while True:
+                yield Message(kind="text", provider="claude", text="chunk")
+        finally:
+            assert server._ACTIVE_PROVIDER_TURNS == {"claude": 1}
+            cleaned.set()
+
+    monkeypatch.setattr(server.UnifiedConversation, "stream", endless_stream)
+    response = server.chat_completions(server.ChatRequest(
+        model="haiku",
+        stream=True,
+        messages=[{"role": "user", "content": "hi"}],
+        user="cancelled-stream",
+    ))
+
+    async def cancel_response():
+        first_body = asyncio.Event()
+        never_disconnect = asyncio.Event()
+
+        async def receive():
+            await never_disconnect.wait()
+
+        async def send(message):
+            if message["type"] == "http.response.body" and message.get("body"):
+                first_body.set()
+                await never_disconnect.wait()
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/chat/completions",
+            "raw_path": b"/v1/chat/completions",
+            "query_string": b"",
+            "headers": [],
+        }
+        task = asyncio.create_task(response(scope, receive, send))
+        await asyncio.wait_for(first_body.wait(), timeout=3)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_response())
+    assert cleaned.is_set()
+    assert server._ACTIVE_TURNS == 0
+    assert server._ACTIVE_PROVIDER_TURNS == {}
+    assert not server.CONVS["cancelled-stream"].active
+    reacquired = server._acquire_conversation("after-cancel", "claude")
+    reacquired.release()
+
+
+def test_retained_stream_disconnect_cleans_up_before_provider_release(monkeypatch):
+    cleaned = threading.Event()
+
+    def endless_stream(self, prompt, **kwargs):
+        try:
+            while True:
+                yield Message(kind="text", provider="claude", text="chunk")
+        finally:
+            assert server._ACTIVE_PROVIDER_TURNS == {"claude": 1}
+            cleaned.set()
+
+    monkeypatch.setattr(server.UnifiedConversation, "stream", endless_stream)
+    response = server.chat_completions(server.ChatRequest(
+        model="haiku",
+        stream=True,
+        messages=[{"role": "user", "content": "hi"}],
+        user="disconnected-stream",
+    ))
+
+    async def disconnect_response():
+        first_body = asyncio.Event()
+
+        async def receive():
+            await first_body.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            if message["type"] == "http.response.body" and message.get("body"):
+                first_body.set()
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/chat/completions",
+            "raw_path": b"/v1/chat/completions",
+            "query_string": b"",
+            "headers": [],
+        }
+        await asyncio.wait_for(response(scope, receive, send), timeout=3)
+
+    asyncio.run(disconnect_response())
+    # Keep `response` alive: cleanup must not depend on response GC.
+    assert response is not None
+    assert cleaned.is_set()
+    assert server._ACTIVE_TURNS == 0
+    assert server._ACTIVE_PROVIDER_TURNS == {}
+    assert not server.CONVS["disconnected-stream"].active
+    reacquired = server._acquire_conversation("after-disconnect", "claude")
+    reacquired.release()
+
+
+def test_stream_send_disconnect_cleans_up_before_provider_release(monkeypatch):
+    cleaned = threading.Event()
+
+    def endless_stream(self, prompt, **kwargs):
+        try:
+            while True:
+                yield Message(kind="text", provider="claude", text="chunk")
+        finally:
+            assert server._ACTIVE_PROVIDER_TURNS == {"claude": 1}
+            cleaned.set()
+
+    monkeypatch.setattr(server.UnifiedConversation, "stream", endless_stream)
+    response = server.chat_completions(server.ChatRequest(
+        model="haiku",
+        stream=True,
+        messages=[{"role": "user", "content": "hi"}],
+        user="send-disconnected-stream",
+    ))
+
+    async def disconnect_response():
+        async def receive():
+            await asyncio.Event().wait()
+
+        async def send(message):
+            if message["type"] == "http.response.body" and message.get("body"):
+                raise OSError("client disconnected")
+
+        scope = {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.4"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/chat/completions",
+            "raw_path": b"/v1/chat/completions",
+            "query_string": b"",
+            "headers": [],
+        }
+        with pytest.raises(ClientDisconnect):
+            await response(scope, receive, send)
+
+    asyncio.run(disconnect_response())
+    assert response is not None
+    assert cleaned.is_set()
+    assert server._ACTIVE_TURNS == 0
+    assert server._ACTIVE_PROVIDER_TURNS == {}
+    assert not server.CONVS["send-disconnected-stream"].active
+    reacquired = server._acquire_conversation("after-send-disconnect", "claude")
+    reacquired.release()
+
+
+def test_stream_response_construction_failure_closes_before_release(monkeypatch):
+    cleaned = threading.Event()
+
+    class Content:
+        def close(self):
+            assert server._ACTIVE_PROVIDER_TURNS == {"claude": 1}
+            cleaned.set()
+
+    lease = server._acquire_conversation("construction-failure", "claude")
+
+    def fail_construction(*args, **kwargs):
+        raise RuntimeError("construction failed")
+
+    monkeypatch.setattr(server.StreamingResponse, "__init__", fail_construction)
+    with pytest.raises(RuntimeError, match="construction failed"):
+        server._LeasedStreamingResponse(Content(), lease)
+    assert cleaned.is_set()
+    assert server._ACTIVE_TURNS == 0
+    assert server._ACTIVE_PROVIDER_TURNS == {}
+
+
+def test_async_shape_discovery_failure_closes_and_releases():
+    cleaned = threading.Event()
+
+    class Content:
+        @property
+        def aclose(self):
+            raise RuntimeError("aclose lookup failed")
+
+        def close(self):
+            assert server._ACTIVE_PROVIDER_TURNS == {"claude": 1}
+            cleaned.set()
+
+    lease = server._acquire_conversation("raising-aclose", "claude")
+    with pytest.raises(TypeError, match="must be synchronous"):
+        server._LeasedStreamingResponse(Content(), lease)
+    assert cleaned.is_set()
+    assert server._ACTIVE_TURNS == 0
+    assert server._ACTIVE_PROVIDER_TURNS == {}
+    assert server._ACTIVE_LEASES == {}
+    assert not server.CONVS["raising-aclose"].active
+
+
+def test_async_stream_content_is_rejected_before_asgi_and_releases():
+    cleaned = threading.Event()
+
+    class Content:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration
+
+        def close(self):
+            assert server._ACTIVE_PROVIDER_TURNS == {"claude": 1}
+            cleaned.set()
+
+    lease = server._acquire_conversation("async-content", "claude")
+    with pytest.raises(TypeError, match="must be synchronous"):
+        server._LeasedStreamingResponse(Content(), lease)
+    assert cleaned.is_set()
+    assert server._ACTIVE_TURNS == 0
+    assert server._ACTIVE_PROVIDER_TURNS == {}
+    assert server._ACTIVE_LEASES == {}
+    assert not server.CONVS["async-content"].active
+
+    class AcloseOnly:
+        async def aclose(self):
+            pytest.fail("aclose-only content must never be scheduled")
+
+    lease = server._acquire_conversation("aclose-only", "claude")
+    with pytest.raises(TypeError, match="must be synchronous"):
+        server._LeasedStreamingResponse(AcloseOnly(), lease)
+    assert server._ACTIVE_TURNS == 0
+    assert server._ACTIVE_PROVIDER_TURNS == {}
+    assert server._ACTIVE_LEASES == {}
+    assert not server.CONVS["aclose-only"].active
+
+
+def test_finalize_registration_failure_preserves_error_and_cleans_lease(monkeypatch):
+    cleaned = threading.Event()
+
+    class Content:
+        def __iter__(self):
+            return iter(())
+
+        def close(self):
+            assert server._ACTIVE_PROVIDER_TURNS == {"claude": 1}
+            cleaned.set()
+            raise RuntimeError("cleanup failure must not mask construction")
+
+    def fail_finalize(*args, **kwargs):
+        raise RuntimeError("finalize registration failed")
+
+    monkeypatch.setattr(server.weakref, "finalize", fail_finalize)
+    lease = server._acquire_conversation("finalize-failure", "claude")
+    with pytest.raises(RuntimeError, match="finalize registration failed"):
+        server._LeasedStreamingResponse(Content(), lease)
+    assert cleaned.is_set()
+    assert server._ACTIVE_TURNS == 0
+    assert server._ACTIVE_PROVIDER_TURNS == {}
+    assert server._ACTIVE_LEASES == {}
+    assert not server.CONVS["finalize-failure"].active
+
+
+def test_stream_cleanup_construction_failure_preserves_error_and_lease(monkeypatch):
+    cleaned = threading.Event()
+
+    class Content:
+        def close(self):
+            assert server._ACTIVE_PROVIDER_TURNS == {"claude": 1}
+            cleaned.set()
+
+    def fail_cleanup_construction(self, content, lease):
+        raise RuntimeError("cleanup construction failed")
+
+    monkeypatch.setattr(
+        server._StreamLeaseCleanup, "__init__", fail_cleanup_construction,
+    )
+    lease = server._acquire_conversation("cleanup-construction", "claude")
+    with pytest.raises(RuntimeError, match="cleanup construction failed"):
+        server._LeasedStreamingResponse(Content(), lease)
+    assert cleaned.is_set()
+    assert server._ACTIVE_TURNS == 0
+    assert server._ACTIVE_PROVIDER_TURNS == {}
+    assert server._ACTIVE_LEASES == {}
+    assert not server.CONVS["cleanup-construction"].active
+
+
+def test_shutdown_releases_all_provider_reservations():
+    lease = server._acquire_conversation("shutdown", "claude")
+
+    async def shutdown():
+        async with server._lifespan(server.app):
+            assert server._ACTIVE_PROVIDER_TURNS == {"claude": 1}
+
+    asyncio.run(shutdown())
+    assert lease._released
+    assert server._ACTIVE_TURNS == 0
+    assert server._ACTIVE_PROVIDER_TURNS == {}
+    assert not server.CONVS["shutdown"].active
 
 
 def test_lease_releases_after_provider_error(monkeypatch):
@@ -551,6 +1067,7 @@ def test_lease_releases_after_provider_error(monkeypatch):
         server.chat_completions(request)
     assert exc_info.value.status_code == 502
     assert server._ACTIVE_TURNS == 0
+    assert server._ACTIVE_PROVIDER_TURNS == {}
     assert not server.CONVS["error-case"].active
 
 

@@ -430,7 +430,7 @@ def test_server_policy_rejects_explicit_agentic_provider_prefixes_before_state(
     monkeypatch.setattr(
         server,
         "_acquire_conversation",
-        lambda user: pytest.fail("server state must not be acquired"),
+        lambda user, provider: pytest.fail("server state must not be acquired"),
     )
 
     for model in ("codex/gpt-5.4-mini", "gemini/gemini-3.5-flash"):

@@ -1121,7 +1121,7 @@ def test_server_rejects_extension_prefix_with_legacy_error_before_route_or_state
     )
     monkeypatch.setattr(
         server, "_acquire_conversation",
-        lambda user: state_calls.__setitem__("n", state_calls["n"] + 1),
+        lambda user, provider: state_calls.__setitem__("n", state_calls["n"] + 1),
     )
     req = server.ChatRequest(
         model="acme/model",
@@ -1141,7 +1141,7 @@ def test_server_preserves_core_inferred_slash_models(monkeypatch):
     pytest.importorskip("fastapi")
     from unified_cli import server
 
-    def state_reached(user):
+    def state_reached(user, provider):
         raise RuntimeError("core route reached conversation state")
 
     monkeypatch.setattr(server, "_acquire_conversation", state_reached)
