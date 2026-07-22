@@ -131,7 +131,7 @@ def run_setup(
     states = _snapshot()
     login_results: list[StepResult] = []
     for s in states:
-        if s.bin_path and not (s.has_oauth or s.has_api_key):
+        if s.bin_path and not s.has_oauth:
             login_results.append(_login_one(s, console))
     if not login_results:
         console.print(f"[green]{t('setup.login.all_authed')}[/green]")

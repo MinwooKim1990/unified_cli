@@ -120,6 +120,21 @@ def test_auth_cell_shows_token_label(monkeypatch, tmp_path):
     assert "Token" in str(ui.auth_cell(st))
 
 
+def test_detected_api_key_is_ignored_by_default():
+    from unified_cli.i18n import t
+
+    st = ui.ProviderState(
+        name="claude", bin_path="/x", has_oauth=False, has_api_key=True,
+        api_key_env="ANTHROPIC_API_KEY", model_count=1,
+        model_source="hardcoded", default_model="m",
+    )
+
+    assert st.health == "setup_needed"
+    assert t(
+        "ui.auth.api_key_ignored", env="ANTHROPIC_API_KEY",
+    ) in str(ui.auth_cell(st))
+
+
 def test_auth_cell_flags_blocked_keychain():
     st = ui.ProviderState(
         name="claude", bin_path="/x", has_oauth=False, has_api_key=False,

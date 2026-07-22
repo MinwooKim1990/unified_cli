@@ -1,4 +1,4 @@
-"""BaseProvider ABC with shared subprocess execution, retry, and fallback."""
+"""BaseProvider ABC with shared subprocess execution and safe retry policy."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ import contextvars
 import json
 import os
 import queue
+import random
+import re
 import selectors
 import signal
 import subprocess
@@ -49,8 +51,16 @@ def _cleanup_global_temp_files() -> None:
             pass
 
 
-# Max 2 retries (0.5s, 1.5s) for network errors; 1 retry for auth fallback.
-_NETWORK_BACKOFF = (0.5, 1.5)
+# At most three executions of one turn. Delay limits are Core-owned rather than
+# provider-configurable so provider quotas and denials cannot be bypassed by
+# increasing a retry knob.
+_RETRY_MAX_ATTEMPTS = 3
+_RETRY_BACKOFF_BASE = 0.5
+_RETRY_MAX_WAIT = 5.0
+_RETRY_MAX_TOTAL_DELAY = 8.0
+_RETRY_EVIDENCE_BYTES = 128 * 1024
+_RETRY_EVIDENCE_MAX_DEPTH = 16
+_RETRY_EVIDENCE_MAX_NODES = 256
 
 # Default subprocess timeouts. The wrapped CLIs occasionally hang (network
 # stalls, OAuth refresh edge cases, etc); without timeouts a REPL or HTTP
@@ -137,6 +147,133 @@ def _cancel_requested(cancel_event: Optional[threading.Event]) -> bool:
         # A caller-supplied flag that cannot be read must never weaken the
         # ordinary subprocess lifecycle or turn into an arbitrary exception.
         return False
+
+
+class _CombinedCancelEvent:
+    """Small Event-compatible OR view used by async executor bridges."""
+
+    def __init__(self, *events: Optional[threading.Event]):
+        self._events = tuple(event for event in events if event is not None)
+
+    def is_set(self) -> bool:
+        return any(_cancel_requested(event) for event in self._events)
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        wake = threading.Event()
+        while not self.is_set():
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                wake.wait(min(remaining, 0.05))
+            else:
+                wake.wait(0.05)
+        return True
+
+
+_TOOL_EVIDENCE_RE = re.compile(
+    r"\btool[_ .-]?(?:use|start|result|call)\b|\bfunction[_ .-]?call\b"
+    r"|\bcommand[_ .-]?execution\b|\bweb[_ .-]?search\b|\bmcp[_ .-]?call\b",
+    re.I,
+)
+_PUBLIC_JSON_EVIDENCE_RE = re.compile(
+    r'(?i)"(?:assistant|output|content|text|session(?:_id)?|usage|reasoning'
+    r'|tool(?:_use|_result|_calls?)?|function_call|command_execution|done'
+    r'|result|response|delta|item|role|event)"\s*:'
+    r'|"(?:type|kind)"\s*:\s*"(?:error|done|session|usage|reasoning|text'
+    r'|assistant|tool(?:_use|_result|_call)?|function_call|command_execution)"',
+    re.I,
+)
+_PRETURN_ERROR_TOP_KEYS = {
+    "error", "errors", "message", "code", "status", "status_code",
+    "http_status", "retry_after", "retry-after", "retryafter",
+    "retry_delay", "retrydelay", "retry_delay_seconds", "request_id",
+    "trace_id", "headers",
+}
+_PRETURN_ERROR_NESTED_KEYS = _PRETURN_ERROR_TOP_KEYS | {
+    "type", "@type", "param", "details", "detail", "reason", "metadata",
+    "retry_info", "retryinfo", "violations", "x-request-id",
+}
+_PRETURN_ERROR_MARKERS = {
+    "error", "errors", "code", "status", "status_code", "http_status",
+}
+
+
+def _is_pre_turn_error_envelope(value: object) -> bool:
+    """Validate a small, non-event error envelope with bounded traversal."""
+    if not isinstance(value, dict) or not value:
+        return False
+    top_keys = {str(key).lower() for key in value}
+    if not top_keys.issubset(_PRETURN_ERROR_TOP_KEYS):
+        return False
+    if not top_keys.intersection(_PRETURN_ERROR_MARKERS):
+        return False
+
+    stack: list[tuple[object, int, bool]] = [(value, 0, True)]
+    visited = 0
+    while stack:
+        item, depth, is_top = stack.pop()
+        visited += 1
+        if visited > _RETRY_EVIDENCE_MAX_NODES or depth > _RETRY_EVIDENCE_MAX_DEPTH:
+            return False
+        if isinstance(item, dict):
+            allowed = (_PRETURN_ERROR_TOP_KEYS if is_top
+                       else _PRETURN_ERROR_NESTED_KEYS)
+            for key, child in item.items():
+                key_text = str(key).lower()
+                if key_text not in allowed or _TOOL_EVIDENCE_RE.search(key_text):
+                    return False
+                stack.append((child, depth + 1, False))
+        elif isinstance(item, list):
+            for child in item:
+                stack.append((child, depth + 1, False))
+        elif isinstance(item, str):
+            if _TOOL_EVIDENCE_RE.search(item):
+                return False
+        elif item is not None and not isinstance(item, (bool, int, float)):
+            return False
+    return True
+
+
+def _json_line_is_pre_turn_error(line: str) -> bool:
+    try:
+        value = json.loads(line)
+    except (json.JSONDecodeError, ValueError, RecursionError):
+        return False
+    return _is_pre_turn_error_envelope(value)
+
+
+def _retry_evidence_proves_no_side_effects(
+    stdout: str, stderr: str, error: UnifiedError
+) -> bool:
+    """Conservatively decide whether replay can occur before any tool work."""
+    encoded_size = len(stdout.encode("utf-8")) + len(stderr.encode("utf-8"))
+    if encoded_size > _RETRY_EVIDENCE_BYTES:
+        return False
+    combined = stdout + "\n" + stderr
+    if (_TOOL_EVIDENCE_RE.search(combined)
+            or _PUBLIC_JSON_EVIDENCE_RE.search(combined)):
+        return False
+    reason = getattr(error, "_retry_reason", "permanent")
+    if reason == "transient_network" and not getattr(
+        error, "_retry_pre_request", False
+    ):
+        # A reset/timeout after request dispatch can occur after remote tools.
+        return False
+    if reason not in {"transient_network", "transient_rate_limit"}:
+        return False
+    for line in stdout.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        if not _json_line_is_pre_turn_error(text):
+            return False
+    for line in stderr.splitlines():
+        text = line.strip()
+        if text.startswith(("{", "[")) and not _json_line_is_pre_turn_error(text):
+            return False
+    return True
 
 
 def _cancelled_error(provider: str) -> UnifiedError:
@@ -810,9 +947,8 @@ class BaseProvider(ABC):
     name: ClassVar[ProviderId]
     default_model: ClassVar[str]
     api_key_env: ClassVar[str]       # e.g., "ANTHROPIC_API_KEY"
-    # Some subscription CLIs are OAuth-only. Such providers still expose an
-    # API-key environment variable for UI/status compatibility, but must never
-    # retry an OAuth failure by injecting that key into a different CLI.
+    # Retained for source compatibility with provider subclasses. Authentication
+    # failures are never replayed with an inherited credential.
     allow_api_key_fallback: ClassVar[bool] = True
 
     @classmethod
@@ -838,6 +974,10 @@ class BaseProvider(ABC):
         max_stream_buffer_bytes: int = DEFAULT_MAX_STREAM_BUFFER_BYTES,
         max_stream_events: int = DEFAULT_MAX_STREAM_EVENTS,
         max_stream_line_bytes: int = DEFAULT_MAX_STREAM_LINE_BYTES,
+        _retry_wait: Optional[Callable[[float, Optional[threading.Event]], bool]] = None,
+        _retry_random: Optional[Callable[[], float]] = None,
+        _retry_clock: Optional[Callable[[], float]] = None,
+        _retry_async_wait: Optional[Callable[[float], object]] = None,
     ):
         self.model = model or self.default_model
         self.cwd = cwd
@@ -868,6 +1008,10 @@ class BaseProvider(ABC):
         self.max_stream_buffer_bytes = max_stream_buffer_bytes
         self.max_stream_events = max_stream_events
         self.max_stream_line_bytes = max_stream_line_bytes
+        self._retry_wait = _retry_wait or self._default_retry_wait
+        self._retry_random = _retry_random or random.SystemRandom().random
+        self._retry_clock = _retry_clock or time.monotonic
+        self._retry_async_wait = _retry_async_wait or asyncio.sleep
         # Materialized attachment files are tied to an explicit invocation
         # scope, not a thread. Async streams can interleave on one event-loop
         # thread, so thread-local tracking could delete another task's image.
@@ -1003,9 +1147,10 @@ class BaseProvider(ABC):
         OAuth, not per-token API billing. So by default we STRIP any inherited
         vendor API key (e.g. an exported ANTHROPIC_API_KEY) — otherwise the
         wrapped CLI would silently switch to metered API billing and defeat the
-        package's core value. Only the explicit auth-expired fallback path
-        (`fallback_api_key=True`) keeps the key. A deliberate key passed via
-        `extra_env` always wins (applied after the pop).
+        package's core value. ``fallback_api_key`` remains for compatibility
+        with private integrations, but automatic request paths never enable it.
+        A deliberate key passed via `extra_env` always wins (applied after the
+        pop).
         """
         env = os.environ.copy()
         if not (fallback_api_key and self.allow_api_key_fallback):
@@ -1175,6 +1320,8 @@ class BaseProvider(ABC):
             raise _ProcessOutputLimit(overflow_sources[0] if overflow_sources else "output")
         if reader_failures:
             raise _ProcessPipeError("stdout/stderr", reader_failures[0])
+        if _cancel_requested(cancel_event):
+            raise _ProcessCancelled()
         return (
             b"".join(stdout_chunks).decode("utf-8", "replace"),
             b"".join(stderr_chunks).decode("utf-8", "replace"),
@@ -1199,6 +1346,101 @@ class BaseProvider(ABC):
             cause=f"{source}: {cause!r}",
         )
 
+    @staticmethod
+    def _default_retry_wait(
+        delay: float, cancel_event: Optional[threading.Event]
+    ) -> bool:
+        if cancel_event is not None:
+            try:
+                return bool(cancel_event.wait(delay))
+            except Exception:
+                pass
+        waiter = threading.Event()
+        return bool(waiter.wait(delay))
+
+    def _retry_delay(
+        self, error: UnifiedError, retry_index: int, remaining: float
+    ) -> Optional[float]:
+        retry_after = getattr(error, "_retry_after", None)
+        if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool):
+            requested = float(retry_after)
+        else:
+            try:
+                sample = float(self._retry_random())
+            except (TypeError, ValueError, OverflowError):
+                sample = 0.5
+            if sample != sample:
+                sample = 0.5
+            sample = min(1.0, max(0.0, sample))
+            requested = (
+                _RETRY_BACKOFF_BASE * (2 ** retry_index) * (0.75 + 0.5 * sample)
+            )
+        delay = min(requested, _RETRY_MAX_WAIT, remaining)
+        return delay if delay > 0 else None
+
+    def _wait_for_retry(
+        self,
+        error: UnifiedError,
+        retry_index: int,
+        *,
+        scheduled: float,
+        cancel_event: Optional[threading.Event],
+    ) -> Optional[float]:
+        if _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
+        delay = self._retry_delay(
+            error, retry_index, max(0.0, _RETRY_MAX_TOTAL_DELAY - scheduled),
+        )
+        if delay is None:
+            return None
+        wait_started = self._retry_clock()
+        if self._retry_wait(delay, cancel_event) or _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
+        try:
+            elapsed = max(0.0, float(self._retry_clock()) - wait_started)
+        except (TypeError, ValueError, OverflowError):
+            elapsed = delay
+        return scheduled + max(delay, elapsed)
+
+    async def _await_retry(
+        self,
+        error: UnifiedError,
+        retry_index: int,
+        *,
+        scheduled: float,
+        cancel_event: Optional[threading.Event],
+    ) -> Optional[float]:
+        if _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
+        delay = self._retry_delay(
+            error, retry_index, max(0.0, _RETRY_MAX_TOTAL_DELAY - scheduled),
+        )
+        if delay is None:
+            return None
+        wait_started = self._retry_clock()
+        if cancel_event is None:
+            await self._retry_async_wait(delay)  # type: ignore[misc]
+        else:
+            loop = asyncio.get_running_loop()
+            cancelled = await loop.run_in_executor(None, cancel_event.wait, delay)
+            if cancelled:
+                raise _cancelled_error(self.name)
+        if _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
+        try:
+            elapsed = max(0.0, float(self._retry_clock()) - wait_started)
+        except (TypeError, ValueError, OverflowError):
+            elapsed = delay
+        return scheduled + max(delay, elapsed)
+
+    @staticmethod
+    def _retryable(error: UnifiedError, *, evidence_safe: bool) -> bool:
+        return bool(
+            evidence_safe
+            and getattr(error, "_retry_reason", "permanent")
+            in {"transient_network", "transient_rate_limit"}
+        )
+
     def _run(
         self,
         args: list[str],
@@ -1211,13 +1453,12 @@ class BaseProvider(ABC):
         `stdin_data` (if given) is piped to the child's stdin — used by
         Claude's stream-json image input mode.
 
-        Handles auth-expired fallback (retry once with API key env) and network
-        retries (up to 2 with exponential backoff).
+        Replays only bounded, provably pre-side-effect transient failures.
         """
-        tried_api_fallback = False
         last_err: Optional[UnifiedError] = None
+        scheduled_delay = 0.0
 
-        for attempt in range(len(_NETWORK_BACKOFF) + 1):
+        for attempt in range(_RETRY_MAX_ATTEMPTS):
             try:
                 run_kwargs = {"fallback_api_key": False}
                 if cancel_event is not None:
@@ -1239,43 +1480,26 @@ class BaseProvider(ABC):
             except _ProcessPipeError as exc:
                 raise self._pipe_reader_error(exc.source, exc.cause)
             if returncode == 0:
+                if _cancel_requested(cancel_event):
+                    raise _cancelled_error(self.name)
                 return stdout
 
             err = classify(self.name, stderr, stdout, returncode)
             last_err = err
 
-            if err.kind == "auth_expired" and not tried_api_fallback:
-                if (self.allow_api_key_fallback
-                        and self.api_key_env in os.environ):
-                    tried_api_fallback = True
-                    try:
-                        run_kwargs = {"fallback_api_key": True}
-                        if cancel_event is not None:
-                            run_kwargs["cancel_event"] = cancel_event
-                        stdout, stderr, returncode = self._run_once(
-                            args, stdin_data, **run_kwargs
-                        )
-                    except _ProcessCancelled:
-                        raise _cancelled_error(self.name)
-                    except _ProcessTimedOut:
-                        raise UnifiedError(
-                            kind="network", provider=self.name,
-                            message=t("err.base.timeout_fallback", provider=self.name),
-                            hint=t("err.base.timeout_fallback.hint"),
-                        )
-                    except _ProcessOutputLimit as exc:
-                        raise self._output_limit_error(exc.source)
-                    except _ProcessPipeError as exc:
-                        raise self._pipe_reader_error(exc.source, exc.cause)
-                    if returncode == 0:
-                        return stdout
-                    err = classify(self.name, stderr, stdout, returncode)
-                    last_err = err
-                raise err  # no key available or fallback also failed
-
-            if err.kind == "network" and attempt < len(_NETWORK_BACKOFF):
-                time.sleep(_NETWORK_BACKOFF[attempt])
-                continue
+            evidence_safe = _retry_evidence_proves_no_side_effects(
+                stdout, stderr, err,
+            )
+            if self._retryable(err, evidence_safe=evidence_safe) and (
+                attempt + 1 < _RETRY_MAX_ATTEMPTS
+            ):
+                waited = self._wait_for_retry(
+                    err, attempt, scheduled=scheduled_delay,
+                    cancel_event=cancel_event,
+                )
+                if waited is not None:
+                    scheduled_delay = waited
+                    continue
 
             raise err
 
@@ -1309,6 +1533,8 @@ class BaseProvider(ABC):
                 stdout = self._run(args, **run_kwargs)
                 resp = self._parse_json_response(stdout, model or self.model)
                 _check_session_match(self.name, session_id, resp.session_id)
+                if _cancel_requested(cancel_event):
+                    raise _cancelled_error(self.name)
             except UnifiedError as e:
                 _usage_tracker.record(
                     self.name, model or self.model,
@@ -1325,6 +1551,8 @@ class BaseProvider(ABC):
                 session_id=resp.session_id,
                 prompt_preview=prompt,
             )
+            if _cancel_requested(cancel_event):
+                raise _cancelled_error(self.name)
             return resp
         finally:
             self._cleanup_temp_files(scope)
@@ -1355,6 +1583,8 @@ class BaseProvider(ABC):
                 if cancel_event is not None:
                     run_kwargs["cancel_event"] = cancel_event
                 for msg in self._stream_run(args, **run_kwargs):
+                    if _cancel_requested(cancel_event):
+                        raise _cancelled_error(self.name)
                     if msg.kind == "usage" and msg.usage:
                         final_usage = msg.usage
                     if msg.kind == "session" and msg.session_id:
@@ -1362,6 +1592,8 @@ class BaseProvider(ABC):
                         if not session_checked:
                             _check_session_match(self.name, session_id, msg.session_id)
                             session_checked = True
+                    if _cancel_requested(cancel_event):
+                        raise _cancelled_error(self.name)
                     yield msg
             except UnifiedError as e:
                 _usage_tracker.record(
@@ -1370,6 +1602,8 @@ class BaseProvider(ABC):
                     prompt_preview=prompt, error_kind=e.kind,
                 )
                 raise
+            if _cancel_requested(cancel_event):
+                raise _cancelled_error(self.name)
             _usage_tracker.record(
                 self.name, model or self.model,
                 input_tokens=final_usage.input_tokens or 0,
@@ -1379,12 +1613,30 @@ class BaseProvider(ABC):
                 session_id=final_session,
                 prompt_preview=prompt,
             )
+            if _cancel_requested(cancel_event):
+                raise _cancelled_error(self.name)
         finally:
             self._cleanup_temp_files(scope)
 
     async def achat(self, prompt: str, **kw) -> Response:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: self.chat(prompt, **kw))
+        loop = asyncio.get_running_loop()
+        task_cancel = threading.Event()
+        call_kw = dict(kw)
+        combined_cancel = _CombinedCancelEvent(
+            kw.get("cancel_event"), task_cancel,
+        )
+        call_kw["cancel_event"] = combined_cancel
+        future = loop.run_in_executor(
+            None, lambda: self.chat(prompt, **call_kw),
+        )
+        try:
+            resp = await future
+        except asyncio.CancelledError:
+            task_cancel.set()
+            raise
+        if _cancel_requested(combined_cancel):
+            raise _cancelled_error(self.name)
+        return resp
 
     async def astream(
         self,
@@ -1398,7 +1650,6 @@ class BaseProvider(ABC):
     ) -> AsyncIterator[Message]:
         _reject_empty_prompt(prompt, self.name)
         scope = self._new_temp_scope()
-        stream_state = self._new_stream_state()
         token = self._temp_scope.set(scope)
         try:
             args, stdin_data = self._build_args(
@@ -1414,49 +1665,119 @@ class BaseProvider(ABC):
         final_usage = Usage()
         final_session = ""
         session_checked = False
-        transport = None
-        protocol: Optional[_AsyncJsonlProtocol] = None
+        scheduled_delay = 0.0
         try:
+            for attempt in range(_RETRY_MAX_ATTEMPTS):
+                emitted = False
+                try:
+                    async for msg in self._astream_once(
+                        args,
+                        stdin_data=stdin_data,
+                        stream_state=self._new_stream_state(),
+                        cancel_event=cancel_event,
+                    ):
+                        if _cancel_requested(cancel_event):
+                            raise _cancelled_error(self.name)
+                        emitted = True
+                        if msg.kind == "usage" and msg.usage:
+                            final_usage = msg.usage
+                        if (msg.kind == "session" and msg.session_id
+                                and not session_checked):
+                            final_session = msg.session_id
+                            _check_session_match(
+                                self.name, session_id, msg.session_id,
+                            )
+                            session_checked = True
+                        if _cancel_requested(cancel_event):
+                            raise _cancelled_error(self.name)
+                        yield msg
+                    break
+                except UnifiedError as err:
+                    evidence_safe = bool(
+                        not emitted
+                        and getattr(err, "_retry_evidence_safe", False)
+                    )
+                    if self._retryable(err, evidence_safe=evidence_safe) and (
+                        attempt + 1 < _RETRY_MAX_ATTEMPTS
+                    ):
+                        waited = await self._await_retry(
+                            err, attempt, scheduled=scheduled_delay,
+                            cancel_event=cancel_event,
+                        )
+                        if waited is not None:
+                            scheduled_delay = waited
+                            continue
+                    raise
             if _cancel_requested(cancel_event):
                 raise _cancelled_error(self.name)
-            loop = asyncio.get_running_loop()
-            factory = lambda: _AsyncJsonlProtocol(
-                loop,
-                max_output_bytes=self.max_output_bytes,
-                max_stderr_bytes=self.max_stderr_bytes,
-                max_buffer_bytes=self.max_stream_buffer_bytes,
-                max_events=self.max_stream_events,
-                max_line_bytes=self.max_stream_line_bytes,
+            _usage_tracker.record(
+                self.name, model or self.model,
+                input_tokens=final_usage.input_tokens or 0,
+                output_tokens=final_usage.output_tokens or 0,
+                cached_tokens=final_usage.cached_tokens or 0,
+                latency_ms=int((time.time() - t0) * 1000),
+                session_id=final_session,
+                prompt_preview=prompt,
             )
+            if _cancel_requested(cancel_event):
+                raise _cancelled_error(self.name)
+        except UnifiedError as err:
+            _usage_tracker.record(
+                self.name, model or self.model,
+                latency_ms=int((time.time() - t0) * 1000),
+                prompt_preview=prompt, error_kind=err.kind,
+            )
+            raise
+        finally:
+            self._cleanup_temp_files(scope)
+
+    async def _astream_once(
+        self,
+        args: list[str],
+        *,
+        stream_state: object,
+        stdin_data: Optional[str] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> AsyncIterator[Message]:
+        """Run one async subprocess stream and retain pre-turn retry evidence."""
+        if _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
+        loop = asyncio.get_running_loop()
+        factory = lambda: _AsyncJsonlProtocol(
+            loop,
+            max_output_bytes=self.max_output_bytes,
+            max_stderr_bytes=self.max_stderr_bytes,
+            max_buffer_bytes=self.max_stream_buffer_bytes,
+            max_events=self.max_stream_events,
+            max_line_bytes=self.max_stream_line_bytes,
+        )
+        transport = None
+        protocol: Optional[_AsyncJsonlProtocol] = None
+        retry_evidence_safe = True
+        try:
             transport, protocol = await loop.subprocess_exec(
                 factory, *args,
-                stdin=asyncio.subprocess.PIPE if stdin_data else asyncio.subprocess.DEVNULL,
+                stdin=(asyncio.subprocess.PIPE if stdin_data
+                       else asyncio.subprocess.DEVNULL),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.cwd, env=self._env(),
                 **_popen_process_group_kwargs(),
             )
-        except BaseException:
-            self._cleanup_temp_files(scope)
-            raise
-        assert protocol is not None
-        if stdin_data:
-            stdin_transport = transport.get_pipe_transport(0)
-            try:
-                if stdin_transport is None:
-                    raise BrokenPipeError("subprocess stdin transport unavailable")
-                stdin_transport.write(stdin_data.encode("utf-8"))
-                await asyncio.wait_for(
-                    protocol.stdin_writable.wait(), timeout=self.timeout)
-            except BaseException:
-                _terminate_process_tree(transport, force_group=True)
-                await protocol.close()
-                self._cleanup_temp_files(scope)
-                raise
-            finally:
-                if stdin_transport is not None:
-                    stdin_transport.close()
-        try:
+            if stdin_data:
+                stdin_transport = transport.get_pipe_transport(0)
+                try:
+                    if stdin_transport is None:
+                        raise BrokenPipeError(
+                            "subprocess stdin transport unavailable"
+                        )
+                    stdin_transport.write(stdin_data.encode("utf-8"))
+                    await asyncio.wait_for(
+                        protocol.stdin_writable.wait(), timeout=self.timeout,
+                    )
+                finally:
+                    if stdin_transport is not None:
+                        stdin_transport.close()
             while True:
                 if _cancel_requested(cancel_event):
                     _terminate_process_tree(transport)
@@ -1465,35 +1786,23 @@ class BaseProvider(ABC):
                             else self.first_output_timeout)
                 try:
                     kind, payload = await asyncio.wait_for(
-                        protocol.queue.get(), timeout=min(deadline, 0.1))
+                        protocol.queue.get(), timeout=min(deadline, 0.1),
+                    )
                 except asyncio.TimeoutError:
                     if _cancel_requested(cancel_event):
                         _terminate_process_tree(transport)
                         raise _cancelled_error(self.name)
-                    # process_exited() owns a separate absolute pipe grace and
-                    # will enqueue EOF at its cutoff. Do not misclassify that
-                    # short drain window as an idle timeout.
                     if protocol.process_exited_event.is_set():
                         continue
                     if time.monotonic() - protocol.last_output <= deadline:
                         continue
-                    # Queue empty for `deadline` with the child alive → the CHILD
-                    # is silent (the consumer only ever fills the queue, never
-                    # drains it) — a wedged process, e.g. claude blocked on the
-                    # Keychain under launchd. Kill it and surface a hang error.
                     _terminate_process_tree(transport)
-                    err = self._hang_error(before_output=not protocol.produced)
-                    _usage_tracker.record(
-                        self.name, model or self.model,
-                        latency_ms=int((time.time() - t0) * 1000),
-                        prompt_preview=prompt, error_kind=err.kind,
-                    )
-                    raise err
-                if kind == "eof":
-                    break
+                    raise self._hang_error(before_output=not protocol.produced)
                 if _cancel_requested(cancel_event):
                     _terminate_process_tree(transport)
                     raise _cancelled_error(self.name)
+                if kind == "eof":
+                    break
                 if kind == "limit":
                     raise self._output_limit_error(str(payload or "output"))
                 if kind == "reader_error":
@@ -1501,20 +1810,30 @@ class BaseProvider(ABC):
                 raw = payload
                 protocol.consume_line(len(raw))
                 line = raw.decode("utf-8", "replace").strip()
-                if not line or not line.startswith("{"):
+                if not line:
+                    continue
+                if not line.startswith("{"):
+                    retry_evidence_safe = False
                     continue
                 try:
                     obj = json.loads(line)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, ValueError, RecursionError):
+                    retry_evidence_safe = False
                     continue
-                for msg in self._stream_normalize(obj, stream_state):
-                    if msg.kind == "usage" and msg.usage:
-                        final_usage = msg.usage
-                    if (msg.kind == "session" and msg.session_id
-                            and not session_checked):
-                        final_session = msg.session_id
-                        _check_session_match(self.name, session_id, msg.session_id)
-                        session_checked = True
+                try:
+                    messages = list(self._stream_normalize(obj, stream_state))
+                except RecursionError:
+                    retry_evidence_safe = False
+                    continue
+                if _cancel_requested(cancel_event):
+                    _terminate_process_tree(transport)
+                    raise _cancelled_error(self.name)
+                if messages or not _is_pre_turn_error_envelope(obj):
+                    retry_evidence_safe = False
+                for msg in messages:
+                    if _cancel_requested(cancel_event):
+                        _terminate_process_tree(transport)
+                        raise _cancelled_error(self.name)
                     yield msg
             if not protocol.process_exited_event.is_set():
                 try:
@@ -1530,32 +1849,24 @@ class BaseProvider(ABC):
             if protocol.overflow_reason:
                 raise self._output_limit_error(protocol.overflow_reason)
             if protocol.returncode != 0:
-                err_bytes = b"".join(protocol.stderr_chunks)
-                err = classify(
-                    self.name, err_bytes.decode("utf-8", "replace"), "",
-                    protocol.returncode,
+                stderr_text = b"".join(protocol.stderr_chunks).decode(
+                    "utf-8", "replace",
                 )
-                # Mirror sync stream(): record the error turn before raising.
-                _usage_tracker.record(
-                    self.name, model or self.model,
-                    latency_ms=int((time.time() - t0) * 1000),
-                    prompt_preview=prompt, error_kind=err.kind,
+                err = classify(
+                    self.name, stderr_text, "", protocol.returncode,
+                )
+                err._retry_evidence_safe = bool(  # type: ignore[attr-defined]
+                    retry_evidence_safe
+                    and _retry_evidence_proves_no_side_effects(
+                        "", stderr_text, err,
+                    )
                 )
                 raise err
-            # Success — record usage parity with sync stream().
-            _usage_tracker.record(
-                self.name, model or self.model,
-                input_tokens=final_usage.input_tokens or 0,
-                output_tokens=final_usage.output_tokens or 0,
-                cached_tokens=final_usage.cached_tokens or 0,
-                latency_ms=int((time.time() - t0) * 1000),
-                session_id=final_session,
-                prompt_preview=prompt,
-            )
         finally:
-            _terminate_process_tree(transport, force_group=True)
-            await protocol.close()
-            self._cleanup_temp_files(scope)
+            if transport is not None:
+                _terminate_process_tree(transport, force_group=True)
+            if protocol is not None:
+                await protocol.close()
 
     def _stream_once(
         self,
@@ -1625,18 +1936,42 @@ class BaseProvider(ABC):
             cancel_event=cancel_event,
         ).start()
         produced_any = False
+        retry_evidence_safe = True
         loop_done = False
         try:
             for line in reader:
+                if _cancel_requested(cancel_event):
+                    _terminate_process_tree(proc)
+                    raise _cancelled_error(self.name)
                 line = line.strip()
-                if not line or not line.startswith("{"):
+                if not line:
+                    continue
+                if not line.startswith("{"):
+                    retry_evidence_safe = False
                     continue
                 try:
                     obj = json.loads(line)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, ValueError, RecursionError):
+                    retry_evidence_safe = False
                     continue
-                for msg in self._stream_normalize(obj, stream_state):
+                try:
+                    messages = list(self._stream_normalize(obj, stream_state))
+                except RecursionError:
+                    retry_evidence_safe = False
+                    continue
+                if _cancel_requested(cancel_event):
+                    _terminate_process_tree(proc)
+                    raise _cancelled_error(self.name)
+                if messages or not _is_pre_turn_error_envelope(obj):
+                    retry_evidence_safe = False
+                for msg in messages:
+                    if _cancel_requested(cancel_event):
+                        _terminate_process_tree(proc)
+                        raise _cancelled_error(self.name)
                     produced_any = True
+                    if _cancel_requested(cancel_event):
+                        _terminate_process_tree(proc)
+                        raise _cancelled_error(self.name)
                     yield msg
             loop_done = True
         finally:
@@ -1691,8 +2026,13 @@ class BaseProvider(ABC):
 
         if proc.returncode not in (0, None):
             err = classify(self.name, stderr_text, "", proc.returncode)
-            # attach a marker so the outer retry loop can decide
+            # Private markers let the outer loop enforce both public-output and
+            # raw tool-evidence boundaries without changing UnifiedError's ABI.
             err._produced_any = produced_any  # type: ignore[attr-defined]
+            err._retry_evidence_safe = bool(  # type: ignore[attr-defined]
+                retry_evidence_safe
+                and _retry_evidence_proves_no_side_effects("", stderr_text, err)
+            )
             raise err
 
     def _stream_run(
@@ -1702,8 +2042,10 @@ class BaseProvider(ABC):
         *,
         cancel_event: Optional[threading.Event] = None,
     ) -> Iterator[Message]:
-        """Sync streaming with one auth-fallback retry on pre-stream failure."""
-        try:
+        """Sync streaming with bounded replay before any public event only."""
+        scheduled_delay = 0.0
+        for attempt in range(_RETRY_MAX_ATTEMPTS):
+            emitted = False
             once_kwargs = {
                 "fallback": False,
                 "stream_state": self._new_stream_state(),
@@ -1711,21 +2053,29 @@ class BaseProvider(ABC):
             }
             if cancel_event is not None:
                 once_kwargs["cancel_event"] = cancel_event
-            yield from self._stream_once(args, **once_kwargs)
-            return
-        except UnifiedError as err:
-            produced = getattr(err, "_produced_any", False)
-            if (err.kind == "auth_expired"
-                    and not produced
-                    and self.allow_api_key_fallback
-                    and self.api_key_env in os.environ):
-                once_kwargs = {
-                    "fallback": True,
-                    "stream_state": self._new_stream_state(),
-                    "stdin_data": stdin_data,
-                }
-                if cancel_event is not None:
-                    once_kwargs["cancel_event"] = cancel_event
-                yield from self._stream_once(args, **once_kwargs)
+            try:
+                for message in self._stream_once(args, **once_kwargs):
+                    if _cancel_requested(cancel_event):
+                        raise _cancelled_error(self.name)
+                    emitted = True
+                    if _cancel_requested(cancel_event):
+                        raise _cancelled_error(self.name)
+                    yield message
                 return
-            raise
+            except UnifiedError as err:
+                evidence_safe = bool(
+                    not emitted
+                    and not getattr(err, "_produced_any", False)
+                    and getattr(err, "_retry_evidence_safe", False)
+                )
+                if self._retryable(err, evidence_safe=evidence_safe) and (
+                    attempt + 1 < _RETRY_MAX_ATTEMPTS
+                ):
+                    waited = self._wait_for_retry(
+                        err, attempt, scheduled=scheduled_delay,
+                        cancel_event=cancel_event,
+                    )
+                    if waited is not None:
+                        scheduled_delay = waited
+                        continue
+                raise

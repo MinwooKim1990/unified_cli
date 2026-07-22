@@ -112,7 +112,8 @@ provider 카탈로그, 상태 의미, 활성화 전 필요한 근거는
   가져오며, 어떤 자격증명도 대신 저장·전송하지 않습니다.
 
 - 구독 OAuth (Pro/Max, ChatGPT Plus/Pro, Antigravity) 로 로그인되어 있으면 **구독 크레딧으로** 실행
-- Claude/Codex 는 API 키 환경변수로 **자동 폴백** (agy 는 OAuth 전용)
+- 상속된 provider API 키는 자식 환경에서 제거하며, 인증 실패 턴을 다른
+  credential로 자동 재생하지 않음
 - **이미지 입력 멀티모달** — 3 provider 전부. Claude 는 Read 도구, Codex 는 `-i` 플래그, Gemini(`agy`) 는 `@<path>` 참조를 사용합니다. 권한 우회는 자동으로 켜지지 않습니다.
 - 히스토리 · 스트리밍 · 도구 사용 · **웹서치 기본 ON** · OpenAI 호환 HTTP 서버
 - 대화형 **REPL** (`unified-cli repl`): `/` 입력 시 라이브 슬래시 메뉴, `/model`·`/provider` 선택기(최신 모델 표시, 기본값 ★), 라이브 `/status` — `prompt_toolkit` 기반
@@ -340,7 +341,7 @@ cli = create("claude", web_search=False)
 
 > Gemini provider는 이제 Antigravity `agy` CLI를 래핑합니다. agy는 에이전틱이라 웹서치를 스스로 판단해 수행하며 on/off 토글이 없습니다 (`web_search=`는 사실상 no-op). 단, **기본 비활성화**라 `UNIFIED_CLI_ENABLE_GEMINI=1` 을 설정해야 사용할 수 있습니다(`agy` 자동화 시 서비스 이용 제한 가능성).
 
-## 에러 분류 + 자동 복구
+## 에러 분류 + 제한된 안전 재시도
 
 ```python
 from unified_cli import UnifiedError
@@ -355,9 +356,10 @@ except UnifiedError as e:
 ```
 
 동작:
-- **auth_expired**: Claude/Codex 는 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` 환경변수가 있으면 **자동으로 1회 재시도**. 없으면 hint 포함한 에러 raise. Gemini provider(Antigravity `agy`)는 **OAuth 전용**이라 API 키 폴백이 없으니 `agy` 재로그인이 필요
-- **network**: exponential backoff (0.5s, 1.5s) 로 최대 2회 재시도
-- **rate_limit / model_not_allowed / not_found**: 즉시 raise
+- **auth_expired / 403 authorization / quota / policy denial**: credential을 바꾸거나 턴을 재생하지 않고 즉시 raise
+- **network / rate_limit**: 턴 및 tool 실행 전임이 출력 증거로 확인되는 일시적 네트워크 실패와 429만 최대 2회 재시도. 유효한 `Retry-After`를 우선 적용하고, 없으면 bounded exponential backoff + jitter 사용
+- **tool 실행 가능성이 있거나 streaming event가 하나라도 공개된 뒤의 실패**: 중복 side effect/output 방지를 위해 자동 재시도하지 않음
+- **model_not_allowed / not_found**: 즉시 raise
 
 ## CLI
 
@@ -520,13 +522,24 @@ export CODEX_CLI_PATH=/opt/homebrew/bin/codex
 claude setup-token                         # 실제 터미널에서 한 번만 실행
 # → 나온 토큰을 서비스 환경변수로:
 export CLAUDE_CODE_OAUTH_TOKEN=<token>     # OAuth 등가, 종량 과금 아님
-# (종량 API 과금을 원하면 대신:  export ANTHROPIC_API_KEY=sk-...)
 ```
 
 > 기본적으로 래퍼는 **구독 OAuth**로 실행되며, 상속된
 > `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`를 자식 환경에서 **제거**합니다 — export된 키
 > 때문에 몰래 종량 과금으로 바뀌지 않게 하기 위함입니다. 헤드리스 인증은
-> `CLAUDE_CODE_OAUTH_TOKEN`을 쓰고, 종량 과금을 *원할 때만* API 키를 export 하세요.
+> `CLAUDE_CODE_OAUTH_TOKEN`을 쓰세요. 의도적으로 종량 호출을 하려면 **새 Python
+> 요청**에만 키를 명시적으로 전달하세요:
+
+```python
+from unified_cli import create
+
+metered = create(
+    "claude", extra_env={"ANTHROPIC_API_KEY": "<보안 저장소에서 읽은 키>"},
+)
+metered.chat("새 요청")
+```
+
+실패한 OAuth 턴을 이 credential로 자동 재시도하지 않습니다.
 
 **배포 전에 증명하세요.** 서비스와 **동일한 컨텍스트**(예: launchd 잡 내부)에서
 preflight를 실행하면 provider마다 아주 작은 실제 호출을 해서 거기서 auth가 실제로
@@ -567,7 +580,7 @@ cli-wrapper-unified/
     ├── core.py          # Message, Response, Usage, ModelInfo
     ├── errors.py        # UnifiedError + classify (정규식 매칭 테이블)
     ├── discovery.py     # find_{claude,codex,gemini}_bin()
-    ├── base.py          # BaseProvider (retry + api-key fallback 포함)
+    ├── base.py          # BaseProvider (side-effect-aware retry 포함)
     ├── models.py        # list_models() dispatcher
     ├── factory.py       # create() + route()
     ├── conversation.py  # UnifiedConversation
@@ -582,7 +595,7 @@ cli-wrapper-unified/
 ## 주의
 
 - 구독 기반 호출은 **3자 서비스로 재판매 금지** (각 provider ToS). 개인 로컬 자동화 전용
-- `auth_expired` 자동 복구는 API 키 환경변수 fallback 뿐. 브라우저 로그인은 수동으로
+- `auth_expired`는 자동 재생하지 않습니다. hint에 따라 provider CLI에 수동으로 다시 로그인하세요.
 - 호출당 Node/Rust 프로세스 spawn 오버헤드 ~수백 ms — 초저지연 시스템엔 부적합
 - Gemini(`agy`)는 헤드리스 출력이 평문이라 토큰 사용량 보고가 없음(usage=None). 세션은 `--conversation <UUID>`/`--continue`, id는 `~/.gemini/antigravity-cli/conversations/`의 최신 .db에서 복구. 에이전틱 루프라 기본 timeout 300s
 

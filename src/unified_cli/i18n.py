@@ -480,10 +480,10 @@ _EN = {
     "setup.login.generic_note": "Setup continues automatically once done.",
     "setup.login.prompt": "\\[{name}] Log in now?",
     "setup.login.skipped": "  [yellow]Skipped.[/yellow] Run manually: {cmd}",
-    "setup.login.skipped_env": "  Or set the {env} environment variable to use an API key.",
+    "setup.login.skipped_env": "  For a new explicitly metered Python request, pass {env} via `extra_env`; inherited keys are ignored.",
     "setup.login.spawned": "  [green]✓ Login process exited[/green]",
     "setup.login.exit_maybe_cancelled": "  [yellow]Login process exit {code} (may have been cancelled)[/yellow]",
-    "setup.login.all_authed": "✓ All providers already authenticated (OAuth or API key)",
+    "setup.login.all_authed": "✓ All providers already authenticated with OAuth or a headless token",
     "setup.verify.testing": "{name} test call...",
     "setup.verify.no_binary": "  [red]✗ {name}: no binary — skipping verification[/red]",
     "setup.verify.no_auth": "  [red]✗ {name}: no auth — skipping verification[/red]",
@@ -502,6 +502,7 @@ _EN = {
     "ui.health.missing_binary": "missing binary",
     "ui.auth.none": "(none)",
     "ui.auth.keychain_blocked": "Keychain blocked",
+    "ui.auth.api_key_ignored": "${env} detected (ignored by default)",
     "ui.bin.not_found": "(not found)",
     "ui.table.status_title": "Provider status",
     "ui.table.col.provider": "Provider",
@@ -531,8 +532,8 @@ _EN = {
 
     # ===== errors (errors.py) — messages/hints WE generate =====
     "err.cause_label": "cause",
-    "err.hint.claude_login": "Re-run `claude /login` or set the ANTHROPIC_API_KEY environment variable.",
-    "err.hint.codex_login": "Re-run `codex login` or set the OPENAI_API_KEY environment variable.",
+    "err.hint.claude_login": "Re-run `claude /login`. For a new explicitly metered request, pass ANTHROPIC_API_KEY via `extra_env`; failed turns are not replayed.",
+    "err.hint.codex_login": "Re-run `codex login`. For a new explicitly metered request, pass OPENAI_API_KEY via `extra_env`; failed turns are not replayed.",
     "err.hint.gemini_login": "Run `agy` to log in again via the browser (Antigravity). "
                              "The old gemini CLI is blocked for individual accounts.",
     "err.hint.antigravity_migrate": "The old gemini CLI ended individual-account support — migrated to "
@@ -544,7 +545,7 @@ _EN = {
                                           "To use a new model (e.g. gpt-5.5), upgrade the CLI first with "
                                           "`brew upgrade codex` or `npm i -g @openai/codex@latest`.",
     "err.hint.codex_subscription_fallback": "Check available models with `unified-cli models codex`.",
-    "err.hint.network_retry": "Check your network connection. The unified wrapper already retried twice.",
+    "err.hint.network_retry": "Check your network connection. Only clearly pre-turn transient failures are retried automatically.",
     "err.hint.check_resource": "Check whether the requested resource (model/session) exists.",
     "err.hint.install_cli": "CLI binary not found. Install the provider CLI and check your PATH.",
     "err.msg.auth_expired": "{provider} authentication has expired.",
@@ -568,8 +569,6 @@ _EN = {
     "err.base.timeout": "{provider} response did not arrive within {timeout}s.",
     "err.base.timeout.hint": "Possible network/CLI hang. Increase the timeout or retry. "
                              "Adjustable via BaseProvider(timeout=N).",
-    "err.base.timeout_fallback": "{provider} timed out during API-key fallback.",
-    "err.base.timeout_fallback.hint": "Check your network and retry.",
     "err.base.stream_timeout": "{provider} stream did not finish within {timeout}s.",
     "err.base.stream_timeout.hint": "For long replies, increase it via BaseProvider(timeout=N).",
     "err.base.no_first_output": "{provider} produced no output within {timeout}s "
@@ -578,7 +577,7 @@ _EN = {
                               "hang forever waiting on the login Keychain (no TTY to "
                               "unlock it). Fix: run `claude setup-token` in a terminal, "
                               "then set CLAUDE_CODE_OAUTH_TOKEN in the service "
-                              "environment (or export ANTHROPIC_API_KEY). See the README "
+                              "environment. See the README "
                               "section 'Running under launchd / cron / a server'.",
     "err.base.line_too_long": "{provider} emitted an oversized output line.",
     "err.base.line_too_long.hint": "A single streamed line exceeded the read buffer; "
@@ -1019,10 +1018,10 @@ _KO = {
     "setup.login.generic_note": "완료 후 자동으로 setup 이 이어집니다.",
     "setup.login.prompt": "\\[{name}] 지금 로그인할까요?",
     "setup.login.skipped": "  [yellow]건너뜀.[/yellow] 수동 실행: {cmd}",
-    "setup.login.skipped_env": "  또는 환경변수 {env} 설정으로 API key 사용 가능.",
+    "setup.login.skipped_env": "  새 Python 요청을 명시적으로 종량제 호출하려면 `extra_env`로 {env}를 전달하세요. 상속된 키는 무시됩니다.",
     "setup.login.spawned": "  [green]✓ 로그인 프로세스 종료[/green]",
     "setup.login.exit_maybe_cancelled": "  [yellow]로그인 프로세스 exit {code} (취소되었을 수 있음)[/yellow]",
-    "setup.login.all_authed": "✓ 모든 provider 가 이미 인증됨 (OAuth 또는 API key)",
+    "setup.login.all_authed": "✓ 모든 provider 가 OAuth 또는 headless token으로 인증됨",
     "setup.verify.testing": "{name} 테스트 호출...",
     "setup.verify.no_binary": "  [red]✗ {name}: 바이너리 없음 — 검증 건너뜀[/red]",
     "setup.verify.no_auth": "  [red]✗ {name}: 인증 없음 — 검증 건너뜀[/red]",
@@ -1041,6 +1040,7 @@ _KO = {
     "ui.health.missing_binary": "바이너리 없음",
     "ui.auth.none": "(없음)",
     "ui.auth.keychain_blocked": "키체인 차단됨",
+    "ui.auth.api_key_ignored": "${env} 감지됨 (기본 호출에서는 무시)",
     "ui.bin.not_found": "(찾을 수 없음)",
     "ui.table.status_title": "Provider 상태",
     "ui.table.col.provider": "Provider",
@@ -1070,8 +1070,8 @@ _KO = {
 
     # ===== errors (errors.py) =====
     "err.cause_label": "원인",
-    "err.hint.claude_login": "`claude /login` 을 재실행하거나 ANTHROPIC_API_KEY 환경변수를 설정하세요.",
-    "err.hint.codex_login": "`codex login` 을 재실행하거나 OPENAI_API_KEY 환경변수를 설정하세요.",
+    "err.hint.claude_login": "`claude /login` 을 재실행하세요. 새 요청을 명시적으로 종량제 호출하려면 `extra_env`로 ANTHROPIC_API_KEY를 전달하세요. 실패한 턴은 자동 재생하지 않습니다.",
+    "err.hint.codex_login": "`codex login` 을 재실행하세요. 새 요청을 명시적으로 종량제 호출하려면 `extra_env`로 OPENAI_API_KEY를 전달하세요. 실패한 턴은 자동 재생하지 않습니다.",
     "err.hint.gemini_login": "`agy` 를 실행해 브라우저로 다시 로그인하세요 (Antigravity). "
                              "구 gemini CLI 는 개인 계정에서 차단됨.",
     "err.hint.antigravity_migrate": "구 gemini CLI 는 개인 계정 지원 종료 — Antigravity `agy` 로 마이그레이션됨. "
@@ -1082,7 +1082,7 @@ _KO = {
                                           "신규 모델 (예: gpt-5.5) 을 쓰려면 `brew upgrade codex` 또는 "
                                           "`npm i -g @openai/codex@latest` 로 CLI 부터 업그레이드하세요.",
     "err.hint.codex_subscription_fallback": "사용 가능한 모델은 `unified-cli models codex` 로 확인하세요.",
-    "err.hint.network_retry": "네트워크 연결을 확인하세요. 통합 래퍼는 이미 2회 재시도했습니다.",
+    "err.hint.network_retry": "네트워크 연결을 확인하세요. 턴 시작 전임이 명확한 일시적 실패만 자동 재시도합니다.",
     "err.hint.check_resource": "요청한 리소스(모델/세션)가 존재하는지 확인하세요.",
     "err.hint.install_cli": "CLI 바이너리를 찾을 수 없습니다. 해당 provider CLI를 설치하고 PATH를 확인하세요.",
     "err.msg.auth_expired": "{provider} 인증이 만료되었습니다.",
@@ -1106,8 +1106,6 @@ _KO = {
     "err.base.timeout": "{provider} 응답이 {timeout}초 안에 오지 않음.",
     "err.base.timeout.hint": "네트워크/CLI hang 가능성. timeout 을 늘리거나 다시 시도하세요. "
                              "BaseProvider(timeout=N) 으로 조정 가능.",
-    "err.base.timeout_fallback": "{provider} API key fallback 중 timeout.",
-    "err.base.timeout_fallback.hint": "네트워크 확인 후 재시도.",
     "err.base.stream_timeout": "{provider} 스트림이 {timeout}초 안에 끝나지 않음.",
     "err.base.stream_timeout.hint": "긴 응답이면 BaseProvider(timeout=N) 으로 늘리세요.",
     "err.base.no_first_output": "{provider}가 {timeout}초 안에 아무 출력도 내지 않음 "
@@ -1115,8 +1113,8 @@ _KO = {
     "err.base.keychain_hint": "macOS에서 launchd / cron / 서비스로 실행하면 `claude`가 "
                               "로그인 키체인을 여는 TTY가 없어 무한 대기할 수 있습니다. 해결: "
                               "터미널에서 `claude setup-token` 을 실행한 뒤 "
-                              "CLAUDE_CODE_OAUTH_TOKEN 을 서비스 환경변수로 설정하세요 "
-                              "(또는 ANTHROPIC_API_KEY export). README의 "
+                              "CLAUDE_CODE_OAUTH_TOKEN 을 서비스 환경변수로 설정하세요. "
+                              "README의 "
                               "'launchd / cron / 서버에서 실행' 섹션 참고.",
     "err.base.line_too_long": "{provider} 출력 한 줄이 너무 큽니다.",
     "err.base.line_too_long.hint": "스트리밍 한 줄이 읽기 버퍼를 초과했습니다. 반복되면 "

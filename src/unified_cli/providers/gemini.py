@@ -40,12 +40,15 @@ from typing import AsyncIterator, Iterator, Optional
 
 from ..base import (
     BaseProvider,
+    _CombinedCancelEvent,
+    _RETRY_MAX_ATTEMPTS,
     _StreamReader,
     _cancel_requested,
     _cancelled_error,
     _close_popen_pipes,
     _drain_binary_into,
     _popen_process_group_kwargs,
+    _retry_evidence_proves_no_side_effects,
     _terminate_process_tree,
 )
 from ..core import Message, Response, Usage
@@ -327,7 +330,7 @@ class GeminiProvider(BaseProvider):
 
     # ----- streaming (plain text, line-buffered) -----
 
-    def _stream_run(
+    def _stream_once_plain(
         self,
         args: list[str],
         stdin_data: Optional[str] = None,
@@ -393,9 +396,18 @@ class GeminiProvider(BaseProvider):
         loop_done = False
         try:
             for line in reader:
+                if _cancel_requested(cancel_event):
+                    _terminate_process_tree(proc)
+                    raise _cancelled_error(self.name)
                 collected.append(line)
                 if line.strip():
+                    if _cancel_requested(cancel_event):
+                        _terminate_process_tree(proc)
+                        raise _cancelled_error(self.name)
                     produced = True
+                    if _cancel_requested(cancel_event):
+                        _terminate_process_tree(proc)
+                        raise _cancelled_error(self.name)
                     yield Message(kind="text", provider="gemini",
                                   text=line, raw={"line": line})
             loop_done = True
@@ -454,6 +466,12 @@ class GeminiProvider(BaseProvider):
             self._check_ineligible(full + "\n" + stderr_text)
             err = classify(self.name, stderr_text, full, proc.returncode)
             err._produced_any = produced  # type: ignore[attr-defined]
+            err._retry_evidence_safe = bool(  # type: ignore[attr-defined]
+                not produced
+                and _retry_evidence_proves_no_side_effects(
+                    full, stderr_text, err,
+                )
+            )
             raise err
 
         self._check_ineligible(full)
@@ -463,10 +481,56 @@ class GeminiProvider(BaseProvider):
                 message=t("err.gemini.empty_response"),
                 hint=t("err.gemini.empty_response.hint"),
             )
+        if _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
         sid = self._resolve_session_id()
         if sid:
+            if _cancel_requested(cancel_event):
+                raise _cancelled_error(self.name)
             yield Message(kind="session", provider="gemini", session_id=sid, raw={})
+        if _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
         yield Message(kind="done", provider="gemini", raw={})
+
+    def _stream_run(
+        self,
+        args: list[str],
+        stdin_data: Optional[str] = None,
+        *,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Iterator[Message]:
+        """Plain-text sync stream with the same pre-output retry boundary."""
+        scheduled_delay = 0.0
+        for attempt in range(_RETRY_MAX_ATTEMPTS):
+            emitted = False
+            try:
+                for message in self._stream_once_plain(
+                    args, stdin_data=stdin_data, cancel_event=cancel_event,
+                ):
+                    if _cancel_requested(cancel_event):
+                        raise _cancelled_error(self.name)
+                    emitted = True
+                    if _cancel_requested(cancel_event):
+                        raise _cancelled_error(self.name)
+                    yield message
+                return
+            except UnifiedError as err:
+                evidence_safe = bool(
+                    not emitted
+                    and not getattr(err, "_produced_any", False)
+                    and getattr(err, "_retry_evidence_safe", False)
+                )
+                if self._retryable(err, evidence_safe=evidence_safe) and (
+                    attempt + 1 < _RETRY_MAX_ATTEMPTS
+                ):
+                    waited = self._wait_for_retry(
+                        err, attempt, scheduled=scheduled_delay,
+                        cancel_event=cancel_event,
+                    )
+                    if waited is not None:
+                        scheduled_delay = waited
+                        continue
+                raise
 
     async def astream(
         self,
@@ -480,20 +544,37 @@ class GeminiProvider(BaseProvider):
     ) -> AsyncIterator[Message]:
         # agy has no async event stream; run the blocking call in an executor
         # and surface the result as text → session → done.
-        loop = asyncio.get_event_loop()
-        resp = await loop.run_in_executor(
+        loop = asyncio.get_running_loop()
+        task_cancel = threading.Event()
+        combined_cancel = _CombinedCancelEvent(cancel_event, task_cancel)
+        future = loop.run_in_executor(
             None,
             lambda: self.chat(
                 prompt, session_id=session_id, resume_last=resume_last,
-                model=model, images=images, cancel_event=cancel_event,
+                model=model, images=images, cancel_event=combined_cancel,
             ),
         )
+        try:
+            resp = await future
+        except asyncio.CancelledError:
+            # run_in_executor cannot stop an already-running worker, so signal
+            # the subprocess/retry wait before returning cancellation promptly.
+            task_cancel.set()
+            raise
         if resp.text:
+            if _cancel_requested(combined_cancel):
+                raise _cancelled_error(self.name)
             yield Message(kind="text", provider="gemini", text=resp.text, raw={})
         if resp.session_id:
+            if _cancel_requested(combined_cancel):
+                raise _cancelled_error(self.name)
             yield Message(kind="session", provider="gemini",
                           session_id=resp.session_id, raw={})
+        if _cancel_requested(combined_cancel):
+            raise _cancelled_error(self.name)
         yield Message(kind="done", provider="gemini", raw={})
+        if _cancel_requested(combined_cancel):
+            raise _cancelled_error(self.name)
 
     # ----- session listing -----
 

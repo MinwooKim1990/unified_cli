@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Provider turns now retry only clearly pre-turn transient network failures or
+  transient HTTP 429 responses, with bounded `Retry-After` handling,
+  exponential backoff with jitter, strict attempt/delay caps, and
+  cancellation-aware waits. Once output or tool execution may have begun, the
+  turn is never replayed.
+- Authentication/authorization failures, quota exhaustion, and policy denials
+  are never retried. The wrapper no longer changes to an inherited API key and
+  replays a failed OAuth turn; recovery hints direct users to login or to make a
+  new, explicitly metered Python request via `extra_env`.
+
 ## [0.4.0] - 2026-07-14
 
 ### Security
