@@ -3,7 +3,6 @@
   "baseline_source": "docs/development/platform-next-stage0-baseline.md",
   "metrics": {
     "calibration_process_startup": {
-      "baseline_milliseconds": 30.355,
       "samples": 9,
       "statistic": "p95",
       "threshold": {
@@ -12,8 +11,27 @@
       },
       "warmups": 2
     },
+    "calibration_import_workload": {
+      "baseline_milliseconds": 49.712,
+      "profile": "core_import",
+      "samples": 15,
+      "statistic": "median",
+      "threshold": {
+        "kind": "fixed",
+        "milliseconds": 99.712
+      },
+      "warmups": 3
+    },
     "core_import": {
       "baseline_milliseconds": 48.606,
+      "normalization": {
+        "baseline_milliseconds": 49.712,
+        "calibration_value": "inner_ms",
+        "kind": "paired_import_bracket",
+        "max_adjustment_milliseconds": 50.0,
+        "max_calibration_milliseconds": 99.712,
+        "profile": "core_import"
+      },
       "samples": 15,
       "statistic": "median",
       "threshold": {
@@ -26,12 +44,12 @@
     "core_version": {
       "baseline_milliseconds": 94.635,
       "normalization": {
-        "combine": "sum",
-        "kind": "positive_baseline_delta",
-        "references": [
-          "calibration_process_startup",
-          "core_import"
-        ]
+        "baseline_milliseconds": 97.284,
+        "calibration_value": "process_ms",
+        "kind": "paired_import_bracket",
+        "max_adjustment_milliseconds": 50.0,
+        "max_calibration_milliseconds": 147.284,
+        "profile": "core_version"
       },
       "samples": 15,
       "statistic": "median",
@@ -43,7 +61,6 @@
       "warmups": 3
     },
     "ext_import": {
-      "baseline_milliseconds": 52.066,
       "samples": 15,
       "statistic": "p95",
       "threshold": {
@@ -54,12 +71,12 @@
     },
     "ext_passive_registry": {
       "normalization": {
-        "combine": "minimum",
-        "kind": "positive_baseline_delta",
-        "references": [
-          "core_import",
-          "ext_import"
-        ]
+        "baseline_milliseconds": 80.838,
+        "calibration_value": "inner_ms",
+        "kind": "paired_import_bracket",
+        "max_adjustment_milliseconds": 50.0,
+        "max_calibration_milliseconds": 130.838,
+        "profile": "ext_passive_registry"
       },
       "samples": 15,
       "statistic": "p95",
