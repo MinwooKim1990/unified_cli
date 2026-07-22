@@ -764,6 +764,159 @@ class SnapshotAndRuntimeTests(unittest.TestCase):
             self.assertFalse(root.exists())
             self.assertEqual(retained.read_text(encoding="utf-8"), "keep")
 
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin-only O_SYMLINK fallback")
+    def test_derived_snapshot_removal_uses_darwin_symlink_flag_fallback(self):
+        with tempfile.TemporaryDirectory(prefix="snapshot-symlink-fallback-") as temporary:
+            parent = Path(os.path.realpath(temporary)) / self.identity.lab_id
+            parent.mkdir(mode=0o700)
+            root = parent / "runtime-snapshot"
+            outside = Path(os.path.realpath(temporary)) / "outside"
+            outside.mkdir(mode=0o700)
+            retained = outside / "retained"
+            retained.write_text("keep", encoding="utf-8")
+            resource = DerivedSnapshotResource(str(root))
+            resource.create()
+            (root / "outside-link").symlink_to(outside, target_is_directory=True)
+            original_open = os.open
+            symlink_flags = []
+            missing = object()
+            original_symlink_flag = getattr(os, "O_SYMLINK", missing)
+
+            def record_symlink_open(path, flags, mode=0o777, *, dir_fd=None):
+                if path == "outside-link":
+                    symlink_flags.append(flags)
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            if original_symlink_flag is not missing:
+                delattr(os, "O_SYMLINK")
+            try:
+                with mock.patch(
+                    "tools.unified_ext_lab.docker_runtime.os.open",
+                    side_effect=record_symlink_open,
+                ):
+                    self.assertTrue(resource.remove())
+            finally:
+                if original_symlink_flag is not missing:
+                    setattr(os, "O_SYMLINK", original_symlink_flag)
+
+            self.assertEqual(len(symlink_flags), 1)
+            self.assertEqual(symlink_flags[0] & 0x00200000, 0x00200000)
+            self.assertFalse(root.exists())
+            self.assertEqual(retained.read_text(encoding="utf-8"), "keep")
+
+    def test_derived_snapshot_removal_fails_closed_on_symlink_open_error(self):
+        with tempfile.TemporaryDirectory(prefix="snapshot-symlink-open-fault-") as temporary:
+            parent = Path(os.path.realpath(temporary)) / self.identity.lab_id
+            parent.mkdir(mode=0o700)
+            root = parent / "runtime-snapshot"
+            outside = Path(os.path.realpath(temporary)) / "outside"
+            outside.mkdir(mode=0o700)
+            retained = outside / "retained"
+            retained.write_text("keep", encoding="utf-8")
+            resource = DerivedSnapshotResource(str(root))
+            resource.create()
+            outside_link = root / "outside-link"
+            outside_link.symlink_to(outside, target_is_directory=True)
+            original_open = os.open
+
+            def fail_symlink_open(path, flags, mode=0o777, *, dir_fd=None):
+                if path == "outside-link":
+                    raise OSError("injected symlink open failure")
+                return original_open(path, flags, mode, dir_fd=dir_fd)
+
+            with mock.patch(
+                "tools.unified_ext_lab.docker_runtime.os.open",
+                side_effect=fail_symlink_open,
+            ):
+                with self.assertRaisesRegex(
+                    InvariantRefusalError,
+                    "changed during removal",
+                ):
+                    resource.remove()
+
+            self.assertTrue(root.exists())
+            self.assertTrue(outside_link.is_symlink())
+            self.assertEqual(retained.read_text(encoding="utf-8"), "keep")
+
+    def test_derived_snapshot_removal_fails_closed_on_symlink_unlink_error(self):
+        with tempfile.TemporaryDirectory(prefix="snapshot-symlink-unlink-fault-") as temporary:
+            parent = Path(os.path.realpath(temporary)) / self.identity.lab_id
+            parent.mkdir(mode=0o700)
+            root = parent / "runtime-snapshot"
+            outside = Path(os.path.realpath(temporary)) / "outside"
+            outside.mkdir(mode=0o700)
+            retained = outside / "retained"
+            retained.write_text("keep", encoding="utf-8")
+            resource = DerivedSnapshotResource(str(root))
+            resource.create()
+            outside_link = root / "outside-link"
+            outside_link.symlink_to(outside, target_is_directory=True)
+            original_unlink = os.unlink
+
+            def fail_symlink_unlink(name, *, dir_fd=None):
+                if name == "outside-link":
+                    raise OSError("injected symlink unlink failure")
+                return original_unlink(name, dir_fd=dir_fd)
+
+            with mock.patch(
+                "tools.unified_ext_lab.docker_runtime.os.unlink",
+                side_effect=fail_symlink_unlink,
+            ):
+                with self.assertRaisesRegex(
+                    InvariantRefusalError,
+                    "changed during removal",
+                ):
+                    resource.remove()
+
+            self.assertTrue(root.exists())
+            self.assertTrue(outside_link.is_symlink())
+            self.assertEqual(retained.read_text(encoding="utf-8"), "keep")
+
+    def test_derived_snapshot_removal_refuses_symlink_replacement(self):
+        with tempfile.TemporaryDirectory(prefix="snapshot-symlink-race-") as temporary:
+            parent = Path(os.path.realpath(temporary)) / self.identity.lab_id
+            parent.mkdir(mode=0o700)
+            root = parent / "runtime-snapshot"
+            first_outside = Path(os.path.realpath(temporary)) / "first-outside"
+            second_outside = Path(os.path.realpath(temporary)) / "second-outside"
+            first_outside.mkdir(mode=0o700)
+            second_outside.mkdir(mode=0o700)
+            first_retained = first_outside / "retained"
+            second_retained = second_outside / "retained"
+            first_retained.write_text("first", encoding="utf-8")
+            second_retained.write_text("second", encoding="utf-8")
+            resource = DerivedSnapshotResource(str(root))
+            resource.create()
+            outside_link = root / "outside-link"
+            moved_link = root / "moved-outside-link"
+            outside_link.symlink_to(first_outside, target_is_directory=True)
+            original_unlink = os.unlink
+            replaced = {"done": False}
+
+            def replace_before_unlink(name, *, dir_fd=None):
+                if name == "outside-link" and not replaced["done"]:
+                    replaced["done"] = True
+                    outside_link.rename(moved_link)
+                    outside_link.symlink_to(second_outside, target_is_directory=True)
+                return original_unlink(name, dir_fd=dir_fd)
+
+            with mock.patch(
+                "tools.unified_ext_lab.docker_runtime.os.unlink",
+                side_effect=replace_before_unlink,
+            ):
+                with self.assertRaisesRegex(
+                    InvariantRefusalError,
+                    "changed during removal",
+                ):
+                    resource.remove()
+
+            self.assertTrue(replaced["done"])
+            self.assertTrue(root.exists())
+            self.assertTrue(moved_link.is_symlink())
+            self.assertFalse(os.path.lexists(outside_link))
+            self.assertEqual(first_retained.read_text(encoding="utf-8"), "first")
+            self.assertEqual(second_retained.read_text(encoding="utf-8"), "second")
+
     def test_derived_snapshot_removal_refuses_directory_entry_replacement(self):
         with tempfile.TemporaryDirectory(prefix="snapshot-race-") as temporary:
             parent = Path(os.path.realpath(temporary)) / self.identity.lab_id

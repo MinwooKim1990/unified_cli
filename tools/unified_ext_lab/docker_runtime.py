@@ -69,6 +69,9 @@ _MAX_TIMEOUT_SECONDS = 3600.0
 _GUEST_DIRECTORY = os.path.dirname(GUEST_EXECUTABLE)
 _SNAPSHOT_GUEST_PARTS = ("rootfs", "opt", "unified-ext-lab")
 _DERIVED_SNAPSHOT_NAME = "runtime-snapshot"
+# Darwin's sys/fcntl.h defines O_SYMLINK with this stable value. Python 3.9
+# does not expose the constant even though the kernel supports the flag.
+_DARWIN_O_SYMLINK = 0x00200000
 
 # Container-only conformance never loads Buildx. This compatibility constant
 # remains exported for callers that audited the former build-based design.
@@ -182,8 +185,8 @@ def _open_nondirectory_at(
 ) -> int:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     if stat.S_ISLNK(expected.st_mode):
-        if sys.platform == "darwin" and hasattr(os, "O_SYMLINK"):
-            flags |= os.O_SYMLINK
+        if sys.platform == "darwin":
+            flags |= getattr(os, "O_SYMLINK", _DARWIN_O_SYMLINK)
         elif sys.platform.startswith("linux") and hasattr(os, "O_PATH"):
             flags |= os.O_PATH | getattr(os, "O_NOFOLLOW", 0)
         else:
