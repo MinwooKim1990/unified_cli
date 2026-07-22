@@ -100,6 +100,11 @@ def test_baseline_pins_reference_digest_anchors_and_exact_policies():
         "kind": "paired_same_metric_reference",
         "metric": "ext_passive_registry",
     }
+    assert metrics["repl_first_prompt"]["normalization"] == {
+        "anchor_milliseconds": 164.551,
+        "kind": "paired_same_metric_reference",
+        "metric": "repl_first_prompt",
+    }
     assert metrics["ext_passive_registry"]["samples"] == 61
     assert metrics["repl_first_prompt"]["samples"] == 31
     assert (
@@ -110,6 +115,7 @@ def test_baseline_pins_reference_digest_anchors_and_exact_policies():
     assert check_performance._threshold(metrics["core_import"]) == 98.606
     assert check_performance._threshold(metrics["core_version"]) == 144.635
     assert check_performance._threshold(metrics["ext_passive_registry"]) == 250.0
+    assert check_performance._threshold(metrics["repl_first_prompt"]) == 300.0
 
 
 def test_exact_repl_sampling_shape_is_fail_closed(tmp_path):
@@ -124,6 +130,30 @@ def test_exact_repl_sampling_shape_is_fail_closed(tmp_path):
             check_performance.load_config(
                 _write_config(tmp_path, mutated, "repl-" + field + ".json")
             )
+
+    mutated = copy.deepcopy(config)
+    mutated["metrics"]["repl_first_prompt"]["normalization"][
+        "anchor_milliseconds"
+    ] += 0.001
+    with pytest.raises(
+        check_performance.PerformanceConfigError,
+        match="repl_first_prompt reference anchor",
+    ):
+        check_performance.load_config(
+            _write_config(tmp_path, mutated, "repl-anchor.json")
+        )
+
+    mutated = copy.deepcopy(config)
+    mutated["metrics"]["repl_first_prompt"]["threshold"][
+        "milliseconds"
+    ] = 300.001
+    with pytest.raises(
+        check_performance.PerformanceConfigError,
+        match="repl_first_prompt policy",
+    ):
+        check_performance.load_config(
+            _write_config(tmp_path, mutated, "repl-threshold.json")
+        )
 
 
 def test_61_sample_p95_is_exact_sorted_index_57_and_tracks_heterogeneous_mutation():
@@ -232,6 +262,126 @@ def test_registry_exact_250_boundary():
         [250.001] * 3, metric,
         reference_before=reference, reference_after=reference,
     )["passed"] is False
+
+
+def test_repl_exact_300_normalized_boundary_and_shared_host_delay():
+    metric = _short(check_performance.load_config(
+        check_performance.DEFAULT_BASELINE
+    )["metrics"]["repl_first_prompt"])
+    anchor = metric["normalization"]["anchor_milliseconds"]
+    # A power of two keeps the synthetic cancellation exact in binary floats;
+    # the policy boundary itself remains 300.000 versus 300.001 milliseconds.
+    shared_delay = 256.0
+    reference = [anchor + shared_delay] * 3
+    shared = check_performance.summarize(
+        [anchor + shared_delay] * 3, metric,
+        reference_before=reference, reference_after=reference,
+    )
+    boundary = check_performance.summarize(
+        [300.0 + shared_delay] * 3, metric,
+        reference_before=reference, reference_after=reference,
+    )
+    regressed = check_performance.summarize(
+        [300.001 + shared_delay] * 3, metric,
+        reference_before=reference, reference_after=reference,
+    )
+    one_slow_side = check_performance.summarize(
+        [300.001 + shared_delay] * 3, metric,
+        reference_before=reference,
+        reference_after=[anchor] * 3,
+    )
+    assert shared["passed"] is True
+    assert boundary["passed"] is True
+    assert regressed["passed"] is False
+    assert one_slow_side["passed"] is False
+    assert shared["p95_ms"] == anchor + shared_delay
+    assert shared["details"]["reference_normalization"][
+        "normalized_observed_ms"
+    ] == anchor
+
+
+def test_repl_measurement_uses_fresh_reference_candidate_reference_order(
+    monkeypatch, tmp_path,
+):
+    metric = _short(check_performance.load_config(
+        check_performance.DEFAULT_BASELINE
+    )["metrics"]["repl_first_prompt"])
+    events = []
+    invocation_environments = []
+    reference_number = 0
+
+    base = tmp_path / "base"
+    base_tmp = base / "tmp"
+    base_tmp.mkdir(parents=True)
+    base_env = {
+        "HOME": str(base / "home"),
+        "TMPDIR": str(base_tmp),
+        "UNIFIED_PERF_EMPTY_CWD": str(base / "empty-cwd"),
+        "UNIFIED_PERF_WORKSPACE": str(base / "workspace"),
+        "UNIFIED_PERF_WRITABLE_ROOTS": str(base),
+        "XDG_CACHE_HOME": str(base / "home" / ".cache"),
+        "XDG_CONFIG_HOME": str(base / "home" / ".config"),
+        "XDG_DATA_HOME": str(base / "home" / ".local" / "share"),
+    }
+
+    def fake_prompt(env, marker):
+        events.append(env["kind"])
+        paths = {
+            name: Path(env[name])
+            for name in (
+                "HOME", "TMPDIR", "UNIFIED_PERF_EMPTY_CWD",
+                "UNIFIED_PERF_WORKSPACE",
+            )
+        }
+        invocation_environments.append(paths)
+        assert set(env["UNIFIED_PERF_WRITABLE_ROOTS"].split(os.pathsep)) == {
+            str(paths["HOME"]),
+            str(paths["TMPDIR"]),
+            str(paths["UNIFIED_PERF_WORKSPACE"]),
+        }
+        for path in paths.values():
+            assert path.is_dir()
+        for path in (
+            paths["HOME"] / "repl_history",
+            paths["TMPDIR"] / "provider.state",
+            paths["UNIFIED_PERF_WORKSPACE"] / "session.state",
+        ):
+            assert not path.exists()
+            path.write_text("poison", encoding="utf-8")
+        return 200.0 if env["kind"] == "candidate" else 190.0
+
+    def fake_fresh(manifest, env, callback, *, registry=False):
+        nonlocal reference_number
+        reference_number += 1
+        return callback({
+            **env,
+            "kind": "reference-" + str(reference_number),
+        })
+
+    monkeypatch.setattr(check_performance, "_pty_prompt_once", fake_prompt)
+    monkeypatch.setattr(check_performance, "_fresh_reference_once", fake_fresh)
+    samples, raw_median, details, before, after = check_performance._measure_repl(
+        metric,
+        {**base_env, "kind": "candidate"},
+        object(),
+        {**base_env, "kind": "base"},
+        Path("unused-marker"),
+    )
+    assert samples == [200.0] * 3
+    assert before == after == [190.0] * 3
+    assert raw_median is None
+    assert details == {"reference_metric": "repl_first_prompt"}
+    assert events == [
+        "reference-1", "candidate", "reference-2",
+        "reference-3", "candidate", "reference-4",
+        "reference-5", "candidate", "reference-6",
+    ]
+    for name in (
+        "HOME", "TMPDIR", "UNIFIED_PERF_EMPTY_CWD", "UNIFIED_PERF_WORKSPACE",
+    ):
+        values = [str(item[name]) for item in invocation_environments]
+        assert len(values) == len(set(values)) == 9
+    assert not list(base_tmp.glob("repl-invocation-*"))
 
 
 def test_normalization_is_per_sample_and_one_slow_side_grants_no_credit():
@@ -894,7 +1044,12 @@ else:
 '''
         check_performance._run(check_performance._python_argv(code), child)
         if marker.exists():
-            assert marker.read_text(encoding="utf-8").startswith("import:")
+            # Python 3.9 can return the already-guarded extension singleton,
+            # while newer loaders may attempt a distinct import. Both paths
+            # must remain checked and leave an explicit guard marker.
+            assert marker.read_text(encoding="utf-8").startswith(
+                ("import:", "subprocess:")
+            )
 
 
 @pytest.mark.skipif(not hasattr(os, "setsid"), reason="setsid is unavailable")
@@ -1081,6 +1236,15 @@ try:
     os.close(file_fd)
 finally:
     os.close(directory_fd)
+class Accessor:
+    open = os.open
+
+accessor_fd = Accessor().open(
+    os.path.join(os.environ["HOME"], "accessor.state"),
+    os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+    0o600,
+)
+os.close(accessor_fd)
 with open(os.devnull, "wb") as handle:
     handle.write(b"ok")
 print("ok")

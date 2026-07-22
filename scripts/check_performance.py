@@ -49,7 +49,7 @@ _METRIC_NAMES = (
     "stream_relay",
 )
 _NORMALIZED_METRICS = frozenset({
-    "core_import", "core_version", "ext_passive_registry",
+    "core_import", "core_version", "ext_passive_registry", "repl_first_prompt",
 })
 REFERENCE_SHA = "be1478884735c862e894959944ba53e149ea4210"
 REFERENCE_SOURCE_TREE_DIGEST = (
@@ -62,6 +62,7 @@ SOURCE_TREES = (
 )
 _CORE_ANCHORS = {"core_import": 48.606, "core_version": 94.635}
 _REGISTRY_ANCHOR = 195.661
+_REPL_ANCHOR = 164.551
 _CREDENTIAL_MARKERS = (
     "API_KEY",
     "ACCESS_TOKEN",
@@ -215,6 +216,8 @@ def load_config(path: Path) -> Dict[str, Any]:
                 raise PerformanceConfigError(name + " reference anchor is invalid")
             if name == "ext_passive_registry" and anchor != _REGISTRY_ANCHOR:
                 raise PerformanceConfigError(name + " reference anchor is invalid")
+            if name == "repl_first_prompt" and anchor != _REPL_ANCHOR:
+                raise PerformanceConfigError(name + " reference anchor is invalid")
     for name, anchor in _CORE_ANCHORS.items():
         metric = metrics[name]
         if metric["baseline_milliseconds"] != anchor or metric["threshold"] != {
@@ -227,6 +230,10 @@ def load_config(path: Path) -> Dict[str, Any]:
         "kind": "fixed", "milliseconds": 250.0,
     }:
         raise PerformanceConfigError("ext_passive_registry policy is invalid")
+    if metrics["repl_first_prompt"]["threshold"] != {
+        "kind": "fixed", "milliseconds": 300.0,
+    }:
+        raise PerformanceConfigError("repl_first_prompt policy is invalid")
     expected_shapes = {
         "core_import": (15, "median", 3),
         "core_version": (15, "median", 3),
@@ -530,25 +537,31 @@ def _mutation_allowed(path, dir_fd=None):
 
 _real_open = os.open
 
-def _guarded_open(path, flags, mode=0o777, *, dir_fd=None):
-    thread_id = _thread.get_ident()
-    stack = _open_dir_fds.setdefault(thread_id, [])
-    stack.append(dir_fd)
-    try:
-        if (
-            _forbid_mutations
-            and isinstance(flags, int)
-            and flags & _write_flags
-            and not _mutation_allowed(path, dir_fd)
-        ):
-            _mark("mutation", path)
-            raise RuntimeError("filesystem mutation disabled by performance harness")
-        return _real_open(path, flags, mode, dir_fd=dir_fd)
-    finally:
-        stack.pop()
-        if not stack:
-            _open_dir_fds.pop(thread_id, None)
+class _OpenGuard:
+    # A callable instance deliberately has no descriptor binding behavior.
+    # Python 3.9's pathlib stores os.open on _NormalAccessor; assigning a plain
+    # Python function here would bind that function and inject the accessor as
+    # an extra first argument.
+    def __call__(self, path, flags, mode=0o777, *, dir_fd=None):
+        thread_id = _thread.get_ident()
+        stack = _open_dir_fds.setdefault(thread_id, [])
+        stack.append(dir_fd)
+        try:
+            if (
+                _forbid_mutations
+                and isinstance(flags, int)
+                and flags & _write_flags
+                and not _mutation_allowed(path, dir_fd)
+            ):
+                _mark("mutation", path)
+                raise RuntimeError("filesystem mutation disabled by performance harness")
+            return _real_open(path, flags, mode, dir_fd=dir_fd)
+        finally:
+            stack.pop()
+            if not stack:
+                _open_dir_fds.pop(thread_id, None)
 
+_guarded_open = _OpenGuard()
 os.open = _guarded_open
 try:
     import posix as _posix
@@ -2319,15 +2332,58 @@ runpy.run_module("unified_cli.cli", run_name="__main__")
     return found_at
 
 
+@contextmanager
+def _fresh_repl_invocation_environment(
+    env: Mapping[str, str],
+) -> Iterator[Dict[str, str]]:
+    """Give one REPL timing invocation private, disposable state roots."""
+    parent = Path(env["TMPDIR"])
+    with tempfile.TemporaryDirectory(
+        prefix="repl-invocation-", dir=parent,
+    ) as raw:
+        base = Path(raw)
+        home = base / "home"
+        tmp = base / "tmp"
+        child_cwd = base / "empty-cwd"
+        workspace = base / "workspace"
+        for directory in (home, tmp, child_cwd, workspace):
+            directory.mkdir(mode=0o700)
+        child = dict(env)
+        child.update({
+            "HOME": str(home),
+            "TMPDIR": str(tmp),
+            "UNIFIED_PERF_EMPTY_CWD": str(child_cwd),
+            "UNIFIED_PERF_WORKSPACE": str(workspace),
+            "UNIFIED_PERF_WRITABLE_ROOTS": os.pathsep.join(
+                str(path) for path in (home, tmp, workspace)
+            ),
+            "XDG_CACHE_HOME": str(home / ".cache"),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "XDG_DATA_HOME": str(home / ".local" / "share"),
+        })
+        yield child
+
+
 def _measure_repl(
-    metric: Mapping[str, Any], env: Mapping[str, str], marker: Path,
-) -> List[float]:
-    samples: List[float] = []
-    for index in range(metric["warmups"] + metric["samples"]):
-        value = _pty_prompt_once(env, marker)
-        if index >= metric["warmups"]:
-            samples.append(value)
-    return samples
+    metric: Mapping[str, Any], candidate_env: Mapping[str, str],
+    reference_manifest: SourceManifest, base_env: Mapping[str, str], marker: Path,
+) -> Tuple[
+    List[float], Optional[float], Dict[str, Any], List[float], List[float],
+]:
+    def once(env: Mapping[str, str]) -> float:
+        with _fresh_repl_invocation_environment(env) as child:
+            return _pty_prompt_once(child, marker)
+
+    samples, before, after, details = _repeat_same_metric_reference(
+        metric,
+        lambda: once(candidate_env),
+        lambda: _fresh_reference_once(
+            reference_manifest,
+            base_env,
+            once,
+        ),
+    )
+    return samples, None, details, before, after
 
 
 def run_checks(
@@ -2381,9 +2437,9 @@ def run_checks(
                     metrics["manage_bootstrap"], candidate_env, workspace, marker
                 ), None, None, None, None,
             )),
-            ("repl_first_prompt", lambda: (
-                _measure_repl(metrics["repl_first_prompt"], candidate_env, marker),
-                None, None, None, None,
+            ("repl_first_prompt", lambda: _measure_repl(
+                metrics["repl_first_prompt"], candidate_env,
+                reference_manifest, env, marker,
             )),
             ("stream_relay", lambda: (
                 _measure_stream_relay(
