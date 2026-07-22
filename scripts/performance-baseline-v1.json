@@ -95,6 +95,11 @@
       "warmups": 5
     },
     "repl_first_prompt": {
+      "normalization": {
+        "anchor_milliseconds": 164.551,
+        "kind": "paired_same_metric_reference",
+        "metric": "repl_first_prompt"
+      },
       "samples": 31,
       "statistic": "p95",
       "threshold": {

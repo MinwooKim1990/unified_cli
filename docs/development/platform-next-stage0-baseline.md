@@ -191,25 +191,39 @@ module origins. Ambient site packages and ignored packaging metadata cannot
 affect the measurement.
 
 Normalized candidate children also install an audit hook before candidate paths
-become importable. The hook records and rejects filesystem writes/mutations,
-subprocess execution, `fork`/`forkpty`, and `ctypes`/`_ctypes` imports. Thus a
+become importable. Every normalized metric rejects filesystem mutations outside
+its disposable writable roots and rejects subprocess execution. Import and
+registry metrics additionally reject `ctypes`/`_ctypes`; the real-PTY REPL
+metric rejects native process-control calls such as `fork`/`forkpty`. Thus a
 candidate cannot leave a watcher behind or alter a later reference snapshot;
 even a caught attempt leaves a marker and fails the metric closed.
 
-The REPL readiness metric retains its 300 ms p95 policy and now uses three
-warmups plus 31 samples. The larger fixed sample set was adopted after a local
+The REPL readiness metric retains its 300 ms p95 policy and uses three warmups
+plus 31 samples. The larger fixed sample set was adopted after a local
 nine-sample run had two scheduler outliers and a 331.032 ms p95; it reduces
 single-spike sensitivity without retries, best-of-N selection, or a threshold
-increase.
+increase. With per-invocation state isolation enabled, three independent
+hardened runs of the pinned source recorded p95 values of 164.428, 164.551, and
+164.978 ms. Their median, 164.551 ms, is the versioned same-metric anchor.
 
 ## REPL first-prompt readiness gate
 
-The relevant measure is wall time from invoking `unified-cli repl` in a real TTY
-to the first rendered prompt in a fresh process. The harness allocates a
+The relevant raw measure is wall time from invoking `unified-cli repl` in a real
+TTY to the first rendered prompt in a fresh process. The harness allocates a
 disposable pseudo-terminal so prompt-toolkit takes its real interactive path,
 waits for the visible prompt marker, then submits only `/exit`. It uses an
 isolated `HOME` and never submits a provider prompt. A pipe is not an equivalent
 measurement because it selects a different non-TTY/readline path.
+
+The hardened bootstrap and shared runner can add substantial platform cost, so
+each candidate sample is bracketed by fresh snapshots of the pinned reference
+running the exact same PTY metric. Reports retain the raw candidate and both raw
+reference arrays. Only the per-sample same-metric normalized p95 is compared to
+the unchanged, fail-closed 300 ms policy. One slow reference side grants no
+allowance. Every warmup, candidate, and reference invocation also receives a
+different disposable HOME, temporary directory, workspace, empty working
+directory, and XDG state roots, so one invocation cannot influence a later
+sample through history, settings, cache, or session state.
 
 ## Raw provider-versus-wrapper prompt latency: pending
 
