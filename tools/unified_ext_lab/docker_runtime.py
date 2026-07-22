@@ -21,6 +21,7 @@ from .docker import (
     DockerOperation,
     GuestAction,
     LockedContextSnapshot,
+    _parse_env_mapping,
     snapshot_image_context,
     validate_inspect,
 )
@@ -601,6 +602,13 @@ def validate_locked_base_inspect(
         or record.get("Architecture") != profile.architecture
     ):
         raise InvariantRefusalError("locked base image or platform drift")
+    config = record.get("Config")
+    if type(config) is not dict:
+        raise InvariantRefusalError("locked base environment drift")
+    try:
+        _parse_env_mapping(config.get("Env"))
+    except InvariantRefusalError as error:
+        raise InvariantRefusalError("locked base environment drift") from error
     return MappingProxyType(record)
 
 
@@ -861,6 +869,7 @@ class RealDockerCommandBuilder(_RealDockerIdentityCommands):
         super().__init__(spec)
         self._profile = profile
         self._base = DockerCommandBuilder(spec)
+        self._expected_container_env: Optional[Tuple[str, ...]] = None
         source = os.path.join(spec.context, *_SNAPSHOT_GUEST_PARTS)
         if (
             os.path.realpath(source) != source
@@ -881,6 +890,20 @@ class RealDockerCommandBuilder(_RealDockerIdentityCommands):
         record = validate_locked_base_inspect(
             self._profile, payload, expected_id=self._spec.base_image
         )
+        base_environment = _parse_env_mapping(record["Config"]["Env"])
+        fixed_environment = _parse_env_mapping(list(FIXED_ENV))
+        base_environment.update(fixed_environment)
+        expected = tuple(
+            "{}={}".format(name, value)
+            for name, value in base_environment.items()
+        )
+        if (
+            self._expected_container_env is not None
+            and _parse_env_mapping(list(self._expected_container_env))
+            != _parse_env_mapping(list(expected))
+        ):
+            raise InvariantRefusalError("locked base environment drift")
+        self._expected_container_env = expected
         return _resource_id(ResourceRole.IMAGE, record["Id"])
 
     def build_image(self) -> Tuple[str, ...]:
@@ -944,12 +967,17 @@ class RealDockerCommandBuilder(_RealDockerIdentityCommands):
 
     def validate_inspect(self, role: ResourceRole, payload: object) -> str:
         if role is ResourceRole.CONTAINER:
+            if self._expected_container_env is None:
+                raise InvariantRefusalError(
+                    "locked base environment is not bound"
+                )
             validate_inspect(
                 self._spec,
                 role,
                 payload,
                 container_image=self._spec.base_image,
                 bind_mount=self._bind_mount,
+                container_env=self._expected_container_env,
             )
         else:
             validate_inspect(self._spec, role, payload)

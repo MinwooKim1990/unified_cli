@@ -79,6 +79,7 @@ _BASE_REFERENCE_RE = re.compile(
 )
 _LOCAL_IMAGE_ID_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 _CHECKSUM_RE = re.compile(r"^[0-9a-f]{64}$")
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _FIXTURE_RELATIVE_PATH = os.path.join(
     "rootfs", "opt", "unified-ext-lab", "fixtures", "fake-provider"
 )
@@ -1519,6 +1520,30 @@ def _empty_list(value: object) -> Sequence[object]:
     return _list(value)
 
 
+def _parse_env_mapping(value: object) -> Dict[str, str]:
+    """Parse Docker inspect Env without losing duplicate-name evidence."""
+
+    entries = _list(value)
+    environment: Dict[str, str] = {}
+    for entry in entries:
+        if (
+            type(entry) is not str
+            or "\n" in entry
+            or "\r" in entry
+            or "\x00" in entry
+        ):
+            raise InvariantRefusalError("inspect policy drift")
+        name, separator, entry_value = entry.partition("=")
+        if (
+            not separator
+            or _ENV_NAME_RE.fullmatch(name) is None
+            or name in environment
+        ):
+            raise InvariantRefusalError("inspect policy drift")
+        environment[name] = entry_value
+    return environment
+
+
 def _expected_mounts(spec: DockerLabSpec) -> Tuple[Tuple[object, ...], ...]:
     if spec.ephemeral_storage:
         return ()
@@ -1540,6 +1565,7 @@ def validate_inspect(
     *,
     container_image: Optional[str] = None,
     bind_mount: Optional[Tuple[str, str]] = None,
+    container_env: Optional[Tuple[str, ...]] = None,
 ) -> None:
     """Reject malformed JSON or any drift from the managed security policy."""
 
@@ -1559,6 +1585,8 @@ def validate_inspect(
         or bind_mount[1] == "/"
     ):
         raise UsageStateError("invalid expected container bind mount")
+    if container_env is not None and type(container_env) is not tuple:
+        raise UsageStateError("invalid expected container environment")
     normalized = _role(role)
     if type(payload) is bytes:
         try:
@@ -1587,6 +1615,7 @@ def validate_inspect(
                 record,
                 container_image=container_image,
                 bind_mount=bind_mount,
+                container_env=FIXED_ENV if container_env is None else container_env,
             )
         elif normalized is ResourceRole.IMAGE:
             _validate_image_record(resource, record)
@@ -1682,6 +1711,7 @@ def _validate_container_record(
     *,
     container_image: Optional[str],
     bind_mount: Optional[Tuple[str, str]],
+    container_env: Tuple[str, ...],
 ) -> None:
     config = _dict(record["Config"])
     host = _dict(record["HostConfig"])
@@ -1727,6 +1757,17 @@ def _validate_container_record(
     ):
         raise InvariantRefusalError("inspect policy drift")
 
+    observed_environment = _parse_env_mapping(config["Env"])
+    expected_environment = _parse_env_mapping(list(container_env))
+    security_options = _list(host["SecurityOpt"])
+    if (
+        len(security_options) != 1
+        or type(security_options[0]) is not str
+        or security_options[0]
+        not in ("no-new-privileges=true", "no-new-privileges:true")
+    ):
+        raise InvariantRefusalError("inspect policy drift")
+
     ulimits = []
     for limit_value in _list(host["Ulimits"]):
         limit = _dict(limit_value)
@@ -1758,7 +1799,7 @@ def _validate_container_record(
         _labels(config["Labels"]),
         config["User"],
         config["Image"],
-        tuple(_list(config["Env"])),
+        observed_environment,
         config["WorkingDir"],
         tuple(_list(config["Entrypoint"])),
         tuple(_list(config["Cmd"])),
@@ -1766,7 +1807,7 @@ def _validate_container_record(
         _empty_dict(config["Volumes"]),
         host["ReadonlyRootfs"],
         tuple(_list(host["CapDrop"])),
-        tuple(_list(host["SecurityOpt"])),
+        True,
         host["NetworkMode"],
         host["Init"],
         host["PidsLimit"],
@@ -1791,7 +1832,7 @@ def _validate_container_record(
         dict(resource.labels),
         CONTAINER_USER,
         spec.image.name if container_image is None else container_image,
-        FIXED_ENV,
+        expected_environment,
         CONTAINER_WORKSPACE,
         (GUEST_EXECUTABLE,),
         ("idle",),
@@ -1799,7 +1840,7 @@ def _validate_container_record(
         {},
         True,
         ("ALL",),
-        ("no-new-privileges:true",),
+        True,
         "none",
         True,
         128,

@@ -75,6 +75,20 @@ VERSION_PAYLOAD = json.dumps(
     {"Client": {"Version": "99.0.0"}, "Server": {"Version": "99.0.0"}}
 )
 BUILDX_PAYLOAD = "github.com/docker/buildx v0.99.1-deadbeef 0123456789abcdef\n"
+BASE_ENV = (
+    "LANG=C.UTF-8",
+    "GPG_KEY=7169605F62C751356D054A26A821E680E5FA6305",
+    "PYTHON_VERSION=3.12.13",
+    "PYTHON_SHA256=c08bc65a81971c1dd5783182826503369466c7e67374d1646519adf05207b684",
+)
+ACTUAL_CONTAINER_ENV = (
+    "XDG_CONFIG_HOME=/home/lab/.config",
+    "XDG_DATA_HOME=/home/lab/.local/share",
+    "HOME=/home/lab",
+    "PATH=/usr/bin:/bin",
+    "TMPDIR=/tmp",
+    "XDG_CACHE_HOME=/home/lab/.cache",
+) + BASE_ENV
 
 
 def base_payload(profile: RealDockerProfile, image_id: str = BASE_ID) -> str:
@@ -82,6 +96,7 @@ def base_payload(profile: RealDockerProfile, image_id: str = BASE_ID) -> str:
         [
             {
                 "Architecture": profile.architecture,
+                "Config": {"Env": list(BASE_ENV)},
                 "Id": image_id,
                 "Os": profile.operating_system,
                 "RepoDigests": [profile.base_reference],
@@ -183,7 +198,7 @@ class RealModelRunner:
             "Config": {
                 "Cmd": ["idle"],
                 "Entrypoint": [GUEST_EXECUTABLE],
-                "Env": list(FIXED_ENV),
+                "Env": list(ACTUAL_CONTAINER_ENV),
                 "ExposedPorts": {},
                 "Image": self.builder.spec.base_image,
                 "Labels": dict(resource.labels),
@@ -216,7 +231,7 @@ class RealModelRunner:
                 "Privileged": False,
                 "PublishAllPorts": False,
                 "ReadonlyRootfs": True,
-                "SecurityOpt": ["no-new-privileges:true"],
+                "SecurityOpt": ["no-new-privileges=true"],
                 "Tmpfs": dict(TMPFS_OPTIONS),
                 "Ulimits": [{"Hard": 1024, "Name": "nofile", "Soft": 1024}],
                 "VolumesFrom": [],
@@ -444,6 +459,28 @@ class ProfileAndParserTests(unittest.TestCase):
         del wrong[0]["Id"]
         with self.assertRaises(InvariantRefusalError):
             validate_locked_base_inspect(profile, json.dumps(wrong))
+
+    def test_locked_base_environment_is_a_strict_unique_mapping(self):
+        profile = load_real_docker_profile()
+        invalid_environments = (
+            None,
+            "LANG=C.UTF-8",
+            [None],
+            ["MALFORMED"],
+            ["9INVALID=value"],
+            ["BAD-NAME=value"],
+            ["BAD\nNAME=value"],
+            ["BAD\x00NAME=value"],
+            ["LANG=C.UTF-8", "LANG=wrong"],
+        )
+        for environment in invalid_environments:
+            with self.subTest(environment=environment):
+                payload = json.loads(base_payload(profile))
+                payload[0]["Config"]["Env"] = environment
+                with self.assertRaisesRegex(
+                    InvariantRefusalError, "locked base environment drift"
+                ):
+                    validate_locked_base_inspect(profile, json.dumps(payload))
 
     def test_non_routable_profile_fails_closed(self):
         profile = load_real_docker_profile()
@@ -1292,6 +1329,7 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
         self.assertFalse(any("image" in argv and "rm" in argv for argv in self.runner.commands))
 
     def test_container_runtime_image_id_drift_is_refused(self):
+        self.builder.validate_base_image(base_payload(self.profile))
         record = self.runner._container_record(CONTAINER_ID)
         record["Image"] = REPLACEMENT_IMAGE_ID
 
@@ -1300,6 +1338,142 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
                 ResourceRole.CONTAINER,
                 json.dumps([record]),
             )
+
+    def test_container_inspect_requires_bound_base_environment(self):
+        record = self.runner._container_record(CONTAINER_ID)
+        with self.assertRaisesRegex(
+            InvariantRefusalError, "base environment is not bound"
+        ):
+            self.builder.validate_inspect(
+                ResourceRole.CONTAINER,
+                json.dumps([record]),
+            )
+
+    def test_actual_engine_environment_shape_and_reordering_pass(self):
+        self.builder.validate_base_image(base_payload(self.profile))
+        record = self.runner._container_record(CONTAINER_ID)
+        self.assertEqual(tuple(record["Config"]["Env"]), ACTUAL_CONTAINER_ENV)
+        self.builder.validate_inspect(
+            ResourceRole.CONTAINER,
+            json.dumps([record]),
+        )
+        record["Config"]["Env"].reverse()
+        self.builder.validate_inspect(
+            ResourceRole.CONTAINER,
+            json.dumps([record]),
+        )
+
+    def test_fixed_environment_overrides_same_named_base_values(self):
+        payload = json.loads(base_payload(self.profile))
+        payload[0]["Config"]["Env"].append("PATH=/untrusted/base/path")
+        self.builder.validate_base_image(json.dumps(payload))
+        record = self.runner._container_record(CONTAINER_ID)
+        self.builder.validate_inspect(
+            ResourceRole.CONTAINER,
+            json.dumps([record]),
+        )
+        record["Config"]["Env"] = [
+            "PATH=/untrusted/base/path" if value == "PATH=/usr/bin:/bin" else value
+            for value in record["Config"]["Env"]
+        ]
+        with self.assertRaisesRegex(InvariantRefusalError, "inspect policy drift"):
+            self.builder.validate_inspect(
+                ResourceRole.CONTAINER,
+                json.dumps([record]),
+            )
+
+    def test_container_environment_drift_is_refused_exactly(self):
+        self.builder.validate_base_image(base_payload(self.profile))
+        baseline = self.runner._container_record(CONTAINER_ID)
+        environments = {
+            "duplicate": list(ACTUAL_CONTAINER_ENV) + ["HOME=/other"],
+            "unknown": list(ACTUAL_CONTAINER_ENV) + ["UNKNOWN=value"],
+            "missing": list(ACTUAL_CONTAINER_ENV[:-1]),
+            "wrong": [
+                "LANG=wrong" if value == "LANG=C.UTF-8" else value
+                for value in ACTUAL_CONTAINER_ENV
+            ],
+            "missing_equals": list(ACTUAL_CONTAINER_ENV) + ["MALFORMED"],
+            "invalid_name": list(ACTUAL_CONTAINER_ENV) + ["9INVALID=value"],
+            "newline": list(ACTUAL_CONTAINER_ENV) + ["BAD=value\nnext"],
+            "nul": list(ACTUAL_CONTAINER_ENV) + ["BAD=value\x00next"],
+            "non_string": list(ACTUAL_CONTAINER_ENV) + [None],
+        }
+        for name, environment in environments.items():
+            with self.subTest(name=name):
+                record = json.loads(json.dumps(baseline))
+                record["Config"]["Env"] = environment
+                with self.assertRaisesRegex(
+                    InvariantRefusalError, "inspect policy drift"
+                ):
+                    self.builder.validate_inspect(
+                        ResourceRole.CONTAINER,
+                        json.dumps([record]),
+                    )
+        for malformed in (None, "HOME=/home/lab", {}):
+            with self.subTest(container=type(malformed).__name__):
+                record = json.loads(json.dumps(baseline))
+                record["Config"]["Env"] = malformed
+                with self.assertRaisesRegex(
+                    InvariantRefusalError, "inspect policy drift"
+                ):
+                    self.builder.validate_inspect(
+                        ResourceRole.CONTAINER,
+                        json.dumps([record]),
+                    )
+
+    def test_security_option_equivalent_spellings_and_drift(self):
+        self.builder.validate_base_image(base_payload(self.profile))
+        baseline = self.runner._container_record(CONTAINER_ID)
+        for option in ("no-new-privileges=true", "no-new-privileges:true"):
+            with self.subTest(option=option):
+                record = json.loads(json.dumps(baseline))
+                record["HostConfig"]["SecurityOpt"] = [option]
+                self.builder.validate_inspect(
+                    ResourceRole.CONTAINER,
+                    json.dumps([record]),
+                )
+        for options in (
+            ["no-new-privileges=false"],
+            ["no-new-privileges:false"],
+            ["no-new-privileges"],
+            ["no-new-privileges=true", "seccomp=unconfined"],
+            [],
+            None,
+        ):
+            with self.subTest(options=options):
+                record = json.loads(json.dumps(baseline))
+                record["HostConfig"]["SecurityOpt"] = options
+                with self.assertRaisesRegex(
+                    InvariantRefusalError, "inspect policy drift"
+                ):
+                    self.builder.validate_inspect(
+                        ResourceRole.CONTAINER,
+                        json.dumps([record]),
+                    )
+
+    def test_create_records_identity_starts_and_reaches_ready_untainted(self):
+        created = self.lifecycle.create()
+        self.assertEqual(created.phase, StatePhase.CREATED)
+        self.assertEqual(created.created_roles, ("container",))
+        self.assertEqual(dict(created.resource_ids), {"container": CONTAINER_ID})
+        self.assertFalse(created.tainted)
+        create = self.builder.create_container()
+        inspect_container = self.builder.inspect(ResourceRole.CONTAINER)
+        start = self.builder.start_container(CONTAINER_ID)
+        ready = self.builder.exec_guest(GuestAction.READY, CONTAINER_ID)
+        self.assertLess(
+            self.runner.commands.index(create),
+            self.runner.commands.index(inspect_container),
+        )
+        self.assertLess(
+            self.runner.commands.index(inspect_container),
+            self.runner.commands.index(start),
+        )
+        self.assertLess(
+            self.runner.commands.index(start), self.runner.commands.index(ready)
+        )
+        self.assertEqual(self.runner.readiness_attempts, 1)
 
     def test_same_process_cleanup_does_not_reinspect_the_locked_base(self):
         self._forward_to_evidence()
