@@ -1,8 +1,8 @@
-"""Canonical, non-promotional evidence for the offline fixture harness.
+"""Canonical, non-promotional evidence for isolated extension labs.
 
-Only the synthetic harness fixture can be represented here. The executor is
-exactly either the in-memory fake or the separately gated real-Docker profile.
-Both remain non-promotional and cannot be mistaken for provider evidence.
+Synthetic fixture evidence and Stage-6C accountless-provider evidence share a
+strict shape but have disjoint kind/executor pairs.  Neither is credentialed
+provider evidence and neither can be promotional.
 """
 
 from __future__ import annotations
@@ -28,7 +28,11 @@ MAX_EVIDENCE_BYTES = 1024 * 1024
 EVIDENCE_KIND = "harness_fixture"
 EXECUTOR_KIND = "fake_docker"
 REAL_EXECUTOR_KIND = "real_docker"
-EXECUTOR_KINDS = frozenset((EXECUTOR_KIND, REAL_EXECUTOR_KIND))
+ACCOUNTLESS_EVIDENCE_KIND = "provider_accountless"
+ACCOUNTLESS_EXECUTOR_KIND = "provider_accountless_docker"
+EXECUTOR_KINDS = frozenset(
+    (ACCOUNTLESS_EXECUTOR_KIND, EXECUTOR_KIND, REAL_EXECUTOR_KIND)
+)
 PROMOTION_ELIGIBLE = False
 
 SOURCE_KINDS = frozenset(
@@ -265,7 +269,7 @@ class FixturePlatform:
     def __post_init__(self) -> None:
         if (
             self.evidence_kind != EVIDENCE_KIND
-            or self.executor_kind not in EXECUTOR_KINDS
+            or self.executor_kind not in (EXECUTOR_KIND, REAL_EXECUTOR_KIND)
         ):
             raise UsageStateError("invalid harness fixture execution kind")
         if self.promotion_eligible is not False:
@@ -281,6 +285,51 @@ class FixturePlatform:
             executor_kind=data["executor_kind"],
             promotion_eligible=data["promotion_eligible"],
         )
+
+
+@dataclass(frozen=True)
+class AccountlessProviderPlatform:
+    """The only platform marker accepted for Stage-6C provider evidence."""
+
+    evidence_kind: str = ACCOUNTLESS_EVIDENCE_KIND
+    executor_kind: str = ACCOUNTLESS_EXECUTOR_KIND
+    promotion_eligible: bool = PROMOTION_ELIGIBLE
+
+    def __post_init__(self) -> None:
+        if (
+            self.evidence_kind != ACCOUNTLESS_EVIDENCE_KIND
+            or self.executor_kind != ACCOUNTLESS_EXECUTOR_KIND
+        ):
+            raise UsageStateError("invalid accountless provider execution kind")
+        if self.promotion_eligible is not False:
+            raise InvariantRefusalError(
+                "accountless provider evidence cannot be promotional"
+            )
+
+    @classmethod
+    def from_value(
+        cls,
+        value: Union["AccountlessProviderPlatform", Mapping[str, object]],
+    ) -> "AccountlessProviderPlatform":
+        if type(value) is cls:
+            return value
+        data = _exact_mapping(value, _PLATFORM_KEYS, "accountless provider platform")
+        return cls(
+            evidence_kind=data["evidence_kind"],
+            executor_kind=data["executor_kind"],
+            promotion_eligible=data["promotion_eligible"],
+        )
+
+
+def _platform_from_value(value: object) -> object:
+    if type(value) is AccountlessProviderPlatform:
+        return value
+    if type(value) is FixturePlatform:
+        return value
+    data = _exact_mapping(value, _PLATFORM_KEYS, "platform")
+    if data["evidence_kind"] == ACCOUNTLESS_EVIDENCE_KIND:
+        return AccountlessProviderPlatform.from_value(data)
+    return FixturePlatform.from_value(data)
 
 
 @dataclass(frozen=True)
@@ -382,7 +431,9 @@ def _clock_value(clock_ns: Callable[[], int]) -> int:
 def capture_draft(
     state: LabState,
     artifact: Union[ArtifactEvidence, Mapping[str, object]],
-    platform: Union[FixturePlatform, Mapping[str, object]],
+    platform: Union[
+        AccountlessProviderPlatform, FixturePlatform, Mapping[str, object]
+    ],
     schema_hashes: Union[SchemaHashes, Mapping[str, object]],
     *,
     clock_ns: Callable[[], int] = time.time_ns,
@@ -411,7 +462,7 @@ def capture_draft(
         raise InvariantRefusalError(
             "captured artifact does not match durable artifact evidence"
         )
-    platform_value = FixturePlatform.from_value(platform)
+    platform_value = _platform_from_value(platform)
     hashes = SchemaHashes.from_value(schema_hashes)
     draft = {
         "artifact": artifact_value.to_dict(),
@@ -445,10 +496,12 @@ def capture_draft(
 def validate_draft(value: object) -> Mapping[str, object]:
     data = _exact_mapping(value, _DRAFT_KEYS, "evidence draft")
     ArtifactEvidence.from_value(data["artifact"])
-    FixturePlatform(
-        evidence_kind=data["evidence_kind"],
-        executor_kind=data["executor_kind"],
-        promotion_eligible=data["promotion_eligible"],
+    _platform_from_value(
+        {
+            "evidence_kind": data["evidence_kind"],
+            "executor_kind": data["executor_kind"],
+            "promotion_eligible": data["promotion_eligible"],
+        }
     )
     SchemaHashes(
         manifest_schema_sha256=data["manifest_schema_sha256"],
@@ -512,7 +565,7 @@ def build_manifest(
         "artifact": dict(draft["artifact"]),
         "captured_at_ns": draft["captured_at_ns"],
         "cleanup": clean.to_dict(),
-        "evidence_kind": EVIDENCE_KIND,
+        "evidence_kind": draft["evidence_kind"],
         "executor_kind": draft["executor_kind"],
         "lab_id": state.lab_id,
         "manifest_schema_sha256": draft["manifest_schema_sha256"],
@@ -531,11 +584,13 @@ def validate_manifest(value: object) -> Mapping[str, object]:
     data = _exact_mapping(value, _MANIFEST_KEYS, "evidence manifest")
     if data["schema"] != EVIDENCE_SCHEMA:
         raise UsageStateError("unsupported evidence schema")
-    if (
-        data["evidence_kind"] != EVIDENCE_KIND
-        or data["executor_kind"] not in EXECUTOR_KINDS
-    ):
-        raise UsageStateError("invalid evidence execution kind")
+    _platform_from_value(
+        {
+            "evidence_kind": data["evidence_kind"],
+            "executor_kind": data["executor_kind"],
+            "promotion_eligible": data["promotion_eligible"],
+        }
+    )
     if data["promotion_eligible"] is not False:
         raise InvariantRefusalError("fixture evidence cannot be promotional")
     ArtifactEvidence.from_value(data["artifact"])

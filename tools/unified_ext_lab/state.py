@@ -48,8 +48,13 @@ STATE_SCHEMA = 3
 LEGACY_FIXTURE_STATE_SCHEMA = 2
 FIXTURE_EXECUTION_PROFILE = "fixture-fake-v1"
 REAL_DOCKER_EXECUTION_PROFILE = "real-docker-v1"
+PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE = "provider-accountless-v1"
 EXECUTION_PROFILES = frozenset(
-    (FIXTURE_EXECUTION_PROFILE, REAL_DOCKER_EXECUTION_PROFILE)
+    (
+        FIXTURE_EXECUTION_PROFILE,
+        PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE,
+        REAL_DOCKER_EXECUTION_PROFILE,
+    )
 )
 MAX_STATE_BYTES = 1024 * 1024
 STATE_FILE_NAME = "state.json"
@@ -464,6 +469,32 @@ _LEGACY_SYNTHETIC_ARTIFACT = MappingProxyType(
 )
 _UNBOUND_RUNTIME_SNAPSHOT = MappingProxyType({"runtime_snapshot_bound": False})
 _BOUND_RUNTIME_SNAPSHOT = MappingProxyType({"runtime_snapshot_bound": True})
+_BOUND_PROVIDER_RUNTIME_SNAPSHOT = MappingProxyType(
+    {
+        "runtime_snapshot_bound": True,
+        "runtime_snapshot_identity_bound": True,
+    }
+)
+_REMOVING_RUNTIME_SNAPSHOT = MappingProxyType(
+    {"runtime_snapshot_bound": True, "runtime_snapshot_removal_started": True}
+)
+_REMOVING_PROVIDER_RUNTIME_SNAPSHOT = MappingProxyType(
+    {
+        "runtime_snapshot_bound": True,
+        "runtime_snapshot_identity_bound": True,
+        "runtime_snapshot_removal_started": True,
+    }
+)
+_REMOVED_RUNTIME_SNAPSHOT = MappingProxyType(
+    {"runtime_snapshot_bound": True, "runtime_snapshot_removed": True}
+)
+_REMOVED_PROVIDER_RUNTIME_SNAPSHOT = MappingProxyType(
+    {
+        "runtime_snapshot_bound": True,
+        "runtime_snapshot_identity_bound": True,
+        "runtime_snapshot_removed": True,
+    }
+)
 _DRAFT_KEYS = frozenset(
     (
         "evidence_kind",
@@ -487,6 +518,7 @@ def _validate_execution_profile(value: object) -> str:
 def _executor_for_profile(execution_profile: str) -> str:
     return {
         FIXTURE_EXECUTION_PROFILE: "fake_docker",
+        PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE: "provider_accountless_docker",
         REAL_DOCKER_EXECUTION_PROFILE: "real_docker",
     }[execution_profile]
 
@@ -540,10 +572,6 @@ def _validate_draft(value: object) -> Optional[Mapping[str, object]]:
         return None
     data = _exact_mapping(value, _DRAFT_KEYS, "draft evidence")
     _exact_mapping(data["artifact"], _ARTIFACT_KEYS, "draft artifact")
-    if data["evidence_kind"] != "harness_fixture":
-        raise UsageStateError("invalid draft evidence kind")
-    if data["executor_kind"] not in ("fake_docker", "real_docker"):
-        raise UsageStateError("invalid draft executor kind")
     if data["promotion_eligible"] is not False:
         raise InvariantRefusalError("fixture evidence cannot be promotional")
     if type(data["operations"]) not in (list, tuple):
@@ -711,7 +739,57 @@ class LabState:
             raise UsageStateError("state phase requires seal intent")
         if phase not in _SEAL_INTENT_PHASES and self.seal_intent is not None:
             raise UsageStateError("seal intent is premature for state phase")
-        object.__setattr__(self, "baseline_equalities", _validate_baselines(self.baseline_equalities))
+        baselines = _validate_baselines(self.baseline_equalities)
+        if "runtime_snapshot_removal_started" in baselines and (
+            execution_profile
+            not in (
+                REAL_DOCKER_EXECUTION_PROFILE,
+                PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE,
+            )
+            or dict(baselines)
+            not in (
+                dict(_REMOVING_RUNTIME_SNAPSHOT),
+                dict(_REMOVING_PROVIDER_RUNTIME_SNAPSHOT),
+            )
+        ):
+            raise InvariantRefusalError("invalid runtime snapshot removal intent")
+        if "runtime_snapshot_removed" in baselines and (
+            execution_profile
+            not in (
+                REAL_DOCKER_EXECUTION_PROFILE,
+                PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE,
+            )
+            or dict(baselines)
+            not in (
+                dict(_REMOVED_RUNTIME_SNAPSHOT),
+                dict(_REMOVED_PROVIDER_RUNTIME_SNAPSHOT),
+            )
+        ):
+            raise InvariantRefusalError("invalid runtime snapshot removal state")
+        if "runtime_snapshot_identity_bound" in baselines and (
+            execution_profile != PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE
+            or dict(baselines)
+            not in (
+                dict(_BOUND_PROVIDER_RUNTIME_SNAPSHOT),
+                dict(_REMOVING_PROVIDER_RUNTIME_SNAPSHOT),
+                dict(_REMOVED_PROVIDER_RUNTIME_SNAPSHOT),
+            )
+        ):
+            raise InvariantRefusalError("invalid runtime snapshot identity state")
+        if (
+            execution_profile == PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE
+            and dict(baselines)
+            not in (
+                dict(_UNBOUND_RUNTIME_SNAPSHOT),
+                dict(_BOUND_PROVIDER_RUNTIME_SNAPSHOT),
+                dict(_REMOVING_PROVIDER_RUNTIME_SNAPSHOT),
+                dict(_REMOVED_PROVIDER_RUNTIME_SNAPSHOT),
+            )
+        ):
+            raise InvariantRefusalError(
+                "provider runtime snapshot identity state is required"
+            )
+        object.__setattr__(self, "baseline_equalities", baselines)
 
     @classmethod
     def initial(
@@ -1006,7 +1084,11 @@ class LabState:
         """Bind validated fixture identity to a pre-created real-Docker intent."""
 
         if (
-            self.execution_profile != REAL_DOCKER_EXECUTION_PROFILE
+            self.execution_profile
+            not in (
+                REAL_DOCKER_EXECUTION_PROFILE,
+                PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE,
+            )
             or self.phase is not StatePhase.NEW
             or dict(self.baseline_equalities) != dict(_UNBOUND_RUNTIME_SNAPSHOT)
             or self.created_roles
@@ -1019,7 +1101,12 @@ class LabState:
             self,
             revision=self.revision + 1,
             artifact_evidence=artifact,
-            baseline_equalities=_BOUND_RUNTIME_SNAPSHOT,
+            baseline_equalities=(
+                _BOUND_PROVIDER_RUNTIME_SNAPSHOT
+                if self.execution_profile
+                == PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE
+                else _BOUND_RUNTIME_SNAPSHOT
+            ),
         )
 
     def record_owned_role(self, role: Union[ResourceRole, str]) -> "LabState":
@@ -1098,6 +1185,72 @@ class LabState:
             self,
             revision=self.revision + 1,
             removed_roles=self.removed_roles + (value,),
+        )
+
+    def record_runtime_snapshot_removed(self) -> "LabState":
+        """Durably record exact derived-snapshot removal during cleanup."""
+
+        if (
+            self.execution_profile
+            not in (
+                REAL_DOCKER_EXECUTION_PROFILE,
+                PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE,
+            )
+            or self.phase is not StatePhase.DESTROY_PENDING
+        ):
+            raise UsageStateError(
+                "runtime snapshot removal can only be recorded during cleanup"
+            )
+        if dict(self.baseline_equalities) in (
+            dict(_REMOVED_RUNTIME_SNAPSHOT),
+            dict(_REMOVED_PROVIDER_RUNTIME_SNAPSHOT),
+        ):
+            return self
+        if dict(self.baseline_equalities) == dict(_REMOVING_RUNTIME_SNAPSHOT):
+            removed = _REMOVED_RUNTIME_SNAPSHOT
+        elif dict(self.baseline_equalities) == dict(
+            _REMOVING_PROVIDER_RUNTIME_SNAPSHOT
+        ):
+            removed = _REMOVED_PROVIDER_RUNTIME_SNAPSHOT
+        else:
+            raise InvariantRefusalError("runtime snapshot removal identity drift")
+        return replace(
+            self,
+            revision=self.revision + 1,
+            baseline_equalities=removed,
+        )
+
+    def record_runtime_snapshot_removal_started(self) -> "LabState":
+        """Durably enter the exact derived-snapshot mutation window."""
+
+        if (
+            self.execution_profile
+            not in (
+                REAL_DOCKER_EXECUTION_PROFILE,
+                PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE,
+            )
+            or self.phase is not StatePhase.DESTROY_PENDING
+        ):
+            raise UsageStateError(
+                "runtime snapshot removal can only start during cleanup"
+            )
+        if dict(self.baseline_equalities) in (
+            dict(_REMOVING_RUNTIME_SNAPSHOT),
+            dict(_REMOVING_PROVIDER_RUNTIME_SNAPSHOT),
+        ):
+            return self
+        if dict(self.baseline_equalities) == dict(_BOUND_RUNTIME_SNAPSHOT):
+            removing = _REMOVING_RUNTIME_SNAPSHOT
+        elif dict(self.baseline_equalities) == dict(
+            _BOUND_PROVIDER_RUNTIME_SNAPSHOT
+        ):
+            removing = _REMOVING_PROVIDER_RUNTIME_SNAPSHOT
+        else:
+            raise InvariantRefusalError("runtime snapshot removal identity drift")
+        return replace(
+            self,
+            revision=self.revision + 1,
+            baseline_equalities=removing,
         )
 
     def fail_pending(self, observation: OperationObservation) -> "LabState":
@@ -2888,6 +3041,36 @@ class LockedLabStateStore:
         if current.phase is not _phase(expected):
             raise UsageStateError("state phase changed")
         updated = current.record_removed_role(role)
+        if updated is not current:
+            self._write(updated)
+        return updated
+
+    def record_runtime_snapshot_removed(
+        self,
+        expected: Union[StatePhase, str],
+    ) -> LabState:
+        """Persist a proved derived-snapshot removal before phase advance."""
+
+        self._require_active()
+        current = self.load()
+        if current.phase is not _phase(expected):
+            raise UsageStateError("state phase changed")
+        updated = current.record_runtime_snapshot_removed()
+        if updated is not current:
+            self._write(updated)
+        return updated
+
+    def record_runtime_snapshot_removal_started(
+        self,
+        expected: Union[StatePhase, str],
+    ) -> LabState:
+        """Persist snapshot-removal intent before the filesystem mutation."""
+
+        self._require_active()
+        current = self.load()
+        if current.phase is not _phase(expected):
+            raise UsageStateError("state phase changed")
+        updated = current.record_runtime_snapshot_removal_started()
         if updated is not current:
             self._write(updated)
         return updated

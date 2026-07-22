@@ -33,6 +33,7 @@ from .errors import (
     UsageStateError,
 )
 from .evidence import (
+    ACCOUNTLESS_EXECUTOR_KIND,
     ArtifactEvidence,
     CleanupEvidence,
     EXECUTOR_KINDS,
@@ -49,6 +50,7 @@ from .model import ResourceRole
 from .runner import CommandResult, DEFAULT_MAX_OUTPUT_BYTES, Runner
 from .state import (
     FIXTURE_EXECUTION_PROFILE,
+    PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE,
     REAL_DOCKER_EXECUTION_PROFILE,
     LabState,
     LabStateStore,
@@ -172,13 +174,18 @@ class FixtureLifecycle:
             raise UsageStateError("invalid lifecycle executor kind")
         expected_executor = {
             FIXTURE_EXECUTION_PROFILE: EXECUTOR_KIND,
+            PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE: ACCOUNTLESS_EXECUTOR_KIND,
             REAL_DOCKER_EXECUTION_PROFILE: REAL_EXECUTOR_KIND,
         }.get(execution_profile)
         if expected_executor != executor_kind:
             raise InvariantRefusalError("lifecycle executor profile mismatch")
         if (
             command_builder is None
-            and execution_profile == REAL_DOCKER_EXECUTION_PROFILE
+            and execution_profile
+            in (
+                PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE,
+                REAL_DOCKER_EXECUTION_PROFILE,
+            )
         ):
             raise InvariantRefusalError(
                 "lifecycle command builder profile mismatch"
@@ -198,16 +205,25 @@ class FixtureLifecycle:
             raise UsageStateError("invalid lifecycle command policy") from error
         if type(builds_image) is not bool:
             raise UsageStateError("invalid lifecycle command policy")
-        expected_resource_ids = execution_profile == REAL_DOCKER_EXECUTION_PROFILE
+        expected_resource_ids = execution_profile in (
+            PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE,
+            REAL_DOCKER_EXECUTION_PROFILE,
+        )
         if uses_resource_ids is not expected_resource_ids:
             raise InvariantRefusalError("lifecycle command builder profile mismatch")
-        if execution_profile == REAL_DOCKER_EXECUTION_PROFILE and (
+        if execution_profile in (
+            PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE,
+            REAL_DOCKER_EXECUTION_PROFILE,
+        ) and (
             runtime_snapshot is None
             or not callable(getattr(runtime_snapshot, "remove", None))
             or not callable(getattr(runtime_snapshot, "present", None))
         ):
             raise InvariantRefusalError("real-Docker snapshot resource is unavailable")
-        if execution_profile != REAL_DOCKER_EXECUTION_PROFILE and runtime_snapshot is not None:
+        if execution_profile not in (
+            PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE,
+            REAL_DOCKER_EXECUTION_PROFILE,
+        ) and runtime_snapshot is not None:
             raise InvariantRefusalError("fixture lifecycle cannot own a runtime snapshot")
         self._store = store
         self._spec = spec
@@ -649,7 +665,11 @@ class FixtureLifecycle:
 
         spec = self._require_forward_spec()
         if (
-            self._execution_profile != REAL_DOCKER_EXECUTION_PROFILE
+            self._execution_profile
+            not in (
+                PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE,
+                REAL_DOCKER_EXECUTION_PROFILE,
+            )
             or self._runtime_snapshot is None
             or not self._runtime_snapshot.present()
         ):
@@ -665,10 +685,18 @@ class FixtureLifecycle:
     ) -> LabState:
         spec = self._require_forward_spec()
         identity = self._spec.identity
-        if self._execution_profile == REAL_DOCKER_EXECUTION_PROFILE:
+        if self._execution_profile in (
+            PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE,
+            REAL_DOCKER_EXECUTION_PROFILE,
+        ):
             if baseline_equalities is not None:
                 raise UsageStateError("real-Docker baselines are fixed")
             expected_baselines = {"runtime_snapshot_bound": True}
+            if (
+                self._execution_profile
+                == PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE
+            ):
+                expected_baselines["runtime_snapshot_identity_bound"] = True
         else:
             expected_baselines = (
                 {} if baseline_equalities is None else dict(baseline_equalities)
@@ -678,7 +706,10 @@ class FixtureLifecycle:
             try:
                 state = locked.load()
             except FileNotFoundError:
-                if self._execution_profile == REAL_DOCKER_EXECUTION_PROFILE:
+                if self._execution_profile in (
+                    PROVIDER_ACCOUNTLESS_EXECUTION_PROFILE,
+                    REAL_DOCKER_EXECUTION_PROFILE,
+                ):
                     raise UsageStateError("real-Docker lifecycle intent is unavailable")
                 state = locked.create_initial(
                     identity.provider_id,
@@ -832,6 +863,9 @@ class FixtureLifecycle:
             observed_protocol_schema_sha256=_OBSERVED_PROTOCOL_SCHEMA_SHA256,
         )
 
+    def _evidence_platform(self) -> FixturePlatform:
+        return FixturePlatform(executor_kind=self._executor_kind)
+
     def evidence(self) -> LabState:
         self._require_forward_spec()
         with self._store.locked(self._spec.identity.lab_id) as locked:
@@ -848,7 +882,7 @@ class FixtureLifecycle:
                 draft = capture_draft(
                     captured_state,
                     self._artifact(captured_state),
-                    FixturePlatform(executor_kind=self._executor_kind),
+                    self._evidence_platform(),
                     self._schema_hashes(),
                     clock_ns=self._evidence_clock_ns,
                 )
@@ -953,6 +987,26 @@ class FixtureLifecycle:
             current = locked.load()
             self._require_identity(current)
             current = self._persist_mutation_hold(locked, current)
+            snapshot_removal_started = (
+                current.baseline_equalities.get(
+                    "runtime_snapshot_removal_started"
+                )
+                is True
+            )
+            snapshot_removed = (
+                current.baseline_equalities.get("runtime_snapshot_removed")
+                is True
+            )
+            snapshot_bound = (
+                current.baseline_equalities.get("runtime_snapshot_bound")
+                is True
+            )
+            snapshot_identity_bound = (
+                current.baseline_equalities.get(
+                    "runtime_snapshot_identity_bound"
+                )
+                is True
+            )
             if current.phase not in _ALLOWED_PHASES_FOR_DESTROY:
                 raise UsageStateError("destroy is unavailable in this lifecycle phase")
             pending = locked.transition(current.phase, StatePhase.DESTROY_PENDING)
@@ -1079,7 +1133,79 @@ class FixtureLifecycle:
                     failed = True
             if not failed and self._runtime_snapshot is not None:
                 try:
-                    self._runtime_snapshot.remove()
+                    tracks_removal = getattr(
+                        self._runtime_snapshot,
+                        "tracks_removal_state",
+                        False,
+                    )
+                    if type(tracks_removal) is not bool:
+                        raise UsageStateError(
+                            "invalid runtime snapshot removal policy"
+                        )
+                    if tracks_removal and not snapshot_bound:
+                        if self._runtime_snapshot.present():
+                            raise InvariantRefusalError(
+                                "unbound runtime snapshot appeared"
+                            )
+                    elif tracks_removal and snapshot_removed:
+                        if self._runtime_snapshot.present():
+                            raise InvariantRefusalError(
+                                "removed runtime snapshot reappeared"
+                            )
+                        if snapshot_identity_bound:
+                            finalized = getattr(
+                                self._runtime_snapshot,
+                                "removal_finalized",
+                                None,
+                            )
+                            finalize = getattr(
+                                self._runtime_snapshot,
+                                "finalize_removal",
+                                None,
+                            )
+                            if not callable(finalized) or not callable(finalize):
+                                raise UsageStateError(
+                                    "runtime snapshot identity finalizer is unavailable"
+                                )
+                            if finalized() is not True:
+                                finalize()
+                    elif tracks_removal:
+                        remove_for_cleanup = getattr(
+                            self._runtime_snapshot,
+                            "remove_for_cleanup",
+                            None,
+                        )
+                        if not callable(remove_for_cleanup):
+                            raise UsageStateError(
+                                "runtime snapshot removal proof is unavailable"
+                            )
+                        pending = locked.record_runtime_snapshot_removal_started(
+                            StatePhase.DESTROY_PENDING
+                        )
+                        removed_now = remove_for_cleanup(
+                            reconcile_absent=snapshot_removal_started,
+                            identity_required=snapshot_identity_bound,
+                        )
+                        if type(removed_now) is not bool:
+                            raise InvariantRefusalError(
+                                "invalid runtime snapshot removal result"
+                            )
+                        pending = locked.record_runtime_snapshot_removed(
+                            StatePhase.DESTROY_PENDING
+                        )
+                        if snapshot_identity_bound:
+                            finalize = getattr(
+                                self._runtime_snapshot,
+                                "finalize_removal",
+                                None,
+                            )
+                            if not callable(finalize):
+                                raise UsageStateError(
+                                    "runtime snapshot identity finalizer is unavailable"
+                                )
+                            finalize()
+                    else:
+                        self._runtime_snapshot.remove()
                 except LabError:
                     # A failed identity proof can mean the derived snapshot was
                     # moved away from its deterministic name.  Preserve that
@@ -1134,7 +1260,52 @@ class FixtureLifecycle:
                     remaining += 1
             if self._runtime_snapshot is not None:
                 try:
-                    if self._runtime_snapshot.present():
+                    tracks_removal = getattr(
+                        self._runtime_snapshot,
+                        "tracks_removal_state",
+                        False,
+                    )
+                    if type(tracks_removal) is not bool:
+                        raise UsageStateError(
+                            "invalid runtime snapshot removal policy"
+                        )
+                    snapshot_present = self._runtime_snapshot.present()
+                    if tracks_removal:
+                        snapshot_bound = (
+                            pending.baseline_equalities.get(
+                                "runtime_snapshot_bound"
+                            )
+                            is True
+                        )
+                        removal_recorded = (
+                            pending.baseline_equalities.get(
+                                "runtime_snapshot_removed"
+                            )
+                            is True
+                        )
+                        identity_bound = (
+                            pending.baseline_equalities.get(
+                                "runtime_snapshot_identity_bound"
+                            )
+                            is True
+                        )
+                        identity_finalized = True
+                        if identity_bound and removal_recorded:
+                            finalized = getattr(
+                                self._runtime_snapshot,
+                                "removal_finalized",
+                                None,
+                            )
+                            if not callable(finalized):
+                                raise UsageStateError(
+                                    "runtime snapshot identity finalizer is unavailable"
+                                )
+                            identity_finalized = finalized() is True
+                        if snapshot_present or (
+                            snapshot_bound and not removal_recorded
+                        ) or not identity_finalized:
+                            remaining += 1
+                    elif snapshot_present:
                         remaining += 1
                 except LabError:
                     failed = True
@@ -1254,7 +1425,7 @@ class FixtureLifecycle:
                 draft = capture_draft(
                     clean_state,
                     self._artifact(clean_state),
-                    FixturePlatform(executor_kind=self._executor_kind),
+                    self._evidence_platform(),
                     self._schema_hashes(),
                     clock_ns=self._evidence_clock_ns,
                 )

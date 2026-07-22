@@ -1,0 +1,34 @@
+#!/bin/sh
+# Opt-in Stage-6C launcher with a fixed interpreter and canonical checkout.
+set -eu
+
+case "$0" in
+  /*) SCRIPT=$0 ;;
+  *) SCRIPT=$PWD/$0 ;;
+esac
+if [ -L "$SCRIPT" ]; then
+  echo "unified-ext-provider-lab: symlink launcher is not supported" >&2
+  exit 2
+fi
+SCRIPT_DIR=$(CDPATH= cd -- "${SCRIPT%/*}" && pwd -P)
+SCRIPT=$SCRIPT_DIR/${SCRIPT##*/}
+ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd -P)
+if [ "$SCRIPT" != "$ROOT/scripts/unified-ext-provider-lab" ]; then
+  echo "unified-ext-provider-lab: launcher is outside its canonical checkout" >&2
+  exit 2
+fi
+PYTHON=/usr/bin/python3
+if [ ! -f "$PYTHON" ] || [ ! -x "$PYTHON" ]; then
+  echo "unified-ext-provider-lab: /usr/bin/python3 is required" >&2
+  exit 3
+fi
+cd "$ROOT"
+exec "$PYTHON" -I -S -c '
+import runpy
+import sys
+
+root = sys.argv.pop(1)
+sys.path.append(root)
+sys.argv[0] = root + "/scripts/unified-ext-provider-lab"
+runpy.run_module("tools.unified_ext_lab.__main_provider__", run_name="__main__")
+' "$ROOT" "$@"
