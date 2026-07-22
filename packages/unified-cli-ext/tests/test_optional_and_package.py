@@ -70,6 +70,10 @@ def test_optional_dependency_absent_errors_are_clear(monkeypatch):
         mcp_module.require_mcp_sdk()
 
 
+@pytest.mark.skipif(
+    not ((3, 10) <= sys.version_info < (3, 15)),
+    reason="ACP SDK import failures require a supported Python runtime",
+)
 def test_broken_optional_sdk_import_is_not_reported_as_uninstalled(monkeypatch):
     acp_module = importlib.import_module("unified_cli_ext.transports.acp")
 
@@ -83,13 +87,25 @@ def test_broken_optional_sdk_import_is_not_reported_as_uninstalled(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("module_name", "loader_name"),
+    ("module_name", "loader_name", "runtime_supported"),
     (
-        ("unified_cli_ext.transports.acp", "require_acp_sdk"),
-        ("unified_cli_ext.tools.mcp_bridge", "require_mcp_sdk"),
+        (
+            "unified_cli_ext.transports.acp",
+            "require_acp_sdk",
+            (3, 10) <= sys.version_info < (3, 15),
+        ),
+        (
+            "unified_cli_ext.tools.mcp_bridge",
+            "require_mcp_sdk",
+            sys.version_info >= (3, 10),
+        ),
     ),
 )
-def test_optional_sdk_runtime_import_failure_is_redacted(monkeypatch, module_name, loader_name):
+def test_optional_sdk_runtime_import_failure_is_redacted(
+    monkeypatch, module_name, loader_name, runtime_supported
+):
+    if not runtime_supported:
+        pytest.skip("SDK import failures require a supported Python runtime")
     module = importlib.import_module(module_name)
     secret = "secret-sdk-import"
 
@@ -107,6 +123,41 @@ def test_optional_sdk_runtime_import_failure_is_redacted(monkeypatch, module_nam
     assert secret not in str(caught.value)
     assert secret not in rendered
     assert caught.value.__cause__ is None
+
+
+@pytest.mark.parametrize(
+    ("module_name", "loader_name", "runtime_supported", "requirement"),
+    (
+        (
+            "unified_cli_ext.transports.acp",
+            "require_acp_sdk",
+            (3, 10) <= sys.version_info < (3, 15),
+            r"Python >=3\.10,<3\.15",
+        ),
+        (
+            "unified_cli_ext.tools.mcp_bridge",
+            "require_mcp_sdk",
+            sys.version_info >= (3, 10),
+            r"Python >=3\.10",
+        ),
+    ),
+)
+def test_optional_sdk_unsupported_python_fails_closed_before_import(
+    monkeypatch, module_name, loader_name, runtime_supported, requirement
+):
+    if runtime_supported:
+        pytest.skip("runtime is supported by this optional SDK")
+    module = importlib.import_module(module_name)
+    import_attempts = []
+
+    def unexpected_import(name, *args, **kwargs):
+        import_attempts.append(name)
+        raise AssertionError("unsupported runtime attempted an SDK import")
+
+    monkeypatch.setattr(importlib, "import_module", unexpected_import)
+    with pytest.raises(OptionalDependencyError, match=requirement):
+        getattr(module, loader_name)()
+    assert import_attempts == []
 
 
 def test_acp_adapter_is_lazy_official_sdk_wrapper(monkeypatch):
