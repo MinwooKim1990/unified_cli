@@ -12,7 +12,12 @@ const MAX_SESSION_ROWS = 250;
 const MAX_MODEL_ROWS = 500;
 const MANAGE_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const PROVIDER_ID_PATTERN = /^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$/;
+const CAPABILITY_ID_PATTERN = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
+const UNSAFE_PROVIDER_TEXT_PATTERN = /[\p{C}\p{Zl}\p{Zp}]/u;
 const WORKSPACE_ID_PATTERN = /^ws_[A-Za-z0-9_-]{32}$/;
+const CORE_PROVIDER_IDS = new Set(["claude", "codex", "gemini"]);
+const EXT_SUPPORT_STATUSES = new Set(["stable", "preview", "experimental", "held"]);
+const MAX_MANAGE_PROVIDERS = 35;
 
 const messages = {
   en: {
@@ -87,7 +92,8 @@ const messages = {
     allowPromptPreview: "Allow short prompt previews in usage",
     languageLocalNote: "Language changes apply immediately and are stored when you choose Save settings.",
     saveSettings: "Save settings", settingsSaved: "Settings saved", settingsFailed: "Settings could not be saved",
-    primaryLandmark: "Primary", managementViews: "Management views", summary: "Summary"
+    primaryLandmark: "Primary", managementViews: "Management views", summary: "Summary",
+    metadataOnly: "Metadata only", supportStatus: "Support status"
   },
   ko: {
     actions: "작업", activeSessions: "활성 세션", addImages: "이미지 추가",
@@ -161,7 +167,8 @@ const messages = {
     allowPromptPreview: "사용량에 짧은 프롬프트 미리보기 허용",
     languageLocalNote: "언어 변경은 즉시 적용되며 설정 저장을 선택하면 서버에 저장됩니다.",
     saveSettings: "설정 저장", settingsSaved: "설정 저장됨", settingsFailed: "설정을 저장하지 못했습니다",
-    primaryLandmark: "주요 영역", managementViews: "관리 화면", summary: "요약"
+    primaryLandmark: "주요 영역", managementViews: "관리 화면", summary: "요약",
+    metadataOnly: "메타데이터 전용", supportStatus: "지원 상태"
   }
 };
 
@@ -340,13 +347,82 @@ function showView(name, focusMain = true) {
   if (focusMain) byId("main-content").focus({ preventScroll: true });
 }
 
+function normalizeProvider(value, fallbackId = "") {
+  if (!isRecord(value)) return null;
+  const rawId = typeof value.id === "string" ? value.id : fallbackId;
+  if (rawId.length > 64 || !PROVIDER_ID_PATTERN.test(rawId)) return null;
+  const source = value.source === "builtin" ? "builtin" : value.source === "extension" ? "extension" : "";
+  if (!source) return null;
+  const isCore = source === "builtin" && CORE_PROVIDER_IDS.has(rawId);
+  const isExtension = source === "extension" && !CORE_PROVIDER_IDS.has(rawId) && rawId !== "agy";
+  if (!isCore && !isExtension) return null;
+  const status = typeof value.status === "string" && value.status.length <= 32 ? value.status : "unknown";
+  const supportStatus = typeof value.support_status === "string" && value.support_status.length <= 32
+    ? value.support_status : "unknown";
+  if ((isCore && (status !== "builtin" || supportStatus !== "stable"))
+      || (isExtension && (status !== "loaded" || !EXT_SUPPORT_STATUSES.has(supportStatus)))) return null;
+  const capabilities = Array.isArray(value.capabilities)
+    ? value.capabilities.slice(0, 64).filter((item) => (
+      typeof item === "string" && item.length <= 64 && CAPABILITY_ID_PATTERN.test(item)
+    )) : [];
+  const defaultModel = typeof value.default_model === "string" && value.default_model.length <= 512
+    ? value.default_model : null;
+  const policy = isRecord(value.server_policy) ? value.server_policy : {};
+  const normalized = {
+    id: rawId,
+    source,
+    status,
+    support_status: supportStatus,
+    default_model: supportStatus === "held" ? null : defaultModel,
+    capabilities: supportStatus === "held" ? [] : capabilities,
+    server_policy: {
+      enabled: isCore && policy.enabled === true,
+      requires_external_isolation: isExtension || policy.requires_external_isolation === true
+    },
+    chat_supported: isCore && value.chat_supported === true,
+    verify_supported: isCore && value.verify_supported === true,
+    models_supported: isCore && value.models_supported === true,
+    default_supported: isCore && value.default_supported === true,
+    metadata_only: isExtension
+  };
+  if (isCore) {
+    const commands = isRecord(value.commands) ? value.commands : {};
+    const copiedCommands = {};
+    ["docs_url", "install", "login", "status", "logout"].forEach((key) => {
+      const item = commands[key];
+      if (item === null || (typeof item === "string" && item.length <= 500)) copiedCommands[key] = item;
+    });
+    normalized.commands = copiedCommands;
+    if (typeof value.install_command === "string" && value.install_command.length <= 500) {
+      normalized.install_command = value.install_command;
+    }
+    if (typeof value.login_command === "string" && value.login_command.length <= 500) {
+      normalized.login_command = value.login_command;
+    }
+  }
+  return normalized;
+}
+
 function normalizeProviders(value) {
-  if (Array.isArray(value)) return value.filter(isRecord).slice(0, 50);
-  if (!isRecord(value)) return [];
-  return Object.entries(value).slice(0, 50).map(([name, metadata]) => {
-    const data = isRecord(metadata) ? metadata : {};
-    return { ...data, name: textValue(data.name || data.provider || name, name, 80) };
+  const candidates = Array.isArray(value)
+    ? value.slice(0, MAX_MANAGE_PROVIDERS).map((provider) => ["", provider])
+    : isRecord(value)
+      ? Object.entries(value).slice(0, MAX_MANAGE_PROVIDERS)
+      : [];
+  const providers = [];
+  const ids = new Set();
+  candidates.forEach(([fallbackId, candidate]) => {
+    const provider = normalizeProvider(candidate, fallbackId);
+    if (!provider || ids.has(provider.id)) return;
+    ids.add(provider.id);
+    providers.push(provider);
   });
+  return providers;
+}
+
+function providerSupports(id, field) {
+  const provider = state.providers.find((item) => providerId(item) === id);
+  return Boolean(provider) && provider[field] === true;
 }
 
 function normalizeWorkspaces(value) {
@@ -469,23 +545,30 @@ function renderProviders() {
     const card = makeElement("article", "provider-card");
     const header = makeElement("header");
     const title = makeElement("div");
-    title.append(makeElement("h3", "", name), makeElement("p", "muted", textValue(provider.description, textValue(provider.kind, "CLI provider", 100), 300)));
+    const subtitle = provider.source === "extension"
+      ? `${t("metadataOnly")} · ${textValue(provider.support_status, t("unknown"), 32)}`
+      : "CLI provider";
+    title.append(makeElement("h3", "", name), makeElement("p", "muted", subtitle));
     header.append(title, providerBadge(provider));
     card.append(header);
     const details = makeElement("dl", "summary-list");
+    appendSummaryRow(details, t("source"), provider.source === "extension" ? t("ext") : t("core"));
     appendSummaryRow(details, t("version"), textValue(provider.version || provider.cli_version, t("notAvailable"), 100));
     appendSummaryRow(details, t("status"), textValue(provider.status || provider.health || provider.state, availability === "ready" ? t("ready") : t("unknown"), 120));
+    appendSummaryRow(details, t("supportStatus"), textValue(provider.support_status, t("unknown"), 32));
+    appendSummaryRow(details, t("defaultModel"), textValue(provider.default_model, t("notAvailable"), 512));
     appendSummaryRow(details, t("capabilities"), capabilityText(provider.capabilities));
-    appendSummaryRow(details, t("compatibility"), compatibilityText(provider));
+    appendSummaryRow(details, t("serverMode"), provider.server_policy.enabled === true ? t("enabled") : t("disabled"));
     card.append(details);
-    const commands = isRecord(provider.commands) ? provider.commands : {};
+    const coreCommands = provider.source === "builtin" && CORE_PROVIDER_IDS.has(id);
+    const commands = coreCommands && isRecord(provider.commands) ? provider.commands : {};
     const install = textValue(provider.install_command || provider.install || commands.install, "", 500);
     const login = textValue(provider.login_command || provider.login || commands.login, "", 500);
-    if (install) card.append(createCopyCommand(t("installCommand"), install));
-    if (login) card.append(createCopyCommand(t("loginCommand"), login));
+    if (coreCommands && install) card.append(createCopyCommand(t("installCommand"), install));
+    if (coreCommands && login) card.append(createCopyCommand(t("loginCommand"), login));
     const verify = makeElement("button", "button secondary", t("verify"));
     verify.type = "button";
-    verify.disabled = state.mode !== "manage" || provider.verify_supported === false || !id;
+    verify.disabled = state.mode !== "manage" || provider.verify_supported !== true || !id;
     verify.addEventListener("click", () => verifyProvider(id, verify, card));
     card.append(verify);
     target.append(card);
@@ -494,6 +577,7 @@ function renderProviders() {
 }
 
 async function verifyProvider(id, button, card) {
+  if (!providerSupports(id, "verify_supported")) return;
   button.disabled = true;
   button.textContent = t("verifying");
   try {
@@ -531,10 +615,11 @@ function populateProviderOptions() {
     state.providers.forEach((provider) => {
       const id = providerId(provider);
       if (!id) return;
-      if (select.id === "chat-provider" && provider.chat_supported === false) return;
       const name = providerName(provider);
       const option = makeElement("option", "", name);
       option.value = id;
+      if (select.id === "chat-provider") option.disabled = provider.chat_supported !== true;
+      if (select.id === "models-provider") option.disabled = provider.models_supported !== true;
       select.append(option);
     });
     if (Array.from(select.options).some((option) => option.value === current)) select.value = current;
@@ -561,8 +646,7 @@ function populateSettingsOptions() {
   resetOptions(providerSelect, "selectProvider");
   state.providers.forEach((provider) => {
     const id = providerId(provider);
-    const coreDefault = ["claude", "codex", "gemini"].includes(id);
-    if (!id || (!coreDefault && provider.default_supported !== true)) return;
+    if (!id || provider.default_supported !== true) return;
     const option = makeElement("option", "", providerName(provider));
     option.value = id;
     providerSelect.append(option);
@@ -584,12 +668,38 @@ function validBootstrap(data) {
   if (!isRecord(data) || data.version !== 1) return false;
   if (data.mode !== "manage" || data.manage !== true || data.authenticated !== true) return false;
   if (typeof data.csrf_token !== "string" || !MANAGE_TOKEN_PATTERN.test(data.csrf_token)) return false;
-  if (!Array.isArray(data.providers) || !Array.isArray(data.workspaces)) return false;
+  if (!Array.isArray(data.providers) || data.providers.length > MAX_MANAGE_PROVIDERS || !Array.isArray(data.workspaces)) return false;
   if (!isRecord(data.settings) || !isRecord(data.security) || !isRecord(data.limits) || !isRecord(data.versions) || !isRecord(data.defaults)) return false;
   if (typeof data.versions.unified_cli !== "string" || !data.versions.unified_cli || data.versions.unified_cli.length > 100) return false;
   const providerIds = new Set();
   for (const provider of data.providers) {
     if (!isRecord(provider) || typeof provider.id !== "string" || provider.id.length > 64 || !PROVIDER_ID_PATTERN.test(provider.id) || providerIds.has(provider.id)) return false;
+    if (provider.source !== "builtin" && provider.source !== "extension") return false;
+    const core = provider.source === "builtin" && CORE_PROVIDER_IDS.has(provider.id);
+    const extension = provider.source === "extension" && !CORE_PROVIDER_IDS.has(provider.id) && provider.id !== "agy";
+    if (!core && !extension) return false;
+    if (core && (provider.status !== "builtin" || provider.support_status !== "stable")) return false;
+    if (extension && (provider.status !== "loaded" || !EXT_SUPPORT_STATUSES.has(provider.support_status))) return false;
+    if (["chat_supported", "verify_supported", "models_supported", "default_supported", "metadata_only"].some((key) => typeof provider[key] !== "boolean")) return false;
+    if (extension && (provider.chat_supported !== false || provider.verify_supported !== false
+        || provider.models_supported !== false || provider.default_supported !== false
+        || provider.metadata_only !== true)) return false;
+    if (core && provider.metadata_only !== false) return false;
+    if (!Array.isArray(provider.capabilities) || provider.capabilities.length > 64
+        || provider.capabilities.some((item) => typeof item !== "string" || item.length > 64 || !CAPABILITY_ID_PATTERN.test(item))) return false;
+    if (!isRecord(provider.server_policy)
+        || typeof provider.server_policy.enabled !== "boolean"
+        || typeof provider.server_policy.requires_external_isolation !== "boolean") return false;
+    if (extension && (provider.server_policy.enabled !== false
+        || provider.server_policy.requires_external_isolation !== true)) return false;
+    if (provider.support_status === "held") {
+      if (provider.default_model !== null || provider.capabilities.length !== 0) return false;
+    } else if (typeof provider.default_model !== "string" || !provider.default_model
+        || provider.default_model.length > 512 || provider.default_model !== provider.default_model.trim()
+        || UNSAFE_PROVIDER_TEXT_PATTERN.test(provider.default_model)) return false;
+    if (extension && (Object.hasOwn(provider, "commands")
+        || Object.hasOwn(provider, "install_command") || Object.hasOwn(provider, "login_command")
+        || Object.hasOwn(provider, "error"))) return false;
     providerIds.add(provider.id);
   }
   const workspaceIds = new Set();
@@ -603,6 +713,9 @@ function validBootstrap(data) {
   if (settings.browser_permission !== "read_only" || typeof settings.browser_prompt_preview !== "boolean" || typeof settings.web !== "boolean") return false;
   if (!["claude", "codex", "gemini"].includes(settings.default_provider)) return false;
   if (settings.workspace_id !== null && (typeof settings.workspace_id !== "string" || !workspaceIds.has(settings.workspace_id))) return false;
+  if (!CORE_PROVIDER_IDS.has(data.defaults.provider)
+      || typeof data.defaults.model !== "string" || !data.defaults.model
+      || data.defaults.model.length > 512 || UNSAFE_PROVIDER_TEXT_PATTERN.test(data.defaults.model)) return false;
   return Number.isSafeInteger(data.limits.prompt_chars)
     && Number.isSafeInteger(data.limits.images)
     && Number.isSafeInteger(data.limits.image_bytes)
@@ -979,7 +1092,7 @@ function updateOverviewFromUsage(value) {
 }
 
 async function loadModels(provider, force = false) {
-  if (!provider || state.modelsLoading) return;
+  if (!provider || state.modelsLoading || !providerSupports(provider, "models_supported")) return;
   if (!force && state.modelsByProvider.has(provider)) {
     renderModels(state.modelsByProvider.get(provider));
     return;
@@ -1001,7 +1114,7 @@ async function loadModels(provider, force = false) {
     byId("models-status").textContent = errorMessage(error, t("loadFailed"));
   } finally {
     state.modelsLoading = false;
-    byId("refresh-models").disabled = !byId("models-provider").value;
+    byId("refresh-models").disabled = !providerSupports(byId("models-provider").value, "models_supported");
   }
 }
 
@@ -1067,8 +1180,12 @@ async function loadSessions() {
 function sessionKind(item) {
   const raw = textValue(item.kind || item.type || item.scope, "core").toLowerCase();
   if (raw === "ext" || raw === "external" || item.external === true) return "ext";
-  const descriptor = state.providers.find((provider) => providerId(provider) === textValue(item.provider, ""));
-  return descriptor && textValue(descriptor.source, "").toLowerCase() === "ext" ? "ext" : "core";
+  const sessionProvider = textValue(item.provider, "", 64);
+  const descriptor = state.providers.find((provider) => providerId(provider) === sessionProvider);
+  const source = descriptor ? textValue(descriptor.source, "").toLowerCase() : "";
+  if (source === "ext" || source === "extension") return "ext";
+  return PROVIDER_ID_PATTERN.test(sessionProvider) && !CORE_PROVIDER_IDS.has(sessionProvider)
+    ? "ext" : "core";
 }
 
 function sessionId(item) {
@@ -1099,7 +1216,7 @@ function renderSessions(rows) {
     const actions = makeElement("td");
     if (state.mode === "manage" && id) {
       const descriptor = state.providers.find((provider) => providerId(provider) === textValue(item.provider, ""));
-      const canResume = Boolean(item.workspace_id) && (!descriptor || descriptor.chat_supported !== false);
+      const canResume = Boolean(item.workspace_id) && descriptor && descriptor.chat_supported === true;
       const resume = sessionButton(t("resume"), () => resumeSession(item));
       resume.disabled = !canResume;
       actions.append(
@@ -1513,6 +1630,10 @@ async function submitChat(event) {
   const provider = byId("chat-provider").value;
   const workspace = byId("chat-workspace").value;
   const prompt = byId("chat-prompt").value.trim();
+  if (!providerSupports(provider, "chat_supported")) {
+    byId("chat-status").textContent = t("selectionRequired");
+    return;
+  }
   if (!prompt) {
     byId("chat-status").textContent = t("promptRequired");
     byId("chat-prompt").focus();
@@ -1591,8 +1712,9 @@ function wireEvents() {
   byId("refresh-overview").addEventListener("click", refreshOverview);
   byId("models-provider").addEventListener("change", (event) => {
     const provider = event.target.value;
-    byId("refresh-models").disabled = !provider;
-    if (provider) loadModels(provider);
+    const supported = providerSupports(provider, "models_supported");
+    byId("refresh-models").disabled = !supported;
+    if (supported) loadModels(provider);
   });
   byId("refresh-models").addEventListener("click", () => loadModels(byId("models-provider").value, true));
   byId("chat-provider").addEventListener("change", (event) => {

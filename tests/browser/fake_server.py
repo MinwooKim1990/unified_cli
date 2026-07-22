@@ -23,6 +23,8 @@ os.environ.update({
 sys.path.insert(0, str(ROOT / "src"))
 
 from unified_cli import manage, registry, server  # noqa: E402
+from unified_cli.plugin import ProviderServerPolicyV1  # noqa: E402
+from unified_cli.registry import ProviderDescriptorV1  # noqa: E402
 
 
 def _unexpected_provider_probe(*_args, **_kwargs):
@@ -49,7 +51,37 @@ def main() -> None:
     EntryPoint.load = _unexpected_provider_probe
 
     port = _free_loopback_port()
-    token = server.prepare_manage((str(WORKSPACE),))
+    extension = ProviderDescriptorV1(
+        id="preview-ext",
+        source="extension",
+        status="loaded",
+        support_status="preview",
+        default_model="preview </script><img src=x onerror=alert(1)>",
+        capabilities=frozenset(("chat", "models", "server")),
+        route_prefixes=("preview-ext",),
+        server_policy=ProviderServerPolicyV1(
+            enabled=True, requires_external_isolation=False,
+        ),
+    )
+    token = server.prepare_manage(
+        (str(WORKSPACE),), provider_snapshots=(extension,),
+    )
+    runtime = manage.get_manage_runtime()
+    assert runtime is not None
+    runtime.session_manager.upsert(
+        provider="preview-ext",
+        session_id="native-preview-session",
+        model="preview-model",
+        cwd=str(WORKSPACE),
+        name="Ext metadata session",
+    )
+    runtime.session_manager.upsert(
+        provider="orphan-ext",
+        session_id="native-orphan-session",
+        model="orphan-model",
+        cwd=str(WORKSPACE),
+        name="Uninjected Ext session",
+    )
     try:
         print("READY {} {}".format(port, token), flush=True)
         uvicorn.run(server.app, host="127.0.0.1", port=port, log_level="warning")

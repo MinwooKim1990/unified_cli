@@ -9,6 +9,7 @@ crosses the browser boundary.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import hashlib
@@ -42,7 +43,8 @@ from .models import (
     invalidate_model_cache as invalidate_core_model_cache,
     list_models,
 )
-from .registry import list_providers
+from .plugin import ProviderServerPolicyV1
+from .registry import ProviderDescriptorV1, list_providers
 from .session_manager import SessionManager, SessionRecord
 from .settings import load_settings, save_settings
 from .usage import tracker
@@ -65,8 +67,32 @@ VERIFY_VERSION_TTL_SECONDS = 300.0
 VERIFY_AUTH_TTL_SECONDS = 15.0
 PROVIDER_MODELS_TTL_SECONDS = 60.0
 MAX_PROVIDER_CACHE_ENTRIES = 64
+MAX_EXTENSION_PROVIDER_SNAPSHOTS = 32
+MAX_EXTENSION_PROVIDER_CAPABILITIES = 64
 
 _HANDLE_RE = re.compile(r"^[a-z]+_[A-Za-z0-9_-]{16,64}$", re.ASCII)
+_EXT_PROVIDER_ID_RE = re.compile(
+    r"^[a-z][a-z0-9]*(?:[-_][a-z0-9]+)*$", re.ASCII
+)
+_EXT_CAPABILITY_RE = re.compile(
+    r"^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$", re.ASCII
+)
+_CORE_PROVIDER_IDS = frozenset(("claude", "codex", "gemini"))
+_RESERVED_MANAGE_PROVIDER_IDS = frozenset((*_CORE_PROVIDER_IDS, "agy"))
+_EXT_SUPPORT_STATUSES = frozenset(
+    ("stable", "preview", "experimental", "held")
+)
+_SNAPSHOT_CANCELLATION_EXCEPTIONS = (
+    KeyboardInterrupt,
+    GeneratorExit,
+    asyncio.CancelledError,
+)
+_MANAGE_STREAM_ERROR_CODES = frozenset((
+    "manage_disabled",
+    "provider_forbidden",
+    "provider_unsupported",
+    "permission_forbidden",
+))
 _DATA_IMAGE_RE = re.compile(
     r"data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/]+={0,2})",
     re.ASCII,
@@ -324,6 +350,166 @@ def _safe_text(value: object, *, maximum: int) -> str:
     return "".join(output)
 
 
+def _valid_snapshot_text(
+    value: object, *, maximum: int, allow_empty: bool = False
+) -> bool:
+    """Validate one callback-free metadata string before browser exposure."""
+
+    if type(value) is not str or len(value) > maximum:
+        return False
+    if (not value and not allow_empty) or value != value.strip():
+        return False
+    try:
+        value.encode("utf-8", "strict")
+    except UnicodeError:
+        return False
+    return not any(
+        unicodedata.category(char).startswith("C")
+        or unicodedata.category(char) in {"Zl", "Zp"}
+        for char in value
+    )
+
+
+def _copy_extension_provider_snapshot(
+    value: object,
+) -> ProviderDescriptorV1:
+    """Return a conservative Core-owned copy of one Ext descriptor.
+
+    ``ProviderDescriptorV1`` is deliberately a metadata container rather than
+    a validator.  Manage mode therefore revalidates every field it retains and
+    reconstructs the descriptor without provider-owned aliases.  Executable
+    policy is never inferred from capabilities or from the advertised server
+    policy.
+    """
+
+    if type(value) is not ProviderDescriptorV1:
+        raise ValueError("extension provider snapshot is invalid")
+    try:
+        provider_id = value.id
+        source = value.source
+        lifecycle_status = value.status
+        support_status = value.support_status
+        default_model = value.default_model
+        capabilities = value.capabilities
+        route_prefixes = value.route_prefixes
+        server_policy = value.server_policy
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("extension provider snapshot is invalid") from None
+
+    if (
+        type(provider_id) is not str
+        or len(provider_id) > 64
+        or _EXT_PROVIDER_ID_RE.fullmatch(provider_id) is None
+        or provider_id in _RESERVED_MANAGE_PROVIDER_IDS
+        or type(source) is not str
+        or type(lifecycle_status) is not str
+        or type(support_status) is not str
+        or source != "extension"
+        or lifecycle_status != "loaded"
+        or support_status not in _EXT_SUPPORT_STATUSES
+    ):
+        raise ValueError("extension provider snapshot is invalid")
+
+    if type(capabilities) is not frozenset or (
+        len(capabilities) > MAX_EXTENSION_PROVIDER_CAPABILITIES
+    ):
+        raise ValueError("extension provider snapshot is invalid")
+    copied_capabilities = []
+    for capability in capabilities:
+        if (
+            type(capability) is not str
+            or len(capability) > 64
+            or _EXT_CAPABILITY_RE.fullmatch(capability) is None
+        ):
+            raise ValueError("extension provider snapshot is invalid")
+        copied_capabilities.append(capability)
+
+    if type(route_prefixes) is not tuple or len(route_prefixes) > 1:
+        raise ValueError("extension provider snapshot is invalid")
+    if route_prefixes and (
+        type(route_prefixes[0]) is not str
+        or route_prefixes[0] != provider_id
+    ):
+        raise ValueError("extension provider snapshot is invalid")
+    if server_policy is not None and type(server_policy) is not ProviderServerPolicyV1:
+        raise ValueError("extension provider snapshot is invalid")
+    if server_policy is not None and (
+        type(server_policy.enabled) is not bool
+        or type(server_policy.requires_external_isolation) is not bool
+    ):
+        raise ValueError("extension provider snapshot is invalid")
+
+    if support_status == "held":
+        # Held metadata may be shown, but never as executable or configured.
+        copied_default_model = None
+        copied_capabilities = []
+    else:
+        if not _valid_snapshot_text(default_model, maximum=512):
+            raise ValueError("extension provider snapshot is invalid")
+        copied_default_model = default_model
+
+    return ProviderDescriptorV1(
+        id=provider_id,
+        source="extension",
+        status="loaded",
+        support_status=support_status,
+        default_model=copied_default_model,
+        capabilities=frozenset(tuple(copied_capabilities)),
+        route_prefixes=(provider_id,),
+        # Manage's actual Ext server policy is conservative regardless of a
+        # plugin's descriptive claim. No HTTP or browser permission follows.
+        server_policy=ProviderServerPolicyV1(
+            enabled=False,
+            requires_external_isolation=True,
+        ),
+        error=None,
+    )
+
+
+def _copy_extension_provider_snapshots(value: object) -> Tuple[ProviderDescriptorV1, ...]:
+    """Materialize one bounded built-in container and retain no caller aliases."""
+
+    if value is None:
+        return ()
+    if type(value) is dict:
+        if len(value) > MAX_EXTENSION_PROVIDER_SNAPSHOTS:
+            raise ValueError("extension provider snapshots exceed the limit")
+        try:
+            materialized = tuple(value.items())
+        except _SNAPSHOT_CANCELLATION_EXCEPTIONS:
+            raise
+        except BaseException:
+            raise ValueError("extension provider snapshots are invalid") from None
+    elif type(value) in (list, tuple):
+        if len(value) > MAX_EXTENSION_PROVIDER_SNAPSHOTS:
+            raise ValueError("extension provider snapshots exceed the limit")
+        try:
+            materialized = tuple((None, item) for item in value)
+        except _SNAPSHOT_CANCELLATION_EXCEPTIONS:
+            raise
+        except BaseException:
+            raise ValueError("extension provider snapshots are invalid") from None
+    else:
+        raise ValueError("extension provider snapshots must be a list, tuple, or dict")
+    if len(materialized) > MAX_EXTENSION_PROVIDER_SNAPSHOTS:
+        raise ValueError("extension provider snapshots exceed the limit")
+
+    copied: Dict[str, ProviderDescriptorV1] = {}
+    for key, descriptor in materialized:
+        try:
+            item = _copy_extension_provider_snapshot(descriptor)
+        except _SNAPSHOT_CANCELLATION_EXCEPTIONS:
+            raise
+        except BaseException:
+            raise ValueError("extension provider snapshot is invalid") from None
+        if key is not None and (type(key) is not str or key != item.id):
+            raise ValueError("extension provider snapshot mapping is invalid")
+        if item.id in copied:
+            raise ValueError("extension provider snapshots contain a duplicate id")
+        copied[item.id] = item
+    return tuple(copied[provider_id] for provider_id in sorted(copied))
+
+
 def _redacted_output(value: str, home: str) -> str:
     text = _safe_text(value, maximum=2_048)
     if home:
@@ -454,7 +640,12 @@ def _run_verify_argv(argv: Tuple[str, ...], cwd: str) -> Dict[str, Any]:
 class ManageRuntime:
     """Process-scoped state for one explicitly prepared manage server."""
 
-    def __init__(self, workspaces: Sequence[str]):
+    def __init__(
+        self,
+        workspaces: Sequence[str],
+        *,
+        provider_snapshots: object = None,
+    ):
         self._lock = threading.RLock()
         self._handle_key = secrets.token_bytes(32)
         self._bootstrap_digest = _digest(_urlsafe_random())  # replaced immediately
@@ -479,6 +670,12 @@ class ManageRuntime:
         self.session_manager = SessionManager()
         self.workspaces = self._prepare_workspaces(workspaces)
         self._workspace_by_id = {workspace.id: workspace for workspace in self.workspaces}
+        self._extension_provider_snapshots = _copy_extension_provider_snapshots(
+            provider_snapshots
+        )
+        self._extension_provider_ids = frozenset(
+            descriptor.id for descriptor in self._extension_provider_snapshots
+        )
 
     def _prepare_workspaces(self, values: Sequence[str]) -> Tuple[Workspace, ...]:
         if isinstance(values, (str, bytes)) or len(values) > 32:
@@ -505,6 +702,7 @@ class ManageRuntime:
     def issue_bootstrap(self) -> str:
         token = _urlsafe_random()
         with self._lock:
+            self._require_enabled_locked()
             self._bootstrap_digest = _digest(token)
             self._bootstrap_expires = time.monotonic() + BOOTSTRAP_TTL_SECONDS
         return token
@@ -551,6 +749,14 @@ class ManageRuntime:
             self._bootstrap_expires = 0.0
         for chat in chats:
             chat.cancel_event.set()
+
+    def _require_enabled_locked(self) -> None:
+        if self._disabled:
+            raise ManageError(
+                503,
+                "manage_disabled",
+                "The management runtime is disabled.",
+            )
 
     @staticmethod
     def _cache_get(cache: OrderedDict, key: object) -> Optional[object]:
@@ -699,6 +905,7 @@ class ManageRuntime:
             created_at=time.time(), last_seen=now,
         )
         with self._lock:
+            self._require_enabled_locked()
             attempts = self._failed_bootstraps.setdefault(_digest(peer_key), deque())
             while attempts and now - attempts[0] > 60.0:
                 attempts.popleft()
@@ -723,6 +930,11 @@ class ManageRuntime:
         return self._bootstrap_payload(session), raw_cookie
 
     def _bootstrap_payload(self, session: BrowserSession) -> Dict[str, Any]:
+        with self._lock:
+            self._require_enabled_locked()
+            return self._bootstrap_payload_locked(session)
+
+    def _bootstrap_payload_locked(self, session: BrowserSession) -> Dict[str, Any]:
         settings = self.safe_settings()
         default_workspace = self._workspace_by_id.get(settings["workspace_id"])
         versions = {"unified_cli": self._core_version()}
@@ -788,6 +1000,7 @@ class ManageRuntime:
             return None
         key = _digest(cookie)
         with self._lock:
+            self._require_enabled_locked()
             session = self._sessions.get(key)
             if session is None:
                 if required:
@@ -885,27 +1098,46 @@ class ManageRuntime:
                 candidate.web = value
             else:
                 raise ManageError(400, "invalid_settings", "A setting value is not allowed.")
-        try:
-            save_settings(candidate)
-        except (OSError, TypeError, ValueError):
-            raise ManageError(500, "settings_failed", "Settings could not be saved.") from None
+        with self._lock:
+            self._require_enabled_locked()
+            try:
+                save_settings(candidate)
+            except (OSError, TypeError, ValueError):
+                raise ManageError(500, "settings_failed", "Settings could not be saved.") from None
         return self.safe_settings()
 
-    @staticmethod
-    def provider_metadata() -> Dict[str, Any]:
-        try:
-            descriptors = list_providers(include_ext=True)
-        except UnifiedError:
-            descriptors = list_providers(include_ext=False)
+    def provider_metadata(self) -> Dict[str, Any]:
+        with self._lock:
+            self._require_enabled_locked()
+            return self._provider_metadata_locked()
+
+    def _provider_metadata_locked(self) -> Dict[str, Any]:
+        # Core listing is a pure in-process snapshot. Ext entry points are
+        # never enumerated here; only constructor-injected Core-owned copies
+        # are eligible for display.
+        descriptors = list_providers(include_ext=False)
         rows = []
         for descriptor in descriptors:
+            policy = descriptor.server_policy
             row: Dict[str, Any] = {
                 "id": descriptor.id,
                 "source": descriptor.source,
                 "status": descriptor.status,
+                "support_status": descriptor.support_status,
                 "default_model": descriptor.default_model,
+                "capabilities": sorted(descriptor.capabilities),
+                "server_policy": {
+                    "enabled": bool(policy is not None and policy.enabled is True),
+                    "requires_external_isolation": bool(
+                        policy is None
+                        or policy.requires_external_isolation is True
+                    ),
+                },
                 "chat_supported": descriptor.id in {"claude", "codex"},
                 "verify_supported": descriptor.id in _VERIFY_SPECS,
+                "models_supported": descriptor.id in _CORE_PROVIDER_IDS,
+                "default_supported": descriptor.id in _CORE_PROVIDER_IDS,
+                "metadata_only": False,
             }
             if descriptor.id in _COPY_COMMANDS:
                 commands = dict(_COPY_COMMANDS[descriptor.id])
@@ -915,12 +1147,49 @@ class ManageRuntime:
             if descriptor.error:
                 row["error"] = descriptor.error
             rows.append(row)
+        for descriptor in self._extension_provider_snapshots:
+            policy = descriptor.server_policy
+            rows.append({
+                "id": descriptor.id,
+                "source": "extension",
+                "status": "loaded",
+                "support_status": descriptor.support_status,
+                "default_model": descriptor.default_model,
+                "capabilities": sorted(descriptor.capabilities),
+                "server_policy": {
+                    "enabled": False,
+                    "requires_external_isolation": bool(
+                        policy is None
+                        or policy.requires_external_isolation is True
+                    ),
+                },
+                "chat_supported": False,
+                "verify_supported": False,
+                "models_supported": False,
+                "default_supported": False,
+                "metadata_only": True,
+            })
         return {"providers": rows}
+
+    def _is_extension_provider_id(self, value: object) -> bool:
+        return (
+            type(value) is str
+            and len(value) <= 64
+            and value in self._extension_provider_ids
+        )
+
+    @staticmethod
+    def _provider_unsupported() -> ManageError:
+        return ManageError(
+            403,
+            "provider_unsupported",
+            "This provider operation is unavailable in browser management.",
+        )
 
     def provider_models(
         self, provider_id: str, *, force_refresh: bool = False
     ) -> Dict[str, Any]:
-        if provider_id not in {"claude", "codex", "gemini"}:
+        if type(provider_id) is not str or provider_id not in _CORE_PROVIDER_IDS:
             raise ManageError(403, "provider_unsupported", "Provider models are unavailable.")
 
         with self._lock:
@@ -1102,7 +1371,13 @@ class ManageRuntime:
     def verify_provider(
         self, provider_id: str, *, force_refresh: bool = False
     ) -> Dict[str, Any]:
-        specs = _VERIFY_SPECS.get(provider_id)
+        if self._is_extension_provider_id(provider_id):
+            raise self._provider_unsupported()
+        specs = (
+            _VERIFY_SPECS.get(provider_id)
+            if type(provider_id) is str and len(provider_id) <= 64
+            else None
+        )
         if specs is None:
             raise ManageError(403, "verify_unsupported", "Provider verification is unsupported.")
 
@@ -1356,11 +1631,13 @@ class ManageRuntime:
         }
 
     def list_sessions(self) -> Dict[str, Any]:
-        try:
-            records = self.session_manager.list(include_archived=True)
-        except (OSError, ValueError):
-            raise ManageError(500, "sessions_failed", "Sessions could not be read.") from None
-        return {"sessions": [self._record_to_safe(record) for record in records]}
+        with self._lock:
+            self._require_enabled_locked()
+            try:
+                records = self.session_manager.list(include_archived=True)
+            except (OSError, ValueError):
+                raise ManageError(500, "sessions_failed", "Sessions could not be read.") from None
+            return {"sessions": [self._record_to_safe(record) for record in records]}
 
     def _resolve_session(self, handle: object) -> SessionRecord:
         if type(handle) is not str or _HANDLE_RE.fullmatch(handle) is None:
@@ -1382,70 +1659,77 @@ class ManageRuntime:
     def patch_session(self, handle: str, payload: object) -> Dict[str, Any]:
         if type(payload) is not dict or not payload or not set(payload).issubset({"name", "archived"}):
             raise ManageError(400, "invalid_session", "Session changes are invalid.")
+        name = payload.get("name")
+        if "name" in payload and (
+            type(name) is not str or not name.strip() or len(name) > 200
+        ):
+            raise ManageError(400, "invalid_session", "Session name is invalid.")
+        archived = payload.get("archived")
+        if "archived" in payload and type(archived) is not bool:
+            raise ManageError(400, "invalid_session", "Archived must be a boolean.")
         record = self._resolve_session(handle)
-        try:
-            if "name" in payload:
-                name = payload["name"]
-                if type(name) is not str or not name.strip() or len(name) > 200:
-                    raise ManageError(400, "invalid_session", "Session name is invalid.")
-                record = self.session_manager.rename(
-                    provider=record.provider, session_id=record.session_id, name=name)
-            if "archived" in payload:
-                archived = payload["archived"]
-                if type(archived) is not bool:
-                    raise ManageError(400, "invalid_session", "Archived must be a boolean.")
-                record = self.session_manager.archive(
-                    provider=record.provider, session_id=record.session_id,
-                    archived=archived)
-        except ManageError:
-            raise
-        except (KeyError, OSError, ValueError):
-            raise ManageError(404, "session_not_found", "Session was not found.") from None
+        with self._lock:
+            self._require_enabled_locked()
+            try:
+                if "name" in payload:
+                    record = self.session_manager.rename(
+                        provider=record.provider, session_id=record.session_id, name=name)
+                if "archived" in payload:
+                    record = self.session_manager.archive(
+                        provider=record.provider, session_id=record.session_id,
+                        archived=archived)
+            except ManageError:
+                raise
+            except (KeyError, OSError, ValueError):
+                raise ManageError(404, "session_not_found", "Session was not found.") from None
         return {"session": self._record_to_safe(record)}
 
     def delete_session(self, handle: str) -> Dict[str, Any]:
         record = self._resolve_session(handle)
-        try:
-            removed = self.session_manager.delete(
-                provider=record.provider, session_id=record.session_id)
-        except (OSError, ValueError):
-            raise ManageError(500, "sessions_failed", "Session could not be deleted.") from None
+        with self._lock:
+            self._require_enabled_locked()
+            try:
+                removed = self.session_manager.delete(
+                    provider=record.provider, session_id=record.session_id)
+            except (OSError, ValueError):
+                raise ManageError(500, "sessions_failed", "Session could not be deleted.") from None
         if not removed:
             raise ManageError(404, "session_not_found", "Session was not found.")
         return {"deleted": True, "id": handle}
 
-    @staticmethod
-    def usage_snapshot() -> Dict[str, Any]:
-        snapshot = tracker.snapshot()
-        settings = load_settings()
-        recent = []
-        for record in snapshot.get("recent", [])[:100]:
-            error_kind = record.get("error_kind")
-            safe = {
-                "timestamp": record.get("ts"),
-                "provider": record.get("provider"),
-                "model": record.get("model"),
-                "input_tokens": record.get("input_tokens"),
-                "output_tokens": record.get("output_tokens"),
-                "cached_tokens": record.get("cached_tokens"),
-                "latency_ms": record.get("latency_ms"),
-                "error_code": error_kind,
-                "status": "error" if error_kind else "success",
+    def usage_snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            self._require_enabled_locked()
+            snapshot = tracker.snapshot()
+            settings = load_settings()
+            recent = []
+            for record in snapshot.get("recent", [])[:100]:
+                error_kind = record.get("error_kind")
+                safe = {
+                    "timestamp": record.get("ts"),
+                    "provider": record.get("provider"),
+                    "model": record.get("model"),
+                    "input_tokens": record.get("input_tokens"),
+                    "output_tokens": record.get("output_tokens"),
+                    "cached_tokens": record.get("cached_tokens"),
+                    "latency_ms": record.get("latency_ms"),
+                    "error_code": error_kind,
+                    "status": "error" if error_kind else "success",
+                }
+                if settings.browser_prompt_preview:
+                    safe["prompt_preview"] = _safe_text(
+                        record.get("prompt_preview", ""), maximum=60)
+                recent.append(safe)
+            aggregates = snapshot.get("aggregates", [])
+            return {
+                "aggregates": aggregates,
+                "totals": {
+                    "input_tokens": sum(int(row.get("input_tokens") or 0) for row in aggregates),
+                    "output_tokens": sum(int(row.get("output_tokens") or 0) for row in aggregates),
+                    "cached_tokens": sum(int(row.get("cached_tokens") or 0) for row in aggregates),
+                },
+                "recent": recent,
             }
-            if settings.browser_prompt_preview:
-                safe["prompt_preview"] = _safe_text(
-                    record.get("prompt_preview", ""), maximum=60)
-            recent.append(safe)
-        aggregates = snapshot.get("aggregates", [])
-        return {
-            "aggregates": aggregates,
-            "totals": {
-                "input_tokens": sum(int(row.get("input_tokens") or 0) for row in aggregates),
-                "output_tokens": sum(int(row.get("output_tokens") or 0) for row in aggregates),
-                "cached_tokens": sum(int(row.get("cached_tokens") or 0) for row in aggregates),
-            },
-            "recent": recent,
-        }
 
     def _workspace(self, value: object) -> Workspace:
         if type(value) is not str or len(value) > 80:
@@ -1488,10 +1772,14 @@ class ManageRuntime:
         if not set(payload).issubset(allowed):
             raise ManageError(400, "invalid_chat", "Chat request contains unsupported fields.")
         provider = payload.get("provider")
-        if provider not in {"claude", "codex"}:
+        if self._is_extension_provider_id(provider):
+            raise self._provider_unsupported()
+        if type(provider) is not str or provider not in {"claude", "codex"}:
             raise ManageError(403, "provider_forbidden", "Provider is unavailable for browser chat.")
         if payload.get("permission", "read_only") != "read_only":
             raise ManageError(403, "permission_forbidden", "Browser chat is read-only.")
+        with self._lock:
+            self._require_enabled_locked()
         prompt = payload.get("prompt")
         if type(prompt) is not str or not prompt.strip() or len(prompt) > MAX_PROMPT_CHARS:
             raise ManageError(400, "invalid_prompt", "Prompt is empty or exceeds the limit.")
@@ -1528,6 +1816,7 @@ class ManageRuntime:
             images.append(image)
 
         with self._lock:
+            self._require_enabled_locked()
             if len(self._active_chats) >= MAX_ACTIVE_CHATS:
                 raise ManageError(429, "chat_capacity", "Too many chats are active.")
             if provider in self._provider_active:
@@ -1553,6 +1842,7 @@ class ManageRuntime:
         if type(chat_id) is not str or _HANDLE_RE.fullmatch(chat_id) is None:
             raise ManageError(404, "chat_not_found", "Chat was not found.")
         with self._lock:
+            self._require_enabled_locked()
             chat = self._active_chats.get(chat_id)
             if chat is None or not hmac.compare_digest(chat.owner_key, owner_key):
                 raise ManageError(404, "chat_not_found", "Chat was not found.")
@@ -1620,6 +1910,8 @@ class ManageRuntime:
         )
 
     def stream_chat(self, chat: ActiveChat) -> Iterator[bytes]:
+        with self._lock:
+            self._require_enabled_locked()
         conversation = self._conversation_for_chat(chat)
         initial: Dict[str, Any] = {"type": "session", "chat_id": chat.id}
         if chat.browser_session_id:
@@ -1632,6 +1924,8 @@ class ManageRuntime:
         reasoning_enabled = load_settings().reasoning_display == "compact"
         upstream = None
         try:
+            with self._lock:
+                self._require_enabled_locked()
             upstream = conversation.stream(
                 chat.prompt,
                 provider=chat.provider,
@@ -1723,6 +2017,24 @@ class ManageRuntime:
                     pass
             status = "cancelled" if chat.cancel_event.is_set() else "completed"
             yield self._line({"type": "done", "status": status})
+        except ManageError as error:
+            safe_code = (
+                error.code
+                if type(error.code) is str
+                and error.code in _MANAGE_STREAM_ERROR_CODES
+                else "manage_error"
+            )
+            safe_message = (
+                _safe_text(error.message, maximum=300)
+                if safe_code != "manage_error" and type(error.message) is str
+                else "The management request failed."
+            )
+            yield self._line({
+                "type": "error",
+                "code": safe_code,
+                "message": safe_message,
+            })
+            yield self._line({"type": "done", "status": "error"})
         except UnifiedError as error:
             if chat.cancel_event.is_set() or getattr(error, "_cancelled", False):
                 yield self._line({"type": "done", "status": "cancelled"})
@@ -1776,11 +2088,15 @@ _RUNTIME_LOCK = threading.RLock()
 _RUNTIME: Optional[ManageRuntime] = None
 
 
-def prepare_manage(workspaces: Sequence[str]) -> str:
+def prepare_manage(
+    workspaces: Sequence[str], *, provider_snapshots: object = None
+) -> str:
     """Enable/replace manage mode and return a one-time 256-bit bootstrap token."""
     global _RUNTIME
     try:
-        runtime = ManageRuntime(workspaces)
+        runtime = ManageRuntime(
+            workspaces, provider_snapshots=provider_snapshots
+        )
     except (OSError, TypeError, ValueError):
         raise UnifiedError(
             kind="config", provider="claude",
@@ -1791,19 +2107,23 @@ def prepare_manage(workspaces: Sequence[str]) -> str:
     with _RUNTIME_LOCK:
         previous = _RUNTIME
         _RUNTIME = runtime
-    if previous is not None:
-        previous.disable()
+        if previous is not None:
+            previous.disable()
     return token
 
 
-def ensure_manage(workspaces: Sequence[str]) -> Optional[str]:
+def ensure_manage(
+    workspaces: Sequence[str], *, provider_snapshots: object = None
+) -> Optional[str]:
     """Prepare once for ``run(manage=True)``; never rotate an existing token."""
     global _RUNTIME
     with _RUNTIME_LOCK:
         if _RUNTIME is not None:
             return None
         try:
-            runtime = ManageRuntime(workspaces)
+            runtime = ManageRuntime(
+                workspaces, provider_snapshots=provider_snapshots
+            )
         except (OSError, TypeError, ValueError):
             raise UnifiedError(
                 kind="config", provider="claude",
@@ -1821,8 +2141,8 @@ def disable_manage() -> None:
     with _RUNTIME_LOCK:
         runtime = _RUNTIME
         _RUNTIME = None
-    if runtime is not None:
-        runtime.disable()
+        if runtime is not None:
+            runtime.disable()
 
 
 def get_manage_runtime() -> Optional[ManageRuntime]:

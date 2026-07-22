@@ -22,6 +22,8 @@ httpx = pytest.importorskip("httpx")
 from unified_cli import manage, server, session_manager, settings  # noqa: E402
 from unified_cli.core import Response, Usage  # noqa: E402
 from unified_cli.errors import UnifiedError  # noqa: E402
+from unified_cli.plugin import ProviderServerPolicyV1  # noqa: E402
+from unified_cli.registry import ProviderDescriptorV1  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -61,6 +63,24 @@ async def bootstrap(api, token, *, origin=None):
 
 def mutation_headers(csrf, origin="http://127.0.0.1"):
     return {"Origin": origin, "X-CSRF-Token": csrf}
+
+
+def extension_snapshot(
+    provider_id="preview-ext", *, support_status="preview",
+    default_model="preview-model", capabilities=frozenset(("chat", "models")),
+):
+    return ProviderDescriptorV1(
+        id=provider_id,
+        source="extension",
+        status="loaded",
+        support_status=support_status,
+        default_model=default_model,
+        capabilities=capabilities,
+        route_prefixes=(provider_id,),
+        server_policy=ProviderServerPolicyV1(
+            enabled=True, requires_external_isolation=False,
+        ),
+    )
 
 
 def test_manage_disabled_is_404_but_plain_dashboard_remains_available():
@@ -252,7 +272,7 @@ def test_security_headers_csp_no_cors_and_manage_body_limit(tmp_path, monkeypatc
 def test_bootstrap_and_provider_listing_do_not_probe_models_or_import_plugins(
     tmp_path, monkeypatch,
 ):
-    calls = {"models": 0, "popen": 0, "load": 0}
+    calls = {"entry_points": 0, "models": 0, "popen": 0, "load": 0}
 
     class EntryPoint:
         name = "safeext"
@@ -264,7 +284,11 @@ def test_bootstrap_and_provider_listing_do_not_probe_models_or_import_plugins(
 
     import unified_cli.registry as registry
     registry._reset_provider_registry_for_tests()
-    monkeypatch.setattr(registry.importlib_metadata, "entry_points", lambda: [EntryPoint()])
+    def forbidden_discovery():
+        calls["entry_points"] += 1
+        raise AssertionError("entry points enumerated")
+
+    monkeypatch.setattr(registry.importlib_metadata, "entry_points", forbidden_discovery)
     monkeypatch.setattr(manage, "list_models", lambda *_a, **_kw: calls.__setitem__("models", calls["models"] + 1))
     monkeypatch.setattr(manage.subprocess, "Popen", lambda *_a, **_kw: calls.__setitem__("popen", calls["popen"] + 1))
     token = server.prepare_manage([str(tmp_path)])
@@ -273,9 +297,369 @@ def test_bootstrap_and_provider_listing_do_not_probe_models_or_import_plugins(
         async with client() as api:
             response = await bootstrap(api, token)
             assert response.status_code == 200
-            assert any(row["id"] == "safeext" for row in response.json()["providers"])
+            assert {row["id"] for row in response.json()["providers"]} == {
+                "claude", "codex", "gemini",
+            }
     run(scenario())
-    assert calls == {"models": 0, "popen": 0, "load": 0}
+    assert calls == {"entry_points": 0, "models": 0, "popen": 0, "load": 0}
+
+
+def test_injected_extension_snapshot_is_copied_bounded_metadata_only(
+    tmp_path,
+):
+    hostile_model = "preview-model </script><img src=x onerror=alert(1)>"
+    descriptor = extension_snapshot(default_model=hostile_model)
+    token = server.prepare_manage(
+        [str(tmp_path)], provider_snapshots={"preview-ext": descriptor},
+    )
+    object.__setattr__(descriptor, "default_model", "mutated-secret-model")
+    object.__setattr__(descriptor, "capabilities", frozenset(("factory",)))
+
+    async def scenario():
+        async with client() as api:
+            response = await bootstrap(api, token)
+            assert response.status_code == 200
+            rows = response.json()["providers"]
+            extension = next(row for row in rows if row["id"] == "preview-ext")
+            assert extension == {
+                "id": "preview-ext",
+                "source": "extension",
+                "status": "loaded",
+                "support_status": "preview",
+                "default_model": hostile_model,
+                "capabilities": ["chat", "models"],
+                "server_policy": {
+                    "enabled": False,
+                    "requires_external_isolation": True,
+                },
+                "chat_supported": False,
+                "verify_supported": False,
+                "models_supported": False,
+                "default_supported": False,
+                "metadata_only": True,
+            }
+            assert "mutated-secret-model" not in response.text
+            assert all(key not in extension for key in (
+                "commands", "install_command", "login_command", "error",
+                "route_prefixes", "receipt", "token", "path", "secret",
+            ))
+
+    run(scenario())
+
+
+def test_held_extension_snapshot_has_no_model_capability_or_action(tmp_path):
+    held = extension_snapshot(
+        provider_id="held-ext",
+        support_status="held",
+        default_model="must-not-render",
+        capabilities=frozenset(("chat", "models", "server")),
+    )
+    runtime = manage.ManageRuntime([str(tmp_path)], provider_snapshots=[held])
+    extension = next(
+        row for row in runtime.provider_metadata()["providers"]
+        if row["id"] == "held-ext"
+    )
+    assert extension["support_status"] == "held"
+    assert extension["default_model"] is None
+    assert extension["capabilities"] == []
+    assert extension["server_policy"] == {
+        "enabled": False, "requires_external_isolation": True,
+    }
+    assert extension["chat_supported"] is False
+    assert extension["verify_supported"] is False
+    assert extension["models_supported"] is False
+
+
+def test_extension_snapshot_validation_has_no_hostile_equality_callbacks(tmp_path):
+    calls = []
+
+    class Boom:
+        def __eq__(self, _other):
+            calls.append("eq")
+            raise AssertionError("provider field equality executed")
+
+        def __ne__(self, _other):
+            calls.append("ne")
+            raise AssertionError("provider field inequality executed")
+
+    forged = object.__new__(ProviderDescriptorV1)
+    object.__setattr__(forged, "id", "forged-ext")
+    object.__setattr__(forged, "source", Boom())
+    object.__setattr__(forged, "status", "loaded")
+    object.__setattr__(forged, "default_model", "model")
+    object.__setattr__(forged, "capabilities", frozenset())
+    object.__setattr__(forged, "route_prefixes", ("forged-ext",))
+    object.__setattr__(forged, "server_policy", None)
+    object.__setattr__(forged, "error", None)
+    object.__setattr__(forged, "support_status", "preview")
+
+    with pytest.raises(ValueError, match="snapshot is invalid"):
+        manage.ManageRuntime([str(tmp_path)], provider_snapshots=[forged])
+    assert calls == []
+
+
+def test_extension_snapshot_container_bounds_duplicates_and_callback_boundary(
+    tmp_path, monkeypatch,
+):
+    with pytest.raises(ValueError, match="exceed the limit"):
+        manage.ManageRuntime(
+            [str(tmp_path)],
+            provider_snapshots=[
+                extension_snapshot(provider_id="ext-{}".format(index))
+                for index in range(manage.MAX_EXTENSION_PROVIDER_SNAPSHOTS + 1)
+            ],
+        )
+    with pytest.raises(ValueError, match="duplicate"):
+        manage.ManageRuntime(
+            [str(tmp_path)],
+            provider_snapshots=[extension_snapshot(), extension_snapshot()],
+        )
+    broken = extension_snapshot(provider_id="broken-ext")
+    object.__setattr__(broken, "status", "broken")
+    with pytest.raises(ValueError, match="snapshot is invalid"):
+        manage.ManageRuntime([str(tmp_path)], provider_snapshots=[broken])
+    with pytest.raises(ValueError, match="mapping is invalid"):
+        manage.ManageRuntime(
+            [str(tmp_path)],
+            provider_snapshots={"other-ext": extension_snapshot()},
+        )
+    with pytest.raises(ValueError, match="list, tuple, or dict"):
+        manage.ManageRuntime(
+            [str(tmp_path)], provider_snapshots=(item for item in ()),
+        )
+
+    monkeypatch.setattr(
+        manage,
+        "_copy_extension_provider_snapshot",
+        lambda _value: (_ for _ in ()).throw(SystemExit("secret")),
+    )
+    with pytest.raises(ValueError, match="snapshot is invalid") as error:
+        manage.ManageRuntime(
+            [str(tmp_path)], provider_snapshots=[extension_snapshot()],
+        )
+    assert "secret" not in str(error.value)
+
+
+def test_prepare_and_ensure_forward_snapshots_without_reprocessing_existing_runtime(
+    tmp_path,
+):
+    first_token = server.prepare_manage(
+        [str(tmp_path)], provider_snapshots=[extension_snapshot()],
+    )
+    assert first_token
+    first = manage.get_manage_runtime()
+    assert first is not None
+    assert any(
+        row["id"] == "preview-ext"
+        for row in first.provider_metadata()["providers"]
+    )
+    # ensure_manage must not touch a new snapshot argument while a runtime is
+    # already installed.
+    assert manage.ensure_manage(
+        [str(tmp_path)], provider_snapshots=object(),
+    ) is None
+
+    second_token = server.prepare_manage(
+        [str(tmp_path)],
+        provider_snapshots=[extension_snapshot(provider_id="second-ext")],
+    )
+    assert second_token and second_token != first_token
+    second = manage.get_manage_runtime()
+    assert second is not None and second is not first
+    assert any(
+        row["id"] == "second-ext"
+        for row in second.provider_metadata()["providers"]
+    )
+    with pytest.raises(manage.ManageError) as old_error:
+        first.verify_provider("preview-ext")
+    assert old_error.value.code == "provider_unsupported"
+
+
+def test_extension_browser_operations_are_stable_403_without_callbacks(
+    tmp_path, monkeypatch,
+):
+    calls = {"models": 0, "verify": 0, "conversation": 0, "popen": 0}
+
+    def forbidden(name):
+        def invoke(*_args, **_kwargs):
+            calls[name] += 1
+            raise AssertionError("extension callback executed")
+        return invoke
+
+    monkeypatch.setattr(manage, "list_models", forbidden("models"))
+    monkeypatch.setattr(manage, "_run_verify_argv", forbidden("verify"))
+    monkeypatch.setattr(manage, "UnifiedConversation", forbidden("conversation"))
+    monkeypatch.setattr(manage.subprocess, "Popen", forbidden("popen"))
+    token = server.prepare_manage(
+        [str(tmp_path)], provider_snapshots=[extension_snapshot()],
+    )
+
+    async def scenario():
+        async with client() as api:
+            exchanged = await bootstrap(api, token)
+            csrf = exchanged.json()["csrf_token"]
+            workspace_id = exchanged.json()["workspaces"][0]["id"]
+            headers = mutation_headers(csrf)
+            responses = [
+                await api.post(
+                    "/api/ui/v1/providers/preview-ext/verify",
+                    json={}, headers=headers,
+                ),
+                await api.post(
+                    "/api/ui/v1/providers/preview-ext/models",
+                    json={}, headers=headers,
+                ),
+                await api.post(
+                    "/api/ui/v1/chat",
+                    json={
+                        "provider": "preview-ext",
+                        "workspace_id": workspace_id,
+                        "permission": "read_only",
+                        "prompt": "hello",
+                    },
+                    headers=headers,
+                ),
+            ]
+            assert [response.status_code for response in responses] == [403, 403, 403]
+            assert [response.json()["error"]["code"] for response in responses] == [
+                "provider_unsupported", "provider_unsupported", "provider_unsupported",
+            ]
+
+    run(scenario())
+    assert calls == {"models": 0, "verify": 0, "conversation": 0, "popen": 0}
+
+
+@pytest.mark.parametrize("provider_id", ["bad\x00id", "x" * 10_000])
+def test_hostile_provider_operation_ids_fail_with_bounded_errors(
+    tmp_path, monkeypatch, provider_id,
+):
+    runtime = manage.ManageRuntime([str(tmp_path)])
+    calls = []
+    monkeypatch.setattr(
+        manage, "_run_verify_argv",
+        lambda *_args, **_kwargs: calls.append("verify"),
+    )
+    monkeypatch.setattr(
+        manage, "list_models",
+        lambda *_args, **_kwargs: calls.append("models"),
+    )
+    operations = (
+        (lambda: runtime.verify_provider(provider_id), "verify_unsupported"),
+        (lambda: runtime.provider_models(provider_id), "provider_unsupported"),
+        (lambda: runtime.start_chat({"provider": provider_id}, "owner"), "provider_forbidden"),
+    )
+    for operation, code in operations:
+        with pytest.raises(manage.ManageError) as error:
+            operation()
+        assert error.value.status_code == 403
+        assert error.value.code == code
+        assert len(error.value.message) <= 100
+        assert provider_id not in error.value.message
+    assert calls == []
+
+
+def test_disabled_old_runtime_cannot_start_core_or_mutate_local_state(
+    tmp_path, monkeypatch,
+):
+    runtime = manage.ManageRuntime(
+        [str(tmp_path)], provider_snapshots=[extension_snapshot()],
+    )
+    token = runtime.issue_bootstrap()
+    _payload, cookie = runtime.bootstrap(
+        supplied_token=token, supplied_csrf=None, cookie=None,
+        peer_key="127.0.0.1",
+    )
+    owner = runtime.authenticate(cookie, rate=False)
+    runtime.session_manager = session_manager.SessionManager(
+        settings.SETTINGS_DIR / "disabled-sessions.json"
+    )
+    runtime.session_manager.upsert(
+        provider="preview-ext", session_id="native-ext-session",
+        model="preview-model", cwd=str(tmp_path), name="before",
+    )
+    handle = runtime.list_sessions()["sessions"][0]["id"]
+    chat = runtime.start_chat({
+        "provider": "claude",
+        "workspace_id": runtime.workspaces[0].id,
+        "permission": "read_only",
+        "prompt": "hello",
+    }, owner.key)
+    callbacks = []
+    writes = []
+    monkeypatch.setattr(
+        runtime, "_conversation_for_chat",
+        lambda _chat: callbacks.append("conversation") or pytest.fail(
+            "disabled runtime created a provider conversation"
+        ),
+    )
+    monkeypatch.setattr(
+        manage, "_decode_data_image",
+        lambda _value: callbacks.append("image") or pytest.fail(
+            "disabled runtime decoded an image"
+        ),
+    )
+    monkeypatch.setattr(
+        manage, "save_settings", lambda _settings: writes.append("settings"),
+    )
+
+    runtime.disable()
+    for operation in (
+        runtime.provider_metadata,
+        runtime.list_sessions,
+        runtime.usage_snapshot,
+        runtime.issue_bootstrap,
+        lambda: runtime.bootstrap(
+            supplied_token=None, supplied_csrf=owner.csrf_token,
+            cookie=cookie, peer_key="127.0.0.1",
+        ),
+        lambda: runtime.patch_settings({"theme": "dark"}),
+        lambda: runtime.patch_session(handle, {"name": "after"}),
+        lambda: runtime.delete_session(handle),
+        lambda: runtime.cancel_chat(chat.id, owner.key),
+        lambda: runtime.start_chat({
+            "provider": "claude",
+            "workspace_id": runtime.workspaces[0].id,
+            "permission": "read_only",
+            "prompt": "again",
+            "images": ["data:image/png;base64,ignored"],
+        }, owner.key),
+        lambda: next(runtime.stream_chat(chat)),
+    ):
+        with pytest.raises(manage.ManageError) as error:
+            operation()
+        assert error.value.status_code == 503
+        assert error.value.code == "manage_disabled"
+    assert callbacks == []
+    assert writes == []
+    assert runtime.session_manager.list(include_archived=True)[0].name == "before"
+
+    for operation in (
+        lambda: runtime.verify_provider("preview-ext"),
+        lambda: runtime.provider_models("preview-ext"),
+        lambda: runtime.start_chat({"provider": "preview-ext"}, owner.key),
+    ):
+        with pytest.raises(manage.ManageError) as error:
+            operation()
+        assert error.value.status_code == 403
+        assert error.value.code == "provider_unsupported"
+
+
+def test_session_patch_validates_all_fields_before_rename(tmp_path):
+    runtime = manage.ManageRuntime([str(tmp_path)])
+    runtime.session_manager = session_manager.SessionManager(
+        settings.SETTINGS_DIR / "atomic-sessions.json"
+    )
+    runtime.session_manager.upsert(
+        provider="preview-ext", session_id="native-ext-session",
+        model="preview-model", cwd=str(tmp_path), name="before",
+    )
+    handle = runtime.list_sessions()["sessions"][0]["id"]
+    with pytest.raises(manage.ManageError) as error:
+        runtime.patch_session(handle, {"name": "after", "archived": "yes"})
+    assert error.value.code == "invalid_session"
+    record = runtime.session_manager.list(include_archived=True)[0]
+    assert record.name == "before"
+    assert record.archived is False
 
 
 def test_model_discovery_is_an_explicit_same_origin_mutation(tmp_path, monkeypatch):
