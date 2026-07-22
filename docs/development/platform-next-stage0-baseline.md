@@ -93,6 +93,28 @@ excluded. `unified-cli --version` is timed outside the process and therefore
 includes executable and interpreter startup; its implementation has a dedicated
 fast path that avoids parser construction and provider discovery.
 
+## Portable gate host references
+
+The offline performance gate keeps the Stage 0 Core import and version values
+above as its code baselines. On 2026-07-22, three sequential runs of the gate at
+integration commit `bd616c2` recorded process-startup p95 values of 30.605,
+29.130, and 30.355 ms and Ext import p95 values of 53.486, 50.740, and 52.066
+ms. The medians of those run-level statistics, 30.355 and 52.066 ms, are the
+versioned host references in `scripts/performance-baseline-v1.json`.
+
+For a reference metric `r`, the gate computes only its positive host delta,
+`d(r) = max(0, observed(r) - baseline(r))`. Core version uses the sum of the
+process-startup and Core-import deltas. The passive Ext registry uses the
+minimum of the Core- and Ext-import deltas, so a regression in only one import
+path cannot enlarge its allowance. A target passes when
+`observed(target) - host_adjustment <= policy_threshold`; the JSON result keeps
+the effective raw threshold and reports the adjustment, normalized observation,
+policy threshold, and per-reference deltas under `details.host_normalization`.
+
+Every reference remains an independent hard gate. Host normalization therefore
+removes shared platform cost without turning a slow reference or target into an
+automatic pass.
+
 ## REPL first-prompt baseline: pending
 
 The relevant measure is wall time from invoking `unified-cli repl` in a real TTY
