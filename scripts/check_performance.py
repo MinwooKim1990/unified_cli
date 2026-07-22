@@ -11,21 +11,25 @@ gate.  The only executable exercised as a provider is the repository fixture.
 from __future__ import annotations
 
 import argparse
+import ast
 import errno
+import hashlib
 import json
 import math
 import os
 import pty
 import select
 import signal
+import stat
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 
 SCHEMA_VERSION = 1
@@ -35,7 +39,6 @@ CORE_VERSION = "0.5.0"
 EXT_VERSION = "0.1.0"
 _METRIC_NAMES = (
     "calibration_process_startup",
-    "calibration_import_workload",
     "core_import",
     "core_version",
     "ext_import",
@@ -45,25 +48,20 @@ _METRIC_NAMES = (
     "repl_first_prompt",
     "stream_relay",
 )
-_LEGACY_METRIC_NAMES = tuple(
-    name for name in _METRIC_NAMES
-    if name != "calibration_import_workload"
-)
 _NORMALIZED_METRICS = frozenset({
     "core_import", "core_version", "ext_passive_registry",
 })
-_CALIBRATION_PROFILE_MODULES = {
-    "core_import": 420,
-    "core_version": 500,
-    "ext_passive_registry": 720,
-}
-_CALIBRATION_VALUE_BY_TARGET = {
-    "core_import": "inner_ms",
-    "core_version": "process_ms",
-    "ext_passive_registry": "inner_ms",
-}
-_CALIBRATION_PACKAGE = "_unified_perf_import_calibration_v1"
-_CALIBRATION_SENTINEL_MODULUS = 1_000_000_007
+REFERENCE_SHA = "be1478884735c862e894959944ba53e149ea4210"
+REFERENCE_SOURCE_TREE_DIGEST = (
+    "7f21edae7ab640afb342261ef4092586101edc9549661e391032ce6906fc04f4"
+)
+SOURCE_TREE_DIGEST_ALGORITHM = "sha256-path-content-v1"
+SOURCE_TREES = (
+    "src/unified_cli",
+    "packages/unified-cli-ext/src/unified_cli_ext",
+)
+_CORE_ANCHORS = {"core_import": 48.606, "core_version": 94.635}
+_REGISTRY_ANCHOR = 195.661
 _CREDENTIAL_MARKERS = (
     "API_KEY",
     "ACCESS_TOKEN",
@@ -82,6 +80,22 @@ class PerformanceConfigError(ValueError):
 
 class MeasurementError(RuntimeError):
     """A benchmark could not prove its offline contract."""
+
+
+@dataclass(frozen=True)
+class _ManifestEntry:
+    """One immutable source-tree directory or regular-file payload."""
+
+    relative: str
+    payload: Optional[bytes]
+
+
+@dataclass(frozen=True)
+class SourceManifest:
+    """Source bytes captured once by the parent before any measured child."""
+
+    entries: Tuple[_ManifestEntry, ...]
+    digest: str
 
 
 def _exact_number(value: object, label: str, *, positive: bool = True) -> float:
@@ -104,7 +118,7 @@ def load_config(path: Path) -> Dict[str, Any]:
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise PerformanceConfigError("performance baseline is not valid JSON") from exc
     if type(data) is not dict or set(data) != {
-        "baseline_id", "baseline_source", "metrics", "schema_version",
+        "baseline_id", "baseline_source", "metrics", "reference", "schema_version",
     }:
         raise PerformanceConfigError("performance baseline has an invalid top-level shape")
     if (
@@ -116,25 +130,31 @@ def load_config(path: Path) -> Dict[str, Any]:
         raise PerformanceConfigError("performance baseline id is invalid")
     if type(data["baseline_source"]) is not str or not data["baseline_source"].strip():
         raise PerformanceConfigError("performance baseline source is invalid")
+    reference = data["reference"]
+    if type(reference) is not dict or set(reference) != {
+        "digest_algorithm", "sha", "source_tree_digest", "source_trees",
+    }:
+        raise PerformanceConfigError("performance reference is invalid")
+    if reference["sha"] != REFERENCE_SHA:
+        raise PerformanceConfigError("performance reference SHA is invalid")
+    if reference["digest_algorithm"] != SOURCE_TREE_DIGEST_ALGORITHM:
+        raise PerformanceConfigError("performance reference digest algorithm is invalid")
+    if reference["source_trees"] != list(SOURCE_TREES):
+        raise PerformanceConfigError("performance reference source trees are invalid")
+    digest = reference["source_tree_digest"]
+    if digest != REFERENCE_SOURCE_TREE_DIGEST:
+        raise PerformanceConfigError("performance reference digest is invalid")
     metrics = data["metrics"]
-    if type(metrics) is not dict:
-        raise PerformanceConfigError("performance baseline metric set is incomplete")
-    metric_names = frozenset(metrics)
-    legacy = metric_names == frozenset(_LEGACY_METRIC_NAMES)
-    if not legacy and metric_names != frozenset(_METRIC_NAMES):
+    if type(metrics) is not dict or frozenset(metrics) != frozenset(_METRIC_NAMES):
         raise PerformanceConfigError("performance baseline metric set is incomplete")
 
     for name in _METRIC_NAMES:
-        if name not in metrics:
-            continue
         metric = metrics[name]
         required = {"samples", "statistic", "threshold", "warmups"}
         allowed = set(required)
         if name in {"core_import", "core_version"}:
             allowed.add("baseline_milliseconds")
-        if not legacy and name == "calibration_import_workload":
-            allowed.update({"baseline_milliseconds", "profile"})
-        if not legacy and name in _NORMALIZED_METRICS:
+        if name in _NORMALIZED_METRICS:
             allowed.add("normalization")
         if type(metric) is not dict or set(metric) != allowed:
             raise PerformanceConfigError(name + " has an invalid shape")
@@ -176,60 +196,51 @@ def load_config(path: Path) -> Dict[str, Any]:
         if "baseline_milliseconds" in metric:
             _exact_number(metric["baseline_milliseconds"], name + " baseline")
 
-        if legacy:
-            continue
-        if name == "calibration_import_workload":
-            if kind != "fixed":
-                raise PerformanceConfigError(name + " threshold must be fixed")
-            if metric["profile"] != "core_import":
-                raise PerformanceConfigError(name + " profile is invalid")
-            if float(threshold["milliseconds"]) != (
-                float(metric["baseline_milliseconds"]) + 50.0
-            ):
-                raise PerformanceConfigError(name + " validity envelope is invalid")
         if name in _NORMALIZED_METRICS:
             normalization = metric["normalization"]
             if type(normalization) is not dict or set(normalization) != {
-                "baseline_milliseconds",
-                "calibration_value",
+                "anchor_milliseconds",
                 "kind",
-                "max_adjustment_milliseconds",
-                "max_calibration_milliseconds",
-                "profile",
+                "metric",
             }:
                 raise PerformanceConfigError(name + " normalization is invalid")
-            if normalization["kind"] != "paired_import_bracket":
+            if normalization["kind"] != "paired_same_metric_reference":
                 raise PerformanceConfigError(name + " normalization kind is unsupported")
-            if normalization["profile"] != name:
-                raise PerformanceConfigError(name + " normalization profile is invalid")
-            if normalization["calibration_value"] != _CALIBRATION_VALUE_BY_TARGET[name]:
-                raise PerformanceConfigError(name + " calibration value is invalid")
-            baseline = _exact_number(
-                normalization["baseline_milliseconds"],
-                name + " calibration baseline",
+            if normalization["metric"] != name:
+                raise PerformanceConfigError(name + " reference metric is invalid")
+            anchor = _exact_number(
+                normalization["anchor_milliseconds"], name + " reference anchor",
             )
-            maximum = _exact_number(
-                normalization["max_calibration_milliseconds"],
-                name + " calibration maximum",
-            )
-            adjustment = _exact_number(
-                normalization["max_adjustment_milliseconds"],
-                name + " maximum adjustment",
-            )
-            if maximum != baseline + 50.0 or adjustment != 50.0:
-                raise PerformanceConfigError(name + " calibration envelope is invalid")
-    if not legacy:
-        calibration = metrics["calibration_import_workload"]
-        core_normalization = metrics["core_import"]["normalization"]
+            if name in _CORE_ANCHORS and anchor != _CORE_ANCHORS[name]:
+                raise PerformanceConfigError(name + " reference anchor is invalid")
+            if name == "ext_passive_registry" and anchor != _REGISTRY_ANCHOR:
+                raise PerformanceConfigError(name + " reference anchor is invalid")
+    for name, anchor in _CORE_ANCHORS.items():
+        metric = metrics[name]
+        if metric["baseline_milliseconds"] != anchor or metric["threshold"] != {
+            "absolute_slack_milliseconds": 50.0,
+            "kind": "baseline_regression",
+            "relative_slack": 0.1,
+        }:
+            raise PerformanceConfigError(name + " policy is invalid")
+    if metrics["ext_passive_registry"]["threshold"] != {
+        "kind": "fixed", "milliseconds": 250.0,
+    }:
+        raise PerformanceConfigError("ext_passive_registry policy is invalid")
+    expected_shapes = {
+        "core_import": (15, "median", 3),
+        "core_version": (15, "median", 3),
+        "ext_passive_registry": (61, "p95", 3),
+        "repl_first_prompt": (31, "p95", 3),
+    }
+    for name, (samples, statistic, warmups) in expected_shapes.items():
+        metric = metrics[name]
         if (
-            calibration["baseline_milliseconds"]
-            != core_normalization["baseline_milliseconds"]
-            or calibration["threshold"]["milliseconds"]
-            != core_normalization["max_calibration_milliseconds"]
+            metric["samples"] != samples
+            or metric["statistic"] != statistic
+            or metric["warmups"] != warmups
         ):
-            raise PerformanceConfigError(
-                "standalone import calibration does not match Core normalization"
-            )
+            raise PerformanceConfigError(name + " sampling policy is invalid")
     return data
 
 
@@ -281,7 +292,8 @@ def summarize(
     *,
     raw_median: Optional[float] = None,
     details: Optional[Mapping[str, Any]] = None,
-    normalization_adjustments: Optional[Sequence[float]] = None,
+    reference_before: Optional[Sequence[float]] = None,
+    reference_after: Optional[Sequence[float]] = None,
 ) -> Dict[str, Any]:
     if len(samples) != metric["samples"] or any(
         not math.isfinite(value) or value < 0 for value in samples
@@ -292,58 +304,61 @@ def summarize(
     statistic = metric["statistic"]
     observed = _observed(samples, metric)
     policy_limit = _threshold(metric, raw_median=raw_median)
-    adjustment = 0.0
     normalization_details: Optional[Dict[str, Any]] = None
     normalization = metric.get("normalization")
     if normalization is not None:
         if (
-            normalization_adjustments is None
-            or len(normalization_adjustments) != len(samples)
+            reference_before is None
+            or reference_after is None
+            or len(reference_before) != len(samples)
+            or len(reference_after) != len(samples)
             or any(
-                not math.isfinite(value)
-                or value < 0
-                or value > normalization["max_adjustment_milliseconds"]
-                for value in normalization_adjustments
+                not math.isfinite(value) or value < 0
+                for value in (*reference_before, *reference_after)
             )
         ):
-            raise MeasurementError("paired host normalization is invalid")
+            raise MeasurementError("paired reference normalization is invalid")
+        anchor = float(normalization["anchor_milliseconds"])
+        adjustments = [
+            max(0.0, min(before, after) - anchor)
+            for before, after in zip(reference_before, reference_after)
+        ]
         normalized_samples = [
             max(0.0, sample - delta)
-            for sample, delta in zip(samples, normalization_adjustments)
+            for sample, delta in zip(samples, adjustments)
         ]
         normalized_observed = _observed(normalized_samples, metric)
-        adjustment = observed - normalized_observed
-        if not math.isfinite(adjustment) or adjustment < 0:
-            raise MeasurementError("paired host normalization is invalid")
         normalization_details = {
-            "adjustment_ms": _rounded(adjustment),
+            "anchor_ms": _rounded(anchor),
             "kind": normalization["kind"],
             "normalized_observed_ms": _rounded(normalized_observed),
             "normalized_samples_ms": [
                 _rounded(value) for value in normalized_samples
             ],
             "paired_adjustments_ms": [
-                _rounded(value) for value in normalization_adjustments
+                _rounded(value) for value in adjustments
             ],
             "policy_threshold_ms": _rounded(policy_limit),
+            "reference_after_ms": [_rounded(value) for value in reference_after],
+            "reference_before_ms": [_rounded(value) for value in reference_before],
         }
-    elif normalization_adjustments is not None:
-        raise MeasurementError("unexpected host normalization adjustments")
-    limit = policy_limit + adjustment
-    if not math.isfinite(limit):
-        raise MeasurementError("host-normalized threshold is invalid")
+        comparison_observed = normalized_observed
+    elif reference_before is not None or reference_after is not None:
+        raise MeasurementError("unexpected reference samples")
+    else:
+        comparison_observed = observed
     result: Dict[str, Any] = {
         "median_ms": _rounded(median),
         "observed_ms": _rounded(observed),
         "p95_ms": _rounded(p95),
-        "passed": observed <= limit,
+        "passed": comparison_observed <= policy_limit,
         "samples_ms": [_rounded(value) for value in samples],
         "statistic": statistic,
-        "threshold_ms": _rounded(limit),
+        "threshold_ms": _rounded(policy_limit),
     }
     result_details = dict(details or {})
     if normalization_details is not None:
-        result_details["host_normalization"] = normalization_details
+        result_details["reference_normalization"] = normalization_details
     if result_details:
         result["details"] = result_details
     return result
@@ -364,6 +379,7 @@ import ssl
 import sys
 
 _real_socket = socket.socket
+_writing_marker = False
 
 def _offline(*args, **kwargs):
     raise RuntimeError("network disabled by performance harness")
@@ -379,28 +395,72 @@ socket.getaddrinfo = _offline
 ssl.wrap_socket = _offline
 
 def _mark(kind, detail):
+    global _writing_marker
     marker = os.environ.get("UNIFIED_PERF_GUARD_MARKER")
-    if marker:
+    if marker and not _writing_marker:
+        _writing_marker = True
         try:
             with open(marker, "a", encoding="utf-8") as handle:
                 handle.write(kind + ":" + os.path.basename(str(detail)) + "\\n")
         except OSError:
             pass
+        finally:
+            _writing_marker = False
+
+def _mutation_detail(event, args):
+    if event == "open":
+        path = args[0] if args else "unknown"
+        mode = args[1] if len(args) > 1 else None
+        flags = args[2] if len(args) > 2 else 0
+        write_flags = (
+            os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC
+        )
+        if hasattr(os, "O_TMPFILE"):
+            write_flags |= os.O_TMPFILE
+        writes = (
+            isinstance(mode, str) and any(char in mode for char in "wax+")
+        ) or (isinstance(flags, int) and bool(flags & write_flags))
+        if writes:
+            return path
+        return None
+    mutation_events = {
+        "os.chdir", "os.chflags", "os.chmod", "os.chown", "os.fchdir",
+        "os.lchflags", "os.link", "os.mkdir", "os.mknod", "os.remove",
+        "os.removexattr", "os.rename", "os.replace", "os.rmdir",
+        "os.setxattr", "os.symlink", "os.truncate", "os.unlink", "os.utime",
+    }
+    if event in mutation_events:
+        return args[0] if args else "unknown"
+    return None
 
 def _audit(event, args):
-    if os.environ.get("UNIFIED_PERF_FORBID_SUBPROCESSES") != "1":
+    if _writing_marker:
         return
-    if event == "subprocess.Popen":
-        executable = args[0] if args else "unknown"
-    elif event in {"os.exec", "os.posix_spawn", "os.spawn", "os.system", "pty.spawn"}:
-        executable = args[0] if args else "unknown"
-    else:
-        return
-    allowed = os.environ.get("UNIFIED_PERF_ALLOWED_EXECUTABLE")
-    if allowed and os.path.realpath(str(executable)) == os.path.realpath(allowed):
-        return
-    _mark("subprocess", executable)
-    raise RuntimeError("provider subprocess disabled by performance harness")
+    if os.environ.get("UNIFIED_PERF_FORBID_MUTATIONS") == "1":
+        detail = _mutation_detail(event, args)
+        if detail is not None:
+            _mark("mutation", detail)
+            raise RuntimeError("filesystem mutation disabled by performance harness")
+        if event in {"os.fork", "os.forkpty"}:
+            _mark("fork", event)
+            raise RuntimeError("fork disabled by performance harness")
+        if event == "import" and args and args[0] in {"ctypes", "_ctypes"}:
+            _mark("import", args[0])
+            raise RuntimeError("native audit bypass disabled by performance harness")
+    if os.environ.get("UNIFIED_PERF_FORBID_SUBPROCESSES") == "1":
+        if event == "subprocess.Popen":
+            executable = args[0] if args else "unknown"
+        elif event in {
+            "os.exec", "os.posix_spawn", "os.spawn", "os.system", "pty.spawn",
+        }:
+            executable = args[0] if args else "unknown"
+        else:
+            return
+        allowed = os.environ.get("UNIFIED_PERF_ALLOWED_EXECUTABLE")
+        if allowed and os.path.realpath(str(executable)) == os.path.realpath(allowed):
+            return
+        _mark("subprocess", executable)
+        raise RuntimeError("provider subprocess disabled by performance harness")
 
 sys.addaudithook(_audit)
 
@@ -443,67 +503,353 @@ sys.meta_path.insert(0, _ImportCanary())
     return marker
 
 
-def _calibration_sentinels() -> Dict[int, int]:
-    sentinels: Dict[int, int] = {}
-    for index in range(max(_CALIBRATION_PROFILE_MODULES.values())):
-        payload_total = sum(
-            ((index + 3) * (item + 5)) % 997 for item in range(96)
-        )
-        sentinels[index] = (payload_total + index) % _CALIBRATION_SENTINEL_MODULUS
-    return sentinels
-
-
-def _calibration_profile_sentinel(profile: str) -> int:
-    count = _CALIBRATION_PROFILE_MODULES[profile]
-    sentinels = _calibration_sentinels()
-    return sum(sentinels[index] for index in range(count)) % (
-        _CALIBRATION_SENTINEL_MODULUS
+def _excluded_source_path(path: Path) -> bool:
+    return (
+        "__pycache__" in path.parts
+        or path.suffix in {".pyc", ".pyo"}
+        or any(part.endswith((".egg-info", ".dist-info")) for part in path.parts)
     )
 
 
-def _write_import_calibration(directory: Path) -> None:
-    """Create a disposable pure-Python import DAG with deterministic sentinels."""
-    package = directory / _CALIBRATION_PACKAGE
-    package.mkdir(mode=0o700)
-    package.joinpath("__init__.py").write_text(
-        "WORKLOAD_VERSION = 1\n", encoding="utf-8",
-    )
-    sentinels = _calibration_sentinels()
-    for index, sentinel in sentinels.items():
-        source = f'''\
-_PAYLOAD = tuple((({index} + 3) * (item + 5)) % 997 for item in range(96))
+def _manifest_digest(entries: Sequence[_ManifestEntry]) -> str:
+    digest = hashlib.sha256()
+    consumed = set()
+    for source_tree in SOURCE_TREES:
+        prefix = source_tree + "/"
+        bucket = [
+            entry for entry in entries
+            if entry.relative == source_tree or entry.relative.startswith(prefix)
+        ]
+        for entry in sorted(bucket, key=lambda item: item.relative):
+            consumed.add(entry.relative)
+            encoded = entry.relative.encode("utf-8")
+            if entry.payload is None:
+                digest.update(b"D\0" + encoded + b"\0")
+            else:
+                digest.update(
+                    b"F\0" + encoded + b"\0"
+                    + str(len(entry.payload)).encode("ascii") + b"\0"
+                    + entry.payload
+                )
+    if len(consumed) != len(entries):
+        raise MeasurementError("source manifest contains an undeclared path")
+    return digest.hexdigest()
 
-class CalibrationNode:
-    __slots__ = ("value",)
-    def __init__(self, value):
-        self.value = value
 
-def fold_payload():
-    return sum(_PAYLOAD)
-
-SENTINEL = (
-    fold_payload() + {index}
-) % {_CALIBRATION_SENTINEL_MODULUS}
-assert SENTINEL == {sentinel}
-'''
-        package.joinpath(f"leaf_{index:03d}.py").write_text(
-            source, encoding="utf-8",
+def _read_regular_file(directory_fd: int, name: str, expected: os.stat_result) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        file_fd = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise MeasurementError("source tree changed while it was inspected") from exc
+    try:
+        before = os.fstat(file_fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (before.st_dev, before.st_ino) != (expected.st_dev, expected.st_ino)
+        ):
+            raise MeasurementError("source tree contains a special file")
+        chunks: List[bytes] = []
+        while True:
+            chunk = os.read(file_fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(file_fd)
+        stable_fields = (
+            "st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns",
         )
-    for profile, count in _CALIBRATION_PROFILE_MODULES.items():
-        names = [f"leaf_{index:03d}" for index in range(count)]
-        imports = "\n".join(f"    {name}," for name in names)
-        values = "\n".join(f"    {name}.SENTINEL," for name in names)
-        expected = _calibration_profile_sentinel(profile)
-        package.joinpath(f"profile_{profile}.py").write_text(f'''\
-from . import (
-{imports}
-)
+        if any(getattr(before, field) != getattr(after, field) for field in stable_fields):
+            raise MeasurementError("source tree changed while it was inspected")
+        payload = b"".join(chunks)
+        if len(payload) != before.st_size:
+            raise MeasurementError("source tree changed while it was inspected")
+        return payload
+    finally:
+        os.close(file_fd)
 
-SENTINEL = sum((
-{values}
-)) % {_CALIBRATION_SENTINEL_MODULUS}
-assert SENTINEL == {expected}
-''', encoding="utf-8")
+
+def _open_directory(directory_fd: int, name: str, expected: os.stat_result) -> int:
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        child_fd = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise MeasurementError("source tree changed while it was inspected") from exc
+    observed = os.fstat(child_fd)
+    if (
+        not stat.S_ISDIR(observed.st_mode)
+        or (observed.st_dev, observed.st_ino) != (expected.st_dev, expected.st_ino)
+    ):
+        os.close(child_fd)
+        raise MeasurementError("source tree contains a special file")
+    return child_fd
+
+
+def _scan_manifest_directory(
+    directory_fd: int,
+    relative: str,
+    entries: List[_ManifestEntry],
+    *,
+    include: bool,
+) -> None:
+    if include:
+        entries.append(_ManifestEntry(relative, None))
+    try:
+        with os.scandir(directory_fd) as iterator:
+            children = sorted(iterator, key=lambda item: item.name)
+    except OSError as exc:
+        raise MeasurementError("source tree is unreadable") from exc
+    for child in children:
+        child_relative = relative + "/" + child.name
+        try:
+            observed = child.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise MeasurementError("source tree changed while it was inspected") from exc
+        if stat.S_ISLNK(observed.st_mode):
+            raise MeasurementError("source tree contains a symlink")
+        excluded = _excluded_source_path(Path(child_relative))
+        if stat.S_ISDIR(observed.st_mode):
+            child_fd = _open_directory(directory_fd, child.name, observed)
+            try:
+                _scan_manifest_directory(
+                    child_fd,
+                    child_relative,
+                    entries,
+                    include=include and not excluded,
+                )
+            finally:
+                os.close(child_fd)
+        elif stat.S_ISREG(observed.st_mode):
+            payload = _read_regular_file(directory_fd, child.name, observed)
+            if include and not excluded:
+                entries.append(_ManifestEntry(child_relative, payload))
+        else:
+            raise MeasurementError("source tree contains a special file")
+
+
+def _read_source_manifest(root: Path) -> SourceManifest:
+    """Capture verified bytes using no-follow descriptor-relative traversal."""
+    root = root.absolute()
+    try:
+        root_lstat = os.lstat(root)
+    except OSError as exc:
+        raise MeasurementError("source root is missing or unreadable") from exc
+    if stat.S_ISLNK(root_lstat.st_mode) or not stat.S_ISDIR(root_lstat.st_mode):
+        raise MeasurementError("source root is not a real directory")
+    if root.resolve() != root:
+        raise MeasurementError("source root is not a real directory")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    try:
+        root_fd = os.open(str(root), flags)
+    except OSError as exc:
+        raise MeasurementError("source root is missing or unreadable") from exc
+    entries: List[_ManifestEntry] = []
+    try:
+        opened_root = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(opened_root.st_mode)
+            or (opened_root.st_dev, opened_root.st_ino)
+            != (root_lstat.st_dev, root_lstat.st_ino)
+        ):
+            raise MeasurementError("source root changed while it was inspected")
+        for relative in SOURCE_TREES:
+            current_fd = os.dup(root_fd)
+            try:
+                for component in relative.split("/"):
+                    try:
+                        observed = os.stat(
+                            component, dir_fd=current_fd, follow_symlinks=False,
+                        )
+                    except OSError as exc:
+                        raise MeasurementError("source tree is missing or unreadable") from exc
+                    if stat.S_ISLNK(observed.st_mode):
+                        raise MeasurementError("source tree is missing or symlinked")
+                    next_fd = _open_directory(current_fd, component, observed)
+                    os.close(current_fd)
+                    current_fd = next_fd
+                _scan_manifest_directory(
+                    current_fd, relative, entries, include=True,
+                )
+            finally:
+                os.close(current_fd)
+    finally:
+        os.close(root_fd)
+    manifest = SourceManifest(tuple(entries), _manifest_digest(entries))
+    _require_manifest_version(
+        manifest, "src/unified_cli/__init__.py", CORE_VERSION,
+    )
+    _require_manifest_version(
+        manifest,
+        "packages/unified-cli-ext/src/unified_cli_ext/__init__.py",
+        EXT_VERSION,
+    )
+    return manifest
+
+
+def _require_manifest_version(
+    manifest: SourceManifest, relative: str, expected: str,
+) -> None:
+    payload = next(
+        (entry.payload for entry in manifest.entries if entry.relative == relative),
+        None,
+    )
+    if payload is None:
+        raise MeasurementError("source version proof failed")
+    try:
+        module = ast.parse(payload.decode("utf-8"))
+    except (SyntaxError, UnicodeError) as exc:
+        raise MeasurementError("source version proof failed") from exc
+    versions = [
+        node.value.value
+        for node in module.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "__version__"
+            for target in node.targets
+        )
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    ]
+    if versions != [expected]:
+        raise MeasurementError("source version proof failed")
+
+
+def source_tree_digest(root: Path) -> str:
+    """Hash sorted POSIX paths and file bytes from the two versioned trees.
+
+    ``sha256-path-content-v1`` writes ``D\\0<path>\\0`` for directories and
+    ``F\\0<path>\\0<size>\\0<bytes>`` for regular files. Cache/bytecode and
+    packaging metadata directories are excluded from both hashing and copying.
+    """
+    return _read_source_manifest(root).digest
+
+
+def _safe_source_tree(root: Path) -> Path:
+    """Compatibility validator backed by the descriptor-safe manifest reader."""
+    _read_source_manifest(root)
+    return root.absolute()
+
+
+def _reference_head_sha(root: Path) -> str:
+    marker = root / ".git"
+    if marker.is_symlink():
+        raise MeasurementError("reference Git metadata is symlinked")
+    if marker.is_dir():
+        git_dir = marker.resolve()
+    elif marker.is_file():
+        try:
+            declaration = marker.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError) as exc:
+            raise MeasurementError("reference Git metadata is unreadable") from exc
+        if not declaration.startswith("gitdir: "):
+            raise MeasurementError("reference Git metadata is malformed")
+        git_dir = Path(declaration[8:])
+        if not git_dir.is_absolute():
+            git_dir = marker.parent / git_dir
+        if git_dir.is_symlink() or not git_dir.is_dir():
+            raise MeasurementError("reference Git directory is invalid")
+        git_dir = git_dir.resolve()
+    else:
+        raise MeasurementError("reference Git metadata is missing")
+    head = git_dir / "HEAD"
+    if head.is_symlink() or not head.is_file():
+        raise MeasurementError("reference HEAD proof is missing")
+    try:
+        value = head.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as exc:
+        raise MeasurementError("reference HEAD proof is unreadable") from exc
+    if (
+        len(value) != 40
+        or any(char not in "0123456789abcdef" for char in value)
+    ):
+        raise MeasurementError("reference checkout is not at a detached full SHA")
+    return value
+
+
+def _validate_reference_manifest(
+    root: Path, *, expected_sha: str, expected_digest: str,
+) -> SourceManifest:
+    """Validate explicit expectations and retain the exact verified bytes."""
+    root = root.absolute()
+    if _reference_head_sha(root) != expected_sha:
+        raise MeasurementError("reference checkout SHA mismatch")
+    manifest = _read_source_manifest(root)
+    if manifest.digest != expected_digest:
+        raise MeasurementError("reference source-tree digest mismatch")
+    return manifest
+
+
+def load_reference_manifest(
+    root: Path, config: Mapping[str, Any],
+) -> SourceManifest:
+    reference = config["reference"]
+    return _validate_reference_manifest(
+        root,
+        expected_sha=reference["sha"],
+        expected_digest=reference["source_tree_digest"],
+    )
+
+
+def validate_reference_root(root: Path, config: Mapping[str, Any]) -> Path:
+    load_reference_manifest(root, config)
+    return root.absolute()
+
+
+def _materialize_manifest(
+    manifest: SourceManifest, destination: Path, *, registry: bool = False,
+) -> Path:
+    if destination.exists():
+        raise MeasurementError("sanitized source destination already exists")
+    try:
+        destination.mkdir(mode=0o700)
+        for entry in manifest.entries:
+            relative = entry.relative
+            if registry:
+                mapped: Optional[str] = None
+                for source_tree in SOURCE_TREES:
+                    if relative == source_tree:
+                        mapped = Path(source_tree).name
+                        break
+                    prefix = source_tree + "/"
+                    if relative.startswith(prefix):
+                        mapped = Path(source_tree).name + "/" + relative[len(prefix):]
+                        break
+                if mapped is None:
+                    continue
+                relative = mapped
+            target = destination / relative
+            if entry.payload is None:
+                target.mkdir(mode=0o700, parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                file_fd = os.open(str(target), flags, 0o600)
+                try:
+                    view = memoryview(entry.payload)
+                    while view:
+                        written = os.write(file_fd, view)
+                        if written <= 0:
+                            raise OSError("short write")
+                        view = view[written:]
+                finally:
+                    os.close(file_fd)
+    except OSError as exc:
+        raise MeasurementError("could not create sanitized source tree") from exc
+    return destination.resolve()
+
+
+def _build_registry_sandbox(root: Path, destination: Path) -> Path:
+    return _materialize_manifest(
+        _read_source_manifest(root), destination, registry=True,
+    )
 
 
 @contextmanager
@@ -514,24 +860,30 @@ def isolated_environment(root: Path = ROOT) -> Iterator[Tuple[Dict[str, str], Pa
         home = base / "home"
         tmp = base / "tmp"
         binaries = base / "bin"
+        child_cwd = base / "empty-cwd"
         guard = base / "guard"
         workspace = base / "workspace"
-        calibration = base / "import-calibration"
-        for directory in (home, tmp, binaries, guard, workspace, calibration):
+        for directory in (home, tmp, binaries, child_cwd, guard, workspace):
             directory.mkdir(mode=0o700)
         marker = _write_guard(guard)
-        _write_import_calibration(calibration)
         source = root / "tests" / "fixtures" / "core_provider_cli.py"
         fixture = binaries / "fixture-provider-cli"
         payload = source.read_text(encoding="utf-8")
         payload = payload.replace("#!/usr/bin/env python3", "#!" + sys.executable, 1)
         fixture.write_text(payload, encoding="utf-8")
         fixture.chmod(0o700)
-        python_path = os.pathsep.join((
-            str(guard),
-            str(root / "src"),
-            str(root / "packages" / "unified-cli-ext" / "src"),
-        ))
+        runtime_paths = []
+        for item in sys.path:
+            if not item:
+                continue
+            candidate = Path(item).resolve()
+            parts = set(candidate.parts)
+            if (
+                candidate.is_dir()
+                and ("site-packages" in parts or "dist-packages" in parts)
+                and str(candidate) not in runtime_paths
+            ):
+                runtime_paths.append(str(candidate))
         env = {
             "COLUMNS": "100",
             "HOME": str(home),
@@ -541,17 +893,15 @@ def isolated_environment(root: Path = ROOT) -> Iterator[Tuple[Dict[str, str], Pa
             "NO_COLOR": "1",
             "PATH": str(binaries),
             "PROMPT_TOOLKIT_NO_CPR": "1",
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PYTHONHASHSEED": "0",
-            "PYTHONNOUSERSITE": "1",
-            "PYTHONPATH": python_path,
             "TERM": "xterm-256color",
             "TMPDIR": str(tmp),
             "UNIFIED_CLI_DISABLE_PLUGINS": "1",
             "UNIFIED_CLI_LANG": "en",
+            "UNIFIED_PERF_EMPTY_CWD": str(child_cwd),
             "UNIFIED_PERF_GUARD_MARKER": str(marker),
-            "UNIFIED_PERF_IMPORT_CALIBRATION_ROOT": str(calibration),
-            "UNIFIED_PERF_REPOSITORY_ROOT": str(root.resolve()),
+            "UNIFIED_PERF_GUARD_ROOT": str(guard),
+            "UNIFIED_PERF_RUNTIME_PATHS": os.pathsep.join(runtime_paths),
+            "UNIFIED_PERF_WORKSPACE": str(workspace),
             "XDG_CACHE_HOME": str(home / ".cache"),
             "XDG_CONFIG_HOME": str(home / ".config"),
             "XDG_DATA_HOME": str(home / ".local" / "share"),
@@ -573,7 +923,7 @@ def _run(
     try:
         completed = subprocess.run(
             list(argv),
-            cwd=str(ROOT if cwd is None else cwd),
+            cwd=str(Path(env["UNIFIED_PERF_EMPTY_CWD"]) if cwd is None else cwd),
             env=dict(env),
             input=input_bytes,
             stdin=subprocess.DEVNULL if input_bytes is None else None,
@@ -604,6 +954,96 @@ def _json_output(payload: bytes) -> Any:
         raise MeasurementError("measurement subprocess returned malformed JSON") from exc
 
 
+def _distribution_inventory(
+    distributions: Sequence[Any],
+) -> Tuple[List[Tuple[Any, Any]], List[Tuple[Any, Any, Any, Any]]]:
+    """Return an exact inventory without the version-sensitive global EP API."""
+    packages = sorted(
+        (distribution.metadata.get("Name"), distribution.version)
+        for distribution in distributions
+    )
+    entry_points = sorted(
+        (
+            entry_point.group,
+            entry_point.name,
+            entry_point.value,
+            distribution.metadata.get("Name"),
+        )
+        for distribution in distributions
+        for entry_point in distribution.entry_points
+    )
+    return packages, entry_points
+
+
+_ISOLATED_BOOTSTRAP = r'''
+import importlib.util as _perf_importlib_util
+import os as _perf_os
+import sys as _perf_sys
+
+def _perf_bootstrap_within(parent, candidate):
+    try:
+        return _perf_os.path.commonpath((parent, candidate)) == parent
+    except ValueError:
+        return False
+
+_perf_base = _perf_os.path.realpath(_perf_sys.base_prefix)
+_perf_stdlib = []
+for _perf_entry in _perf_sys.path:
+    if not _perf_entry:
+        continue
+    _perf_candidate = _perf_os.path.realpath(_perf_entry)
+    _perf_parts = set(_perf_os.path.normpath(_perf_candidate).split(_perf_os.sep))
+    if not _perf_bootstrap_within(_perf_base, _perf_candidate):
+        continue
+    if "site-packages" in _perf_parts or "dist-packages" in _perf_parts:
+        continue
+    if _perf_candidate not in _perf_stdlib:
+        _perf_stdlib.append(_perf_candidate)
+assert _perf_stdlib
+_perf_sys.path[:] = _perf_stdlib
+
+_perf_guard_root = _perf_os.path.realpath(
+    _perf_os.environ["UNIFIED_PERF_GUARD_ROOT"]
+)
+_perf_guard_path = _perf_os.path.join(_perf_guard_root, "sitecustomize.py")
+_perf_guard_spec = _perf_importlib_util.spec_from_file_location(
+    "_unified_performance_guard", _perf_guard_path
+)
+assert _perf_guard_spec is not None and _perf_guard_spec.loader is not None
+_perf_guard_module = _perf_importlib_util.module_from_spec(_perf_guard_spec)
+_perf_sys.modules[_perf_guard_spec.name] = _perf_guard_module
+_perf_guard_spec.loader.exec_module(_perf_guard_module)
+
+_perf_sources = [
+    _perf_os.path.realpath(item)
+    for item in _perf_os.environ["UNIFIED_PERF_SOURCE_PATHS"].split(_perf_os.pathsep)
+    if item
+]
+_perf_runtime = []
+if _perf_os.environ.get("UNIFIED_PERF_REGISTRY_BOOTSTRAP") != "1":
+    _perf_runtime = [
+        _perf_os.path.realpath(item)
+        for item in _perf_os.environ.get("UNIFIED_PERF_RUNTIME_PATHS", "").split(
+            _perf_os.pathsep
+        )
+        if item
+    ]
+_perf_sys.path[:] = [_perf_guard_root] + _perf_stdlib + _perf_sources + _perf_runtime
+assert _perf_sys.path[0] == _perf_guard_root
+assert all(_perf_sys.path.index(_perf_guard_root) < _perf_sys.path.index(item)
+           for item in _perf_sources)
+assert _perf_os.path.realpath(_perf_os.getcwd()) == _perf_os.path.realpath(
+    _perf_os.environ["UNIFIED_PERF_EMPTY_CWD"]
+)
+assert not _perf_os.listdir(_perf_os.getcwd())
+'''
+
+
+def _python_argv(code: str) -> Tuple[str, ...]:
+    """Run all Python children through one isolated, absolute guard bootstrap."""
+    return (sys.executable, "-I", "-S", "-B", "-c", _ISOLATED_BOOTSTRAP + code)
+
+
 def _repeat_process(
     argv: Sequence[str],
     env: Mapping[str, str],
@@ -627,301 +1067,219 @@ def _repeat_process(
 def _assert_guard_marker_clear(marker: Path) -> None:
     if marker.exists():
         raise MeasurementError(
-            "startup path attempted a forbidden import or provider subprocess"
+            "startup path attempted a forbidden action"
         )
 
 
 def _measure_calibration(metric: Mapping[str, Any], env: Mapping[str, str]) -> List[float]:
-    return _repeat_process((sys.executable, "-c", "pass"), env, metric)
+    return _repeat_process(_python_argv("\npass\n"), env, metric)
 
 
-def _import_calibration_once(
-    env: Mapping[str, str], marker: Path, *, profile: str, value_name: str,
-) -> float:
-    count = _CALIBRATION_PROFILE_MODULES[profile]
-    module_name = _CALIBRATION_PACKAGE + ".profile_" + profile
-    expected_sentinel = _calibration_profile_sentinel(profile)
-    child_env = dict(env)
-    calibration_root = os.path.realpath(
-        env["UNIFIED_PERF_IMPORT_CALIBRATION_ROOT"]
-    )
-    child_env["PYTHONPATH"] = os.pathsep.join((
-        os.path.realpath(marker.parent),
-        calibration_root,
-    ))
-    child_env["UNIFIED_PERF_CALIBRATION_MODULE"] = module_name
-    child_env["UNIFIED_PERF_CALIBRATION_MODULE_COUNT"] = str(count + 2)
-    child_env["UNIFIED_PERF_CALIBRATION_SENTINEL"] = str(expected_sentinel)
-    child_env["UNIFIED_PERF_FORBID_CORE_IMPORTS"] = "1"
-    child_env["UNIFIED_PERF_FORBID_EXT_IMPORTS"] = "1"
-    child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
-    child_env["UNIFIED_PERF_FORBID_SUBPROCESSES"] = "1"
-    code = r'''
-import importlib
-import importlib.util
-import json
-import os
-import sys
-import time
+def _environment_for_source_paths(
+    env: Mapping[str, str], core_root: Path, ext_root: Path,
+) -> Dict[str, str]:
+    child = dict(env)
+    guard = Path(env["UNIFIED_PERF_GUARD_ROOT"]).resolve()
+    core_root = core_root.resolve()
+    ext_root = ext_root.resolve()
+    source_paths = []
+    for path in (core_root, ext_root):
+        if str(path) not in source_paths:
+            source_paths.append(str(path))
+    child["UNIFIED_PERF_SOURCE_PATHS"] = os.pathsep.join(source_paths)
+    child["UNIFIED_PERF_DESIGNATED_CORE_ROOT"] = str(core_root)
+    child["UNIFIED_PERF_DESIGNATED_EXT_ROOT"] = str(ext_root)
+    child["UNIFIED_PERF_GUARD_ROOT"] = str(guard)
+    child.pop("PYTHONPATH", None)
+    return child
 
-root = os.path.realpath(os.environ["UNIFIED_PERF_IMPORT_CALIBRATION_ROOT"])
-repository_root = os.path.realpath(os.environ["UNIFIED_PERF_REPOSITORY_ROOT"])
-module_name = os.environ["UNIFIED_PERF_CALIBRATION_MODULE"]
-expected_count = int(os.environ["UNIFIED_PERF_CALIBRATION_MODULE_COUNT"])
-expected_sentinel = int(os.environ["UNIFIED_PERF_CALIBRATION_SENTINEL"])
 
-def is_within(parent, candidate):
+def _source_environment(
+    env: Mapping[str, str], root: Path, *, sanitized_root: Optional[Path] = None,
+) -> Dict[str, str]:
+    root = _safe_source_tree(root)
+    if sanitized_root is None:
+        core_root = (root / "src").resolve()
+        ext_root = (root / "packages" / "unified-cli-ext" / "src").resolve()
+    else:
+        sanitized_root = sanitized_root.resolve()
+        core_root = ext_root = sanitized_root
+    child = _environment_for_source_paths(env, core_root, ext_root)
+    if sanitized_root is not None:
+        child["UNIFIED_PERF_SANITIZED_ROOT"] = str(sanitized_root)
+    return child
+
+
+_ORIGIN_PROOF = r'''
+def _perf_within(parent, candidate):
     try:
         return os.path.commonpath((parent, candidate)) == parent
     except ValueError:
         return False
 
-base_prefix = os.path.realpath(sys.base_prefix)
-safe_paths = [root]
-for entry in sys.path:
-    candidate = os.path.realpath(entry or os.getcwd())
-    parts = set(os.path.normpath(candidate).split(os.sep))
-    if candidate == root or is_within(root, candidate):
-        continue
-    if not is_within(base_prefix, candidate):
-        continue
-    if "site-packages" in parts or "dist-packages" in parts:
-        continue
-    if candidate not in safe_paths:
-        safe_paths.append(candidate)
-sys.path[:] = safe_paths
-assert not any(is_within(repository_root, path) for path in sys.path)
-spec = importlib.util.find_spec(module_name)
-assert spec is not None and spec.origin is not None
-assert os.path.commonpath((root, os.path.realpath(spec.origin))) == root
-start = time.perf_counter_ns()
-module = importlib.import_module(module_name)
-inner_ms = (time.perf_counter_ns() - start) / 1e6
-loaded = {
-    name: item for name, item in sys.modules.items()
-    if name == "_unified_perf_import_calibration_v1"
-    or name.startswith("_unified_perf_import_calibration_v1.")
-}
-assert len(loaded) == expected_count
-for item in loaded.values():
-    origin = getattr(item, "__file__", None)
-    assert origin is not None
-    assert os.path.commonpath((root, os.path.realpath(origin))) == root
-assert module.SENTINEL == expected_sentinel
-print(json.dumps({
-    "inner_ms": inner_ms,
-    "module_count": len(loaded),
-    "origin": os.path.realpath(module.__file__),
-    "search_paths": list(sys.path),
-    "sentinel": module.SENTINEL,
-}, sort_keys=True, separators=(",", ":")))
+def _perf_prove_origins(prefix, root):
+    loaded = {
+        name: module for name, module in sys.modules.items()
+        if name == prefix or name.startswith(prefix + ".")
+    }
+    assert loaded
+    for module in loaded.values():
+        origin = getattr(module, "__file__", None)
+        assert origin is not None
+        assert _perf_within(root, os.path.realpath(origin))
 '''
-    elapsed, payload = _run(
-        (sys.executable, "-c", code),
-        child_env,
-        cwd=Path(calibration_root),
-    )
-    result = _json_output(payload)
-    if type(result) is not dict or set(result) != {
-        "inner_ms", "module_count", "origin", "search_paths", "sentinel",
-    }:
-        raise MeasurementError("import calibration returned malformed proof")
-    root = os.path.realpath(env["UNIFIED_PERF_IMPORT_CALIBRATION_ROOT"])
-    repository_root = os.path.realpath(env["UNIFIED_PERF_REPOSITORY_ROOT"])
-    search_paths = result["search_paths"]
-    try:
-        origin_is_local = os.path.commonpath((
-            root, os.path.realpath(str(result["origin"])),
-        )) == root
-    except (OSError, ValueError):
-        origin_is_local = False
-    if (
-        type(result["module_count"]) is not int
-        or result["module_count"] != count + 2
-        or type(result["sentinel"]) is not int
-        or result["sentinel"] != expected_sentinel
-        or type(search_paths) is not list
-        or not search_paths
-        or any(type(path) is not str for path in search_paths)
-        or not origin_is_local
-    ):
-        raise MeasurementError("import calibration proof did not match its fixture")
-    resolved_search_paths = [os.path.realpath(path) for path in search_paths]
-    try:
-        repository_visible = any(
-            os.path.commonpath((repository_root, path)) == repository_root
-            for path in resolved_search_paths
-        )
-    except ValueError:
-        repository_visible = True
-    if (
-        root not in resolved_search_paths
-        or repository_visible
-        or any(
-            "site-packages" in set(os.path.normpath(path).split(os.sep))
-            or "dist-packages" in set(os.path.normpath(path).split(os.sep))
-            for path in resolved_search_paths
-        )
-    ):
-        raise MeasurementError("import calibration search path is not isolated")
-    inner = result["inner_ms"]
-    if type(inner) not in (int, float) or not math.isfinite(inner) or inner < 0:
-        raise MeasurementError("import calibration returned an invalid duration")
-    _assert_guard_marker_clear(marker)
-    return float(inner) if value_name == "inner_ms" else elapsed
 
 
-def _measure_import_calibration(
-    metric: Mapping[str, Any], env: Mapping[str, str], marker: Path,
-) -> List[float]:
-    """Measure the standalone Core-sized synthetic import readiness gate."""
-    samples: List[float] = []
-    for index in range(metric["warmups"] + metric["samples"]):
-        value = _import_calibration_once(
-            env, marker, profile=metric["profile"], value_name="inner_ms",
-        )
-        if index >= metric["warmups"]:
-            samples.append(value)
-    return samples
-
-
-def _paired_adjustment(
-    before: float, after: float, normalization: Mapping[str, Any],
-) -> float:
-    maximum = float(normalization["max_calibration_milliseconds"])
-    if any(
-        not math.isfinite(value) or value < 0
-        for value in (before, after)
-    ):
-        raise MeasurementError("import calibration duration is invalid")
-    outside = (before > maximum, after > maximum)
-    if all(outside):
-        raise MeasurementError("import calibration is outside its validity envelope")
-    if any(outside):
-        return 0.0
-    baseline = float(normalization["baseline_milliseconds"])
-    adjustment = min(max(0.0, before - baseline), max(0.0, after - baseline))
-    if adjustment > float(normalization["max_adjustment_milliseconds"]):
-        raise MeasurementError("import calibration adjustment exceeds its envelope")
-    return adjustment
-
-
-def _repeat_process_bracketed(
-    argv: Sequence[str],
-    env: Mapping[str, str],
-    marker: Path,
+def _repeat_same_metric_reference(
     metric: Mapping[str, Any],
-    *,
-    inner_float: bool = False,
-    validate: Optional[Any] = None,
-) -> Tuple[List[float], List[float], Dict[str, Any]]:
-    normalization = metric["normalization"]
+    candidate_once: Any,
+    reference_once: Any,
+) -> Tuple[List[float], List[float], List[float], Dict[str, Any]]:
     samples: List[float] = []
-    adjustments: List[float] = []
     before_samples: List[float] = []
     after_samples: List[float] = []
     total = metric["warmups"] + metric["samples"]
     for index in range(total):
-        before = _import_calibration_once(
-            env,
-            marker,
-            profile=normalization["profile"],
-            value_name=normalization["calibration_value"],
-        )
-        elapsed, payload = _run(argv, env)
-        value = _float_output(payload) if inner_float else elapsed
-        if validate is not None:
-            validate(payload)
-        after = _import_calibration_once(
-            env,
-            marker,
-            profile=normalization["profile"],
-            value_name=normalization["calibration_value"],
-        )
-        adjustment = _paired_adjustment(before, after, normalization)
+        before = float(reference_once())
+        candidate = float(candidate_once())
+        after = float(reference_once())
+        if any(
+            not math.isfinite(value) or value < 0
+            for value in (before, candidate, after)
+        ):
+            raise MeasurementError("paired reference measurement is invalid")
         if index >= metric["warmups"]:
-            samples.append(value)
-            adjustments.append(adjustment)
             before_samples.append(before)
+            samples.append(candidate)
             after_samples.append(after)
-    return samples, adjustments, {
-        "import_calibration": {
-            "after_ms": [_rounded(value) for value in after_samples],
-            "before_ms": [_rounded(value) for value in before_samples],
-            "calibration_value": normalization["calibration_value"],
-            "max_calibration_ms": _rounded(
-                normalization["max_calibration_milliseconds"]
-            ),
-            "profile": normalization["profile"],
-        },
+    return samples, before_samples, after_samples, {
+        "reference_metric": metric["normalization"]["metric"],
     }
 
 
+@contextmanager
+def _fresh_reference_environment(
+    manifest: SourceManifest,
+    env: Mapping[str, str],
+    *,
+    registry: bool = False,
+) -> Iterator[Dict[str, str]]:
+    """Materialize one random reference snapshot for exactly one invocation."""
+    with tempfile.TemporaryDirectory(
+        prefix="reference-invocation-", dir=env["TMPDIR"],
+    ) as raw:
+        destination = Path(raw) / "source"
+        source = _materialize_manifest(manifest, destination, registry=registry)
+        if registry:
+            child = _environment_for_source_paths(env, source, source)
+            child["UNIFIED_PERF_SANITIZED_ROOT"] = str(source)
+            child["UNIFIED_PERF_REGISTRY_BOOTSTRAP"] = "1"
+        else:
+            child = _environment_for_source_paths(
+                env,
+                source / "src",
+                source / "packages" / "unified-cli-ext" / "src",
+            )
+        yield child
+
+
+def _fresh_reference_once(
+    manifest: SourceManifest,
+    env: Mapping[str, str],
+    callback: Callable[[Mapping[str, str]], float],
+    *,
+    registry: bool = False,
+) -> float:
+    with _fresh_reference_environment(manifest, env, registry=registry) as child:
+        return float(callback(child))
+
+
 def _measure_core_import(
-    metric: Mapping[str, Any], env: Mapping[str, str], marker: Path,
+    metric: Mapping[str, Any], candidate_env: Mapping[str, str],
+    reference_manifest: SourceManifest, base_env: Mapping[str, str], marker: Path,
 ) -> Tuple[
-    List[float], Optional[float], Optional[Dict[str, Any]], Optional[List[float]],
+    List[float], Optional[float], Dict[str, Any], List[float], List[float],
 ]:
-    child_env = dict(env)
-    child_env["UNIFIED_PERF_FORBID_EXT_IMPORTS"] = "1"
-    child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
-    child_env["UNIFIED_PERF_FORBID_SUBPROCESSES"] = "1"
-    code = (
-        "import time; start=time.perf_counter_ns(); import unified_cli; "
-        "elapsed=(time.perf_counter_ns()-start)/1e6; "
-        "assert unified_cli.__version__=='" + CORE_VERSION + "'; print(elapsed)"
+    def once(env: Mapping[str, str]) -> float:
+        child_env = dict(env)
+        child_env["UNIFIED_PERF_FORBID_EXT_IMPORTS"] = "1"
+        child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
+        child_env["UNIFIED_PERF_FORBID_MUTATIONS"] = "1"
+        child_env["UNIFIED_PERF_FORBID_SUBPROCESSES"] = "1"
+        code = r'''
+import os
+import sys
+import time
+start = time.perf_counter_ns()
+import unified_cli
+elapsed = (time.perf_counter_ns() - start) / 1e6
+assert unified_cli.__version__ == "0.5.0"
+''' + _ORIGIN_PROOF + r'''
+_perf_prove_origins(
+    "unified_cli", os.path.realpath(os.environ["UNIFIED_PERF_DESIGNATED_CORE_ROOT"])
+)
+print(elapsed)
+'''
+        _, payload = _run(_python_argv(code), child_env)
+        value = _float_output(payload)
+        _assert_guard_marker_clear(marker)
+        return value
+
+    samples, before, after, details = _repeat_same_metric_reference(
+        metric,
+        lambda: once(candidate_env),
+        lambda: _fresh_reference_once(
+            reference_manifest, base_env, once,
+        ),
     )
-    if "normalization" in metric:
-        samples, adjustments, details = _repeat_process_bracketed(
-            (sys.executable, "-c", code),
-            child_env,
-            marker,
-            metric,
-            inner_float=True,
-        )
-    else:
-        samples = _repeat_process(
-            (sys.executable, "-c", code), child_env, metric, inner_float=True,
-        )
-        adjustments = None
-        details = None
     _assert_guard_marker_clear(marker)
-    return samples, None, details, adjustments
+    return samples, None, details, before, after
 
 
 def _measure_core_version(
-    metric: Mapping[str, Any], env: Mapping[str, str], marker: Path,
+    metric: Mapping[str, Any], candidate_env: Mapping[str, str],
+    reference_manifest: SourceManifest, base_env: Mapping[str, str], marker: Path,
 ) -> Tuple[
-    List[float], Optional[float], Optional[Dict[str, Any]], Optional[List[float]],
+    List[float], Optional[float], Dict[str, Any], List[float], List[float],
 ]:
-    child_env = dict(env)
-    child_env["UNIFIED_PERF_FORBID_EXT_IMPORTS"] = "1"
-    child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
-    child_env["UNIFIED_PERF_FORBID_SUBPROCESSES"] = "1"
-
-    def validate(payload: bytes) -> None:
+    def once(env: Mapping[str, str]) -> float:
+        child_env = dict(env)
+        child_env["UNIFIED_PERF_FORBID_EXT_IMPORTS"] = "1"
+        child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
+        child_env["UNIFIED_PERF_FORBID_MUTATIONS"] = "1"
+        child_env["UNIFIED_PERF_FORBID_SUBPROCESSES"] = "1"
+        code = r'''
+import contextlib
+import io
+import os
+import sys
+import unified_cli
+import unified_cli.cli
+''' + _ORIGIN_PROOF + r'''
+_perf_prove_origins(
+    "unified_cli", os.path.realpath(os.environ["UNIFIED_PERF_DESIGNATED_CORE_ROOT"])
+)
+output = io.StringIO()
+with contextlib.redirect_stdout(output):
+    status = unified_cli.cli.main(["--version"])
+assert status == 0 and output.getvalue().strip() == "0.5.0"
+print(output.getvalue().strip())
+'''
+        elapsed, payload = _run(_python_argv(code), child_env)
         if payload.decode("ascii", "strict").strip() != CORE_VERSION:
             raise MeasurementError("Core version fast path returned the wrong version")
+        _assert_guard_marker_clear(marker)
+        return elapsed
 
-    if "normalization" in metric:
-        samples, adjustments, details = _repeat_process_bracketed(
-            (sys.executable, "-m", "unified_cli.cli", "--version"),
-            child_env,
-            marker,
-            metric,
-            validate=validate,
-        )
-    else:
-        samples = _repeat_process(
-            (sys.executable, "-m", "unified_cli.cli", "--version"),
-            child_env,
-            metric,
-            validate=validate,
-        )
-        adjustments = None
-        details = None
+    samples, before, after, details = _repeat_same_metric_reference(
+        metric,
+        lambda: once(candidate_env),
+        lambda: _fresh_reference_once(
+            reference_manifest, base_env, once,
+        ),
+    )
     _assert_guard_marker_clear(marker)
-    return samples, None, details, adjustments
+    return samples, None, details, before, after
 
 
 def _measure_ext_import(
@@ -936,48 +1294,86 @@ def _measure_ext_import(
         "assert unified_cli_ext.__version__=='" + EXT_VERSION + "'; print(elapsed)"
     )
     samples = _repeat_process(
-        (sys.executable, "-c", code), child_env, metric, inner_float=True,
+        _python_argv(code), child_env, metric, inner_float=True,
     )
     _assert_guard_marker_clear(marker)
     return samples
 
 
 def _measure_ext_registry(
-    metric: Mapping[str, Any], env: Mapping[str, str], marker: Path,
+    metric: Mapping[str, Any], candidate_env: Mapping[str, str],
+    reference_manifest: SourceManifest, base_env: Mapping[str, str], marker: Path,
 ) -> Tuple[
-    List[float], Optional[float], Optional[Dict[str, Any]], Optional[List[float]],
+    List[float], Optional[float], Dict[str, Any], List[float], List[float],
 ]:
-    child_env = dict(env)
-    child_env["UNIFIED_CLI_DISABLE_PLUGINS"] = "0"
-    child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
-    child_env["UNIFIED_PERF_FORBID_SUBPROCESSES"] = "1"
-    code = r'''
+    def once(env: Mapping[str, str]) -> float:
+        child_env = dict(env)
+        child_env["UNIFIED_CLI_DISABLE_PLUGINS"] = "0"
+        child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
+        child_env["UNIFIED_PERF_FORBID_MUTATIONS"] = "1"
+        child_env["UNIFIED_PERF_FORBID_SUBPROCESSES"] = "1"
+        child_env["UNIFIED_PERF_REGISTRY_BOOTSTRAP"] = "1"
+        code = r'''
+from importlib import metadata
+import os
+import sys
 import time
+guard_root = os.path.realpath(os.environ["UNIFIED_PERF_GUARD_ROOT"])
 start = time.perf_counter_ns()
 from unified_cli_ext.providers import ProviderAdapterRegistryV1
 from unified_cli.registry import list_providers
 registry = ProviderAdapterRegistryV1()
 assert registry.descriptors() == ()
 descriptors = list_providers(include_ext=True)
-assert any(item.id == "performance-canary" and item.status == "discovered" for item in descriptors)
-print((time.perf_counter_ns() - start) / 1e6)
+elapsed = (time.perf_counter_ns() - start) / 1e6
+assert sorted((item.id, item.source, item.status) for item in descriptors) == [
+    ("claude", "builtin", "builtin"),
+    ("codex", "builtin", "builtin"),
+    ("gemini", "builtin", "builtin"),
+    ("performance-canary", "extension", "discovered"),
+]
+distributions = list(metadata.distributions())
+inventory = sorted(
+    (distribution.metadata.get("Name"), distribution.version)
+    for distribution in distributions
+)
+assert inventory == [("performance-canary", "1.0")]
+for distribution in distributions:
+    distribution_root = os.path.realpath(distribution.locate_file(""))
+    assert _perf_bootstrap_within(guard_root, distribution_root)
+entry_points = sorted(
+    (item.group, item.name, item.value, distribution.metadata.get("Name"))
+    for distribution in distributions
+    for item in distribution.entry_points
+)
+assert entry_points == [(
+    "unified_cli.providers.v1", "performance-canary",
+    "performance_canary:PLUGIN", "performance-canary",
+)]
+''' + _ORIGIN_PROOF + r'''
+_perf_prove_origins(
+    "unified_cli", os.path.realpath(os.environ["UNIFIED_PERF_DESIGNATED_CORE_ROOT"])
+)
+_perf_prove_origins(
+    "unified_cli_ext", os.path.realpath(os.environ["UNIFIED_PERF_DESIGNATED_EXT_ROOT"])
+)
+assert "performance_canary" not in sys.modules
+print(elapsed)
 '''
-    if "normalization" in metric:
-        samples, adjustments, details = _repeat_process_bracketed(
-            (sys.executable, "-c", code),
-            child_env,
-            marker,
-            metric,
-            inner_float=True,
-        )
-    else:
-        samples = _repeat_process(
-            (sys.executable, "-c", code), child_env, metric, inner_float=True,
-        )
-        adjustments = None
-        details = None
+        _, payload = _run(_python_argv(code), child_env)
+        value = _float_output(payload)
+        _assert_guard_marker_clear(marker)
+        return value
+
+    samples, before, after, details = _repeat_same_metric_reference(
+        metric,
+        lambda: once(candidate_env),
+        lambda: _fresh_reference_once(
+            reference_manifest, base_env, once, registry=True,
+        ),
+    )
     _assert_guard_marker_clear(marker)
-    return samples, None, details, adjustments
+    return samples, None, details, before, after
 
 
 def _measure_manage_bootstrap(
@@ -1014,7 +1410,7 @@ for index in range(total):
         samples.append(elapsed)
 print(json.dumps(samples, separators=(",", ":")))
 '''
-    _, payload = _run((sys.executable, "-c", code), child_env)
+    _, payload = _run(_python_argv(code), child_env)
     values = _json_output(payload)
     if type(values) is not list:
         raise MeasurementError("manage bootstrap returned malformed samples")
@@ -1074,7 +1470,7 @@ async def main():
 
 asyncio.run(main())
 '''
-    _, payload = _run((sys.executable, "-c", code), child_env)
+    _, payload = _run(_python_argv(code), child_env)
     values = _json_output(payload)
     if type(values) is not list:
         raise MeasurementError("stream relay returned malformed samples")
@@ -1141,7 +1537,7 @@ for index in range(count + warmups):
         wrapper_samples.append(timings["wrapper_call"])
 print(json.dumps({"raw": raw_samples, "wrapper": wrapper_samples}, separators=(",", ":")))
 '''
-    _, payload = _run((sys.executable, "-c", code), child_env, timeout=30.0)
+    _, payload = _run(_python_argv(code), child_env, timeout=30.0)
     values = _json_output(payload)
     if type(values) is not dict or set(values) != {"raw", "wrapper"}:
         raise MeasurementError("fake CLI comparison returned malformed samples")
@@ -1170,12 +1566,16 @@ def _pty_prompt_once(env: Mapping[str, str], marker: Path) -> float:
     output = bytearray()
     found_at: Optional[float] = None
     try:
+        repl_code = r'''
+import runpy
+runpy.run_module("unified_cli.cli", run_name="__main__")
+'''
         process = subprocess.Popen(
             [
-                sys.executable, "-m", "unified_cli.cli", "repl",
-                "--provider", "claude", "--no-web-search", "--cwd", str(ROOT),
+                *_python_argv(repl_code), "repl", "--provider", "claude",
+                "--no-web-search", "--cwd", child_env["UNIFIED_PERF_WORKSPACE"],
             ],
-            cwd=str(ROOT),
+            cwd=child_env["UNIFIED_PERF_EMPTY_CWD"],
             env=child_env,
             stdin=slave_fd,
             stdout=slave_fd,
@@ -1243,77 +1643,94 @@ def _measure_repl(
     return samples
 
 
-def run_checks(config: Mapping[str, Any], root: Path = ROOT) -> Dict[str, Any]:
+def run_checks(
+    config: Mapping[str, Any], reference_root: Path, root: Path = ROOT,
+) -> Dict[str, Any]:
+    root = root.absolute()
+    candidate_manifest = _read_source_manifest(root)
+    reference_manifest = load_reference_manifest(reference_root, config)
     metrics = config["metrics"]
     results: Dict[str, Any] = {}
     with isolated_environment(root) as (env, marker, fixture):
-        workspace = Path(env["HOME"]).parent / "workspace"
+        environment_root = Path(env["HOME"]).parent
+        workspace = environment_root / "workspace"
+        candidate_registry_root = _materialize_manifest(
+            candidate_manifest,
+            environment_root / "candidate-registry-source",
+            registry=True,
+        )
+        candidate_env = _source_environment(env, root)
+        candidate_registry_env = _source_environment(
+            env, root, sanitized_root=candidate_registry_root,
+        )
+        candidate_registry_env["UNIFIED_PERF_REGISTRY_BOOTSTRAP"] = "1"
         runners = [
             ("calibration_process_startup", lambda: (
-                _measure_calibration(metrics["calibration_process_startup"], env),
-                None, None, None,
+                _measure_calibration(
+                    metrics["calibration_process_startup"], candidate_env,
+                ),
+                None, None, None, None,
             )),
         ]
-        if "calibration_import_workload" in metrics:
-            runners.append(("calibration_import_workload", lambda: (
-                _measure_import_calibration(
-                    metrics["calibration_import_workload"], env, marker,
-                ),
-                None, None, None,
-            )))
         runners.extend((
             ("core_import", lambda: _measure_core_import(
-                metrics["core_import"], env, marker,
+                metrics["core_import"], candidate_env, reference_manifest, env, marker,
             )),
             ("core_version", lambda: _measure_core_version(
-                metrics["core_version"], env, marker,
+                metrics["core_version"], candidate_env, reference_manifest, env, marker,
             )),
             ("ext_import", lambda: (
-                _measure_ext_import(metrics["ext_import"], env, marker),
-                None, None, None,
+                _measure_ext_import(metrics["ext_import"], candidate_env, marker),
+                None, None, None, None,
             )),
             ("ext_passive_registry", lambda: _measure_ext_registry(
-                metrics["ext_passive_registry"], env, marker,
+                metrics["ext_passive_registry"], candidate_registry_env,
+                reference_manifest, env, marker,
             )),
             ("fake_cli_wrapper_overhead", lambda: (
                 *_measure_fake_overhead(
-                    metrics["fake_cli_wrapper_overhead"], env, fixture, marker
+                    metrics["fake_cli_wrapper_overhead"], candidate_env,
+                    fixture, marker,
                 ),
-                None,
+                None, None,
             )),
             ("manage_bootstrap", lambda: (
                 _measure_manage_bootstrap(
-                    metrics["manage_bootstrap"], env, workspace, marker
-                ), None, None, None,
+                    metrics["manage_bootstrap"], candidate_env, workspace, marker
+                ), None, None, None, None,
             )),
             ("repl_first_prompt", lambda: (
-                _measure_repl(metrics["repl_first_prompt"], env, marker),
-                None, None, None,
+                _measure_repl(metrics["repl_first_prompt"], candidate_env, marker),
+                None, None, None, None,
             )),
             ("stream_relay", lambda: (
-                _measure_stream_relay(metrics["stream_relay"], env, marker),
-                None, None, None,
+                _measure_stream_relay(
+                    metrics["stream_relay"], candidate_env, marker,
+                ),
+                None, None, None, None,
             )),
         ))
         for name, runner in runners:
             try:
-                samples, raw_median, details, adjustments = runner()
+                samples, raw_median, details, before, after = runner()
                 results[name] = summarize(
                     samples,
                     metrics[name],
                     raw_median=raw_median,
                     details=details,
-                    normalization_adjustments=adjustments,
+                    reference_before=before,
+                    reference_after=after,
                 )
-            except (MeasurementError, OSError, ValueError) as exc:
+            except (MeasurementError, OSError, ValueError):
                 results[name] = {
                     "error": "measurement_failed",
                     "passed": False,
                 }
-                print("performance check " + name + " failed: " + str(exc), file=sys.stderr)
+                print("performance check " + name + " failed", file=sys.stderr)
     return {
         "baseline_id": config["baseline_id"],
         "passed": all(result.get("passed") is True for result in results.values()),
+        "reference_sha": config["reference"]["sha"],
         "results": results,
         "schema_version": SCHEMA_VERSION,
     }
@@ -1327,6 +1744,12 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_BASELINE,
         help="versioned JSON baseline/config (default: %(default)s)",
     )
+    parser.add_argument(
+        "--reference-root",
+        type=Path,
+        required=True,
+        help="checkout of the immutable reference SHA",
+    )
     return parser
 
 
@@ -1334,16 +1757,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
     try:
         config = load_config(args.baseline)
-    except PerformanceConfigError as exc:
+    except PerformanceConfigError:
         payload = {
             "error": "invalid_baseline",
             "passed": False,
             "schema_version": SCHEMA_VERSION,
         }
         print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
-        print("performance baseline rejected: " + str(exc), file=sys.stderr)
+        print("performance baseline rejected", file=sys.stderr)
         return 2
-    payload = run_checks(config)
+    try:
+        payload = run_checks(config, args.reference_root)
+    except (MeasurementError, OSError, ValueError):
+        payload = {
+            "error": "invalid_reference",
+            "passed": False,
+            "reference_sha": config["reference"]["sha"],
+            "schema_version": SCHEMA_VERSION,
+        }
+        print("performance reference rejected", file=sys.stderr)
+        print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        return 2
     print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
     return 0 if payload["passed"] else 1
 

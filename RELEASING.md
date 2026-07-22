@@ -67,8 +67,29 @@ stored in GitHub.
 ## Prepare one exact release commit
 
 1. Update the Core and Ext version sources and both changelogs.
-2. From a clean `main`, run the complete offline Core and Ext suites, the
-   performance gate, distribution builds, metadata checks, and clean installs.
+2. From a clean `main`, run the complete offline Core and Ext suites,
+   distribution builds, metadata checks, clean installs, and the following
+   pinned-reference performance gate. The lock is a hash-verified, CPython
+   3.14/Ubuntu 24.04 wheel set for the harness's Core server imports; use the
+   exact command rather than resolving dependencies from the local environment.
+
+   ```bash
+   REFERENCE_SHA="be1478884735c862e894959944ba53e149ea4210"
+   REFERENCE_ROOT="../unified-cli-performance-reference"
+   git fetch --no-tags origin main "$REFERENCE_SHA"
+   git merge-base --is-ancestor "$REFERENCE_SHA" origin/main
+   git worktree add --detach "$REFERENCE_ROOT" "$REFERENCE_SHA"
+   python -m venv /tmp/unified-cli-performance-venv
+   /tmp/unified-cli-performance-venv/bin/python -m pip install --upgrade pip
+   PIP_CONFIG_FILE=/dev/null /tmp/unified-cli-performance-venv/bin/python -m pip install --isolated --no-cache-dir --require-hashes --only-binary=:all: --index-url https://pypi.org/simple -r scripts/performance-requirements.txt
+   /tmp/unified-cli-performance-venv/bin/python scripts/check_performance.py --reference-root "$REFERENCE_ROOT"
+   git worktree remove "$REFERENCE_ROOT"
+   ```
+
+   Keep the detached reference worktree read-only. If the candidate reached
+   `main` through a merge commit, the `git merge-base --is-ancestor` check is
+   required: the pinned reference SHA must remain in `main` ancestry, not only
+   in a local branch or a rewritten history.
 3. Push the release commit to `main` and wait for every required CI check on
    that exact commit to pass.
 4. Record the immutable candidate:
@@ -85,6 +106,11 @@ Do not merge or push another `main` commit between the two tag pushes. Both
 release workflows reject an older ancestor of `main`; equality with the current
 `origin/main` commit is required.
 
+`Required CI gate` is the single stable, fail-closed aggregation of the test
+matrix, pinned-reference performance gate, Ext checks, and distribution-pair
+check (the opt-in browser check is intentionally excluded). Configure this job
+as the required `main` ruleset status check before a production release.
+
 ## Release 1 of 2: Core 0.5.0
 
 Create Core's tag at the recorded commit and push only that tag:
@@ -98,7 +124,8 @@ git push origin refs/tags/v0.5.0
 
 1. prove `v0.5.0`, the event SHA, the checkout, and current `origin/main` are
    the same commit; prove the checkout is clean and the source version is 0.5.0;
-2. run the complete offline Core suite and performance/readiness gate;
+2. in separate required jobs, run the complete offline Core suite and the
+   pinned-reference performance/readiness gate; both must pass before build;
 3. build exactly one Core wheel and one Core sdist, verify both metadata
    identities, filenames, archive roots, wheel RECORD SHA-256 hashes/sizes,
    member file/directory hierarchy, the exact `rich>=13` and
@@ -145,20 +172,22 @@ git push origin refs/tags/ext-v0.1.0
    artifacts, require their recorded sizes and SHA-256 digests, download them
    into a new empty directory, compare the downloaded bytes to that metadata,
    and rerun the complete Core wheel/sdist verifier;
-2. install Core 0.5.0 from public PyPI and run the complete offline Ext suite;
-3. build exactly one Ext wheel and one Ext sdist, verify both metadata
+2. run the separate pinned-reference performance/readiness job; it and the
+   provenance job must pass before testing or building;
+3. install Core 0.5.0 from public PyPI and run the complete offline Ext suite;
+4. build exactly one Ext wheel and one Ext sdist, verify both metadata
    identities, filenames, archive roots, wheel RECORD SHA-256 hashes/sizes,
    member file/directory hierarchy, exactly one default-runtime dependency
    (`unified-cli>=0.5,<0.6`), optional-extra markers, reject Core package paths,
    and check the Ext wheel against the released Core wheel;
-4. clean-install the built Ext wheel alongside released Core and assert both
+5. clean-install the built Ext wheel alongside released Core and assert both
    versions;
-5. publish only the verified Ext artifact through environment `pypi-ext`;
-6. install `unified-cli==0.5.0` and `unified-cli-ext==0.1.0` together from the
+6. publish only the verified Ext artifact through environment `pypi-ext`;
+7. install `unified-cli==0.5.0` and `unified-cli-ext==0.1.0` together from the
    explicit public PyPI index with cache, extra indexes, local links, and
    `no-index` configuration disabled, then verify both versions and dependency
    health;
-7. only after that PyPI smoke passes, download the verified Ext build artifact
+8. only after that PyPI smoke passes, download the verified Ext build artifact
    and create the mandatory GitHub Release for `ext-v0.1.0` with the exact Ext
    wheel and sdist attached. Reruns verify an existing final release and both
    downloaded asset bytes rather than replacing them.
