@@ -44,6 +44,13 @@ _METRIC_NAMES = (
     "repl_first_prompt",
     "stream_relay",
 )
+_REFERENCE_BASELINE_METRICS = frozenset({
+    "calibration_process_startup",
+    "core_import",
+    "core_version",
+    "ext_import",
+})
+_NORMALIZED_METRICS = frozenset({"core_version", "ext_passive_registry"})
 _CREDENTIAL_MARKERS = (
     "API_KEY",
     "ACCESS_TOKEN",
@@ -87,7 +94,10 @@ def load_config(path: Path) -> Dict[str, Any]:
         "baseline_id", "baseline_source", "metrics", "schema_version",
     }:
         raise PerformanceConfigError("performance baseline has an invalid top-level shape")
-    if data["schema_version"] != SCHEMA_VERSION:
+    if (
+        type(data["schema_version"]) is not int
+        or data["schema_version"] != SCHEMA_VERSION
+    ):
         raise PerformanceConfigError("performance baseline schema version is unsupported")
     if type(data["baseline_id"]) is not str or not data["baseline_id"].strip():
         raise PerformanceConfigError("performance baseline id is invalid")
@@ -98,16 +108,26 @@ def load_config(path: Path) -> Dict[str, Any]:
         raise PerformanceConfigError("performance baseline metric set is incomplete")
     for name in _METRIC_NAMES:
         metric = metrics[name]
-        allowed = {"samples", "statistic", "threshold", "warmups"}
-        if name in {"core_import", "core_version"}:
+        required = {"samples", "statistic", "threshold", "warmups"}
+        allowed = set(required)
+        if name in _REFERENCE_BASELINE_METRICS:
             allowed.add("baseline_milliseconds")
-        if type(metric) is not dict or set(metric) != allowed:
+        if name in _NORMALIZED_METRICS:
+            allowed.add("normalization")
+        if (
+            type(metric) is not dict
+            or not required.issubset(metric)
+            or not set(metric).issubset(allowed)
+        ):
             raise PerformanceConfigError(name + " has an invalid shape")
         if type(metric["samples"]) is not int or not 3 <= metric["samples"] <= 101:
             raise PerformanceConfigError(name + " sample count is invalid")
         if type(metric["warmups"]) is not int or not 0 <= metric["warmups"] <= 20:
             raise PerformanceConfigError(name + " warmup count is invalid")
-        if metric["statistic"] not in {"median", "p95"}:
+        if (
+            type(metric["statistic"]) is not str
+            or metric["statistic"] not in {"median", "p95"}
+        ):
             raise PerformanceConfigError(name + " statistic is invalid")
         threshold = metric["threshold"]
         if type(threshold) is not dict or type(threshold.get("kind")) is not str:
@@ -133,8 +153,54 @@ def load_config(path: Path) -> Dict[str, Any]:
                 raise PerformanceConfigError(name + " relative slack is invalid")
         else:
             raise PerformanceConfigError(name + " threshold kind is unsupported")
-        if kind == "baseline_regression":
+        if kind == "baseline_regression" and "baseline_milliseconds" not in metric:
+            raise PerformanceConfigError(name + " baseline is missing")
+        if "baseline_milliseconds" in metric:
             _exact_number(metric["baseline_milliseconds"], name + " baseline")
+        if "normalization" in metric:
+            normalization = metric["normalization"]
+            if type(normalization) is not dict or set(normalization) != {
+                "combine", "kind", "references",
+            }:
+                raise PerformanceConfigError(name + " normalization is invalid")
+            if (
+                type(normalization["kind"]) is not str
+                or normalization["kind"] != "positive_baseline_delta"
+            ):
+                raise PerformanceConfigError(name + " normalization kind is unsupported")
+            if (
+                type(normalization["combine"]) is not str
+                or normalization["combine"] not in {"minimum", "sum"}
+            ):
+                raise PerformanceConfigError(name + " normalization combine is invalid")
+            references = normalization["references"]
+            if (
+                type(references) is not list
+                or not references
+                or any(
+                    type(reference) is not str
+                    or reference not in _REFERENCE_BASELINE_METRICS
+                    or reference == name
+                    for reference in references
+                )
+                or len(references) != len(set(references))
+            ):
+                raise PerformanceConfigError(name + " normalization references are invalid")
+    for name in _NORMALIZED_METRICS:
+        normalization = metrics[name].get("normalization")
+        if normalization is None:
+            continue
+        if any(
+            "baseline_milliseconds" not in metrics[reference]
+            for reference in normalization["references"]
+        ):
+            raise PerformanceConfigError(name + " normalization baseline is missing")
+        target_index = _METRIC_NAMES.index(name)
+        if any(
+            _METRIC_NAMES.index(reference) >= target_index
+            for reference in normalization["references"]
+        ):
+            raise PerformanceConfigError(name + " normalization reference order is invalid")
     return data
 
 
@@ -150,6 +216,15 @@ def percentile(values: Sequence[float], fraction: float) -> float:
 
 def _rounded(value: float) -> float:
     return round(float(value), 3)
+
+
+def _observed(samples: Sequence[float], metric: Mapping[str, Any]) -> float:
+    statistic = metric["statistic"]
+    return (
+        statistics.median(samples)
+        if statistic == "median"
+        else percentile(samples, 0.95)
+    )
 
 
 def _threshold(metric: Mapping[str, Any], *, raw_median: Optional[float] = None) -> float:
@@ -177,6 +252,9 @@ def summarize(
     *,
     raw_median: Optional[float] = None,
     details: Optional[Mapping[str, Any]] = None,
+    normalization_references: Optional[
+        Mapping[str, Tuple[float, float]]
+    ] = None,
 ) -> Dict[str, Any]:
     if len(samples) != metric["samples"] or any(
         not math.isfinite(value) or value < 0 for value in samples
@@ -185,8 +263,46 @@ def summarize(
     median = statistics.median(samples)
     p95 = percentile(samples, 0.95)
     statistic = metric["statistic"]
-    observed = median if statistic == "median" else p95
-    limit = _threshold(metric, raw_median=raw_median)
+    observed = _observed(samples, metric)
+    policy_limit = _threshold(metric, raw_median=raw_median)
+    adjustment = 0.0
+    normalization_details: Optional[Dict[str, Any]] = None
+    normalization = metric.get("normalization")
+    if normalization is not None:
+        if normalization_references is None:
+            raise MeasurementError("host normalization references are missing")
+        deltas: Dict[str, float] = {}
+        for name in normalization["references"]:
+            try:
+                reference_observed, reference_baseline = normalization_references[name]
+            except KeyError as exc:
+                raise MeasurementError(
+                    "host normalization reference is unavailable"
+                ) from exc
+            if not all(
+                math.isfinite(value) and value >= 0
+                for value in (reference_observed, reference_baseline)
+            ):
+                raise MeasurementError("host normalization reference is invalid")
+            deltas[name] = max(0.0, reference_observed - reference_baseline)
+        if normalization["combine"] == "sum":
+            adjustment = sum(deltas.values())
+        else:
+            adjustment = min(deltas.values())
+        if not math.isfinite(adjustment):
+            raise MeasurementError("host normalization adjustment is invalid")
+        normalization_details = {
+            "adjustment_ms": _rounded(adjustment),
+            "kind": normalization["kind"],
+            "normalized_observed_ms": _rounded(observed - adjustment),
+            "policy_threshold_ms": _rounded(policy_limit),
+            "reference_deltas_ms": {
+                name: _rounded(value) for name, value in deltas.items()
+            },
+        }
+    limit = policy_limit + adjustment
+    if not math.isfinite(limit):
+        raise MeasurementError("host-normalized threshold is invalid")
     result: Dict[str, Any] = {
         "median_ms": _rounded(median),
         "observed_ms": _rounded(observed),
@@ -196,8 +312,11 @@ def summarize(
         "statistic": statistic,
         "threshold_ms": _rounded(limit),
     }
-    if details:
-        result["details"] = dict(details)
+    result_details = dict(details or {})
+    if normalization_details is not None:
+        result_details["host_normalization"] = normalization_details
+    if result_details:
+        result["details"] = result_details
     return result
 
 
@@ -765,6 +884,7 @@ def _measure_repl(
 def run_checks(config: Mapping[str, Any], root: Path = ROOT) -> Dict[str, Any]:
     metrics = config["metrics"]
     results: Dict[str, Any] = {}
+    observations: Dict[str, float] = {}
     with isolated_environment(root) as (env, marker, fixture):
         workspace = Path(env["HOME"]).parent / "workspace"
         runners = (
@@ -801,12 +921,27 @@ def run_checks(config: Mapping[str, Any], root: Path = ROOT) -> Dict[str, Any]:
         for name, runner in runners:
             try:
                 samples, raw_median, details = runner()
+                normalization_references = None
+                normalization = metrics[name].get("normalization")
+                if normalization is not None:
+                    normalization_references = {}
+                    for reference in normalization["references"]:
+                        if reference not in observations:
+                            raise MeasurementError(
+                                "host normalization reference was not measured"
+                            )
+                        normalization_references[reference] = (
+                            observations[reference],
+                            float(metrics[reference]["baseline_milliseconds"]),
+                        )
                 results[name] = summarize(
                     samples,
                     metrics[name],
                     raw_median=raw_median,
                     details=details,
+                    normalization_references=normalization_references,
                 )
+                observations[name] = _observed(samples, metrics[name])
             except (MeasurementError, OSError, ValueError) as exc:
                 results[name] = {
                     "error": "measurement_failed",

@@ -3,6 +3,7 @@
   "baseline_source": "docs/development/platform-next-stage0-baseline.md",
   "metrics": {
     "calibration_process_startup": {
+      "baseline_milliseconds": 30.355,
       "samples": 9,
       "statistic": "p95",
       "threshold": {
@@ -24,6 +25,14 @@
     },
     "core_version": {
       "baseline_milliseconds": 94.635,
+      "normalization": {
+        "combine": "sum",
+        "kind": "positive_baseline_delta",
+        "references": [
+          "calibration_process_startup",
+          "core_import"
+        ]
+      },
       "samples": 15,
       "statistic": "median",
       "threshold": {
@@ -34,6 +43,7 @@
       "warmups": 3
     },
     "ext_import": {
+      "baseline_milliseconds": 52.066,
       "samples": 15,
       "statistic": "p95",
       "threshold": {
@@ -43,6 +53,14 @@
       "warmups": 3
     },
     "ext_passive_registry": {
+      "normalization": {
+        "combine": "minimum",
+        "kind": "positive_baseline_delta",
+        "references": [
+          "core_import",
+          "ext_import"
+        ]
+      },
       "samples": 15,
       "statistic": "p95",
       "threshold": {
