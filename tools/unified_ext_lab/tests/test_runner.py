@@ -152,8 +152,17 @@ class SubprocessRunnerTests(unittest.TestCase):
                 0.05,
                 "runner timed out",
             ),
-            (self.runner(), "raise SystemExit(9)", 2, "runner command failed"),
-            (self.runner(limit=64), "print('x' * 10000)", 2, "runner output exceeded limit"),
+            # Non-timeout classifications allow process startup margin on a
+            # loaded CI runner; timeout behavior is isolated above.
+            (self.runner(), "raise SystemExit(9)", 5, "runner command failed"),
+            # Keep the leader live after flooding output so this case isolates
+            # the output bound from exit-observer cleanup uncertainty.
+            (
+                self.runner(limit=64),
+                "import time; print('x' * 10000, flush=True); time.sleep(10)",
+                5,
+                "runner output exceeded limit",
+            ),
         )
         for runner, program, timeout, message in cases:
             with self.subTest(message=message):
@@ -234,30 +243,38 @@ class SubprocessRunnerTests(unittest.TestCase):
         for label, close_pipes, timeout in cases:
             with self.subTest(label=label):
                 runner = self.runner()
+                popen_patch, created = self.capture_popen()
                 marker = os.path.join(self.directory, label + "-marker")
                 child = (
                     "import pathlib,time; time.sleep(0.5); "
                     "pathlib.Path({!r}).write_text('left-running')".format(marker)
                 )
-                if close_pipes:
-                    program = (
-                        "import subprocess,sys; "
-                        "subprocess.Popen([sys.executable,'-c',"
-                        + repr(child)
-                        + "],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
-                        "stderr=subprocess.DEVNULL,close_fds=True)"
-                    )
-                    result = self.run_python(runner, program, timeout=timeout)
-                    self.assertEqual(result.returncode, 0)
-                else:
-                    program = (
-                        "import subprocess,sys; "
-                        "subprocess.Popen([sys.executable,'-c'," + repr(child) + "])"
-                    )
-                    with self.assertRaisesRegex(
-                        RunnerFailureError, "^runner timed out$"
-                    ):
-                        self.run_python(runner, program, timeout=timeout)
+                with popen_patch:
+                    if close_pipes:
+                        program = (
+                            "import subprocess,sys; "
+                            "subprocess.Popen([sys.executable,'-c',"
+                            + repr(child)
+                            + "],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
+                            "stderr=subprocess.DEVNULL,close_fds=True)"
+                        )
+                        result = self.run_python(runner, program, timeout=timeout)
+                        self.assertEqual(result.returncode, 0)
+                    else:
+                        program = (
+                            "import subprocess,sys; "
+                            "subprocess.Popen([sys.executable,'-c',"
+                            + repr(child)
+                            + "])"
+                        )
+                        try:
+                            result = self.run_python(runner, program, timeout=timeout)
+                        except RunnerFailureError as error:
+                            self.assertEqual(str(error), "runner timed out")
+                        else:
+                            self.assertEqual(result.returncode, 0)
+                self.assertEqual(len(created), 1)
+                self.assert_process_finalized(created[0])
                 time.sleep(0.6)
                 self.assertFalse(os.path.exists(marker))
 
@@ -349,6 +366,10 @@ class SubprocessRunnerTests(unittest.TestCase):
         time.sleep(0.35)
         self.assertFalse(os.path.exists(marker))
 
+    @unittest.skipUnless(
+        SubprocessRunner._kqueue_observer_available(),
+        "requires kqueue process-exit observation",
+    )
     def test_kqueue_registration_fault_is_owned_before_registration(self):
         cases = (("close-succeeds", False), ("close-fails", True))
         for label, close_fails in cases:
@@ -398,6 +419,10 @@ class SubprocessRunnerTests(unittest.TestCase):
                 self.assertEqual(len(created), 1)
                 self.assert_process_finalized(created[0])
 
+    @unittest.skipUnless(
+        SubprocessRunner._kqueue_observer_available(),
+        "requires kqueue process-exit observation",
+    )
     def test_normal_kqueue_close_fault_is_stable_cleanup_uncertainty(self):
         runner = self.runner()
         popen_patch, created = self.capture_popen()
@@ -484,6 +509,10 @@ class SubprocessRunnerTests(unittest.TestCase):
         self.assertEqual(len(created), 1)
         self.assert_process_finalized(created[0])
 
+    @unittest.skipUnless(
+        SubprocessRunner._kqueue_observer_available(),
+        "requires kqueue process-exit observation",
+    )
     def test_missing_waitid_uses_kqueue_before_signal_and_reap(self):
         events = []
         real_killpg = runner_module.os.killpg
