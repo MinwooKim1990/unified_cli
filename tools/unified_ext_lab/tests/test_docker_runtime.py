@@ -1083,10 +1083,15 @@ class SnapshotAndRuntimeTests(unittest.TestCase):
 
     def test_buildx_companion_is_copied_into_private_docker_config(self):
         with tempfile.TemporaryDirectory(prefix="buildx-identity-") as temporary:
+            # Hosted Python launchers need not satisfy the runner's strict
+            # ownership mode, so give this fixture its own identity-safe copy.
+            docker = Path(temporary) / "docker"
+            shutil.copyfile(DOCKER, docker)
+            docker.chmod(0o700)
             plugin = Path(temporary) / "docker-buildx"
             plugin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             plugin.chmod(0o700)
-            runner = SubprocessRunner(DOCKER)
+            runner = SubprocessRunner(os.path.realpath(docker))
             self.addCleanup(runner.close)
             identity = runner.bind_docker_buildx(os.path.realpath(plugin))
             environment = dict(runner.private_environment)
