@@ -924,12 +924,12 @@ def test_timeout_precancel_midcancel_and_double_close(
 
     state = FakeSdkState()
     state.delay = 60
-    state.prompt_started = asyncio.Event()
     install_fake(monkeypatch, state)
     token = unified_cli_ext.CancellationToken()
     transport = make_transport(tmp_path, process_identity, cancellation=token)
 
     async def cancel_mid_turn():
+        state.prompt_started = asyncio.Event()
         turn = asyncio.create_task(transport.text_turn("x"))
         await state.prompt_started.wait()
         token.cancel()
