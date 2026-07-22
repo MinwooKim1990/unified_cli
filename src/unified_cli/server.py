@@ -40,7 +40,9 @@ import sys
 import threading
 import time
 import uuid
+import weakref
 from collections import OrderedDict
+from collections.abc import AsyncIterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Optional, Sequence, Union
@@ -130,6 +132,7 @@ _SERVER_CLIENT_CACHE = _positive_env(
     "UNIFIED_CLI_SERVER_CLIENT_CACHE", 4)
 _MAX_ACTIVE_TURNS = _positive_env(
     "UNIFIED_CLI_SERVER_MAX_ACTIVE_TURNS", 4)
+_MAX_ACTIVE_TURNS_PER_PROVIDER = 1
 _ALLOW_AGENTIC_SERVER_PROVIDERS_ENV = "UNIFIED_CLI_SERVER_ALLOW_AGENTIC_PROVIDERS"
 
 # The HTTP server is a separate trust boundary from direct Python/CLI use. It
@@ -356,7 +359,10 @@ async def _lifespan(app: "FastAPI"):
     # explicitly requested local token would otherwise be unauthenticated.
     _require_server_auth_configuration()
     _log.warning(_PERSONAL_USE_NOTICE)
-    yield
+    try:
+        yield
+    finally:
+        _release_all_conversation_leases()
 
 
 app = FastAPI(title="unified-cli OpenAI-compat", lifespan=_lifespan)
@@ -548,9 +554,10 @@ async def _localhost_guard(request: "Request", call_next):
 
 
 # Conversation ids map to slots rather than bare conversations so the LRU can
-# never evict one while it is executing. All slot and active-turn mutation is
-# protected by _CONVS_LOCK; a lease gives an endpoint exclusive ownership of a
-# persisted conversation for its full send/SSE lifetime.
+# never evict one while it is executing. All slot, active-turn, and provider
+# reservation mutation is protected by _CONVS_LOCK; a lease gives an endpoint
+# exclusive ownership of a persisted conversation and resolved provider
+# account for its full send/SSE lifetime.
 @dataclass
 class _ConversationSlot:
     conv: UnifiedConversation
@@ -561,6 +568,8 @@ CONVS: "OrderedDict[str, _ConversationSlot]" = OrderedDict()
 _CONVS_LOCK = threading.Lock()
 _MAX_CONVS = _positive_env("UNIFIED_CLI_SERVER_MAX_CONVERSATIONS", 128)
 _ACTIVE_TURNS = 0
+_ACTIVE_PROVIDER_TURNS: dict[str, int] = {}
+_ACTIVE_LEASES: dict[int, "_ConversationLease"] = {}
 
 
 class ChatMessage(BaseModel):
@@ -838,6 +847,7 @@ def _get_conv(conv_id: str) -> UnifiedConversation:
 class _ConversationLease:
     conv_id: str
     conv: UnifiedConversation
+    provider: str
     slot: Optional[_ConversationSlot] = None
     _released: bool = False
 
@@ -849,12 +859,40 @@ class _ConversationLease:
             self._released = True
             if self.slot is not None:
                 self.slot.active = False
-            _ACTIVE_TURNS = max(0, _ACTIVE_TURNS - 1)
+            if _ACTIVE_TURNS > 0:
+                _ACTIVE_TURNS -= 1
+            provider_turns = _ACTIVE_PROVIDER_TURNS.get(self.provider, 0)
+            if provider_turns <= 1:
+                _ACTIVE_PROVIDER_TURNS.pop(self.provider, None)
+            else:
+                _ACTIVE_PROVIDER_TURNS[self.provider] = provider_turns - 1
+            _ACTIVE_LEASES.pop(id(self), None)
 
 
-def _acquire_conversation(user: Optional[str]) -> _ConversationLease:
+def _canonical_server_provider(provider: str) -> str:
+    """Collapse compatibility names to the resolved provider/account key."""
+    return "gemini" if provider == "agy" else provider
+
+
+def _release_all_conversation_leases() -> None:
+    """Release every live reservation during server shutdown."""
+    global _ACTIVE_TURNS
+    with _CONVS_LOCK:
+        for lease in tuple(_ACTIVE_LEASES.values()):
+            lease._released = True
+            if lease.slot is not None:
+                lease.slot.active = False
+        _ACTIVE_LEASES.clear()
+        _ACTIVE_PROVIDER_TURNS.clear()
+        _ACTIVE_TURNS = 0
+
+
+def _acquire_conversation(
+    user: Optional[str], provider: str = "claude",
+) -> _ConversationLease:
     """Reserve an idle conversation now; do not queue mutable turns."""
     global _ACTIVE_TURNS
+    provider = _canonical_server_provider(provider)
     conv_id = user or str(uuid.uuid4())
     with _CONVS_LOCK:
         slot: Optional[_ConversationSlot] = None
@@ -869,6 +907,12 @@ def _acquire_conversation(user: Optional[str]) -> _ConversationLease:
             _raise_request_error(
                 "This local server is busy; retry shortly.",
                 code="server_busy", status_code=429, retry_after=1,
+            )
+        if (_ACTIVE_PROVIDER_TURNS.get(provider, 0)
+                >= _MAX_ACTIVE_TURNS_PER_PROVIDER):
+            _raise_request_error(
+                "This provider account is busy; retry shortly.",
+                code="provider_busy", status_code=429, retry_after=1,
             )
         if user:
             if slot is None:
@@ -887,7 +931,129 @@ def _acquire_conversation(user: Optional[str]) -> _ConversationLease:
         else:
             conv = _new_server_conversation()
         _ACTIVE_TURNS += 1
-        return _ConversationLease(conv_id=conv_id, conv=conv, slot=slot)
+        _ACTIVE_PROVIDER_TURNS[provider] = (
+            _ACTIVE_PROVIDER_TURNS.get(provider, 0) + 1)
+        lease = _ConversationLease(
+            conv_id=conv_id, conv=conv, provider=provider, slot=slot,
+        )
+        _ACTIVE_LEASES[id(lease)] = lease
+        return lease
+
+
+class _StreamLeaseCleanup:
+    """Close retained stream content before making its provider reusable."""
+
+    def __init__(self, content, lease: _ConversationLease):
+        self.content = content
+        self.lease = lease
+        self._lock = threading.Lock()
+        self._claimed = False
+
+    def _claim(self) -> bool:
+        with self._lock:
+            if self._claimed:
+                return False
+            self._claimed = True
+            return True
+
+    @staticmethod
+    def _log_failure(stage: str, error: BaseException) -> None:
+        # Do not log provider output, content, paths, or exception messages.
+        _log.warning(
+            "Streaming cleanup failed during %s (%s).",
+            stage, type(error).__name__,
+        )
+
+    def _close_sync_content(self) -> None:
+        """Best-effort synchronous close; never raises."""
+        try:
+            close = getattr(self.content, "close", None)
+        except BaseException as error:
+            self._log_failure("close discovery", error)
+            return
+        if close is None:
+            return
+        try:
+            close()
+        except BaseException as error:
+            self._log_failure("close", error)
+
+    def finish(self) -> None:
+        """Deterministically close synchronous content, then release."""
+        if not self._claim():
+            return
+        try:
+            self._close_sync_content()
+        finally:
+            self.lease.release()
+
+
+class _LeasedStreamingResponse(StreamingResponse):
+    """Sync-only response that closes content before releasing its lease."""
+
+    def __init__(self, content, lease: _ConversationLease, **kwargs):
+        cleanup = None
+        try:
+            cleanup = _StreamLeaseCleanup(content, lease)
+            self._stream_cleanup = cleanup
+            try:
+                aclose = getattr(content, "aclose", None)
+                close = getattr(content, "close", None)
+            except BaseException as error:
+                _StreamLeaseCleanup._log_failure(
+                    "stream shape discovery", error,
+                )
+                raise TypeError(
+                    "Internal streaming content must be synchronous."
+                ) from error
+            if isinstance(content, AsyncIterable) or (
+                aclose is not None and close is None
+            ):
+                raise TypeError(
+                    "Internal streaming content must be synchronous."
+                )
+            # Do not install a release-only background task: receive-side
+            # disconnect can otherwise free the provider while Starlette still
+            # retains the original synchronous content iterator.
+            super().__init__(content, **kwargs)
+            # A direct caller can abandon the response without entering ASGI.
+            # The callback closes original content before releasing the lease.
+            self._abandonment_finalizer = weakref.finalize(
+                self, cleanup.finish,
+            )
+        except BaseException:
+            # finish() is non-raising so the original construction/finalizer
+            # exception is preserved.
+            if cleanup is not None:
+                cleanup.finish()
+            else:
+                try:
+                    try:
+                        close = getattr(content, "close", None)
+                    except BaseException as error:
+                        _StreamLeaseCleanup._log_failure(
+                            "construction close discovery", error,
+                        )
+                    else:
+                        if close is not None:
+                            try:
+                                close()
+                            except BaseException as error:
+                                _StreamLeaseCleanup._log_failure(
+                                    "construction close", error,
+                                )
+                finally:
+                    lease.release()
+            raise
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            try:
+                self._stream_cleanup.finish()
+            finally:
+                self._abandonment_finalizer.detach()
 
 
 # ---- endpoints ----
@@ -1131,15 +1297,15 @@ def chat_completions(req: ChatRequest):
 
     prompt, images = _extract_user_message(req.messages)
     images = images or None
+    response_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
+    created = int(time.time())
+
     # Reserve now rather than queueing mutable conversation turns. A second
     # request with the same user id receives a clear 409 while the first owns
     # its native provider session; anonymous requests count toward capacity.
-    lease = _acquire_conversation(req.user)
+    lease = _acquire_conversation(req.user, provider)
     conv_id = lease.conv_id
     conv = lease.conv
-
-    response_id = f"chatcmpl-{uuid.uuid4().hex[:16]}"
-    created = int(time.time())
 
     if req.stream:
         def gen():
@@ -1203,11 +1369,9 @@ def chat_completions(req: ChatRequest):
             yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
             yield "data: [DONE]\n\n"
 
-        # Covers the narrow case where ASGI abandons the response before
-        # iteration starts. release() is deliberately idempotent.
-        return StreamingResponse(
-            gen(), media_type="text/event-stream",
-            background=BackgroundTask(lease.release),
+        # The response owns cleanup from construction through every ASGI exit.
+        return _LeasedStreamingResponse(
+            gen(), lease, media_type="text/event-stream",
         )
 
     try:
