@@ -20,16 +20,18 @@ from typing import Callable, Optional, Sequence, Tuple
 from .docker_runtime import RealDockerRuntime
 from .errors import CleanupIncompleteError, LabError, UsageStateError
 from .lifecycle import FixtureLifecycle
-from .model import LabIdentity, validate_lab_id
+from .model import LabIdentity, ResourceRole, validate_lab_id
 from .state import (
     REAL_DOCKER_EXECUTION_PROFILE,
     LabState,
     LabStateStore,
+    PlannedResource,
     StatePhase,
 )
 
 
 _PROVIDER_ID = "synthetic"
+_RUNTIME_SNAPSHOT_NAME = "runtime-snapshot"
 _TERMINAL_CLEAN_PHASES = frozenset((StatePhase.PASSED, StatePhase.FAILED_CLEAN))
 _STABLE_FORWARD_PHASES = frozenset(
     (StatePhase.NEW, StatePhase.CREATED, StatePhase.INSTALLED, StatePhase.TESTED)
@@ -148,6 +150,19 @@ def _state_namespace(state_root: Path, *, create: bool) -> Path:
 
 def _state_path(state_root: Path, lab_id: str) -> Path:
     return state_root / REAL_DOCKER_EXECUTION_PROFILE / lab_id / "state.json"
+
+
+def _runtime_snapshot_path(namespace: Path, lab_id: str) -> Path:
+    lab = validate_lab_id(lab_id)
+    path = namespace / lab / _RUNTIME_SNAPSHOT_NAME
+    if (
+        not namespace.is_absolute()
+        or os.path.realpath(str(namespace)) != str(namespace)
+        or os.path.normpath(str(path)) != str(path)
+        or os.path.realpath(str(path)) != str(path)
+    ):
+        raise UsageStateError("runtime snapshot path is not canonical")
+    return path
 
 
 def _state_summary(state: LabState) -> dict:
@@ -315,6 +330,7 @@ def _lifecycle(runtime: object, store: LabStateStore, identity: LabIdentity) -> 
         execution_profile=REAL_DOCKER_EXECUTION_PROFILE,
         executor_kind="real_docker",
         command_builder=runtime.commands(spec),
+        runtime_snapshot=runtime.snapshot_resource,
     )
 
 
@@ -324,6 +340,9 @@ def _cleanup_lifecycle(
     identity = LabIdentity(
         state.lab_id, state.provider_id, state.ownership_token
     )
+    runtime.bind_snapshot_for_cleanup(
+        str(_runtime_snapshot_path(store.root, state.lab_id))
+    )
     spec = runtime.cleanup_spec(identity, state.planned_resources)
     return FixtureLifecycle(
         store,
@@ -332,6 +351,7 @@ def _cleanup_lifecycle(
         execution_profile=REAL_DOCKER_EXECUTION_PROFILE,
         executor_kind="real_docker",
         command_builder=runtime.commands(spec),
+        runtime_snapshot=runtime.snapshot_resource,
     )
 
 
@@ -391,8 +411,9 @@ def _conformance_run(
     primary_error: Optional[BaseException] = None
     primary_exit: Optional[int] = None
     try:
-        # Discovery/binding and the complete local preflight happen before an
-        # ownership token or any state/evidence directory is created.
+        # Probe Docker before persistence, but establish the exact NEW intent
+        # before creating the state-derived execution snapshot. A SIGKILL can
+        # therefore never leave an unowned random /tmp snapshot behind.
         runtime.preflight()
         namespace = _state_namespace(state_root, create=True)
         if _state_path(state_root, lab_id).exists():
@@ -401,11 +422,22 @@ def _conformance_run(
         lifecycle_store = LabStateStore(
             namespace, REAL_DOCKER_EXECUTION_PROFILE
         )
+        with lifecycle_store.locked(lab_id) as locked:
+            locked.create_initial(
+                identity.provider_id,
+                identity.ownership_token,
+                (PlannedResource.from_value(identity.resource(ResourceRole.CONTAINER)),),
+                {"runtime_snapshot_bound": False},
+            )
+        runtime.capture_snapshot(
+            str(_runtime_snapshot_path(namespace, lab_id))
+        )
         lifecycle = _lifecycle(
             runtime,
             lifecycle_store,
             identity,
         )
+        lifecycle.bind_runtime_snapshot_intent()
         forward_error: Optional[LabError] = None
         uncertain_exit: Optional[int] = None
         try:

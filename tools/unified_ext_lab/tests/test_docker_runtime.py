@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import unittest
@@ -29,6 +30,7 @@ from tools.unified_ext_lab.docker import (
 )
 from tools.unified_ext_lab.docker_runtime import (
     COPIED_CLI_BUILDX_E2E_REQUIRED,
+    DerivedSnapshotResource,
     RealDockerCleanupCommandBuilder,
     RealDockerRuntime,
     discover_buildx_executable,
@@ -135,6 +137,27 @@ class RealModelRunner:
         self.race_role = None
         self.hidden_roles = set()
         self.inspect_id_overrides = {}
+        # Snapshot validation is part of forward command construction.  Cache the
+        # exact create command while the durable snapshot is present so the
+        # cleanup model never reconstructs it after lifecycle-owned removal.
+        self.create_argv = (
+            self.builder.create_container()
+            if hasattr(self.builder, "create_container")
+            else None
+        )
+        self.start_argv = (
+            self.builder.start_container(CONTAINER_ID)
+            if hasattr(self.builder, "start_container")
+            else None
+        )
+        self.guest_argv = (
+            {
+                action: self.builder.exec_guest(action, CONTAINER_ID)
+                for action in GuestAction
+            }
+            if hasattr(self.builder, "exec_guest")
+            else {}
+        )
 
     def _image_record(self, image_id, *, tagged=True):
         resource = self.builder.spec.resource(ResourceRole.IMAGE)
@@ -162,7 +185,7 @@ class RealModelRunner:
                 "Entrypoint": [GUEST_EXECUTABLE],
                 "Env": list(FIXED_ENV),
                 "ExposedPorts": {},
-                "Image": self.builder.spec.image.name,
+                "Image": self.builder.spec.base_image,
                 "Labels": dict(resource.labels),
                 "User": CONTAINER_USER,
                 "Volumes": {},
@@ -177,6 +200,15 @@ class RealModelRunner:
                 "Init": True,
                 "Memory": MEMORY_BYTES,
                 "MemorySwap": MEMORY_BYTES,
+                "Mounts": [
+                    {
+                        "BindOptions": {"Propagation": "rprivate"},
+                        "ReadOnly": True,
+                        "Source": self.builder.bind_mount[0],
+                        "Target": self.builder.bind_mount[1],
+                        "Type": "bind",
+                    }
+                ],
                 "NanoCpus": NANO_CPUS,
                 "NetworkMode": "none",
                 "PidsLimit": 128,
@@ -190,6 +222,7 @@ class RealModelRunner:
                 "VolumesFrom": [],
             },
             "Id": container_id,
+            "Image": self.builder.spec.base_image,
             "Mounts": [],
             "Name": "/" + resource.name,
             "NetworkSettings": {"Ports": {}},
@@ -260,11 +293,7 @@ class RealModelRunner:
             and argv == self.builder.inspect_base_image()
         ):
             return self._result(argv, base_payload(self.profile))
-        if hasattr(self.builder, "build_image") and argv == self.builder.build_image():
-            self.images[IMAGE_ID] = self._image_record(IMAGE_ID)
-            self.image_name_id = IMAGE_ID
-            return self._result(argv, IMAGE_ID + "\n")
-        if hasattr(self.builder, "create_container") and argv == self.builder.create_container():
+        if self.create_argv is not None and argv == self.create_argv:
             self.containers[CONTAINER_ID] = self._container_record(CONTAINER_ID)
             self.container_name_id = CONTAINER_ID
             return self._result(argv, CONTAINER_ID + "\n")
@@ -292,8 +321,8 @@ class RealModelRunner:
         if len(argv) >= 2 and argv[-2] == "inspect":
             raise RunnerFailureError("resource is absent")
         if (
-            hasattr(self.builder, "start_container")
-            and argv == self.builder.start_container(CONTAINER_ID)
+            self.start_argv is not None
+            and argv == self.start_argv
         ):
             self.running.add(CONTAINER_ID)
             return self._result(argv, CONTAINER_ID + "\n")
@@ -304,7 +333,12 @@ class RealModelRunner:
                 GuestAction.TEST,
                 GuestAction.LOGOUT,
             ):
-                if argv == self.builder.exec_guest(action, container_id):
+                expected_guest = (
+                    self.guest_argv[action]
+                    if container_id == CONTAINER_ID
+                    else self.builder.exec_guest(action, container_id)
+                )
+                if argv == expected_guest:
                     if container_id not in self.running:
                         raise RunnerFailureError("container is not running")
                     if action is GuestAction.READY:
@@ -459,6 +493,16 @@ class SnapshotAndRuntimeTests(unittest.TestCase):
         self.identity = LabIdentity("real-lab", "synthetic", TOKEN)
         self.addCleanup(self.runtime.close)
 
+    def _capture_derived_snapshot(self):
+        temporary = tempfile.TemporaryDirectory(prefix="derived-snapshot-")
+        self.addCleanup(temporary.cleanup)
+        parent = Path(os.path.realpath(temporary.name)) / self.identity.lab_id
+        parent.mkdir(mode=0o700)
+        parent.chmod(0o700)
+        root = parent / "runtime-snapshot"
+        self.runtime.capture_snapshot(str(root))
+        return root
+
     def test_preflight_binds_local_base_and_private_snapshot(self):
         with self.assertRaises(UsageStateError):
             self.runtime.spec(self.identity)
@@ -467,26 +511,40 @@ class SnapshotAndRuntimeTests(unittest.TestCase):
             self.runner.commands,
             [
                 self.runtime.version_argv(),
-                self.runtime.buildx_version_argv(),
                 self.runtime.inspect_base_argv(),
             ],
         )
+        with self.assertRaises(UsageStateError):
+            self.runtime.spec(self.identity)
+        self._capture_derived_snapshot()
         spec = self.runtime.spec(self.identity)
         builder = self.runtime.commands(spec)
         self.assertEqual(spec.base_image, BASE_ID)
         self.assertTrue(spec.context_is_snapshot)
         self.assertTrue(spec.ephemeral_storage)
         self.assertNotEqual(spec.context, IMAGE_DIRECTORY)
-        build = builder.build_image()
-        self.assertIn("BASE_IMAGE=" + BASE_ID, build)
-        self.assertNotIn(IMAGE_DIRECTORY, build)
+        with self.assertRaisesRegex(UsageStateError, "does not build"):
+            builder.build_image()
         self.assertEqual(
             builder.inspect_base_image(),
-            self.runtime.prefix + ("image", "inspect", BASE_ID),
+            self.runtime.prefix + ("image", "inspect", self.profile.base_reference),
         )
         self.assertNotIn("--platform", builder.inspect_base_image())
         create = builder.create_container()
-        self.assertNotIn("--mount", create)
+        self.assertIn("--pull=never", create)
+        self.assertIn(BASE_ID, create)
+        self.assertNotIn(self.profile.base_reference, create)
+        self.assertNotIn("BASE_IMAGE=" + BASE_ID, create)
+        self.assertIn("--mount", create)
+        mount = create[create.index("--mount") + 1]
+        self.assertEqual(
+            mount,
+            "type=bind,src={},dst={},readonly,bind-propagation=rprivate".format(
+                *builder.bind_mount
+            ),
+        )
+        self.assertTrue(builder.bind_mount[0].startswith(spec.context + os.sep))
+        self.assertEqual(builder.bind_mount[1], "/opt/unified-ext-lab")
         self.assertNotIn("volume", create)
         tmpfs_values = [
             create[index + 1]
@@ -494,8 +552,13 @@ class SnapshotAndRuntimeTests(unittest.TestCase):
             if value == "--tmpfs"
         ]
         self.assertEqual({item.split(":", 1)[0] for item in tmpfs_values}, set(TMPFS_OPTIONS))
+        self.assertIn("noexec", TMPFS_OPTIONS["/opt/unified-ext-lab/tool"].split(","))
+        self.assertNotIn("exec", TMPFS_OPTIONS["/opt/unified-ext-lab/tool"].split(","))
         snapshot_root = self.runtime._snapshot_root
+        snapshot_resource = self.runtime.snapshot_resource
         self.runtime.close()
+        self.assertTrue(os.path.exists(snapshot_root))
+        self.assertTrue(snapshot_resource.remove())
         self.assertFalse(os.path.exists(snapshot_root))
 
     def test_snapshot_survives_source_swap_and_rejects_snapshot_mutation(self):
@@ -538,6 +601,232 @@ class SnapshotAndRuntimeTests(unittest.TestCase):
             with self.assertRaises(InvariantRefusalError):
                 DockerCommandBuilder(spec).build_image()
 
+    def test_snapshot_fsyncs_every_entry_bottom_up(self):
+        real_fsync = os.fsync
+        synchronized = []
+
+        def record_fsync(descriptor):
+            metadata = os.fstat(descriptor)
+            synchronized.append((metadata.st_dev, metadata.st_ino))
+            real_fsync(descriptor)
+
+        with tempfile.TemporaryDirectory(prefix="snapshot-fsync-") as temporary:
+            private = Path(os.path.realpath(temporary)) / "private"
+            private.mkdir(mode=0o700)
+            with mock.patch(
+                "tools.unified_ext_lab.docker.os.fsync",
+                side_effect=record_fsync,
+            ):
+                snapshot = snapshot_image_context(str(private))
+
+            entries = [Path(snapshot.context), Path(snapshot.context_lock), private]
+            entries.extend(Path(snapshot.context).rglob("*"))
+            identities = {
+                path: (os.lstat(str(path)).st_dev, os.lstat(str(path)).st_ino)
+                for path in entries
+            }
+            positions = {
+                identity: index for index, identity in enumerate(synchronized)
+            }
+            for path, identity in identities.items():
+                self.assertIn(identity, positions, str(path))
+                if path.is_dir():
+                    for child in path.iterdir():
+                        self.assertLess(
+                            positions[identities[child]],
+                            positions[identity],
+                            "{} was not synchronized before {}".format(child, path),
+                        )
+
+    def test_derived_snapshot_create_fsyncs_child_then_parent(self):
+        real_fsync = os.fsync
+        synchronized = []
+
+        def record_fsync(descriptor):
+            metadata = os.fstat(descriptor)
+            synchronized.append((metadata.st_dev, metadata.st_ino))
+            real_fsync(descriptor)
+
+        with tempfile.TemporaryDirectory(prefix="snapshot-create-fsync-") as temporary:
+            parent = Path(os.path.realpath(temporary)) / self.identity.lab_id
+            parent.mkdir(mode=0o700)
+            root = parent / "runtime-snapshot"
+            resource = DerivedSnapshotResource(str(root))
+            with mock.patch(
+                "tools.unified_ext_lab.docker_runtime.os.fsync",
+                side_effect=record_fsync,
+            ):
+                resource.create()
+
+            root_info = root.stat()
+            parent_info = parent.stat()
+            self.assertEqual(
+                synchronized,
+                [
+                    (root_info.st_dev, root_info.st_ino),
+                    (parent_info.st_dev, parent_info.st_ino),
+                ],
+            )
+
+    def test_snapshot_directory_fsync_failure_prevents_binding_and_is_recoverable(self):
+        self.runtime.preflight()
+        real_fsync = os.fsync
+        directory_syncs = {"count": 0}
+
+        def fail_first_snapshot_directory(descriptor):
+            metadata = os.fstat(descriptor)
+            if stat.S_ISDIR(metadata.st_mode):
+                directory_syncs["count"] += 1
+                if directory_syncs["count"] == 3:
+                    raise OSError("injected directory fsync failure")
+            real_fsync(descriptor)
+
+        with tempfile.TemporaryDirectory(prefix="snapshot-fsync-fault-") as temporary:
+            parent = Path(os.path.realpath(temporary)) / self.identity.lab_id
+            parent.mkdir(mode=0o700)
+            root = parent / "runtime-snapshot"
+            with mock.patch(
+                "tools.unified_ext_lab.docker.os.fsync",
+                side_effect=fail_first_snapshot_directory,
+            ):
+                with self.assertRaisesRegex(
+                    InvariantRefusalError, "cannot be synchronized"
+                ):
+                    self.runtime.capture_snapshot(str(root))
+
+            with self.assertRaisesRegex(UsageStateError, "preflight is required"):
+                self.runtime.spec(self.identity)
+            self.assertTrue(self.runtime.snapshot_resource.remove())
+            self.assertFalse(root.exists())
+
+    def test_derived_snapshot_removal_never_follows_symlinks(self):
+        with tempfile.TemporaryDirectory(prefix="snapshot-unlink-") as temporary:
+            parent = Path(os.path.realpath(temporary)) / self.identity.lab_id
+            parent.mkdir(mode=0o700)
+            root = parent / "runtime-snapshot"
+            outside = Path(os.path.realpath(temporary)) / "outside"
+            outside.mkdir(mode=0o700)
+            retained = outside / "retained"
+            retained.write_text("keep", encoding="utf-8")
+            resource = DerivedSnapshotResource(str(root))
+            resource.create()
+            nested = root / "nested"
+            nested.mkdir(mode=0o700)
+            (nested / "payload").write_text("remove", encoding="utf-8")
+            (root / "outside-link").symlink_to(outside, target_is_directory=True)
+
+            self.assertTrue(resource.remove())
+            self.assertFalse(root.exists())
+            self.assertEqual(retained.read_text(encoding="utf-8"), "keep")
+
+    def test_derived_snapshot_removal_refuses_directory_entry_replacement(self):
+        with tempfile.TemporaryDirectory(prefix="snapshot-race-") as temporary:
+            parent = Path(os.path.realpath(temporary)) / self.identity.lab_id
+            parent.mkdir(mode=0o700)
+            root = parent / "runtime-snapshot"
+            moved = parent / "moved-snapshot"
+            resource = DerivedSnapshotResource(str(root))
+            resource.create()
+            original_rmdir = os.rmdir
+            replaced = {"done": False}
+
+            def replace_before_rmdir(name, *, dir_fd=None):
+                if (
+                    name == "runtime-snapshot"
+                    and dir_fd is not None
+                    and not replaced["done"]
+                ):
+                    replaced["done"] = True
+                    os.rename(
+                        name,
+                        "moved-snapshot",
+                        src_dir_fd=dir_fd,
+                        dst_dir_fd=dir_fd,
+                    )
+                    os.mkdir(name, 0o700, dir_fd=dir_fd)
+                return original_rmdir(name, dir_fd=dir_fd)
+
+            with mock.patch(
+                "tools.unified_ext_lab.docker_runtime.os.rmdir",
+                side_effect=replace_before_rmdir,
+            ):
+                with self.assertRaisesRegex(
+                    InvariantRefusalError,
+                    "changed during removal",
+                ):
+                    resource.remove()
+
+            self.assertTrue(replaced["done"])
+            self.assertFalse(root.exists())
+            self.assertTrue(moved.exists())
+
+    def test_derived_snapshot_removal_refuses_nested_directory_replacement(self):
+        with tempfile.TemporaryDirectory(prefix="snapshot-nested-race-") as temporary:
+            parent = Path(os.path.realpath(temporary)) / self.identity.lab_id
+            parent.mkdir(mode=0o700)
+            root = parent / "runtime-snapshot"
+            moved = parent / "moved-nested"
+            resource = DerivedSnapshotResource(str(root))
+            resource.create()
+            (root / "nested").mkdir(mode=0o700)
+            original_rmdir = os.rmdir
+            replaced = {"done": False}
+
+            def replace_before_rmdir(name, *, dir_fd=None):
+                if name == "nested" and not replaced["done"]:
+                    replaced["done"] = True
+                    os.rename(root / name, moved)
+                    (root / name).mkdir(mode=0o700)
+                return original_rmdir(name, dir_fd=dir_fd)
+
+            with mock.patch(
+                "tools.unified_ext_lab.docker_runtime.os.rmdir",
+                side_effect=replace_before_rmdir,
+            ):
+                with self.assertRaisesRegex(
+                    InvariantRefusalError,
+                    "changed during removal",
+                ):
+                    resource.remove()
+
+            self.assertTrue(replaced["done"])
+            self.assertTrue(root.exists())
+            self.assertTrue(moved.exists())
+
+    def test_derived_snapshot_removal_refuses_regular_file_replacement(self):
+        with tempfile.TemporaryDirectory(prefix="snapshot-file-race-") as temporary:
+            parent = Path(os.path.realpath(temporary)) / self.identity.lab_id
+            parent.mkdir(mode=0o700)
+            root = parent / "runtime-snapshot"
+            moved = parent / "moved-payload"
+            resource = DerivedSnapshotResource(str(root))
+            resource.create()
+            payload = root / "payload"
+            payload.write_bytes(b"original")
+            original_unlink = os.unlink
+            replaced = {"done": False}
+
+            def replace_before_unlink(name, *, dir_fd=None):
+                if name == "payload" and not replaced["done"]:
+                    replaced["done"] = True
+                    os.rename(payload, moved)
+                    payload.write_bytes(b"replacement")
+                return original_unlink(name, dir_fd=dir_fd)
+
+            with mock.patch(
+                "tools.unified_ext_lab.docker_runtime.os.unlink",
+                side_effect=replace_before_unlink,
+            ):
+                with self.assertRaisesRegex(
+                    InvariantRefusalError,
+                    "changed during removal",
+                ):
+                    resource.remove()
+
+            self.assertTrue(replaced["done"])
+            self.assertTrue(root.exists())
+            self.assertEqual(moved.read_bytes(), b"original")
+
     def test_prepare_base_is_the_only_pull_path(self):
         with self.assertRaises(UsageStateError):
             self.runtime.prepare_base(allow_network=False)
@@ -552,29 +841,28 @@ class SnapshotAndRuntimeTests(unittest.TestCase):
             ],
         )
 
-    def test_missing_or_inexact_buildx_fails_before_base_and_snapshot(self):
+    def test_container_only_preflight_does_not_probe_buildx(self):
         self.runner.responses[self.runtime.buildx_version_argv()] = RunnerFailureError("missing")
-        with self.assertRaises(UnsupportedError):
-            self.runtime.preflight()
+        self.runtime.preflight()
         self.assertEqual(
             self.runner.commands,
-            [self.runtime.version_argv(), self.runtime.buildx_version_argv()],
+            [self.runtime.version_argv(), self.runtime.inspect_base_argv()],
         )
         self.assertIsNone(self.runtime._snapshot_root)
 
-    def test_discover_binds_buildx_but_cleanup_discovery_does_not(self):
+    def test_discovery_never_consults_or_binds_buildx(self):
         runner = RecordingRunner()
         with mock.patch(
             "tools.unified_ext_lab.docker_runtime.discover_docker_executable",
             return_value=DOCKER,
         ), mock.patch(
             "tools.unified_ext_lab.docker_runtime.discover_buildx_executable",
-            return_value="/fixed/docker-buildx",
+            side_effect=AssertionError("forward discovery consulted Buildx"),
         ), mock.patch(
             "tools.unified_ext_lab.docker_runtime.SubprocessRunner", return_value=runner
         ):
             runtime = RealDockerRuntime.discover()
-        self.assertEqual(runner.bound_buildx, ["/fixed/docker-buildx"])
+        self.assertEqual(runner.bound_buildx, [])
         runtime.close()
 
         cleanup_runner = RecordingRunner()
@@ -611,7 +899,7 @@ class SnapshotAndRuntimeTests(unittest.TestCase):
             runner._check_identity(require_buildx=False)
             with self.assertRaises(InvariantRefusalError):
                 runner._check_identity()
-        self.assertTrue(COPIED_CLI_BUILDX_E2E_REQUIRED)
+        self.assertFalse(COPIED_CLI_BUILDX_E2E_REQUIRED)
 
 
 class RealLifecycleAndCleanupTests(unittest.TestCase):
@@ -632,13 +920,28 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
         probe.responses[self.runtime.inspect_base_argv()] = base_payload(self.profile)
         self.runtime.preflight()
         self.identity = LabIdentity("real-lab", "synthetic", TOKEN)
-        self.spec = self.runtime.spec(self.identity)
-        self.builder = self.runtime.commands(self.spec)
-        self.runner = RealModelRunner(self.builder, self.profile)
         self.store = LabStateStore(
             state_parent / REAL_DOCKER_EXECUTION_PROFILE,
             REAL_DOCKER_EXECUTION_PROFILE,
         )
+        with self.store.locked(self.identity.lab_id) as locked:
+            locked.create_initial(
+                self.identity.provider_id,
+                self.identity.ownership_token,
+                (
+                    PlannedResource.from_value(
+                        self.identity.resource(ResourceRole.CONTAINER)
+                    ),
+                ),
+                {"runtime_snapshot_bound": False},
+            )
+        self.snapshot_root = (
+            self.store.root / self.identity.lab_id / "runtime-snapshot"
+        )
+        self.runtime.capture_snapshot(str(self.snapshot_root))
+        self.spec = self.runtime.spec(self.identity)
+        self.builder = self.runtime.commands(self.spec)
+        self.runner = RealModelRunner(self.builder, self.profile)
         self.lifecycle = FixtureLifecycle(
             self.store,
             self.spec,
@@ -646,13 +949,15 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
             execution_profile=REAL_DOCKER_EXECUTION_PROFILE,
             executor_kind="real_docker",
             command_builder=self.builder,
+            runtime_snapshot=self.runtime.snapshot_resource,
         )
+        self.lifecycle.bind_runtime_snapshot_intent()
 
     def _forward_to_evidence(self):
         created = self.lifecycle.create()
         self.assertEqual(
             dict(created.resource_ids),
-            {"container": CONTAINER_ID, "image": IMAGE_ID},
+            {"container": CONTAINER_ID},
         )
         self.lifecycle.install()
         self.lifecycle.test()
@@ -662,6 +967,8 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
         self.assertIsInstance(self.lifecycle, FixtureLifecycle)
         self.assertIs(self.lifecycle.spec, self.spec)
         self.assertIs(self.builder.uses_resource_ids, True)
+        self.assertIs(self.builder.builds_image, False)
+        self.assertEqual(self.builder.cleanup_roles, (ResourceRole.CONTAINER,))
 
     def _cleanup_lifecycle(self):
         state = self.lifecycle.status()
@@ -672,9 +979,12 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
             timeout=1,
             cleanup_only=True,
         )
+        runtime.bind_snapshot_for_cleanup(str(self.snapshot_root))
         spec = runtime.cleanup_spec(self.identity, state.planned_resources)
         builder = runtime.commands(spec)
         self.assertIsInstance(builder, RealDockerCleanupCommandBuilder)
+        self.assertEqual(builder.cleanup_roles, (ResourceRole.CONTAINER,))
+        self.assertEqual(builder.planned_roles, (ResourceRole.CONTAINER,))
         self.runner.builder = builder
         lifecycle = FixtureLifecycle(
             self.store,
@@ -683,6 +993,7 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
             execution_profile=REAL_DOCKER_EXECUTION_PROFILE,
             executor_kind="real_docker",
             command_builder=builder,
+            runtime_snapshot=runtime.snapshot_resource,
         )
         return runtime, lifecycle
 
@@ -704,8 +1015,46 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
             execution_profile=REAL_DOCKER_EXECUTION_PROFILE,
             executor_kind="real_docker",
             command_builder=self.builder,
+            runtime_snapshot=self.runtime.snapshot_resource,
         )
         return lifecycle, sleeps
+
+    def _assert_snapshot_cleanup_hold(self, patcher, residue):
+        self._forward_to_evidence()
+        self.lifecycle.logout()
+
+        class PatchFirstRemoval:
+            def __init__(inner_self, resource):
+                inner_self.resource = resource
+                inner_self.used = False
+
+            def remove(inner_self):
+                if not inner_self.used:
+                    inner_self.used = True
+                    with patcher:
+                        return inner_self.resource.remove()
+                return inner_self.resource.remove()
+
+            def present(inner_self):
+                return inner_self.resource.present()
+
+        self.lifecycle._runtime_snapshot = PatchFirstRemoval(
+            self.runtime.snapshot_resource
+        )
+        failed, _summary = self.lifecycle.destroy()
+        self.assertEqual(failed.phase, StatePhase.DESTROY_FAILED)
+        self.assertTrue(failed.tainted)
+        self.assertTrue(residue.exists())
+
+        first_verification, _summary = self.lifecycle.verify_clean()
+        self.assertEqual(first_verification.phase, StatePhase.DIRTY)
+        self.assertTrue(first_verification.tainted)
+        retried, _summary = self.lifecycle.destroy()
+        self.assertEqual(retried.phase, StatePhase.DESTROY_DONE)
+        self.assertTrue(retried.tainted)
+        dirty, _summary = self.lifecycle.verify_clean()
+        self.assertEqual(dirty.phase, StatePhase.DIRTY)
+        self.assertTrue(dirty.tainted)
 
     def test_real_lifecycle_uses_ids_tmpfs_and_persisted_artifact(self):
         captured = self._forward_to_evidence()
@@ -726,7 +1075,87 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
         flattened = tuple(argument for argv in self.runner.commands for argument in argv)
         self.assertNotIn("volume", flattened)
         self.assertIn(CONTAINER_ID, flattened)
-        self.assertIn(IMAGE_ID, flattened)
+        self.assertNotIn(IMAGE_ID, flattened)
+        self.assertFalse(self.snapshot_root.exists())
+
+    def test_top_snapshot_replacement_persists_cleanup_hold_across_retry(self):
+        moved = self.root / "moved-snapshot"
+        original_rmdir = os.rmdir
+        replaced = {"done": False}
+
+        def replace_before_rmdir(name, *, dir_fd=None):
+            if name == "runtime-snapshot" and not replaced["done"]:
+                replaced["done"] = True
+                os.rename(self.snapshot_root, moved)
+                self.snapshot_root.mkdir(mode=0o700)
+            return original_rmdir(name, dir_fd=dir_fd)
+
+        self._assert_snapshot_cleanup_hold(
+            mock.patch(
+                "tools.unified_ext_lab.docker_runtime.os.rmdir",
+                side_effect=replace_before_rmdir,
+            ),
+            moved,
+        )
+        self.assertTrue(replaced["done"])
+
+    def test_nested_snapshot_replacement_persists_cleanup_hold_across_retry(self):
+        nested = (
+            self.snapshot_root
+            / "image-context"
+            / "rootfs"
+            / "opt"
+            / "unified-ext-lab"
+            / "fixtures"
+        )
+        moved = self.root / "moved-fixtures"
+        original_rmdir = os.rmdir
+        replaced = {"done": False}
+
+        def replace_before_rmdir(name, *, dir_fd=None):
+            if name == "fixtures" and not replaced["done"]:
+                replaced["done"] = True
+                os.rename(nested, moved)
+                nested.mkdir(mode=0o700)
+            return original_rmdir(name, dir_fd=dir_fd)
+
+        self._assert_snapshot_cleanup_hold(
+            mock.patch(
+                "tools.unified_ext_lab.docker_runtime.os.rmdir",
+                side_effect=replace_before_rmdir,
+            ),
+            moved,
+        )
+        self.assertTrue(replaced["done"])
+
+    def test_file_snapshot_replacement_persists_cleanup_hold_across_retry(self):
+        payload = (
+            self.snapshot_root
+            / "image-context"
+            / "rootfs"
+            / "opt"
+            / "unified-ext-lab"
+            / "guest.py"
+        )
+        moved = self.root / "moved-guest.py"
+        original_unlink = os.unlink
+        replaced = {"done": False}
+
+        def replace_before_unlink(name, *, dir_fd=None):
+            if name == "guest.py" and not replaced["done"]:
+                replaced["done"] = True
+                os.rename(payload, moved)
+                payload.write_bytes(b"replacement")
+            return original_unlink(name, dir_fd=dir_fd)
+
+        self._assert_snapshot_cleanup_hold(
+            mock.patch(
+                "tools.unified_ext_lab.docker_runtime.os.unlink",
+                side_effect=replace_before_unlink,
+            ),
+            moved,
+        )
+        self.assertTrue(replaced["done"])
 
     def test_create_waits_for_delayed_workspace_readiness_before_guest_work(self):
         self.runner.ready_after = 2
@@ -778,7 +1207,7 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
     def test_readiness_cancellation_enters_cleanup_only_recovery(self):
         class CancelDuringReady(RealModelRunner):
             def run(inner_self, argv, *, timeout):
-                if argv == inner_self.builder.exec_guest(GuestAction.READY, CONTAINER_ID):
+                if argv == inner_self.guest_argv[GuestAction.READY]:
                     inner_self.commands.append(argv)
                     raise RunnerFailureError("runner cancelled")
                 return super(CancelDuringReady, inner_self).run(argv, timeout=timeout)
@@ -791,6 +1220,7 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
             execution_profile=REAL_DOCKER_EXECUTION_PROFILE,
             executor_kind="real_docker",
             command_builder=self.builder,
+            runtime_snapshot=self.runtime.snapshot_resource,
         )
 
         with self.assertRaisesRegex(RunnerFailureError, "runner cancelled"):
@@ -806,7 +1236,7 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
             self.builder.exec_guest(GuestAction.TEST, CONTAINER_ID), runner.commands
         )
 
-    def test_local_base_removed_after_preflight_fails_before_build(self):
+    def test_local_base_removed_after_preflight_fails_before_container_create(self):
         class MissingBaseRunner(RealModelRunner):
             def run(inner_self, argv, *, timeout):
                 if argv == inner_self.builder.inspect_base_image():
@@ -822,13 +1252,17 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
             execution_profile=REAL_DOCKER_EXECUTION_PROFILE,
             executor_kind="real_docker",
             command_builder=self.builder,
+            runtime_snapshot=self.runtime.snapshot_resource,
         )
         with self.assertRaises(RunnerFailureError):
             lifecycle.create()
         self.assertEqual(runner.commands[-1], self.builder.inspect_base_image())
-        self.assertNotIn(self.builder.build_image(), runner.commands)
+        self.assertNotIn(self.builder.create_container(), runner.commands)
         self.assertFalse(any("pull" in argv for argv in runner.commands))
-        self.assertFalse(any(self.profile.base_reference in argv for argv in runner.commands))
+        self.assertEqual(
+            runner.commands.count(self.builder.inspect_base_image()),
+            1,
+        )
 
     def test_container_replacement_between_inspect_and_delete_is_not_deleted(self):
         self._forward_to_evidence()
@@ -849,22 +1283,34 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
             self.runner.commands,
         )
 
-    def test_image_replacement_between_inspect_and_delete_is_not_deleted(self):
-        self._forward_to_evidence()
-        self.lifecycle.logout()
-        self.runner.race_role = ResourceRole.IMAGE
-        self.lifecycle.destroy()
-        self.assertNotIn(IMAGE_ID, self.runner.images)
-        self.assertIn(REPLACEMENT_IMAGE_ID, self.runner.images)
-        dirty, _summary = self.lifecycle.verify_clean()
-        self.assertEqual(dirty.phase, StatePhase.DIRTY)
+    def test_locked_base_image_is_never_managed_or_removed(self):
+        captured = self._forward_to_evidence()
+        self.assertNotIn("image", captured.resource_ids)
+        self.assertNotIn("image", captured.created_roles)
+        self.assertEqual(self.runner.images, {})
+        self.assertFalse(any("build" in argv for argv in self.runner.commands))
+        self.assertFalse(any("image" in argv and "rm" in argv for argv in self.runner.commands))
 
-    def test_same_process_cleanup_does_not_depend_on_forward_platform_metadata(self):
+    def test_container_runtime_image_id_drift_is_refused(self):
+        record = self.runner._container_record(CONTAINER_ID)
+        record["Image"] = REPLACEMENT_IMAGE_ID
+
+        with self.assertRaisesRegex(InvariantRefusalError, "inspect policy drift"):
+            self.builder.validate_inspect(
+                ResourceRole.CONTAINER,
+                json.dumps([record]),
+            )
+
+    def test_same_process_cleanup_does_not_reinspect_the_locked_base(self):
         self._forward_to_evidence()
         self.lifecycle.logout()
-        self.runner.images[IMAGE_ID]["Architecture"] = "unavailable-after-run"
+        base_inspects = self.runner.commands.count(self.builder.inspect_base_image())
         destroyed, _summary = self.lifecycle.destroy()
         self.assertEqual(destroyed.phase, StatePhase.DESTROY_DONE)
+        self.assertEqual(
+            self.runner.commands.count(self.builder.inspect_base_image()),
+            base_inspects,
+        )
         clean, verification = self.lifecycle.verify_clean()
         self.assertEqual(clean.phase, StatePhase.CLEAN_VERIFIED)
         self.assertEqual(verification.remaining_count, 0)
@@ -889,18 +1335,18 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
         )
 
     def test_no_durable_id_retains_name_and_label_validation(self):
-        class PublishThenFailBuild(RealModelRunner):
+        class PublishThenFailCreate(RealModelRunner):
             def run(inner_self, argv, *, timeout):
-                if argv == inner_self.builder.build_image():
-                    result = super(PublishThenFailBuild, inner_self).run(
+                if argv == inner_self.create_argv:
+                    result = super(PublishThenFailCreate, inner_self).run(
                         argv, timeout=timeout
                     )
-                    raise RunnerFailureError("ambiguous build failure")
-                return super(PublishThenFailBuild, inner_self).run(
+                    raise RunnerFailureError("ambiguous container-create failure")
+                return super(PublishThenFailCreate, inner_self).run(
                     argv, timeout=timeout
                 )
 
-        runner = PublishThenFailBuild(self.builder, self.profile)
+        runner = PublishThenFailCreate(self.builder, self.profile)
         lifecycle = FixtureLifecycle(
             self.store,
             self.spec,
@@ -908,59 +1354,20 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
             execution_profile=REAL_DOCKER_EXECUTION_PROFILE,
             executor_kind="real_docker",
             command_builder=self.builder,
+            runtime_snapshot=self.runtime.snapshot_resource,
         )
         with self.assertRaises(RunnerFailureError):
             lifecycle.create()
         self.assertTrue(lifecycle.status().tainted)
-        runner.images[IMAGE_ID]["Config"]["Labels"] = {"changed": "true"}
+        runner.containers[CONTAINER_ID]["Config"]["Labels"] = {"changed": "true"}
 
         destroyed, _summary = lifecycle.destroy()
 
         self.assertEqual(destroyed.phase, StatePhase.DESTROY_FAILED)
-        self.assertIn(IMAGE_ID, runner.images)
-        self.assertNotIn(self.builder.remove_image(IMAGE_ID), runner.commands)
+        self.assertIn(CONTAINER_ID, runner.containers)
+        self.assertNotIn(self.builder.remove_container(CONTAINER_ID), runner.commands)
         dirty, _verification = lifecycle.verify_clean()
         self.assertEqual(dirty.phase, StatePhase.DIRTY)
-
-    def test_late_build_publish_is_cleanup_retryable_but_never_promotable(self):
-        class FailBeforePublish(RealModelRunner):
-            failed = False
-
-            def run(inner_self, argv, *, timeout):
-                if argv == inner_self.builder.build_image() and not inner_self.failed:
-                    inner_self.failed = True
-                    inner_self.commands.append(argv)
-                    raise RunnerFailureError("ambiguous build failure")
-                return super(FailBeforePublish, inner_self).run(
-                    argv, timeout=timeout
-                )
-
-        runner = FailBeforePublish(self.builder, self.profile)
-        lifecycle = FixtureLifecycle(
-            self.store,
-            self.spec,
-            runner,
-            execution_profile=REAL_DOCKER_EXECUTION_PROFILE,
-            executor_kind="real_docker",
-            command_builder=self.builder,
-        )
-        with self.assertRaises(RunnerFailureError):
-            lifecycle.create()
-        self.assertTrue(lifecycle.status().tainted)
-        lifecycle.destroy()
-        dirty, summary = lifecycle.verify_clean()
-        self.assertEqual(dirty.phase, StatePhase.DIRTY)
-        self.assertEqual(summary.remaining_count, 0)
-        with self.assertRaisesRegex(InvariantRefusalError, "tainted"):
-            lifecycle.seal(self.output_parent / "late-build.json")
-
-        runner.images[IMAGE_ID] = runner._image_record(IMAGE_ID)
-        runner.image_name_id = IMAGE_ID
-        removed, _summary = lifecycle.destroy()
-        self.assertEqual(removed.phase, StatePhase.DESTROY_DONE)
-        self.assertNotIn(IMAGE_ID, runner.images)
-        still_dirty, _summary = lifecycle.verify_clean()
-        self.assertEqual(still_dirty.phase, StatePhase.DIRTY)
 
     def test_late_container_publish_is_cleanup_retryable_but_never_promotable(self):
         class FailBeforePublish(RealModelRunner):
@@ -968,7 +1375,7 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
 
             def run(inner_self, argv, *, timeout):
                 if (
-                    argv == inner_self.builder.create_container()
+                    argv == inner_self.create_argv
                     and not inner_self.failed
                 ):
                     inner_self.failed = True
@@ -986,12 +1393,13 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
             execution_profile=REAL_DOCKER_EXECUTION_PROFILE,
             executor_kind="real_docker",
             command_builder=self.builder,
+            runtime_snapshot=self.runtime.snapshot_resource,
         )
         with self.assertRaises(RunnerFailureError):
             lifecycle.create()
         state = lifecycle.status()
         self.assertTrue(state.tainted)
-        self.assertEqual(state.resource_ids.get("image"), IMAGE_ID)
+        self.assertEqual(dict(state.resource_ids), {})
         lifecycle.destroy()
         dirty, _summary = lifecycle.verify_clean()
         self.assertEqual(dirty.phase, StatePhase.DIRTY)
@@ -1009,7 +1417,7 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
         interrupted = {"done": False}
 
         def interrupt_record(locked, expected, role, resource_id):
-            if role is ResourceRole.IMAGE and not interrupted["done"]:
+            if role is ResourceRole.CONTAINER and not interrupted["done"]:
                 interrupted["done"] = True
                 raise KeyboardInterrupt("injected state-write interruption")
             return original(locked, expected, role, resource_id)
@@ -1028,14 +1436,14 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
         self.assertEqual(dirty.phase, StatePhase.DIRTY)
 
     def test_recovery_infers_unresolved_create_window_before_cleanup(self):
-        class FailBuild(RealModelRunner):
+        class FailCreate(RealModelRunner):
             def run(inner_self, argv, *, timeout):
-                if argv == inner_self.builder.build_image():
+                if argv == inner_self.create_argv:
                     inner_self.commands.append(argv)
-                    raise RunnerFailureError("ambiguous build failure")
-                return super(FailBuild, inner_self).run(argv, timeout=timeout)
+                    raise RunnerFailureError("ambiguous container-create failure")
+                return super(FailCreate, inner_self).run(argv, timeout=timeout)
 
-        runner = FailBuild(self.builder, self.profile)
+        runner = FailCreate(self.builder, self.profile)
         lifecycle = FixtureLifecycle(
             self.store,
             self.spec,
@@ -1043,6 +1451,7 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
             execution_profile=REAL_DOCKER_EXECUTION_PROFILE,
             executor_kind="real_docker",
             command_builder=self.builder,
+            runtime_snapshot=self.runtime.snapshot_resource,
         )
         original = LockedLabStateStore.mark_tainted
         interrupted = {"done": False}
@@ -1097,6 +1506,187 @@ class RealLifecycleAndCleanupTests(unittest.TestCase):
         )
         with self.assertRaises(InvariantRefusalError):
             cleanup.cleanup_spec(self.identity, tuple(planned))
+
+    def test_legacy_five_resource_cleanup_recovers_without_snapshot(self):
+        legacy_roles = (
+            ResourceRole.IMAGE,
+            ResourceRole.CONTAINER,
+            ResourceRole.WORKSPACE,
+            ResourceRole.AUTH,
+            ResourceRole.TOOL,
+        )
+        cleanup_order = (
+            ResourceRole.CONTAINER,
+            ResourceRole.AUTH,
+            ResourceRole.TOOL,
+            ResourceRole.WORKSPACE,
+            ResourceRole.IMAGE,
+        )
+        planned = tuple(
+            PlannedResource.from_value(self.identity.resource(role))
+            for role in legacy_roles
+        )
+
+        with tempfile.TemporaryDirectory(prefix="legacy-real-cleanup-") as temporary:
+            store = LabStateStore(
+                Path(os.path.realpath(temporary)) / REAL_DOCKER_EXECUTION_PROFILE,
+                REAL_DOCKER_EXECUTION_PROFILE,
+            )
+            with store.locked(self.identity.lab_id) as locked:
+                locked.create_initial(
+                    self.identity.provider_id,
+                    self.identity.ownership_token,
+                    planned,
+                    {"runtime_snapshot_bound": False},
+                )
+                locked.transition(StatePhase.NEW, StatePhase.CREATE_PENDING)
+                locked.record_resource_id(
+                    StatePhase.CREATE_PENDING, ResourceRole.IMAGE, IMAGE_ID
+                )
+                locked.record_resource_id(
+                    StatePhase.CREATE_PENDING, ResourceRole.CONTAINER, CONTAINER_ID
+                )
+                for role in legacy_roles:
+                    locked.record_owned_role(StatePhase.CREATE_PENDING, role)
+                locked.transition(StatePhase.CREATE_PENDING, StatePhase.CREATED)
+                locked.interrupt_stable_forward(StatePhase.CREATED)
+
+            runtime = RealDockerRuntime(
+                DOCKER, RecordingRunner(), None, timeout=1, cleanup_only=True
+            )
+            self.addCleanup(runtime.close)
+            snapshot_path = store.root / self.identity.lab_id / "runtime-snapshot"
+            runtime.bind_snapshot_for_cleanup(str(snapshot_path))
+            self.assertFalse(runtime.snapshot_resource.present())
+            spec = runtime.cleanup_spec(self.identity, planned)
+            builder = runtime.commands(spec)
+            self.assertEqual(builder.cleanup_roles, cleanup_order)
+            self.assertEqual(builder.planned_roles, legacy_roles)
+
+            class LegacyCleanupRunner:
+                def __init__(inner_self):
+                    inner_self.commands = []
+                    inner_self.present = set(cleanup_order)
+
+                def _record(inner_self, role):
+                    resource = spec.resource(role)
+                    if role is ResourceRole.IMAGE:
+                        return {
+                            "Config": {"Labels": dict(resource.labels)},
+                            "Id": IMAGE_ID,
+                            "RepoTags": [resource.name + ":latest"],
+                        }
+                    if role is ResourceRole.CONTAINER:
+                        return {
+                            "Config": {"Labels": dict(resource.labels)},
+                            "Id": CONTAINER_ID,
+                            "Name": "/" + resource.name,
+                        }
+                    return {
+                        "Labels": dict(resource.labels),
+                        "Name": resource.name,
+                    }
+
+                def run(inner_self, argv, *, timeout):
+                    inner_self.commands.append(argv)
+                    stdout = ""
+                    for role in cleanup_order:
+                        resource_id = {
+                            ResourceRole.IMAGE: IMAGE_ID,
+                            ResourceRole.CONTAINER: CONTAINER_ID,
+                        }.get(role, spec.resource(role).name)
+                        if argv in (
+                            builder.list_owned(role),
+                            builder.list_named(role),
+                        ):
+                            stdout = (
+                                resource_id + "\n"
+                                if role in inner_self.present
+                                else ""
+                            )
+                            break
+                        if (
+                            role in builder.resource_id_roles
+                            and argv == builder.list_identity(role)
+                        ):
+                            if role is ResourceRole.IMAGE:
+                                values = [BASE_ID]
+                                if role in inner_self.present:
+                                    values.append(IMAGE_ID)
+                                stdout = "\n".join(values) + "\n"
+                            elif role in inner_self.present:
+                                stdout = CONTAINER_ID + "\n"
+                            break
+                        inspect_argvs = [builder.inspect(role)]
+                        if role in builder.resource_id_roles:
+                            inspect_argvs.append(builder.inspect(role, resource_id))
+                        if argv in inspect_argvs:
+                            stdout = json.dumps([inner_self._record(role)])
+                            break
+                        if (
+                            role is ResourceRole.CONTAINER
+                            and argv == builder.stop_container(CONTAINER_ID)
+                        ):
+                            break
+                        if (
+                            role is ResourceRole.CONTAINER
+                            and argv == builder.remove_container(CONTAINER_ID)
+                        ):
+                            inner_self.present.remove(role)
+                            break
+                        if (
+                            role is ResourceRole.IMAGE
+                            and argv == builder.remove_image(IMAGE_ID)
+                        ):
+                            inner_self.present.remove(role)
+                            break
+                        if (
+                            role not in builder.resource_id_roles
+                            and argv == builder.remove_volume(role)
+                        ):
+                            inner_self.present.remove(role)
+                            break
+                    else:
+                        raise AssertionError(
+                            "unexpected legacy cleanup argv: {!r}".format(argv)
+                        )
+                    return CommandResult(
+                        argv=argv, returncode=0, stdout=stdout, stderr=""
+                    )
+
+            runner = LegacyCleanupRunner()
+            lifecycle = FixtureLifecycle(
+                store,
+                spec,
+                runner,
+                execution_profile=REAL_DOCKER_EXECUTION_PROFILE,
+                executor_kind="real_docker",
+                command_builder=builder,
+                runtime_snapshot=runtime.snapshot_resource,
+            )
+            destroyed, summary = lifecycle.destroy()
+            self.assertEqual(destroyed.phase, StatePhase.DESTROY_DONE)
+            self.assertEqual(summary.removed_count, 5)
+            clean, verification = lifecycle.verify_clean()
+            self.assertEqual(clean.phase, StatePhase.CLEAN_VERIFIED)
+            self.assertEqual(verification.remaining_count, 0)
+            self.assertFalse(runner.present)
+
+            removals = [
+                builder.remove_container(CONTAINER_ID),
+                builder.remove_volume(ResourceRole.AUTH),
+                builder.remove_volume(ResourceRole.TOOL),
+                builder.remove_volume(ResourceRole.WORKSPACE),
+                builder.remove_image(IMAGE_ID),
+            ]
+            self.assertTrue(all(argv in runner.commands for argv in removals))
+            self.assertTrue(
+                all(
+                    BASE_ID not in argv
+                    and self.profile.base_reference not in argv
+                    for argv in removals
+                )
+            )
 
 
 if __name__ == "__main__":

@@ -43,10 +43,13 @@ guest command, or guest/runtime path input. In particular, it cannot be
 redirected to a provider CLI, another Docker endpoint, or arbitrary host files
 through generic command-line parameters.
 
-The conformance run never pulls an image. Base-image preparation is a distinct
-operation and requires the explicit `--allow-network` acknowledgement; it is
-the only operation that may contact a registry. Running preparation is not
-implicit in a conformance invocation.
+The conformance run never pulls or builds an image and does not discover or
+invoke Buildx. Base-image preparation is a distinct operation and requires the
+explicit `--allow-network` acknowledgement; it is the only operation that may
+contact a registry. A run re-inspects the immutable named digest, requires it
+to resolve to the locked local image ID and platform, and creates the container
+from that exact ID with `--pull=never`. Running preparation is not implicit in
+a conformance invocation.
 
 No actual Docker invocation has been made for Stage 6B at the time of this
 record. The implementation and its tests establish a local-engine synthetic
@@ -71,8 +74,8 @@ worktrees with an explicit `PYTHONPATH`.
 ## Fixed execution boundary
 
 The Docker command builder has no shell-string, Compose, prune, wildcard
-deletion, host-network, bind-mount, or arbitrary guest-command surface. The
-container specification requires:
+deletion, host-network, caller-controlled bind-mount, or arbitrary
+guest-command surface. The container specification requires:
 
 - UID/GID `65532:65532`;
 - a read-only root filesystem;
@@ -92,14 +95,31 @@ relabeled, duplicated, or policy-drifted fixture object is left in place and
 reported as remaining.
 
 Stage 6B's real-Docker run instead requires ephemeral storage: `/tmp` and the
-workspace, auth, and tool locations use fixed `tmpfs` mounts, so it does not
-create those named volumes. Once the daemon has returned an image or container
-ID and the harness has made it durable, cleanup targets that exact ID. Later
-name, tag, or label drift does not redirect that deletion. Before an ID is
-durable, discovery is intentionally conservative: the planned name and the
+workspace, auth, and tool locations use fixed `tmpfs` mounts, all with
+`noexec`, so it does not create named volumes. The locked Python tool copied to
+the writable tool mount is invoked through the immutable base interpreter.
+The only new managed daemon resource is the container; the locked base image
+is inspected but never managed or removed. Once the daemon has returned a
+container ID and the harness has made it durable, cleanup targets that exact
+ID. Later name or label drift does not redirect that deletion. Before the ID
+is durable, discovery is intentionally conservative: the planned name and the
 complete ownership-label set must agree before an object can be recorded or
 removed. A replacement object is never substituted for the durable ID; it
-remains visible to clean verification and keeps the run `DIRTY`.
+remains visible to clean verification and keeps the run `DIRTY`. Cleanup also
+accepts the exact historical five-role plan so interrupted older runs can
+remove their managed container and image without treating the base as owned.
+
+Before any forward container action, the run creates an exact `NEW` intent and
+then copies the hash-locked context into
+`real-docker-v1/<lab-id>/runtime-snapshot`. After snapshot and spec validation,
+it atomically binds the fixture artifact to that intent. Docker receives only
+the fixed read-only bind from the snapshot's guest directory to
+`/opt/unified-ext-lab`; the source path is derived from private state and is
+not caller-selectable. The lifecycle removes this snapshot with no-follow,
+descriptor-relative traversal only after container cleanup succeeds, and
+clean verification requires it to be absent. A kill before or after artifact
+binding therefore leaves a deterministic resource that
+`conformance-recover` can find and remove.
 
 ## Durable lifecycle
 
@@ -242,13 +262,15 @@ scripts/unified-ext-lab-real-docker conformance-recover \
 
 `prepare-base` is the only network-capable command and does nothing without
 the exact `--allow-network` flag. `conformance-run` requires a reachable fixed
-Docker engine and an already-local locked base image. `conformance-recover`
-performs daemon reachability checking followed only by state stabilization,
-logout, exact removal, clean verification, and sealing; it never pulls or
-resumes create, install, test, or evidence work. Its cleanup-only discovery
-does not load or enforce the forward routing hold, Buildx binary, base-image
-lock, platform, or build-context snapshot. `conformance-status` performs no
-Docker discovery or daemon probe.
+Docker engine and an already-local locked base image; it neither builds nor
+loads Buildx. `conformance-recover` performs daemon reachability checking
+followed only by state stabilization, logout, exact removal, derived-snapshot
+cleanup, clean verification, and sealing; it never pulls or resumes create,
+install, test, or evidence work. Its cleanup-only discovery does not load or
+enforce the forward routing hold, Buildx binary, base-image lock, platform, or
+source build context. It derives only the fixed snapshot resource path from
+the validated private state namespace and lab ID. `conformance-status`
+performs no Docker discovery or daemon probe.
 
 The fixture suite does not require Docker or network access:
 

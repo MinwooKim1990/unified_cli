@@ -58,6 +58,16 @@ class _AmbiguousResourceIdPolicy:
     uses_resource_ids = 1
 
 
+class _SnapshotResource:
+    @staticmethod
+    def present():
+        return True
+
+    @staticmethod
+    def remove():
+        return None
+
+
 class FixtureLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="unified-ext-lifecycle-")
@@ -189,6 +199,7 @@ class FixtureLifecycleTests(unittest.TestCase):
             execution_profile=REAL_DOCKER_EXECUTION_PROFILE,
             executor_kind="real_docker",
             command_builder=real_builder,
+            runtime_snapshot=_SnapshotResource(),
         )
         fixture_lifecycle = FixtureLifecycle(self.store, self.spec, self.runner)
         self.assertIs(real_lifecycle.spec, self.spec)
