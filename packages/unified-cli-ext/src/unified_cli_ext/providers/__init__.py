@@ -60,13 +60,46 @@ from .runtime import (
 )
 
 
+_BRIDGE_EXPORTS = frozenset(
+    (
+        "AdapterLaunchResolverV1",
+        "AdapterFinalizerV1",
+        "AdapterProviderBridge",
+        "AdapterRecordMapperV1",
+        "AdapterResponseMapperV1",
+        "AdapterStateFactoryV1",
+        "adapter_plugin",
+        "provider_plugin",
+    )
+)
+
+
+def __getattr__(name):
+    """Load the Core-facing bridge only when explicitly requested."""
+
+    if name not in _BRIDGE_EXPORTS:
+        raise AttributeError(name)
+    import importlib
+
+    module = importlib.import_module(".bridge", __name__)
+    value = getattr(module, name)
+    globals()[name] = value
+    return value
+
+
 __all__ = [
     "INSTALLATION_RECEIPT_ABI_V1",
     "PROVIDER_ADAPTER_ABI_V1",
     "AdapterDescriptorV1",
+    "AdapterFinalizerV1",
     "AdapterInspectionV1",
+    "AdapterLaunchResolverV1",
+    "AdapterProviderBridge",
+    "AdapterRecordMapperV1",
+    "AdapterResponseMapperV1",
     "AdapterServerPolicy",
     "AdapterStatus",
+    "AdapterStateFactoryV1",
     "AuthSpec",
     "ArtifactIdentityV1",
     "BinaryProvenance",
@@ -104,7 +137,9 @@ __all__ = [
     "TransportConfig",
     "VersionProbeSpec",
     "VerifiedLaunchV1",
+    "adapter_plugin",
     "describe_adapter",
     "drain_pending_cleanups",
+    "provider_plugin",
     "valid_provider_id",
 ]

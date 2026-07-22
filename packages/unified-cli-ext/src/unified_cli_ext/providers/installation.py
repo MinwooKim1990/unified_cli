@@ -959,13 +959,17 @@ def _consume_receipt_text_budget(values: Tuple[Any, ...]) -> None:
 
 @dataclass(frozen=True)
 class VerifiedLaunchV1:
-    """Canonical launch prefix and Stage 5A identity for its ``argv[0]``."""
+    """Canonical launch prefix and identities for every executable path."""
 
     provider_id: str
     receipt_kind: InstallationReceiptKindV1
     argv_prefix: Tuple[str, ...]
     executable_identity: ExecutableIdentity
     abi_version: int = INSTALLATION_RECEIPT_ABI_V1
+    # Appended with a default so existing direct-executable v1 construction
+    # retains its positional field mapping. Multi-path receipts always supply
+    # the complete tuple from ``InstallationReceiptV1.verify``.
+    launch_identities: Tuple[ExecutableIdentity, ...] = ()
 
     def __post_init__(self) -> None:
         _provider_id(self.provider_id)
@@ -980,12 +984,29 @@ class VerifiedLaunchV1:
         _validate_executable_identity_shape(self.executable_identity)
         if self.argv_prefix[0] != self.executable_identity.path:
             raise _fail("verified launch executable identity does not match argv")
+        if not self.launch_identities and len(self.argv_prefix) == 1:
+            object.__setattr__(
+                self, "launch_identities", (self.executable_identity,)
+            )
+        if (
+            type(self.launch_identities) is not tuple
+            or len(self.launch_identities) != len(self.argv_prefix)
+            or not self.launch_identities
+        ):
+            raise _fail("verified launch identities do not match argv")
+        for index, identity in enumerate(self.launch_identities):
+            _validate_executable_identity_shape(identity)
+            if identity.path != self.argv_prefix[index]:
+                raise _fail("verified launch identities do not match argv")
+        if self.launch_identities[0] != self.executable_identity:
+            raise _fail("verified launch executable identity changed")
         _consume_receipt_text_budget(
             (
                 self.provider_id,
                 self.receipt_kind,
                 self.argv_prefix,
                 self.executable_identity,
+                self.launch_identities,
             )
         )
 
@@ -1416,6 +1437,14 @@ class InstallationReceiptV1:
             receipt_kind=self.receipt_kind,
             argv_prefix=self.argv_prefix,
             executable_identity=self.executable_identity,
+            launch_identities=(
+                (self.executable_identity,)
+                if len(self.argv_prefix) == 1
+                else (
+                    self.executable_identity,
+                    _executable_from_artifact(self.target_identity),
+                )
+            ),
         )
 
 

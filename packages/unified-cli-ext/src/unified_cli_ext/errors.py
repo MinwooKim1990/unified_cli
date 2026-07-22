@@ -44,6 +44,16 @@ class ProcessFailed(TransportError):
         super().__init__(message)
 
 
+class ProviderReportedError(TransportError):
+    """A provider emitted a canonical error event before clean completion."""
+
+    def __init__(self, *, retryable: bool = False) -> None:
+        if type(retryable) is not bool:
+            retryable = False
+        self.retryable = retryable
+        super().__init__("provider reported a turn failure")
+
+
 class OptionalDependencyError(ExtensionError):
     """An explicitly requested optional integration is unavailable."""
 

@@ -1696,6 +1696,12 @@ def test_run_checks_wires_every_candidate_metric_to_captured_sources(
     config = copy.deepcopy(check_performance.load_config(
         check_performance.DEFAULT_BASELINE
     ))
+    # This test exercises captured-source wiring, not the immutable release
+    # baseline.  Bind its synthetic reference copy to its own prevalidated
+    # manifest so ordinary source edits cannot make the wiring test stale.
+    config["reference"]["source_tree_digest"] = (
+        check_performance.source_tree_digest(reference)
+    )
     for metric in config["metrics"].values():
         metric["samples"] = 1
         metric["warmups"] = 0

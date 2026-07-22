@@ -13,7 +13,7 @@ import stat
 import tempfile
 import threading
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 from ..errors import ConfigurationError, TransportCancelled
 
@@ -360,6 +360,71 @@ def _require_executable_identity_argv(
         raise ConfigurationError(
             "subprocess argv executable does not match executable identity"
         )
+
+
+class _SpawnVerifiedPath:
+    """Revalidate one launch path when ``Popen`` consumes its argv entry."""
+
+    __slots__ = ("_identity", "_path")
+
+    def __init__(self, identity: ExecutableIdentity) -> None:
+        if type(identity) is not ExecutableIdentity:
+            raise ConfigurationError("launch identity is invalid")
+        self._identity = identity
+        self._path = identity.path
+
+    def __fspath__(self) -> str:
+        # subprocess calls os.fsencode on path-like argv entries in its final
+        # argument preparation path.  This runtime-owned hook catches a target
+        # swapped after the ordinary pre-Popen verification checkpoint.
+        self._identity.verify_metadata()
+        return self._path
+
+    def __repr__(self) -> str:
+        return "<_SpawnVerifiedPath>"
+
+
+def _validated_launch_identities(
+    argv: Sequence[str],
+    executable_identity: ExecutableIdentity,
+    launch_identities: Optional[Tuple[ExecutableIdentity, ...]],
+) -> Tuple[ExecutableIdentity, ...]:
+    """Bind every runtime-owned launch-prefix entry to an immutable identity."""
+
+    if launch_identities is None:
+        identities = (executable_identity,)
+    else:
+        if type(launch_identities) is not tuple:
+            raise ConfigurationError("launch identities must be a tuple")
+        identities = launch_identities
+    if not 1 <= len(identities) <= 4 or len(argv) < len(identities):
+        raise ConfigurationError("launch identities do not match subprocess argv")
+    if identities[0] != executable_identity:
+        raise ConfigurationError("launch executable identity changed")
+    for index, identity in enumerate(identities):
+        if type(identity) is not ExecutableIdentity or argv[index] != identity.path:
+            raise ConfigurationError("launch identities do not match subprocess argv")
+    return identities
+
+
+def _guarded_spawn_argv(
+    argv: Sequence[str], identities: Tuple[ExecutableIdentity, ...]
+) -> list:
+    """Return Popen argv whose verified prefix is checked at consumption time."""
+
+    for identity in identities:
+        identity.verify()
+    return [
+        *(_SpawnVerifiedPath(identity) for identity in identities),
+        *argv[len(identities):],
+    ]
+
+
+def _verify_launch_identities(
+    identities: Tuple[ExecutableIdentity, ...]
+) -> None:
+    for identity in identities:
+        identity.verify_metadata()
 
 
 @dataclass(frozen=True)

@@ -15,7 +15,7 @@ try:  # Python 3.9+ (kept isolated so importing unified_cli never enumerates it)
 except ImportError:  # pragma: no cover - defensive for unusual runtimes
     import importlib_metadata  # type: ignore[no-redef]
 
-from .base import BaseProvider
+from .base import BaseProvider, _cancel_requested, _cancelled_error
 from .core import ModelInfo, ProviderId, ProviderName
 from .errors import UnifiedError
 from .plugin import (
@@ -199,37 +199,72 @@ class _ExtensionProviderProxy(BaseProvider):
 
     def chat(self, prompt: str, **kwargs: Any) -> Any:
         failed = False
+        caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
+        if caller_cancelled:
+            raise _cancelled_error(self.name) from None
         try:
             response = self._inner.chat(prompt, **kwargs)
         except _CANCELLATION_EXCEPTIONS:
             raise
         except BaseException:
-            failed = True
+            caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
+            failed = not caller_cancelled
             response = None
+        if caller_cancelled or _cancel_requested(kwargs.get("cancel_event")):
+            raise _cancelled_error(self.name) from None
         if failed:
             raise _plugin_error(self.name, "runtime") from None
         return response
 
     def stream(self, prompt: str, **kwargs: Any) -> Any:
         failed = False
+        caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
+        inner_iterator: Any = None
+        if caller_cancelled:
+            raise _cancelled_error(self.name) from None
         try:
-            yield from self._inner.stream(prompt, **kwargs)
+            inner_iterator = iter(self._inner.stream(prompt, **kwargs))
+            for message in inner_iterator:
+                if _cancel_requested(kwargs.get("cancel_event")):
+                    caller_cancelled = True
+                    break
+                yield message
         except _CANCELLATION_EXCEPTIONS:
             raise
         except BaseException:
-            failed = True
+            caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
+            failed = not caller_cancelled
+        finally:
+            if inner_iterator is not None:
+                try:
+                    close = getattr(inner_iterator, "close", None)
+                    if callable(close):
+                        close()
+                except _CANCELLATION_EXCEPTIONS:
+                    raise
+                except BaseException:
+                    if not caller_cancelled:
+                        failed = True
+        if caller_cancelled or _cancel_requested(kwargs.get("cancel_event")):
+            raise _cancelled_error(self.name) from None
         if failed:
             raise _plugin_error(self.name, "runtime") from None
 
     async def achat(self, prompt: str, **kwargs: Any) -> Any:
         failed = False
+        caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
+        if caller_cancelled:
+            raise _cancelled_error(self.name) from None
         try:
             response = await self._inner.achat(prompt, **kwargs)
         except _CANCELLATION_EXCEPTIONS:
             raise
         except BaseException:
-            failed = True
+            caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
+            failed = not caller_cancelled
             response = None
+        if caller_cancelled or _cancel_requested(kwargs.get("cancel_event")):
+            raise _cancelled_error(self.name) from None
         if failed:
             raise _plugin_error(self.name, "runtime") from None
         return response
@@ -237,17 +272,24 @@ class _ExtensionProviderProxy(BaseProvider):
     async def astream(self, prompt: str, **kwargs: Any) -> Any:
         failed = False
         cancelled = False
+        caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
         inner_iterator: Any = None
+        if caller_cancelled:
+            raise _cancelled_error(self.name) from None
         try:
             stream = self._inner.astream(prompt, **kwargs)
             inner_iterator = stream.__aiter__()
             async for message in inner_iterator:
+                if _cancel_requested(kwargs.get("cancel_event")):
+                    caller_cancelled = True
+                    break
                 yield message
         except _CANCELLATION_EXCEPTIONS:
             cancelled = True
             raise
         except BaseException:
-            failed = True
+            caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
+            failed = not caller_cancelled
         finally:
             if inner_iterator is not None:
                 try:
@@ -257,8 +299,10 @@ class _ExtensionProviderProxy(BaseProvider):
                 except _CANCELLATION_EXCEPTIONS:
                     raise
                 except BaseException:
-                    if not cancelled:
+                    if not cancelled and not caller_cancelled:
                         failed = True
+        if caller_cancelled or _cancel_requested(kwargs.get("cancel_event")):
+            raise _cancelled_error(self.name) from None
         if failed:
             raise _plugin_error(self.name, "runtime") from None
 
