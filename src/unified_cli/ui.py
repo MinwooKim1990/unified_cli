@@ -46,7 +46,9 @@ class ProviderState:
     def health(self) -> str:
         if not self.bin_path:
             return "missing_binary"
-        if not (self.has_oauth or self.has_api_key):
+        # Default provider calls deliberately strip inherited vendor API keys.
+        # Only OAuth/headless-token state is usable without Python `extra_env`.
+        if not self.has_oauth:
             return "setup_needed"
         return "ok"
 
@@ -171,7 +173,7 @@ def auth_cell(state: ProviderState) -> Text:
                                   and not _AUTH_FILES[state.name].exists())
                      else "OAuth")
     if state.has_api_key:
-        parts.append(f"${state.api_key_env}")
+        parts.append(t("ui.auth.api_key_ignored", env=state.api_key_env))
     if not parts:
         # No usable auth. If creds live only in a blocked Keychain, say so —
         # that's the launchd/daemon hang, not a missing login.

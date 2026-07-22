@@ -165,8 +165,8 @@ can import**.
 - **Dual mode**: full-featured CLI (`unified-cli chat`, `repl`, `status`, ...)
   AND clean Python API (`from unified_cli import ...`) — same code, same state
 - **Subscription-aware**: uses your existing `claude` / `codex login` / `agy`
-  OAuth. Claude/Codex fall back automatically to `ANTHROPIC_API_KEY` /
-  `OPENAI_API_KEY` if OAuth expires (agy is OAuth-only)
+  OAuth. Inherited vendor API keys are stripped, and authentication failures
+  never replay a turn under a different credential
 - **Multi-turn history**: CLI via `--continue` / `--resume`, Python via
   `session_id=` or `UnifiedConversation`
 - **Cross-provider conversation**: one `UnifiedConversation` can switch providers
@@ -544,14 +544,24 @@ path):
 claude setup-token                         # run ONCE in a real terminal
 # → copy the token into your service environment:
 export CLAUDE_CODE_OAUTH_TOKEN=<token>     # OAuth-equivalent, NOT metered
-# (or, to use metered API billing instead:  export ANTHROPIC_API_KEY=sk-...)
 ```
 
 > By default the wrapper runs on your **subscription OAuth** and **strips any
 > inherited `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`** from the child env, so an
 > exported key can't silently switch you to per-token billing. Set
-> `CLAUDE_CODE_OAUTH_TOKEN` for headless auth; only export the API key if you
-> *want* metered billing.
+> `CLAUDE_CODE_OAUTH_TOKEN` for headless auth. If you intentionally want a
+> metered call, make a **new Python request** and pass the key explicitly:
+
+```python
+from unified_cli import create
+
+metered = create(
+    "claude", extra_env={"ANTHROPIC_API_KEY": "<key-from-secret-store>"},
+)
+metered.chat("new request")
+```
+
+The wrapper never retries a failed OAuth turn with this credential.
 
 **Prove it before you ship.** Run the preflight **from the same context** as
 your service (e.g. inside the launchd job) — it makes a tiny real call per
@@ -646,7 +656,7 @@ unified_cli/
 │   ├── core.py          # Message, Response, Usage, ModelInfo dataclasses
 │   ├── errors.py        # UnifiedError + classify() per-provider matchers
 │   ├── discovery.py     # find_{claude,codex,gemini}_bin()
-│   ├── base.py          # BaseProvider ABC + retry/fallback
+│   ├── base.py          # BaseProvider ABC + side-effect-aware retry
 │   ├── providers/       # claude.py, codex.py, gemini.py
 │   ├── conversation.py  # UnifiedConversation (cross-provider context)
 │   ├── state.py         # ~/.unified-cli/state.json read/write

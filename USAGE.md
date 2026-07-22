@@ -63,6 +63,18 @@ By default the wrapper runs on your subscription OAuth and strips any inherited
 silently switch you to per-token billing). See the README section “Running under
 launchd / cron / a server” for the full recipe.
 
+For an intentionally metered call, create a new Python provider/request and
+pass the key explicitly; a failed OAuth turn is never replayed with it:
+
+```python
+from unified_cli import create
+
+metered = create(
+    "claude", extra_env={"ANTHROPIC_API_KEY": "<key-from-secret-store>"},
+)
+metered.chat("new request")
+```
+
 ## The four daily usage patterns
 
 | Goal | Tool |
@@ -585,11 +597,11 @@ Every failure is a `UnifiedError` with a `kind` field:
 
 | kind | Meaning | What to do |
 |---|---|---|
-| `auth_expired` | OAuth token expired | Re-run the provider's login. Claude/Codex may retry once with configured `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`; `agy` is OAuth-only. |
-| `rate_limit` | Weekly/daily quota hit | Switch providers or wait |
+| `auth_expired` | OAuth token expired | Re-run the provider's login. Authentication failures are never replayed with a different credential. |
+| `rate_limit` | Transient 429 or weekly/daily quota hit | A pre-turn transient 429 may retry within strict delay caps; quota exhaustion does not. Otherwise switch providers or wait. |
 | `model_not_allowed` | Model rejected for your account | Check `unified-cli models` |
 | `not_found` | Session/resource not found (e.g., wrong cwd for Gemini) | Use a fresh session |
-| `network` | DNS/ECONNRESET | Already retried 2x — check connectivity |
+| `network` | DNS/connection failure | Only clearly pre-turn transient failures retry automatically. Failures after output or possible tool execution do not. |
 | `resource_limit` | A local output, stream, or HTTP safety ceiling was reached | Reduce the request/output; raise an explicit limit only for a trusted workload |
 | `config` | Bad provider name or routing | Error message + hint |
 | `internal` | Unknown — check `.cause` field | Raw stderr first line |
@@ -602,7 +614,7 @@ try:
     create("claude").chat("...")
 except UnifiedError as e:
     if e.kind == "auth_expired":
-        print("Run `claude /login` or set ANTHROPIC_API_KEY:", e.hint)
+        print("Run `claude /login`:", e.hint)
     elif e.kind == "rate_limit":
         create("codex").chat("...")             # try the next provider
     else:
@@ -632,14 +644,21 @@ the request — useful for debugging cross-provider routing.
 **Q. How do I deploy this headless (CI / server)?**
 → Use the provider's supported headless auth first: for Claude, create a
 `CLAUDE_CODE_OAUTH_TOKEN` with `claude setup-token`; Codex uses its own CLI
-login state. `agy` requires an existing OAuth session and has no API-key
-fallback. `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` are intentional metered
-fallbacks only when you explicitly want that billing mode:
+login state. `agy` requires an existing OAuth session. The wrapper never swaps
+credentials to replay a failed turn. If you intentionally want metered API
+billing, pass the provider key explicitly through `extra_env` for that provider
+instance and issue a new request:
 ```bash
 export CLAUDE_CODE_OAUTH_TOKEN=<token>
-# Optional, intentional metered fallbacks:
-# export ANTHROPIC_API_KEY=sk-ant-...
-# export OPENAI_API_KEY=...
+```
+
+```python
+from unified_cli import create
+
+metered = create(
+    "claude", extra_env={"ANTHROPIC_API_KEY": "<key-from-secret-store>"},
+)
+metered.chat("new request")
 ```
 
 **Q. Can I fork / modify / redistribute?**
@@ -650,7 +669,7 @@ export CLAUDE_CODE_OAUTH_TOKEN=<token>
 ```
 factory.create(provider, ...)          ← simplest entry point
     └→ ClaudeProvider / CodexProvider / GeminiProvider
-         └→ BaseProvider._run / _stream_run   ← subprocess + retry + api-key fallback
+         └→ BaseProvider._run / _stream_run   ← subprocess + side-effect-aware retry
               └→ errors.classify              ← converts any failure to UnifiedError
 
 UnifiedConversation                    ← multi-provider chat

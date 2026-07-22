@@ -56,9 +56,8 @@ elif mode == "stderr_flood":
     emit({"type": "text", "text": "after flood"})
     emit({"type": "done"})
 elif mode == "auth":
-    # Succeeds ONLY if the API key reached the child env. The wrapper strips it
-    # by default and re-adds it on the auth fallback, so first call fails and
-    # the fallback retry succeeds.
+    # Succeeds only if the API key reached the child env. Automatic paths strip
+    # inherited credentials and never replay an auth failure with another key.
     if os.environ.get("ANTHROPIC_API_KEY"):
         emit({"type": "text", "text": "ok-after-fallback"}); emit({"type": "done"})
     else:
@@ -433,7 +432,7 @@ def test_slow_consumer_does_not_kill_healthy_child_async():
     assert asyncio.run(run()) == ["drip0", "drip1", "drip2", "drip3"]
 
 
-# ---- _env: subscription-by-default + auth fallback ----
+# ---- _env: subscription-by-default; auth failures are never replayed ----
 
 def test_env_strips_api_key_by_default(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-not-leak")
@@ -455,13 +454,13 @@ def test_default_stream_does_not_leak_inherited_key(monkeypatch):
     assert texts == ["KEY=<none>"]  # key stripped from the child env
 
 
-def test_stream_auth_fallback_retries_with_key(monkeypatch):
-    # First invocation: key stripped → child emits auth error. Fallback retry:
-    # key re-added → child succeeds. Exercises both the _env fix and the retry.
+def test_stream_auth_failure_never_replays_with_inherited_key(monkeypatch):
+    # A 401/auth failure must not switch credentials and replay the turn.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
     fp = FakeProvider("auth")
-    texts = [m.text for m in fp.stream("hi") if m.kind == "text"]
-    assert texts == ["ok-after-fallback"]
+    with pytest.raises(UnifiedError) as ei:
+        list(fp.stream("hi"))
+    assert ei.value.kind == "auth_expired"
 
 
 def test_stream_auth_no_key_no_fallback(monkeypatch):
