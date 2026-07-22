@@ -96,7 +96,8 @@ not universal proof of its absence.
 Offline lab verification completed 254/254 on Apple Python 3.9.6 and Python
 3.14.3; the earlier Core result was 615/615. The Python 3.9 Darwin symlink
 fallback audit found P0/P1/P2 counts of 0. The prior failed diagnostic roots
-`/private/tmp/unified-ext-lab-e2e.jYFpUe` and
+`/private/tmp/unified-ext-lab-e2e.kO5y3m`,
+`/private/tmp/unified-ext-lab-e2e.jYFpUe`, and
 `/private/tmp/unified-ext-lab-e2e.2EoEXX` are intentionally preserved as
 non-promotional `DIRTY` evidence; no resources remain from them.
 

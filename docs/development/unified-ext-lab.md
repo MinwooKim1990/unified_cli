@@ -51,12 +51,14 @@ to resolve to the locked local image ID and platform, and creates the container
 from that exact ID with `--pull=never`. Running preparation is not implicit in
 a conformance invocation.
 
-No actual Docker invocation has been made for Stage 6B at the time of this
-record. The implementation and its tests establish a local-engine synthetic
-conformance boundary only. Docker availability, real provider installation,
-authentication, browser callbacks, account access, paid calls, and provider
-protocol compatibility remain outside this gate and require separate approval
-and provider-specific evidence.
+An authorized local Docker run of the synthetic Stage 6B fixture has completed
+successfully. Its exact commit, engine, locked image, cleanup result, and
+non-promotional evidence are recorded in
+[`platform-next-stage6b-readiness.md`](platform-next-stage6b-readiness.md).
+This proves only the local-engine synthetic conformance boundary. Real provider
+installation, authentication, browser callbacks, account access, paid calls,
+and provider protocol compatibility remain outside this gate and require
+separate approval and provider-specific evidence.
 
 ## Repository boundary
 
