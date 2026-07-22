@@ -71,7 +71,34 @@ distribution tests assert that exact boundary.
 
 ## Execution status
 
-No actual Docker invocation has occurred for Stage 6B. This readiness record
-therefore documents the reviewed synthetic conformance boundary and packaging
-exclusions, not successful Docker execution. Any future local-engine run must
-be separately authorized and retain its non-promotional evidence status.
+Final execution record: commit
+`f26aacc0ef603d35fb2837510a4682d4762011ac` on
+`codex/platform-stage6-actual-fix` completed the authorized local Docker
+conformance run. Docker Desktop 4.82.0 / Engine 29.6.1 used the locked
+`linux/amd64` Python base reference
+`python@sha256:72d3d75f2639ab82b34b29390ad3d6e0827c775befee94edda8e9976818f488d`;
+the immutable local image ID was the same digest.
+
+The final `stage6-e2e-five` run in
+`/private/tmp/unified-ext-lab-e2e.FQCQhU` returned exit 0 with phase
+`PASSED`, result `passed`, `tainted=false`, and revision 20. Evidence mode
+was `0600`; the executor was `real_docker`; `promotion_eligible=false`;
+one resource was created and removed; zero remained; and `verified_clean=true`.
+All lifecycle operations succeeded and the runtime snapshot was absent after
+the run. Post-run managed container, volume, and image label queries each
+returned zero.
+
+During the final run, the authoritative local Docker-host proxy log was
+unchanged before and after: 287788 bytes, 2247 lines, inode 64776299. This is
+observed local evidence supporting no registry/proxy traffic during that run,
+not universal proof of its absence.
+
+Offline lab verification completed 254/254 on Apple Python 3.9.6 and Python
+3.14.3; the earlier Core result was 615/615. The Python 3.9 Darwin symlink
+fallback audit found P0/P1/P2 counts of 0. The prior failed diagnostic roots
+`/private/tmp/unified-ext-lab-e2e.jYFpUe` and
+`/private/tmp/unified-ext-lab-e2e.2EoEXX` are intentionally preserved as
+non-promotional `DIRTY` evidence; no resources remain from them.
+
+No provider installation, authentication, account, or live-vendor validation
+was performed.
