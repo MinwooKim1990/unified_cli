@@ -48,6 +48,8 @@ from .installation import (
     InstallationReceiptV1,
     SymlinkIdentityV1,
     VerifiedLaunchV1,
+    installation_receipt_from_record,
+    installation_receipt_to_record,
 )
 from .runtime import (
     AdapterInspectionV1,
@@ -68,7 +70,10 @@ _BRIDGE_EXPORTS = frozenset(
         "AdapterRecordMapperV1",
         "AdapterResponseMapperV1",
         "AdapterStateFactoryV1",
+        "INSTALLATION_RECEIPT_MEDIA_TYPE_V1",
         "adapter_plugin",
+        "installation_receipt_envelope",
+        "installation_receipt_from_envelope",
         "provider_plugin",
     )
 )
@@ -117,6 +122,7 @@ __all__ = [
     "InteractiveAuthSessionV1",
     "InstallationReceiptKindV1",
     "InstallationReceiptV1",
+    "INSTALLATION_RECEIPT_MEDIA_TYPE_V1",
     "JsonProbeSpec",
     "ModelProbeSpec",
     "OperationLimits",
@@ -140,6 +146,10 @@ __all__ = [
     "adapter_plugin",
     "describe_adapter",
     "drain_pending_cleanups",
+    "installation_receipt_envelope",
+    "installation_receipt_from_envelope",
+    "installation_receipt_from_record",
+    "installation_receipt_to_record",
     "provider_plugin",
     "valid_provider_id",
 ]

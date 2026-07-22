@@ -57,6 +57,20 @@ It also has these ABI metadata fields:
   create, model-list, and doctor operations before calling plugin code.
 - `abi_version`: must be `1`.
 
+ABI v1 also has an additive, opt-in configuration sub-ABI. A plugin that
+implements it sets all three of these tail fields:
+
+- `configuration_abi_version`: exactly
+  `PROVIDER_CONFIGURATION_ABI_V1` (`1`). Omitting it preserves the original
+  ABI-v1 callback behavior.
+- `launch_binder`: a callable accepting one `ProviderLaunchContextV1` and
+  returning exactly one `BoundProviderOperationsV1`.
+- `environment_keys`: at most 64 uppercase environment names that the binder
+  is prepared to receive, normalized to a `frozenset`.
+
+Supplying only part of that metadata is invalid. A `held` plugin cannot opt in
+to the configuration sub-ABI.
+
 Provider ids `claude`, `codex`, `gemini`, and `agy` are reserved.  Extensions
 must not use any of them. IDs beginning with Core model-routing prefixes
 (`claude-`, `gpt-`, `o1-`, `o3-`, `codex-`, or `gemini-`) are also invalid;
@@ -91,6 +105,82 @@ and support status reported separately. `status` remains a compatibility alias
 for `lifecycle_status` in the JSON descriptor.
 An entry-point initializer must not recursively load another provider. Core
 rejects nested loads so circular imports cannot deadlock registry threads.
+
+## Typed launch configuration
+
+The configuration sub-ABI uses the following public Core types:
+
+- `ProviderReceiptEnvelopeV1(provider_id, media_type, payload)` carries a
+  format-tagged, bounded JSON mapping. Core copies it into immutable
+  containers, but the plugin owns the media type, strict decoder, and
+  installation-evidence verification. A normalized persistent receipt must
+  not contain credentials, authenticated URLs, or request-local environment
+  values.
+- `ExtensionLaunchOverridesV1(receipt=None, bin_path=None,
+  provider_home=None, extra_env={})` is the caller-owned explicit input.
+  `receipt` and `bin_path` are mutually exclusive; paths must be normalized
+  absolute paths. This type is never an instruction to inspect ambient
+  environment variables.
+- `ProviderLaunchContextV1` is Core's immutable snapshot after explicit
+  overrides are merged over stored receipt and home metadata. Core supplies
+  only explicitly provided environment entries.
+- `ProviderCreateRequestV1` contains the validated model, absolute workspace,
+  optional timeout, and bounded runtime-limit overrides for one create call.
+- `BoundProviderOperationsV1` contains `factory`, `model_lister`, and `doctor`
+  callbacks closed over that same launch snapshot, plus the normalized receipt
+  and provider home. Core reconstructs the returned value at the boundary.
+
+The binder must validate or capture the receipt before returning and must make
+all three callbacks use the same receipt, environment, and provider home. Its
+factory accepts the typed create request rather than arbitrary keyword
+arguments. Core validates create options before invoking the binder and
+rejects unsupported options.
+
+`environment_keys` is a strict allowlist for typed launch input. Every key in
+`ExtensionLaunchOverridesV1.extra_env` must be declared; an unknown or
+misspelled key rejects the launch with a generic configuration error before
+Core reads stored settings, creates a default provider home, or calls plugin
+code. Declared values are bounded and request-local. They are neither sourced
+from `os.environ` nor persisted. This rule does not change the original ABI-v1
+factory contract or a plugin's own legacy environment policy.
+
+Configured extensions are available through these public APIs:
+
+- `bind_extension_provider(id, extension_launch=...)` returns the
+  Core-reconstructed bound operations without persisting them.
+- `configure_extension_provider(id, extension_launch=..., verify=True)` binds
+  the launch, optionally runs the bound doctor, and persists the binder's
+  normalized receipt and provider home. A doctor result containing
+  `available=False`, or a non-boolean `available`, rejects configuration.
+- `clear_extension_provider_configuration(id)` removes persisted launch state
+  without discovering or importing the provider plugin.
+- `create`, `list_models`, and `doctor_provider` accept `extension_launch` for
+  an explicitly named extension. With no explicit override, a configured
+  extension automatically reuses its stored receipt and home. Legacy plugins
+  continue to use their original factory, model-lister, and doctor callbacks.
+
+Configuration errors crossing this boundary are sanitized. Configured doctor
+results are copied into bounded Core-owned JSON data; the original ABI-v1
+doctor return type remains `Any` and is returned unchanged for legacy plugins.
+
+### Receipt persistence and clear semantics
+
+Core stores a configured receipt as canonical UTF-8 JSON in a private,
+content-addressed file below
+`~/.unified-cli/providers/<id>/receipt-v1-<sha256>.json`. The ordinary settings
+document contains only a typed pointer with the receipt digest and optional
+provider-home path. Core publishes the immutable receipt without overwriting
+an existing path, fsyncs it first, and only then atomically publishes the
+settings pointer. Loads verify the pointer digest, canonical encoding,
+provider id, ownership, file type, link count, and private permissions before
+the plugin can decode the receipt.
+
+Clearing configuration removes only the settings pointer. It intentionally
+leaves the content-addressed receipt blob and provider-home directory in place:
+portable POSIX pathname deletion cannot safely bind an unlink to the inode
+that was previously validated. Once unreferenced, the receipt blob is inert
+and cannot be selected by configured launch. Request-local environment data is
+never written to either location.
 
 ## Disabling extensions and server boundary
 

@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import math
 import os
 import threading
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Literal, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, Literal, Optional, Tuple, Union
 
 try:  # Python 3.9+ (kept isolated so importing unified_cli never enumerates it)
     from importlib import metadata as importlib_metadata
@@ -19,12 +21,22 @@ from .base import BaseProvider, _cancel_requested, _cancelled_error
 from .core import ModelInfo, ProviderId, ProviderName
 from .errors import UnifiedError
 from .plugin import (
+    BoundProviderOperationsV1,
     PROVIDER_PLUGIN_ABI_V1,
+    ProviderCreateRequestV1,
+    ProviderLaunchContextV1,
     ProviderPluginV1,
+    ProviderReceiptEnvelopeV1,
     ProviderServerPolicyV1,
     ProviderSupportStatusV1,
     _valid_provider_id,
 )
+
+if TYPE_CHECKING:
+    from .extension_config import (
+        ExtensionLaunchOverridesV1,
+        StoredExtensionLaunchV1,
+    )
 
 
 ENTRY_POINT_GROUP = "unified_cli.providers.v1"
@@ -85,6 +97,9 @@ _MAX_EXTENSION_MODELS = 1_000
 _MAX_MODEL_ID_CHARS = 512
 _MAX_MODEL_DISPLAY_CHARS = 512
 _PLUGIN_LOAD_WAIT_SECONDS = 30.0
+_MAX_DOCTOR_DEPTH = 8
+_MAX_DOCTOR_ITEMS = 512
+_MAX_DOCTOR_TEXT_BYTES = 64 * 1024
 
 
 def _valid_plugin_text(
@@ -129,6 +144,8 @@ def _plugin_error(provider_id: ProviderId, code: str) -> UnifiedError:
         "abi": f"Provider extension '{provider_id}' uses an unsupported ABI.",
         "metadata": f"Provider extension '{provider_id}' has invalid metadata.",
         "factory": f"Provider extension '{provider_id}' could not be created.",
+        "bind": f"Provider extension '{provider_id}' could not bind its launch context.",
+        "configure": f"Provider extension '{provider_id}' configuration is invalid.",
         "reentrant": f"Provider extension '{provider_id}' re-entered its own loader.",
         "models": f"Provider extension '{provider_id}' could not list models.",
         "doctor": f"Provider extension '{provider_id}' doctor failed.",
@@ -148,6 +165,8 @@ def _plugin_error(provider_id: ProviderId, code: str) -> UnifiedError:
         "abi": "provider plugin ABI rejected",
         "metadata": "provider plugin metadata rejected",
         "factory": "provider factory failed",
+        "bind": "provider launch binder failed",
+        "configure": "provider launch configuration rejected",
         "reentrant": "provider entry-point load was re-entrant",
         "models": "provider model listing failed",
         "doctor": "provider doctor failed",
@@ -440,6 +459,9 @@ def _validate_loaded_plugin(
         server_policy=loaded.server_policy,
         abi_version=loaded.abi_version,
         support_status=loaded.support_status,
+        configuration_abi_version=loaded.configuration_abi_version,
+        launch_binder=loaded.launch_binder,
+        environment_keys=loaded.environment_keys,
     )
     return plugin, None
 
@@ -556,17 +578,219 @@ def _require_executable_support(plugin: ProviderPluginV1) -> None:
         raise _plugin_error(plugin.id, "held") from None
 
 
+def _launch_context_for_plugin(
+    plugin: ProviderPluginV1,
+    extension_launch: Optional["ExtensionLaunchOverridesV1"],
+) -> ProviderLaunchContextV1:
+    """Merge one explicit Core override over stored receipt/home metadata."""
+
+    from .extension_config import (
+        ExtensionLaunchOverridesV1,
+        default_provider_home,
+        load_extension_launch,
+    )
+
+    if extension_launch is not None and type(extension_launch) is not ExtensionLaunchOverridesV1:
+        raise _plugin_error(plugin.id, "configure") from None
+    launch = extension_launch
+    if launch is not None and (
+        frozenset(launch.extra_env).difference(plugin.environment_keys)
+    ):
+        # Typed launch input is an explicit contract. Reject misspelled or
+        # undeclared keys before consulting settings or touching provider-home
+        # state instead of silently weakening the caller's configuration.
+        raise _plugin_error(plugin.id, "configure") from None
+    try:
+        explicit_source = launch is not None and (
+            launch.receipt is not None or launch.bin_path is not None
+        )
+        stored_receipt = None
+        stored_home = None
+        if explicit_source:
+            # An explicit source supersedes a stale receipt blob, but inherits
+            # the separately typed home pointer when the caller did not supply
+            # one. Reading this pointer performs no extension discovery.
+            from .settings import get_extension_launch_settings
+
+            pointer = get_extension_launch_settings(plugin.id)
+            if pointer is not None:
+                stored_home = pointer.provider_home
+        else:
+            stored = load_extension_launch(plugin.id)
+            if stored is not None:
+                stored_receipt = stored.receipt
+                stored_home = stored.provider_home
+
+        receipt = (
+            launch.receipt
+            if launch is not None and launch.receipt is not None
+            else stored_receipt
+        )
+        bin_path = launch.bin_path if launch is not None else None
+        provider_home = (
+            launch.provider_home
+            if launch is not None and launch.provider_home is not None
+            else stored_home
+        )
+        if provider_home is None:
+            provider_home = default_provider_home(plugin.id)
+        supplied_env = launch.extra_env if launch is not None else {}
+        selected_env = {
+            key: supplied_env[key]
+            for key in sorted(plugin.environment_keys)
+            if key in supplied_env
+        }
+        return ProviderLaunchContextV1(
+            provider_id=plugin.id,
+            receipt=receipt,
+            bin_path=bin_path,
+            provider_home=provider_home,
+            provider_env=selected_env,
+        )
+    except _CANCELLATION_EXCEPTIONS:
+        raise
+    except UnifiedError:
+        raise
+    except BaseException:
+        raise _plugin_error(plugin.id, "configure") from None
+
+
+def _bind_plugin_operations(
+    plugin: ProviderPluginV1,
+    context: ProviderLaunchContextV1,
+) -> BoundProviderOperationsV1:
+    """Run a plugin binder and reconstruct its result inside one boundary."""
+
+    failed = False
+    try:
+        binder = plugin.launch_binder
+        if not callable(binder):
+            raise TypeError("provider has no launch binder")
+        supplied = binder(context)
+        if type(supplied) is not BoundProviderOperationsV1:
+            raise TypeError("provider binder returned incompatible operations")
+        normalized_receipt = supplied.normalized_receipt
+        if normalized_receipt is not None:
+            if type(normalized_receipt) is not ProviderReceiptEnvelopeV1:
+                raise TypeError("provider binder returned an invalid receipt")
+            normalized_receipt = ProviderReceiptEnvelopeV1(
+                provider_id=normalized_receipt.provider_id,
+                media_type=normalized_receipt.media_type,
+                payload=normalized_receipt.payload,
+            )
+        bound = BoundProviderOperationsV1(
+            provider_id=supplied.provider_id,
+            factory=supplied.factory,
+            model_lister=supplied.model_lister,
+            doctor=supplied.doctor,
+            normalized_receipt=normalized_receipt,
+            provider_home=supplied.provider_home,
+        )
+        if bound.provider_id != plugin.id:
+            raise ValueError("provider binder id changed")
+    except _CANCELLATION_EXCEPTIONS:
+        raise
+    except BaseException:
+        failed = True
+        bound = None
+    if failed:
+        raise _plugin_error(plugin.id, "bind") from None
+    assert bound is not None
+    return bound
+
+
+def _configured_operations(
+    plugin: ProviderPluginV1,
+    extension_launch: Optional["ExtensionLaunchOverridesV1"],
+    *,
+    required: bool,
+) -> Optional[BoundProviderOperationsV1]:
+    if plugin.configuration_abi_version is None:
+        if required or extension_launch is not None:
+            raise _plugin_error(plugin.id, "configure") from None
+        return None
+    context = _launch_context_for_plugin(plugin, extension_launch)
+    return _bind_plugin_operations(plugin, context)
+
+
+def bind_extension_provider(
+    provider_id: ProviderId,
+    *,
+    extension_launch: Optional["ExtensionLaunchOverridesV1"] = None,
+) -> BoundProviderOperationsV1:
+    """Return Core-reconstructed operations for a configured extension."""
+
+    plugin = load_provider_plugin(provider_id)
+    _require_executable_support(plugin)
+    bound = _configured_operations(
+        plugin, extension_launch, required=True,
+    )
+    assert bound is not None
+    return bound
+
+
+def _create_request(
+    plugin: ProviderPluginV1,
+    model: Optional[str],
+    opts: Mapping[str, Any],
+) -> ProviderCreateRequestV1:
+    values = dict(opts)
+    workspace = values.pop("cwd", None)
+    if "web_search" in values:
+        web_search = values.pop("web_search")
+        if type(web_search) is not bool or web_search:
+            raise ValueError("configured extensions do not accept web_search")
+    if "first_output_timeout" in values:
+        if values.pop("first_output_timeout") is not None:
+            raise ValueError("configured extensions do not accept first_output_timeout")
+    limit_names = (
+        "timeout",
+        "max_output_bytes",
+        "max_stderr_bytes",
+        "max_stream_buffer_bytes",
+        "max_stream_events",
+        "max_stream_line_bytes",
+    )
+    limits = {name: values.pop(name, None) for name in limit_names}
+    if values:
+        raise ValueError("configured extension received unsupported options")
+    return ProviderCreateRequestV1(
+        provider_id=plugin.id,
+        model=plugin.default_model if model is None else model,
+        workspace=workspace,
+        **limits,
+    )
+
+
 def instantiate_extension_provider(
     provider_id: ProviderId,
     *,
     model: Optional[str] = None,
+    extension_launch: Optional["ExtensionLaunchOverridesV1"] = None,
     **opts: Any,
 ) -> BaseProvider:
     plugin = load_provider_plugin(provider_id)
     _require_executable_support(plugin)
+    request = None
+    if plugin.configuration_abi_version is not None:
+        try:
+            # Reject malformed Core options before a binder can touch the
+            # filesystem, invoke provider code, or retain launch context.
+            request = _create_request(plugin, model, opts)
+        except _CANCELLATION_EXCEPTIONS:
+            raise
+        except BaseException:
+            raise _plugin_error(provider_id, "factory") from None
+    bound = _configured_operations(
+        plugin, extension_launch, required=False,
+    )
     failed = False
     try:
-        provider = plugin.factory(model=model or plugin.default_model, **opts)
+        if bound is None:
+            provider = plugin.factory(model=model or plugin.default_model, **opts)
+        else:
+            assert request is not None
+            provider = bound.factory(request)
         if not isinstance(provider, BaseProvider) or provider.name != provider_id:
             raise TypeError("provider factory returned an incompatible object")
         wrapped = _ExtensionProviderProxy(provider_id, provider)
@@ -582,16 +806,28 @@ def instantiate_extension_provider(
     return wrapped
 
 
-def list_extension_models(provider_id: ProviderId) -> list[ModelInfo]:
+def list_extension_models(
+    provider_id: ProviderId,
+    *,
+    extension_launch: Optional["ExtensionLaunchOverridesV1"] = None,
+) -> list[ModelInfo]:
     """Run one explicitly requested extension's model lister safely."""
     plugin = load_provider_plugin(provider_id)
     _require_executable_support(plugin)
+    bound = _configured_operations(
+        plugin, extension_launch, required=False,
+    )
     failed = False
     try:
         # Materialize at most one item past the public limit so a buggy
         # infinite generator cannot grow memory without bound.
         supplied = list(itertools.islice(
-            iter(plugin.model_lister()), _MAX_EXTENSION_MODELS + 1,
+            iter(
+                plugin.model_lister()
+                if bound is None
+                else bound.model_lister()
+            ),
+            _MAX_EXTENSION_MODELS + 1,
         ))
         if len(supplied) > _MAX_EXTENSION_MODELS:
             raise ValueError("provider model_lister returned too many models")
@@ -649,26 +885,153 @@ def list_extension_models(provider_id: ProviderId) -> list[ModelInfo]:
     return models
 
 
-def doctor_provider(provider_id: ProviderId) -> Any:
-    """Run a built-in or explicitly requested extension provider doctor."""
-    if provider_id in BUILTIN_PROVIDER_IDS:
-        from .ui import collect_states
+def _copy_doctor_result(value: Any) -> Any:
+    """Return bounded Core-owned JSON data from one extension doctor."""
 
-        return next(state for state in collect_states() if state.name == provider_id)
+    budget = [_MAX_DOCTOR_ITEMS, _MAX_DOCTOR_TEXT_BYTES]
 
-    plugin = load_provider_plugin(provider_id)
-    _require_executable_support(plugin)
+    def copy(item: Any, depth: int) -> Any:
+        if depth > _MAX_DOCTOR_DEPTH:
+            raise ValueError("provider doctor result is nested too deeply")
+        budget[0] -= 1
+        if budget[0] < 0:
+            raise ValueError("provider doctor result has too many values")
+        if item is None or type(item) in (bool, int):
+            if type(item) is int and item.bit_length() > 4096:
+                raise ValueError("provider doctor integer is too large")
+            return item
+        if type(item) is float:
+            if not math.isfinite(item):
+                raise ValueError("provider doctor number is invalid")
+            return item
+        if type(item) is str:
+            encoded = item.encode("utf-8", "strict")
+            budget[1] -= len(encoded)
+            if budget[1] < 0:
+                raise ValueError("provider doctor text is too large")
+            return item
+        if type(item) in (list, tuple):
+            if len(item) > _MAX_DOCTOR_ITEMS:
+                raise ValueError("provider doctor collection is too large")
+            return [copy(child, depth + 1) for child in item]
+        if not isinstance(item, Mapping):
+            raise TypeError("provider doctor result must contain JSON values")
+        result = {}
+        for index, pair in enumerate(item.items()):
+            if index >= _MAX_DOCTOR_ITEMS:
+                raise ValueError("provider doctor mapping is too large")
+            key, child = pair
+            if type(key) is not str or not key or len(key) > 128:
+                raise ValueError("provider doctor key is invalid")
+            encoded_key = key.encode("utf-8", "strict")
+            budget[1] -= len(encoded_key)
+            if budget[1] < 0:
+                raise ValueError("provider doctor text is too large")
+            result[key] = copy(child, depth + 1)
+        return result
+
+    return copy(value, 0)
+
+
+def _run_extension_doctor(
+    plugin: ProviderPluginV1,
+    bound: Optional[BoundProviderOperationsV1],
+) -> Any:
     failed = False
     try:
-        result = plugin.doctor()
+        supplied = plugin.doctor() if bound is None else bound.doctor()
+        # ABI-v1 legacy doctor returns Any and remains exact. The additive
+        # bound configuration ABI crosses the new Core-owned data boundary.
+        result = supplied if bound is None else _copy_doctor_result(supplied)
     except _CANCELLATION_EXCEPTIONS:
         raise
     except BaseException:
         failed = True
         result = None
     if failed:
-        raise _plugin_error(provider_id, "doctor") from None
+        raise _plugin_error(plugin.id, "doctor") from None
     return result
+
+
+def doctor_provider(
+    provider_id: ProviderId,
+    *,
+    extension_launch: Optional["ExtensionLaunchOverridesV1"] = None,
+) -> Any:
+    """Run a built-in or explicitly requested extension provider doctor."""
+    if provider_id in BUILTIN_PROVIDER_IDS:
+        if extension_launch is not None:
+            raise _plugin_error(provider_id, "configure") from None
+        from .ui import collect_states
+
+        return next(state for state in collect_states() if state.name == provider_id)
+
+    plugin = load_provider_plugin(provider_id)
+    _require_executable_support(plugin)
+    bound = _configured_operations(
+        plugin, extension_launch, required=False,
+    )
+    return _run_extension_doctor(plugin, bound)
+
+
+def configure_extension_provider(
+    provider_id: ProviderId,
+    extension_launch: Optional["ExtensionLaunchOverridesV1"] = None,
+    *,
+    verify: bool = True,
+) -> "StoredExtensionLaunchV1":
+    """Verify and persist one normalized configuration-capable receipt."""
+
+    if type(verify) is not bool:
+        raise _plugin_error(provider_id, "configure") from None
+    plugin = load_provider_plugin(provider_id)
+    _require_executable_support(plugin)
+    bound = _configured_operations(
+        plugin, extension_launch, required=True,
+    )
+    assert bound is not None
+    if verify:
+        result = _run_extension_doctor(plugin, bound)
+        unavailable = False
+        invalid = False
+        try:
+            if isinstance(result, Mapping) and "available" in result:
+                available = result["available"]
+                invalid = type(available) is not bool
+                unavailable = available is False
+        except _CANCELLATION_EXCEPTIONS:
+            raise
+        except BaseException:
+            invalid = True
+        if invalid or unavailable:
+            raise _plugin_error(provider_id, "configure") from None
+    if bound.normalized_receipt is None:
+        raise _plugin_error(provider_id, "configure") from None
+    try:
+        from .extension_config import save_extension_launch
+
+        return save_extension_launch(
+            provider_id,
+            bound.normalized_receipt,
+            provider_home=bound.provider_home,
+        )
+    except _CANCELLATION_EXCEPTIONS:
+        raise
+    except BaseException:
+        raise _plugin_error(provider_id, "configure") from None
+
+
+def clear_extension_provider_configuration(provider_id: ProviderId) -> bool:
+    """Clear persisted Core launch state without importing a provider plugin."""
+
+    try:
+        from .extension_config import clear_extension_launch
+
+        return clear_extension_launch(provider_id)
+    except _CANCELLATION_EXCEPTIONS:
+        raise
+    except BaseException:
+        raise _plugin_error(provider_id, "configure") from None
 
 
 def _builtin_descriptors() -> list[ProviderDescriptorV1]:
@@ -779,6 +1142,9 @@ __all__ = [
     "ProviderDescriptorV1",
     "ProviderDescriptor",
     "RESERVED_PROVIDER_IDS",
+    "bind_extension_provider",
+    "clear_extension_provider_configuration",
+    "configure_extension_provider",
     "extension_provider_exists",
     "doctor_provider",
     "instantiate_extension_provider",

@@ -20,7 +20,8 @@ from typing import AsyncIterator, Iterator, Optional
 from .base import BaseProvider
 from .core import Message, ProviderId, Response
 from .errors import UnifiedError
-from .factory import create
+from .extension_config import ExtensionLaunchOverridesV1
+from .factory import PROVIDERS, create
 from .i18n import t
 
 
@@ -34,6 +35,9 @@ class Turn:
 
 _FINAL_TEXT_ENVELOPES = frozenset((
     "assistant", "message.completed", "response.completed",
+))
+_EXTENSION_LAUNCH_OPTION_KEYS = frozenset((
+    "bin_path", "receipt", "provider_home", "extra_env", "extension_launch",
 ))
 
 
@@ -89,6 +93,9 @@ class UnifiedConversation:
         cross_provider_context: bool = True,
         provider_opts: Optional[dict] = None,
         provider_opts_by_provider: Optional[dict[ProviderId, dict]] = None,
+        extension_launch_by_provider: Optional[
+            dict[ProviderId, ExtensionLaunchOverridesV1]
+        ] = None,
         max_turns: Optional[int] = None,
         max_turn_chars: Optional[int] = None,
         max_clients: Optional[int] = None,
@@ -117,6 +124,23 @@ class UnifiedConversation:
             provider: dict(options)
             for provider, options in (provider_opts_by_provider or {}).items()
         }
+        self.extension_launch_by_provider = {}
+        for provider, launch in (extension_launch_by_provider or {}).items():
+            if provider in PROVIDERS:
+                raise UnifiedError(
+                    kind="config",
+                    provider=provider,
+                    message=(
+                        "Built-in providers do not accept extension launch "
+                        "configuration."
+                    ),
+                )
+            if type(launch) is not ExtensionLaunchOverridesV1:
+                raise ValueError(
+                    "extension_launch_by_provider values must be "
+                    "ExtensionLaunchOverridesV1"
+                )
+            self.extension_launch_by_provider[provider] = launch
         # Public conversations deliberately remain unbounded by default. The
         # local HTTP server opts into these limits so an arbitrary persistent
         # user id cannot retain an unlimited transcript/client cache.
@@ -143,11 +167,29 @@ class UnifiedConversation:
                 **self.provider_opts,
                 **self.provider_opts_by_provider.get(provider, {}),
             }
+            if provider not in PROVIDERS and _EXTENSION_LAUNCH_OPTION_KEYS.intersection(opts):
+                raise UnifiedError(
+                    kind="config",
+                    provider=provider,
+                    message=(
+                        "Extension launch values must use the typed "
+                        "extension_launch_by_provider mapping."
+                    ),
+                )
             if provider != "claude":
                 # `terse` is a Claude-only constructor option; passing it to
                 # codex/gemini would raise TypeError (unexpected kwarg).
                 opts.pop("terse", None)
-            self._clients[key] = create(provider, model=model, **opts)
+            launch = self.extension_launch_by_provider.get(provider)
+            if launch is None:
+                self._clients[key] = create(provider, model=model, **opts)
+            else:
+                self._clients[key] = create(
+                    provider,
+                    model=model,
+                    extension_launch=launch,
+                    **opts,
+                )
         else:
             self._clients.move_to_end(key)
         return self._clients[key]

@@ -18,6 +18,8 @@ from unified_cli_ext.providers.installation import (
     InstallationReceiptKindV1,
     InstallationReceiptV1,
     VerifiedLaunchV1,
+    installation_receipt_from_record,
+    installation_receipt_to_record,
 )
 from unified_cli_ext.transports.security import ExecutableIdentity
 
@@ -118,6 +120,63 @@ def test_direct_receipt_returns_immutable_verified_launch(tmp_path):
         result.argv_prefix = ()
     with pytest.raises(FrozenInstanceError):
         receipt.provider_id = "changed"
+
+
+def test_receipt_record_codec_round_trips_and_sanitizes_persistent_metadata(
+    tmp_path,
+):
+    receipt = _capture_direct(tmp_path)
+
+    record = installation_receipt_to_record(receipt)
+    rebuilt = installation_receipt_from_record(record)
+    assert rebuilt == receipt
+    assert rebuilt.verify() == receipt.verify()
+
+    persistent = installation_receipt_to_record(receipt, persistent=True)
+    assert persistent["acquisition_source"] == "configured-local-installation"
+    assert persistent["acquisition_url"] is None
+    persisted_receipt = installation_receipt_from_record(persistent)
+    assert persisted_receipt.provider_id == receipt.provider_id
+    assert persisted_receipt.verify().argv_prefix == receipt.verify().argv_prefix
+
+
+def test_receipt_record_codec_rejects_unknown_missing_and_changed_evidence(tmp_path):
+    receipt = _capture_direct(tmp_path)
+    record = installation_receipt_to_record(receipt)
+
+    with_unknown = dict(record)
+    with_unknown["unexpected"] = True
+    with pytest.raises(ConfigurationError):
+        installation_receipt_from_record(with_unknown)
+
+    missing = dict(record)
+    del missing["target_identity"]
+    with pytest.raises(ConfigurationError):
+        installation_receipt_from_record(missing)
+
+    boolean_schema = dict(record)
+    boolean_schema["schema"] = True
+    with pytest.raises(ConfigurationError, match="schema"):
+        installation_receipt_from_record(boolean_schema)
+
+    changed = json.loads(json.dumps(record))
+    changed["target_identity"]["sha256"] = "0" * 64
+    with pytest.raises(ConfigurationError):
+        installation_receipt_from_record(changed)
+
+
+def test_explicit_direct_capture_is_complete_verified_receipt(tmp_path):
+    executable = _copy_executable(tmp_path, "vendor-cli")
+    receipt = InstallationReceiptV1.capture_explicit_direct(
+        provider_id="fixture-provider",
+        executable_path=str(executable),
+        executable_basename="vendor-cli",
+    )
+
+    assert receipt.acquisition_url is None
+    assert receipt.acquisition_source == "explicit-local-path"
+    assert receipt.distribution_version == "0.0.0+explicit"
+    assert receipt.verify().argv_prefix == (str(executable),)
 
 
 def test_direct_rejects_symlink_and_detects_file_or_permission_change(tmp_path):

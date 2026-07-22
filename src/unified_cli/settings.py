@@ -38,12 +38,49 @@ _MAX_NAMESPACE_BYTES = 65_536
 _PROVIDERS = frozenset(("claude", "codex", "gemini"))
 _PROVIDER_ID_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _SETTING_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
+_RECEIPT_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _LANG_RE = re.compile(r"^[A-Za-z]{2,8}(?:[-_][A-Za-z0-9]{1,8}){0,2}$")
 _SENSITIVE_KEY_RE = re.compile(
     r"(?:^|[_.-])(api[_-]?key|auth|bearer|cookie|credential|password|secret|token)(?:$|[_.-])",
     re.IGNORECASE,
 )
 _LOCK = threading.RLock()
+_EXTENSION_LAUNCH_KEY = "unified_cli_launch"
+_EXTENSION_LAUNCH_SCHEMA_V1 = 1
+_MISSING = object()
+
+
+@dataclass(frozen=True)
+class ExtensionLaunchSettingsV1:
+    """Small settings pointer to a separately stored provider receipt."""
+
+    provider_id: str
+    receipt_sha256: str
+    provider_home: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not _safe_provider_id(self.provider_id):
+            raise ValueError("invalid provider id")
+        if (
+            type(self.receipt_sha256) is not str
+            or _RECEIPT_SHA256_RE.fullmatch(self.receipt_sha256) is None
+        ):
+            raise ValueError("invalid provider receipt digest")
+        if self.provider_home is not None:
+            if type(self.provider_home) is not str:
+                raise ValueError("invalid provider home")
+            try:
+                encoded_home = os.fsencode(self.provider_home)
+            except (TypeError, UnicodeError):
+                raise ValueError("invalid provider home") from None
+            if (
+                not self.provider_home
+                or "\x00" in self.provider_home
+                or len(encoded_home) > 16 * 1024
+                or not os.path.isabs(self.provider_home)
+                or os.path.normpath(self.provider_home) != self.provider_home
+            ):
+                raise ValueError("invalid provider home")
 
 
 @dataclass
@@ -125,6 +162,42 @@ def _safe_json(value: Any, *, depth: int = 0) -> Any:
     raise ValueError("provider settings must contain JSON-safe values only")
 
 
+def _extension_launch_record(
+    value: object, *, provider_id: str
+) -> ExtensionLaunchSettingsV1:
+    if type(value) is not dict or frozenset(value) != frozenset({
+        "schema", "receipt_sha256", "provider_home",
+    }):
+        raise ValueError("invalid extension launch settings")
+    if (
+        type(value["schema"]) is not int
+        or value["schema"] != _EXTENSION_LAUNCH_SCHEMA_V1
+    ):
+        raise ValueError("unsupported extension launch settings")
+    return ExtensionLaunchSettingsV1(
+        provider_id=provider_id,
+        receipt_sha256=value["receipt_sha256"],
+        provider_home=value["provider_home"],
+    )
+
+
+def _extension_launch_json(value: ExtensionLaunchSettingsV1) -> Dict[str, Any]:
+    if type(value) is not ExtensionLaunchSettingsV1:
+        raise TypeError("launch settings must be ExtensionLaunchSettingsV1")
+    # Reconstruct through the public type before crossing the persistence
+    # boundary; do not trust a mutated/object.__setattr__-forged instance.
+    checked = ExtensionLaunchSettingsV1(
+        provider_id=value.provider_id,
+        receipt_sha256=value.receipt_sha256,
+        provider_home=value.provider_home,
+    )
+    return {
+        "schema": _EXTENSION_LAUNCH_SCHEMA_V1,
+        "receipt_sha256": checked.receipt_sha256,
+        "provider_home": checked.provider_home,
+    }
+
+
 def _provider_settings(value: object, *, strict: bool) -> Dict[str, Dict[str, Any]]:
     if type(value) is not dict or len(value) > _MAX_PROVIDER_NAMESPACES:
         if strict:
@@ -135,7 +208,20 @@ def _provider_settings(value: object, *, strict: bool) -> Dict[str, Dict[str, An
         try:
             if not _safe_provider_id(provider_id) or type(namespace) is not dict:
                 raise ValueError("invalid provider settings namespace")
-            safe = _safe_json(namespace)
+            ordinary = dict(namespace)
+            launch_value = ordinary.pop(_EXTENSION_LAUNCH_KEY, _MISSING)
+            safe = _safe_json(ordinary)
+            if launch_value is not _MISSING:
+                try:
+                    launch = _extension_launch_record(
+                        launch_value, provider_id=provider_id,
+                    )
+                    safe[_EXTENSION_LAUNCH_KEY] = _extension_launch_json(launch)
+                except (TypeError, ValueError):
+                    if strict:
+                        raise
+                    # Corrupt internal launch metadata is discarded without
+                    # poisoning unrelated settings in this provider namespace.
             encoded = json.dumps(safe, ensure_ascii=False, separators=(",", ":"))
             if len(encoded.encode("utf-8")) > _MAX_NAMESPACE_BYTES:
                 raise ValueError("provider settings namespace is too large")
@@ -476,6 +562,87 @@ def load_settings() -> Settings:
     return _normalise(inner, strict=False)
 
 
+def _reserved_launch_values(
+    provider_settings: Mapping[str, Mapping[str, Any]],
+) -> Dict[str, ExtensionLaunchSettingsV1]:
+    result = {}
+    for provider_id, namespace in provider_settings.items():
+        if _EXTENSION_LAUNCH_KEY in namespace:
+            result[provider_id] = _extension_launch_record(
+                namespace[_EXTENSION_LAUNCH_KEY], provider_id=provider_id,
+            )
+    return result
+
+
+def _raw_reserved_launch_values(
+    inner: object,
+) -> Dict[str, ExtensionLaunchSettingsV1]:
+    """Read reserved records from raw v2 data without lossy normalization."""
+
+    if type(inner) is not dict:
+        return {}
+    namespaces = inner.get("provider_settings", {})
+    if type(namespaces) is not dict:
+        return {}
+    result = {}
+    for provider_id, namespace in namespaces.items():
+        if type(namespace) is not dict or _EXTENSION_LAUNCH_KEY not in namespace:
+            continue
+        try:
+            result[provider_id] = _extension_launch_record(
+                namespace[_EXTENSION_LAUNCH_KEY], provider_id=provider_id,
+            )
+        except (TypeError, ValueError):
+            # Ordinary writes may not normalize a malformed reserved record
+            # away and thereby re-enable unpinned fallback. The typed clear
+            # API is the explicit recovery mechanism.
+            raise ValueError(
+                "reserved extension launch settings are invalid"
+            ) from None
+    return result
+
+
+def _write_state_unlocked(
+) -> tuple[Settings, Dict[str, ExtensionLaunchSettingsV1]]:
+    data = _read_payload()
+    version = data.get("version") if data else None
+    inner = data.get("settings") if data else None
+    launches = {}
+    if type(version) is int and version == _VERSION and type(inner) is dict:
+        launches = _raw_reserved_launch_values(inner)
+    if type(version) is int and version in (_LEGACY_VERSION, _VERSION):
+        raw = inner if type(inner) is dict else {}
+        if version == _LEGACY_VERSION:
+            raw = {
+                "lang": raw.get("lang"),
+                "default_provider": raw.get("default_provider"),
+            }
+        current = _normalise(raw, strict=False)
+    else:
+        current = Settings()
+    return current, launches
+
+
+def _with_current_launches(
+    value: Settings,
+    launches: Mapping[str, ExtensionLaunchSettingsV1],
+) -> Settings:
+    candidate = asdict(value)
+    namespaces = _provider_settings(
+        candidate.get("provider_settings", {}), strict=True,
+    )
+    # The current raw document is authoritative. Strip any snapshot copies,
+    # then merge only records observed while holding the file lock.
+    for namespace in namespaces.values():
+        namespace.pop(_EXTENSION_LAUNCH_KEY, None)
+    for provider_id, launch in launches.items():
+        namespace = dict(namespaces.get(provider_id, {}))
+        namespace[_EXTENSION_LAUNCH_KEY] = _extension_launch_json(launch)
+        namespaces[provider_id] = namespace
+    candidate["provider_settings"] = namespaces
+    return _normalise(candidate, strict=True)
+
+
 def save_settings(settings: Settings) -> None:
     """Validate and atomically write settings with private filesystem modes."""
     if not isinstance(settings, Settings):
@@ -485,8 +652,19 @@ def save_settings(settings: Settings) -> None:
         for name in Settings.__dataclass_fields__
     }
     normalised = _normalise(raw, strict=True)
+    supplied_launch_values = _reserved_launch_values(
+        normalised.provider_settings
+    )
     with _file_lock():
-        _save_unlocked(normalised)
+        _current, current_launch_values = _write_state_unlocked()
+        if any(
+            current_launch_values.get(provider_id) != launch
+            for provider_id, launch in supplied_launch_values.items()
+        ):
+            raise ValueError(
+                "reserved extension launch settings require the typed API"
+            )
+        _save_unlocked(_with_current_launches(normalised, current_launch_values))
 
 
 def get(key: str, default: Any = None) -> Any:
@@ -498,30 +676,27 @@ def set(key: str, value: Any) -> None:  # noqa: A001 - deliberate get/set pair
     """Atomically update one validated top-level setting."""
     if key not in Settings.__dataclass_fields__:
         raise KeyError(key)
+    if key == "provider_settings" and type(value) is dict and any(
+        type(namespace) is dict and _EXTENSION_LAUNCH_KEY in namespace
+        for namespace in value.values()
+    ):
+        raise ValueError(
+            "reserved extension launch settings require the typed settings API"
+        )
     with _file_lock():
-        data = _read_payload()
-        version = data.get("version") if data else None
-        if data and type(version) is int and version in (_LEGACY_VERSION, _VERSION):
-            inner = data.get("settings")
-            raw = inner if type(inner) is dict else {}
-            if version == _LEGACY_VERSION:
-                raw = {
-                    "lang": raw.get("lang"),
-                    "default_provider": raw.get("default_provider"),
-                }
-            settings = _normalise(raw, strict=False)
-        else:
-            settings = Settings()
+        settings, launches = _write_state_unlocked()
         candidate = asdict(settings)
         candidate[key] = value
-        _save_unlocked(_normalise(candidate, strict=True))
+        normalised = _normalise(candidate, strict=True)
+        _save_unlocked(_with_current_launches(normalised, launches))
 
 
 def get_provider_settings(provider_id: str) -> Dict[str, Any]:
     """Return an independent copy of one provider's namespaced settings."""
     if not _safe_provider_id(provider_id):
         raise ValueError("invalid provider id")
-    namespace = load_settings().provider_settings.get(provider_id, {})
+    namespace = dict(load_settings().provider_settings.get(provider_id, {}))
+    namespace.pop(_EXTENSION_LAUNCH_KEY, None)
     return _safe_json(namespace)
 
 
@@ -529,13 +704,95 @@ def set_provider_setting(provider_id: str, key: str, value: Any) -> None:
     """Set one provider-specific value without touching other namespaces."""
     if not _safe_provider_id(provider_id):
         raise ValueError("invalid provider id")
-    if type(key) is not str or _SETTING_KEY_RE.fullmatch(key) is None or _is_sensitive_key(key):
+    if (
+        type(key) is not str
+        or _SETTING_KEY_RE.fullmatch(key) is None
+        or _is_sensitive_key(key)
+        or key == _EXTENSION_LAUNCH_KEY
+    ):
         raise ValueError("invalid or sensitive provider setting key")
     safe_value = _safe_json(value)
     with _file_lock():
+        settings, launches = _write_state_unlocked()
+        namespaces = _provider_settings(settings.provider_settings, strict=True)
+        namespace = dict(namespaces.get(provider_id, {}))
+        namespace[key] = safe_value
+        namespaces[provider_id] = namespace
+        candidate = asdict(settings)
+        candidate["provider_settings"] = namespaces
+        normalised = _normalise(candidate, strict=True)
+        _save_unlocked(_with_current_launches(normalised, launches))
+
+
+def clear_provider_settings(provider_id: str) -> bool:
+    """Remove ordinary provider values without clearing Core launch state."""
+    if not _safe_provider_id(provider_id):
+        raise ValueError("invalid provider id")
+    with _file_lock():
+        settings, launches = _write_state_unlocked()
+        namespace = settings.provider_settings.get(provider_id)
+        if namespace is None:
+            return False
+        ordinary = dict(namespace)
+        ordinary.pop(_EXTENSION_LAUNCH_KEY, None)
+        if not ordinary:
+            return False
+        settings.provider_settings.pop(provider_id, None)
+        _save_unlocked(_with_current_launches(settings, launches))
+        return True
+
+
+def get_extension_launch_settings(
+    provider_id: str,
+) -> Optional[ExtensionLaunchSettingsV1]:
+    """Return the typed receipt pointer reserved by Core, if configured."""
+
+    if not _safe_provider_id(provider_id):
+        raise ValueError("invalid provider id")
+    data = _read_payload()
+    if data is None:
+        try:
+            settings_file_exists = SETTINGS_FILE.exists()
+        except OSError:
+            settings_file_exists = True
+        if settings_file_exists:
+            raise ValueError("extension launch settings could not be read")
+        return None
+    version = data.get("version")
+    inner = data.get("settings")
+    if version == _LEGACY_VERSION and type(inner) is dict:
+        return None
+    if type(version) is not int or version != _VERSION or type(inner) is not dict:
+        raise ValueError("extension launch settings document is invalid")
+    namespaces = inner.get("provider_settings", {})
+    if type(namespaces) is not dict:
+        raise ValueError("extension launch settings namespace is invalid")
+    if provider_id not in namespaces:
+        return None
+    namespace = namespaces[provider_id]
+    if type(namespace) is not dict:
+        raise ValueError("extension launch settings namespace is invalid")
+    if _EXTENSION_LAUNCH_KEY not in namespace:
+        return None
+    return _extension_launch_record(
+        namespace[_EXTENSION_LAUNCH_KEY], provider_id=provider_id,
+    )
+
+
+def set_extension_launch_settings(value: ExtensionLaunchSettingsV1) -> None:
+    """Atomically replace only Core's reserved provider launch pointer."""
+
+    record = _extension_launch_json(value)
+    provider_id = value.provider_id
+    with _file_lock():
         data = _read_payload()
         version = data.get("version") if data else None
-        inner = data.get("settings") if data and type(version) is int and version in (_LEGACY_VERSION, _VERSION) else {}
+        inner = (
+            data.get("settings")
+            if data and type(version) is int
+            and version in (_LEGACY_VERSION, _VERSION)
+            else {}
+        )
         if version == _LEGACY_VERSION and type(inner) is dict:
             inner = {
                 "lang": inner.get("lang"),
@@ -544,36 +801,63 @@ def set_provider_setting(provider_id: str, key: str, value: Any) -> None:
         settings = _normalise(inner if type(inner) is dict else {}, strict=False)
         namespaces = _provider_settings(settings.provider_settings, strict=True)
         namespace = dict(namespaces.get(provider_id, {}))
-        namespace[key] = safe_value
+        namespace[_EXTENSION_LAUNCH_KEY] = record
         namespaces[provider_id] = namespace
         candidate = asdict(settings)
         candidate["provider_settings"] = namespaces
         _save_unlocked(_normalise(candidate, strict=True))
 
 
-def clear_provider_settings(provider_id: str) -> bool:
-    """Remove one provider namespace, returning whether it existed."""
+def clear_extension_launch_settings(provider_id: str) -> bool:
+    """Remove only Core's reserved launch pointer for one provider."""
+
     if not _safe_provider_id(provider_id):
         raise ValueError("invalid provider id")
     with _file_lock():
         data = _read_payload()
         version = data.get("version") if data else None
-        inner = data.get("settings") if data and type(version) is int and version in (_LEGACY_VERSION, _VERSION) else {}
+        inner = (
+            data.get("settings")
+            if data and type(version) is int
+            and version in (_LEGACY_VERSION, _VERSION)
+            else {}
+        )
         if version == _LEGACY_VERSION and type(inner) is dict:
             inner = {
                 "lang": inner.get("lang"),
                 "default_provider": inner.get("default_provider"),
             }
+        raw_namespace = None
+        if type(inner) is dict:
+            raw_namespaces = inner.get("provider_settings")
+            if type(raw_namespaces) is dict:
+                candidate_namespace = raw_namespaces.get(provider_id)
+                if type(candidate_namespace) is dict:
+                    raw_namespace = candidate_namespace
+        had_reserved_value = (
+            raw_namespace is not None
+            and _EXTENSION_LAUNCH_KEY in raw_namespace
+        )
         settings = _normalise(inner if type(inner) is dict else {}, strict=False)
-        if provider_id not in settings.provider_settings:
+        namespaces = _provider_settings(settings.provider_settings, strict=True)
+        namespace = dict(namespaces.get(provider_id, {}))
+        if not had_reserved_value and _EXTENSION_LAUNCH_KEY not in namespace:
             return False
-        del settings.provider_settings[provider_id]
-        _save_unlocked(settings)
+        namespace.pop(_EXTENSION_LAUNCH_KEY, None)
+        if namespace:
+            namespaces[provider_id] = namespace
+        else:
+            namespaces.pop(provider_id, None)
+        candidate = asdict(settings)
+        candidate["provider_settings"] = namespaces
+        _save_unlocked(_normalise(candidate, strict=True))
         return True
 
 
 __all__ = [
-    "Settings", "SETTINGS_DIR", "SETTINGS_FILE", "load_settings", "save_settings",
+    "ExtensionLaunchSettingsV1", "Settings", "SETTINGS_DIR", "SETTINGS_FILE",
+    "load_settings", "save_settings",
     "get", "set", "get_provider_settings", "set_provider_setting",
-    "clear_provider_settings",
+    "clear_provider_settings", "get_extension_launch_settings",
+    "set_extension_launch_settings", "clear_extension_launch_settings",
 ]

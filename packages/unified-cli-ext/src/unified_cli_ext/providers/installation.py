@@ -22,7 +22,7 @@ import stat
 import unicodedata
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from ..errors import ConfigurationError
 from ..transports.security import ExecutableIdentity
@@ -1248,6 +1248,26 @@ class InstallationReceiptV1:
     capture_direct_executable = capture_direct
 
     @classmethod
+    def capture_explicit_direct(
+        cls,
+        *,
+        provider_id: str,
+        executable_path: str,
+        executable_basename: str,
+    ) -> "InstallationReceiptV1":
+        """Capture a caller-selected canonical binary without invented provenance."""
+
+        return cls.capture_direct(
+            provider_id=provider_id,
+            executable_path=executable_path,
+            executable_basename=executable_basename,
+            distribution_name=provider_id,
+            distribution_version="0.0.0+explicit",
+            acquisition_source="explicit-local-path",
+            acquisition_url=None,
+        )
+
+    @classmethod
     def capture_npm(
         cls,
         *,
@@ -1448,6 +1468,339 @@ class InstallationReceiptV1:
         )
 
 
+_RECEIPT_RECORD_SCHEMA_V1 = 1
+_RECEIPT_RECORD_KEYS = frozenset(
+    {
+        "schema",
+        "abi_version",
+        "receipt_kind",
+        "distribution_type",
+        "provider_id",
+        "executable_basename",
+        "distribution_name",
+        "distribution_version",
+        "acquisition_source",
+        "acquisition_url",
+        "invoked_launcher_path",
+        "canonical_launch_target",
+        "argv_prefix",
+        "executable_identity",
+        "target_identity",
+        "interpreter_identity",
+        "ownership_root",
+        "package_root",
+        "package_manifest_identity",
+        "package_manifest_bin",
+        "symlink_chain",
+        "ownership_chain",
+        "package_root_chain",
+    }
+)
+
+
+def _exact_record(value: object, keys: frozenset, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise _fail("{} is invalid".format(label))
+    try:
+        actual = frozenset(value.keys())
+    except BaseException:
+        raise _fail("{} is invalid".format(label)) from None
+    if actual != keys or any(type(key) is not str for key in actual):
+        raise _fail("{} is invalid".format(label))
+    return value
+
+
+def _directory_to_record(value: DirectoryIdentityV1) -> Dict[str, Any]:
+    if type(value) is not DirectoryIdentityV1:
+        raise _fail("directory receipt identity is invalid")
+    return {
+        "path": value.path,
+        "device": value.device,
+        "inode": value.inode,
+        "owner": value.owner,
+        "mode": value.mode,
+    }
+
+
+def _directory_from_record(value: object) -> DirectoryIdentityV1:
+    record = _exact_record(
+        value, frozenset({"path", "device", "inode", "owner", "mode"}),
+        "directory receipt identity",
+    )
+    return DirectoryIdentityV1(
+        path=record["path"],
+        device=record["device"],
+        inode=record["inode"],
+        owner=record["owner"],
+        mode=record["mode"],
+    )
+
+
+def _directory_chain_to_record(
+    values: Tuple[DirectoryIdentityV1, ...]
+) -> list:
+    if type(values) is not tuple:
+        raise _fail("directory receipt chain is invalid")
+    return [_directory_to_record(value) for value in values]
+
+
+def _directory_chain_from_record(value: object) -> Tuple[DirectoryIdentityV1, ...]:
+    if type(value) not in (list, tuple) or len(value) > 1024:
+        raise _fail("directory receipt chain is invalid")
+    return tuple(_directory_from_record(item) for item in value)
+
+
+def _executable_to_record(value: ExecutableIdentity) -> Dict[str, Any]:
+    if type(value) is not ExecutableIdentity:
+        raise _fail("executable receipt identity is invalid")
+    return {
+        "path": value.path,
+        "sha256": value.sha256,
+        "device": value.device,
+        "inode": value.inode,
+        "size": value.size,
+        "mtime_ns": value.mtime_ns,
+        "ctime_ns": value.ctime_ns,
+        "mode": value.mode,
+        "owner": value.owner,
+        "parent_chain": [list(item) for item in value.parent_chain],
+        "interpreter": (
+            None
+            if value.interpreter is None
+            else _executable_to_record(value.interpreter)
+        ),
+    }
+
+
+def _executable_from_record(value: object, depth: int = 0) -> ExecutableIdentity:
+    if depth > 8:
+        raise _fail("executable receipt identity is too deeply nested")
+    record = _exact_record(
+        value,
+        frozenset(
+            {
+                "path", "sha256", "device", "inode", "size", "mtime_ns",
+                "ctime_ns", "mode", "owner", "parent_chain", "interpreter",
+            }
+        ),
+        "executable receipt identity",
+    )
+    parent_chain_value = record["parent_chain"]
+    if type(parent_chain_value) not in (list, tuple) or len(parent_chain_value) > 1024:
+        raise _fail("executable receipt parent chain is invalid")
+    parent_chain = []
+    for item in parent_chain_value:
+        if type(item) not in (list, tuple) or len(item) != 5:
+            raise _fail("executable receipt parent chain is invalid")
+        parent_chain.append(tuple(item))
+    interpreter_value = record["interpreter"]
+    interpreter = (
+        None
+        if interpreter_value is None
+        else _executable_from_record(interpreter_value, depth + 1)
+    )
+    return ExecutableIdentity(
+        path=record["path"],
+        sha256=record["sha256"],
+        device=record["device"],
+        inode=record["inode"],
+        size=record["size"],
+        mtime_ns=record["mtime_ns"],
+        mode=record["mode"],
+        owner=record["owner"],
+        parent_chain=tuple(parent_chain),
+        interpreter=interpreter,
+        ctime_ns=record["ctime_ns"],
+    )
+
+
+def _artifact_to_record(value: ArtifactIdentityV1) -> Dict[str, Any]:
+    if type(value) is not ArtifactIdentityV1:
+        raise _fail("artifact receipt identity is invalid")
+    return {
+        "path": value.path,
+        "sha256": value.sha256,
+        "device": value.device,
+        "inode": value.inode,
+        "size": value.size,
+        "mtime_ns": value.mtime_ns,
+        "ctime_ns": value.ctime_ns,
+        "mode": value.mode,
+        "owner": value.owner,
+        "parent_chain": _directory_chain_to_record(value.parent_chain),
+    }
+
+
+def _artifact_from_record(value: object) -> ArtifactIdentityV1:
+    record = _exact_record(
+        value,
+        frozenset(
+            {
+                "path", "sha256", "device", "inode", "size", "mtime_ns",
+                "ctime_ns", "mode", "owner", "parent_chain",
+            }
+        ),
+        "artifact receipt identity",
+    )
+    return ArtifactIdentityV1(
+        path=record["path"],
+        sha256=record["sha256"],
+        device=record["device"],
+        inode=record["inode"],
+        size=record["size"],
+        mtime_ns=record["mtime_ns"],
+        ctime_ns=record["ctime_ns"],
+        mode=record["mode"],
+        owner=record["owner"],
+        parent_chain=_directory_chain_from_record(record["parent_chain"]),
+    )
+
+
+def _symlink_to_record(value: SymlinkIdentityV1) -> Dict[str, Any]:
+    if type(value) is not SymlinkIdentityV1:
+        raise _fail("symlink receipt identity is invalid")
+    return {
+        "path": value.path,
+        "target_text": value.target_text,
+        "resolved_target": value.resolved_target,
+        "device": value.device,
+        "inode": value.inode,
+        "owner": value.owner,
+        "mode": value.mode,
+        "size": value.size,
+        "mtime_ns": value.mtime_ns,
+        "ctime_ns": value.ctime_ns,
+        "parent_chain": _directory_chain_to_record(value.parent_chain),
+    }
+
+
+def _symlink_from_record(value: object) -> SymlinkIdentityV1:
+    record = _exact_record(
+        value,
+        frozenset(
+            {
+                "path", "target_text", "resolved_target", "device", "inode",
+                "owner", "mode", "size", "mtime_ns", "ctime_ns", "parent_chain",
+            }
+        ),
+        "symlink receipt identity",
+    )
+    return SymlinkIdentityV1(
+        path=record["path"],
+        target_text=record["target_text"],
+        resolved_target=record["resolved_target"],
+        device=record["device"],
+        inode=record["inode"],
+        owner=record["owner"],
+        mode=record["mode"],
+        size=record["size"],
+        mtime_ns=record["mtime_ns"],
+        ctime_ns=record["ctime_ns"],
+        parent_chain=_directory_chain_from_record(record["parent_chain"]),
+    )
+
+
+def installation_receipt_to_record(
+    receipt: InstallationReceiptV1, *, persistent: bool = False
+) -> Dict[str, Any]:
+    """Serialize one exact receipt without executable code or class metadata."""
+
+    if type(receipt) is not InstallationReceiptV1:
+        raise _fail("installation receipt type is invalid")
+    receipt.verify()
+    return {
+        "schema": _RECEIPT_RECORD_SCHEMA_V1,
+        "abi_version": receipt.abi_version,
+        "receipt_kind": receipt.receipt_kind.value,
+        "distribution_type": receipt.distribution_type.value,
+        "provider_id": receipt.provider_id,
+        "executable_basename": receipt.executable_basename,
+        "distribution_name": receipt.distribution_name,
+        "distribution_version": receipt.distribution_version,
+        "acquisition_source": (
+            "configured-local-installation"
+            if persistent else receipt.acquisition_source
+        ),
+        # URLs are informational and may contain userinfo/query credentials.
+        "acquisition_url": None if persistent else receipt.acquisition_url,
+        "invoked_launcher_path": receipt.invoked_launcher_path,
+        "canonical_launch_target": receipt.canonical_launch_target,
+        "argv_prefix": list(receipt.argv_prefix),
+        "executable_identity": _executable_to_record(receipt.executable_identity),
+        "target_identity": _artifact_to_record(receipt.target_identity),
+        "interpreter_identity": (
+            None
+            if receipt.interpreter_identity is None
+            else _executable_to_record(receipt.interpreter_identity)
+        ),
+        "ownership_root": receipt.ownership_root,
+        "package_root": receipt.package_root,
+        "package_manifest_identity": (
+            None
+            if receipt.package_manifest_identity is None
+            else _artifact_to_record(receipt.package_manifest_identity)
+        ),
+        "package_manifest_bin": receipt.package_manifest_bin,
+        "symlink_chain": [_symlink_to_record(item) for item in receipt.symlink_chain],
+        "ownership_chain": _directory_chain_to_record(receipt.ownership_chain),
+        "package_root_chain": _directory_chain_to_record(receipt.package_root_chain),
+    }
+
+
+def installation_receipt_from_record(value: Mapping[str, Any]) -> InstallationReceiptV1:
+    """Reconstruct and reverify one strict, hand-written receipt record."""
+
+    record = _exact_record(value, _RECEIPT_RECORD_KEYS, "installation receipt record")
+    if (
+        type(record["schema"]) is not int
+        or record["schema"] != _RECEIPT_RECORD_SCHEMA_V1
+    ):
+        raise _fail("installation receipt record schema is unsupported")
+    try:
+        receipt_kind = InstallationReceiptKindV1(record["receipt_kind"])
+        distribution_type = DistributionTypeV1(record["distribution_type"])
+    except (TypeError, ValueError):
+        raise _fail("installation receipt record enum is invalid") from None
+    argv_value = record["argv_prefix"]
+    symlink_value = record["symlink_chain"]
+    if type(argv_value) not in (list, tuple) or type(symlink_value) not in (list, tuple):
+        raise _fail("installation receipt record collection is invalid")
+    interpreter_value = record["interpreter_identity"]
+    manifest_value = record["package_manifest_identity"]
+    receipt = InstallationReceiptV1(
+        receipt_kind=receipt_kind,
+        distribution_type=distribution_type,
+        provider_id=record["provider_id"],
+        executable_basename=record["executable_basename"],
+        distribution_name=record["distribution_name"],
+        distribution_version=record["distribution_version"],
+        acquisition_source=record["acquisition_source"],
+        acquisition_url=record["acquisition_url"],
+        invoked_launcher_path=record["invoked_launcher_path"],
+        canonical_launch_target=record["canonical_launch_target"],
+        argv_prefix=tuple(argv_value),
+        executable_identity=_executable_from_record(record["executable_identity"]),
+        target_identity=_artifact_from_record(record["target_identity"]),
+        interpreter_identity=(
+            None
+            if interpreter_value is None
+            else _executable_from_record(interpreter_value)
+        ),
+        ownership_root=record["ownership_root"],
+        package_root=record["package_root"],
+        package_manifest_identity=(
+            None if manifest_value is None else _artifact_from_record(manifest_value)
+        ),
+        package_manifest_bin=record["package_manifest_bin"],
+        symlink_chain=tuple(_symlink_from_record(item) for item in symlink_value),
+        ownership_chain=_directory_chain_from_record(record["ownership_chain"]),
+        package_root_chain=_directory_chain_from_record(record["package_root_chain"]),
+        abi_version=record["abi_version"],
+    )
+    receipt.verify()
+    return receipt
+
+
 __all__ = [
     "INSTALLATION_RECEIPT_ABI_V1",
     "ArtifactIdentityV1",
@@ -1457,4 +1810,6 @@ __all__ = [
     "InstallationReceiptV1",
     "SymlinkIdentityV1",
     "VerifiedLaunchV1",
+    "installation_receipt_from_record",
+    "installation_receipt_to_record",
 ]

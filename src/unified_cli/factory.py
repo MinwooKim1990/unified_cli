@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from .base import BaseProvider
 from .core import ProviderId, ProviderName
@@ -11,6 +11,9 @@ from .errors import UnifiedError
 from .i18n import t
 from .models import DEFAULT_MODELS
 from .providers import ClaudeProvider, CodexProvider, GeminiProvider
+
+if TYPE_CHECKING:
+    from .extension_config import ExtensionLaunchOverridesV1
 
 
 PROVIDERS: dict[ProviderName, type[BaseProvider]] = {
@@ -24,10 +27,17 @@ def create(
     provider: ProviderId,
     *,
     model: Optional[str] = None,
+    extension_launch: Optional["ExtensionLaunchOverridesV1"] = None,
     **opts,
 ) -> BaseProvider:
     """Instantiate a provider with its default model unless overridden."""
     if provider in PROVIDERS:
+        if extension_launch is not None:
+            raise UnifiedError(
+                kind="config",
+                provider=provider,
+                message="Built-in providers do not accept extension launch configuration.",
+            )
         builtin = provider  # retained as a narrow key for static type checkers
         return PROVIDERS[builtin](  # type: ignore[index]
             model=model or DEFAULT_MODELS[builtin],  # type: ignore[index]
@@ -37,7 +47,12 @@ def create(
     # Entry-point metadata is inspected only for an explicitly requested
     # unknown id.  Built-in creation above remains a zero-discovery fast path.
     from .registry import instantiate_extension_provider
-    return instantiate_extension_provider(provider, model=model, **opts)
+    return instantiate_extension_provider(
+        provider,
+        model=model,
+        extension_launch=extension_launch,
+        **opts,
+    )
 
 
 # ---- routing: model string → (provider, model) ----
