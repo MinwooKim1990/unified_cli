@@ -96,9 +96,17 @@ test("managed dashboard is accessible, localized, and console-clean", async ({ p
   await expect(page.locator("#main-content")).toBeVisible();
   await expect(page).toHaveURL(/\/dashboard$/);
   await expect(page.locator("#overview-mode")).toHaveText("Manage mode");
-  await expect(page.locator("#overview-provider-list .badge")).toHaveCount(3);
-  await expect(page.locator("#overview-provider-list .badge").filter({ hasText: "Not verified" })).toHaveCount(3);
+  await expect(page.locator("#overview-provider-list .badge")).toHaveCount(4);
+  await expect(page.locator("#overview-provider-list .badge").filter({ hasText: "Not verified" })).toHaveCount(4);
   await expect(page.locator("#overview-provider-list .badge").filter({ hasText: "Unavailable" })).toHaveCount(0);
+  const extensionCard = page.locator(".provider-card").filter({ hasText: "preview-ext" });
+  await expect(extensionCard).toContainText("Metadata only · preview");
+  await expect(extensionCard).toContainText("preview </script><img src=x onerror=alert(1)>");
+  await expect(extensionCard.locator("img")).toHaveCount(0);
+  await expect(extensionCard.locator("button").filter({ hasText: "Verify" })).toBeDisabled();
+  await expect(page.locator('#models-provider option[value="preview-ext"]')).toHaveAttribute("disabled", "");
+  await expect(page.locator('#chat-provider option[value="preview-ext"]')).toHaveAttribute("disabled", "");
+  await expect(page.locator('#setting-default-provider option[value="preview-ext"]')).toHaveCount(0);
   await page.reload();
   await expect(page.locator("#overview-mode")).toHaveText("Manage mode");
   await page.keyboard.press("Tab");
@@ -115,7 +123,7 @@ test("managed dashboard is accessible, localized, and console-clean", async ({ p
 
   await page.getByRole("button", { name: /chat/i }).click();
   const chatProviders = await page.locator("#chat-provider option").evaluateAll(
-    (options) => options.map((option) => option.value).filter(Boolean)
+    (options) => options.filter((option) => option.value && !option.disabled).map((option) => option.value)
   );
   expect(chatProviders.every((provider) => provider === "claude" || provider === "codex")).toBeTruthy();
   await expect(page.locator("#chat-permission")).toHaveValue("read_only");
@@ -125,6 +133,21 @@ test("managed dashboard is accessible, localized, and console-clean", async ({ p
     (label) => getComputedStyle(label).outlineStyle !== "none"
   );
   expect(fileFocusVisible).toBeTruthy();
+
+  await page.getByRole("button", { name: "Sessions", exact: true }).click();
+  await page.getByRole("button", { name: "Refresh sessions" }).click();
+  const extensionSession = page.locator("#sessions-table-body tr").filter({ hasText: "Ext metadata session" });
+  await expect(extensionSession.locator("td").first()).toHaveText("Ext");
+  await expect(extensionSession.getByRole("button", { name: "Resume" })).toBeDisabled();
+  await expect(extensionSession.getByRole("button", { name: "Rename" })).toBeEnabled();
+  await expect(extensionSession.getByRole("button", { name: "Archive" })).toBeEnabled();
+  await expect(extensionSession.getByRole("button", { name: "Delete" })).toBeEnabled();
+  const uninjectedExtensionSession = page.locator("#sessions-table-body tr").filter({ hasText: "Uninjected Ext session" });
+  await expect(uninjectedExtensionSession.locator("td").first()).toHaveText("Ext");
+  await expect(uninjectedExtensionSession.getByRole("button", { name: "Resume" })).toBeDisabled();
+  await expect(uninjectedExtensionSession.getByRole("button", { name: "Rename" })).toBeEnabled();
+  await expect(uninjectedExtensionSession.getByRole("button", { name: "Archive" })).toBeEnabled();
+  await expect(uninjectedExtensionSession.getByRole("button", { name: "Delete" })).toBeEnabled();
 
   await page.getByRole("button", { name: /settings/i }).click();
   await page.locator("#setting-web").check();

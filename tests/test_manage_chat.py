@@ -225,6 +225,59 @@ def test_cancel_chat_is_owner_scoped_and_sets_cooperative_event(tmp_path):
     runtime.finish_chat(chat.id)
 
 
+def test_disable_between_stream_frames_never_enters_provider_callback(tmp_path, monkeypatch):
+    runtime, owner = _runtime(tmp_path)
+    chat = _chat(runtime, owner)
+    calls = []
+
+    class Conversation:
+        def stream(self, *_args, **_kwargs):
+            calls.append("stream")
+            raise AssertionError("disabled runtime entered provider callback")
+
+    monkeypatch.setattr(runtime, "_conversation_for_chat", lambda _chat: Conversation())
+    stream = runtime.stream_chat(chat)
+    first = json.loads(next(stream))
+    assert first["type"] == "session"
+    runtime.disable()
+    events = _events(stream)
+    assert events == [
+        {
+            "type": "error",
+            "code": "manage_disabled",
+            "message": "The management runtime is disabled.",
+        },
+        {"type": "done", "status": "error"},
+    ]
+    assert calls == []
+
+
+def test_stream_relay_preserves_bounded_manage_error_code_and_message(tmp_path, monkeypatch):
+    runtime, owner = _runtime(tmp_path)
+    chat = _chat(runtime, owner)
+
+    class Conversation:
+        @staticmethod
+        def stream(*_args, **_kwargs):
+            raise manage.ManageError(
+                403,
+                "provider_forbidden",
+                "Provider is unavailable for browser chat.",
+            )
+
+    monkeypatch.setattr(runtime, "_conversation_for_chat", lambda _chat: Conversation())
+    stream = runtime.stream_chat(chat)
+    assert json.loads(next(stream))["type"] == "session"
+    assert _events(stream) == [
+        {
+            "type": "error",
+            "code": "provider_forbidden",
+            "message": "Provider is unavailable for browser chat.",
+        },
+        {"type": "done", "status": "error"},
+    ]
+
+
 class BlockingProvider(BaseProvider):
     name = "blocking"
     default_model = "test"

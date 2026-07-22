@@ -207,6 +207,26 @@ def test_provider_updates_are_allowlisted_against_prototype_pollution() -> None:
     assert "prototype" not in js
 
 
+def test_provider_actions_and_extension_metadata_are_strictly_opt_in() -> None:
+    js = JS.read_text(encoding="utf-8")
+    assert 'provider.verify_supported !== true' in js
+    assert 'provider.chat_supported !== true' in js
+    assert 'provider.models_supported !== true' in js
+    assert 'provider.default_supported !== true' in js
+    assert 'provider[field] === true' in js
+    assert 'value.chat_supported === true' in js
+    assert 'value.verify_supported === true' in js
+    assert 'value.models_supported === true' in js
+    assert 'value.default_supported === true' in js
+    assert 'provider.source === "extension"' in js
+    assert 'provider.status !== "loaded"' in js
+    assert 'provider.server_policy.enabled !== false' in js
+    assert 'Object.hasOwn(provider, "commands")' in js
+    assert 'source === "builtin" && CORE_PROVIDER_IDS.has' in js
+    assert 'UNSAFE_PROVIDER_TEXT_PATTERN' in js
+    assert '!CORE_PROVIDER_IDS.has(sessionProvider)' in js
+
+
 def test_provider_state_connection_and_usage_export_fail_closed() -> None:
     js = JS.read_text(encoding="utf-8")
     assert 'return "unchecked"' in js
