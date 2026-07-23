@@ -1,11 +1,11 @@
 # Releasing unified-cli
 
-The planned 0.5.1 release has one distribution, one PyPI project, one immutable
+The planned 0.5.2 release has one distribution, one PyPI project, one immutable
 tag, and one GitHub Release:
 
 - distribution and PyPI project: `unified-cli`;
-- tag: `v0.5.1`;
-- GitHub Release: `v0.5.1`, with the verified wheel and sdist attached.
+- tag: `v0.5.2`;
+- GitHub Release: `v0.5.2`, with the verified wheel and sdist attached.
 
 The single wheel contains both public Python namespaces, `unified_cli` and
 `unified_cli_ext`. Core and extensions are a feature boundary, not separate
@@ -22,16 +22,17 @@ duplicate upload is a release failure, not a condition to hide.
 
 ## Version and release notes
 
-Set the one project version to `0.5.1` in the authoritative Core version source
-used by `pyproject.toml`. Update the root changelog with the 0.5.1 release note
+Set the one project version to `0.5.2` in the authoritative Core version source
+used by `pyproject.toml`. Update the root changelog with the 0.5.2 release note
 before tagging. The extension-source changelog may describe the bundled feature
 changes, but it is not an independently released version.
 
 The release notes must state that the wheel provides both namespaces; Core
 defaults remain Claude, Codex, and Gemini only; extensions are explicit and
-lazy; Grok remains Preview; Qoder, Kilo, and Poolside are runnable
-Experimental integrations; the other 14 extension providers remain Held; and
-all Ext server policies remain disabled.
+lazy; all 18 extensions are runnable Preview providers when explicitly
+selected. Grok has representative live-test evidence, while the other common
+transports are fixture-tested without a vendor or account compatibility
+guarantee; all Ext server policies remain disabled.
 Do not claim authentication or login E2E coverage beyond recorded evidence.
 
 ## One-time trusted-publisher and GitHub setup
@@ -41,7 +42,7 @@ repository's release workflow:
 
 | Package | Owner | Repository | Tag | GitHub environment |
 | --- | --- | --- | --- | --- |
-| `unified-cli` | `MinwooKim1990` | `unified_cli` | `v0.5.1` | `pypi` |
+| `unified-cli` | `MinwooKim1990` | `unified_cli` | `v0.5.2` | `pypi` |
 
 In PyPI, use **Manage → Publishing → Add a new publisher** for `unified-cli`.
 Before the project exists, create a pending publisher from the account
@@ -55,7 +56,7 @@ final GitHub Release job. Do not store a PyPI token in GitHub.
 
 ## Prepare one exact release commit
 
-1. Update the authoritative version to `0.5.1` and update the root changelog.
+1. Update the authoritative version to `0.5.2` and update the root changelog.
 2. From a clean `main`, run the complete required offline test suite,
    distribution build, metadata checks, clean-install checks, and all required
    readiness gates for the unified wheel.
@@ -77,37 +78,37 @@ final GitHub Release job. Do not store a PyPI token in GitHub.
 Do not merge or push another `main` commit between recording `MAIN_SHA` and
 tagging it.
 
-## Publish 0.5.1
+## Publish 0.5.2
 
 Create and push the one release tag:
 
 ```bash
-git tag v0.5.1 "$MAIN_SHA"
-git push origin refs/tags/v0.5.1
+git tag v0.5.2 "$MAIN_SHA"
+git push origin refs/tags/v0.5.2
 ```
 
 The release workflow must:
 
-1. prove that `v0.5.1`, the event SHA, checkout, and current `origin/main` are
-   the same clean commit, and that the source version is `0.5.1`;
+1. prove that `v0.5.2`, the event SHA, checkout, and current `origin/main` are
+   the same clean commit, and that the source version is `0.5.2`;
 2. run the required offline tests and readiness gates before building;
 3. build exactly one `unified-cli` wheel and one sdist, verify their metadata,
    archive roots, RECORD integrity, hashes, package hierarchy, default runtime
    dependencies, and optional-extra markers, then clean-install the wheel;
 4. publish only those verified artifacts through the `pypi` environment;
-5. install `unified-cli==0.5.1` from the explicit public
+5. install `unified-cli==0.5.2` from the explicit public
    `https://pypi.org/simple` index with cache, extra indexes, local links, and
    `no-index` configuration disabled, then verify both public namespaces, the
    entry point, version, and dependency health; and
 6. only after that public-PyPI smoke passes, create the final GitHub Release for
-   `v0.5.1` with the exact verified wheel and sdist attached. A safe rerun
+   `v0.5.2` with the exact verified wheel and sdist attached. A safe rerun
    verifies an existing final release and downloaded asset bytes rather than
    replacing them.
 
 Confirm the two outcomes:
 
-- <https://pypi.org/project/unified-cli/0.5.1/>
-- <https://github.com/MinwooKim1990/unified_cli/releases/tag/v0.5.1>
+- <https://pypi.org/project/unified-cli/0.5.2/>
+- <https://github.com/MinwooKim1990/unified_cli/releases/tag/v0.5.2>
 
 ## Failure and rollback rules
 

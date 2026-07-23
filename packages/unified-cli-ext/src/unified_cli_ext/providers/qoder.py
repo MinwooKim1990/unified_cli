@@ -1,4 +1,4 @@
-"""Experimental ACP 0.11 adapter for the official Qoder CLI."""
+"""Preview ACP 0.11 adapter for the official Qoder CLI."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from .contract import (
     TransportKind,
     VersionProbeSpec,
 )
+from .path_resolver import path_launch_resolver
 
 
 QODER_OFFICIAL_PACKAGE = "@qoder-ai/qodercli"
@@ -53,7 +54,7 @@ def _prepare_home(home: str) -> None:
 ADAPTER_SPEC = ProviderAdapterSpecV1(
     id="qoder",
     display_name="Qoder CLI",
-    status=AdapterStatus.EXPERIMENTAL,
+    status=AdapterStatus.PREVIEW,
     binary=BinarySpec(
         executable="qodercli",
         expected_identity="qodercli",
@@ -97,6 +98,11 @@ ADAPTER_SPEC = ProviderAdapterSpecV1(
 
 PLUGIN = acp_plugin(
     ADAPTER_SPEC,
+    launch_resolver=path_launch_resolver(
+        provider_id=ADAPTER_SPEC.id,
+        executable=ADAPTER_SPEC.binary.executable,
+        package_names=(QODER_OFFICIAL_PACKAGE,),
+    ),
     home_preparer=_prepare_home,
     workspace_guard=partial(
         reject_workspace_config,

@@ -37,7 +37,10 @@ from .security import (
     ExecutableIdentity,
     IsolatedEnvironment,
     TransportLimits,
+    _guarded_spawn_argv,
     _require_executable_identity_argv,
+    _validated_launch_identities,
+    _verify_launch_identities,
     strict_json_loads,
     validated_workspace,
     validate_positive_timeout,
@@ -220,6 +223,7 @@ class AcpProcessTransportV1:
         argv: Sequence[str],
         *,
         executable_identity: ExecutableIdentity,
+        launch_identities: Optional[Tuple[ExecutableIdentity, ...]] = None,
         cwd: str,
         provider_namespace: str,
         provider_env: Optional[Mapping[str, str]] = None,
@@ -238,6 +242,9 @@ class AcpProcessTransportV1:
         if type(executable_identity) is not ExecutableIdentity:
             raise ConfigurationError("executable_identity must be ExecutableIdentity")
         _require_executable_identity_argv(self._argv[0], executable_identity)
+        self._launch_identities = _validated_launch_identities(
+            self._argv, executable_identity, launch_identities
+        )
         if type(limits) is not TransportLimits:
             raise ConfigurationError("limits must be TransportLimits")
         token = cancellation if cancellation is not None else CancellationToken()
@@ -457,12 +464,12 @@ class AcpProcessTransportV1:
             cwd_pin = stack.enter_context(DirectoryPin(self._cwd))
             stack.enter_context(_managed_environment(self._environment))
             self._token.raise_if_cancelled()
-            self._identity.verify()
+            _verify_launch_identities(self._launch_identities)
             cwd_pin.verify()
             self._environment.verify_for_spawn()
             try:
                 process = subprocess.Popen(
-                    list(self._argv),
+                    _guarded_spawn_argv(self._argv, self._launch_identities),
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -478,7 +485,7 @@ class AcpProcessTransportV1:
             self._process = process
             cwd_pin.verify()
             self._environment.verify_after_spawn()
-            self._identity.verify_metadata()
+            _verify_launch_identities(self._launch_identities)
             assert process.stdin is not None
             assert process.stdout is not None
             assert process.stderr is not None

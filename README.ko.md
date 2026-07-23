@@ -6,7 +6,8 @@
 
 🇺🇸 [English README](README.md) · 📖 [상세 가이드 (한국어)](USAGE.ko.md) · 📖 [Detailed usage (EN)](USAGE.md)
 
-Claude Code / OpenAI Codex / Google Antigravity(`agy`) 세 CLI를 **하나의 Python API + CLI** 로 통합.
+Claude Code / OpenAI Codex / Google Antigravity(`agy`)뿐 아니라 **Grok과
+17개 코딩 에이전트 CLI까지 하나의 Python API + CLI로 통합**합니다.
 
 > Google 쪽 provider 키는 여전히 `"gemini"` (그리고 `-m gemini-3.5-flash` 등도 그대로 라우팅) 이지만, 내부적으로 **Antigravity `agy` CLI** 를 래핑합니다 — 2026년 구 `gemini` CLI 의 개인 계정 접근이 제한됐기 때문입니다. 아래 마이그레이션 노트 참고.
 >
@@ -31,8 +32,9 @@ pip install "unified-cli[server]"
 > **사전 준비 — 이 패키지는 아무것도 설치하거나 로그인시키지 않습니다.**
 > `unified-cli` 는 이미 설치된 공식 에이전틱 CLI 들에 그저 명령을 위임하는 얇은
 > 래퍼입니다. **API 키도 자격증명도 포함하지 않으며**, 자체적으로 **어떤
-> 자격증명도 저장하거나 전송하지 않습니다** — 모든 호출은 사용자 머신에 이미
-> 되어 있는 로그인을 그대로 재사용합니다.
+> 자격증명도 저장하거나 전송하지 않습니다**. Stable Core는 사용자 머신의 기존
+> vendor 로그인을 재사용하고, Preview provider는 격리된 전용 home에서 vendor의
+> 공식 로그인을 한 번 더 요구할 수 있습니다.
 >
 > 각 provider 를 쓰려면 해당 CLI 가 설치되어 있고 **본인 구독으로 로그인**되어
 > 있어야 합니다:
@@ -44,71 +46,61 @@ pip install "unified-cli[server]"
 > 셋 다 필요하지 않습니다 — **일부만 있어도 동작**합니다. 래퍼는 `$PATH` 에서
 > 발견되는 `claude` / `codex` / `agy` 만 사용합니다.
 
-## Core와 확장
+## 지원 CLI 한눈에 보기
 
-| | Core 기본값 | 함께 제공되는 확장 |
+일반 `unified-cli` 설치 하나에 Core와 확장이 모두 들어갑니다.
+`unified-cli-ext`를 따로 설치할 필요가 없습니다.
+
+| 상태 | 지원 코딩 CLI (Provider ID) | 의미 |
 |---|---|---|
-| 포함 provider | Claude, Codex, Gemini (`agy`) | 18개 카탈로그 메타데이터: Grok, Kimi, Copilot, Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, Cline, OpenCode, Kilo Code, Factory Droid, Pi, Oh My Pi, Hermes, Poolside, Amp, GitLab Duo |
-| 기본 동작 | 기존 기본값은 바뀌지 않음 | Core 기본값과 서버 허용 목록을 절대 변경하지 않음 |
-| 현재 상태 | Core provider는 기존 동작을 유지 | Grok은 읽기 도구 제한 **Preview**, Qoder·Kilo·Poolside는 실행 가능한 **Experimental**, 나머지 14개는 **Held**, 확장 서버 지원은 비활성화 |
+| **Stable Core** | Claude Code (`claude`), OpenAI Codex (`codex`), Google Antigravity (`gemini` / `agy`) | 기존 동작과 기본값 그대로 유지 |
+| **Preview — 명시적으로 선택하면 실행 가능** | Grok Build (`grok`), Kimi Code (`kimi`), GitHub Copilot CLI (`copilot`), Cursor Agent (`cursor`), CodeBuddy (`codebuddy`), Qoder (`qoder`), Mistral Vibe (`mistral-vibe`), Qwen Code (`qwen`), Cline (`cline`), OpenCode (`opencode`), Kilo Code (`kilo`), Factory Droid (`droid`), Pi (`pi`), Oh My Pi (`oh-my-pi`), Hermes Agent (`hermes`), Poolside Agent CLI (`poolside`), Amp (`amp`), GitLab Duo CLI (`gitlab-duo`) | 공통 transport와 fixture는 검증했지만 대부분의 vendor CLI·계정 조합은 실사용 검증 전 |
 
-Core와 확장은 패키지 경계가 아니라 기능 경계입니다. 계획된 0.5.1 `unified-cli` wheel에는
-공개 namespace `unified_cli`와 `unified_cli_ext`가 모두 포함됩니다. 확장은 vendor CLI를
-포함하지 않고, 로그인·서비스 호출·과금 발생을 하지 않습니다. provider 바이너리와 계정은
-사용자가 직접 설치하고 관리합니다.
-
-<details>
-<summary>함께 제공되는 확장 카탈로그 메타데이터 확인</summary>
+Preview는 “이름만 있는 카탈로그”라는 뜻이 아닙니다. 위 18개는 모두 실행 adapter가
+있으며, 사용자가 명시적으로 고르면 실제 실행을 시도합니다.
 
 ```bash
-python -m pip install "unified-cli==0.5.1"
-python -c "import unified_cli_ext; print(unified_cli_ext.__name__)"
 unified-cli providers --include-ext
+unified-cli chat "이 프로젝트를 설명해줘" --provider grok --cwd "$PWD"
+unified-cli chat "이 변경을 리뷰해줘" --provider kimi --cwd "$PWD"
+unified-cli chat "버그를 찾아줘" --provider copilot --cwd "$PWD"
 ```
 
-Python 명령은 함께 설치된 확장 namespace의 import만 확인하고, `providers` 명령이 설치된
-provider 엔트리포인트 메타데이터를 나열합니다. 여기에는
-`grok`, `kimi`, `copilot`, `cursor`, `codebuddy`, `qoder`, `mistral-vibe`, `qwen`,
-`cline`, `opencode`, `kilo`, `droid`, `pi`, `oh-my-pi`, `hermes`, `poolside`, `amp`,
-`gitlab-duo`가 표시될 수 있습니다. 이 메타데이터 목록 조회는 provider 실행, vendor
-바이너리 탐색, 인증, 네트워크 요청을 하지 않습니다. Grok은 실행 가능한 Preview이고
-Qoder, Kilo, Poolside는 실행 가능한 Experimental이며 나머지 14개 항목은 Held입니다.
-모든 확장 서버 정책은 비활성입니다.
-
-개발자나 테스터가 레거시 로컬 wheel 또는 실패한 분리 wheel을 설치했다면, 계획된 통합
-릴리스를 설치하기 전에 다음과 같이 정리하세요.
+ACP 기반 Preview provider(`qoder`, `kilo`, `hermes`, `poolside`)는 Python 3.10
+이상과 다음 의존성이 필요합니다.
 
 ```bash
-python -m pip uninstall -y unified-cli-ext
-python -m pip install --force-reinstall "unified-cli==0.5.1"
+pip install "unified-cli[acp]"
 ```
 
-`unified-cli providers --include-ext`는 import 없이 탐색하므로 처음에는 수명 주기
-`discovered`, 지원 상태 `unknown`으로 표시합니다. 해당 provider를 명시적으로 요청할
-때만 그 엔트리포인트 하나를 로드합니다. Held 항목은 실행되지 않습니다. Qoder, Kilo,
-Poolside는 Experimental 명시 요청 통합입니다. Grok은 명시적으로
-선택한 로컬 바이너리가 정확한 `0.2.111` 버전·기능 probe를 통과해야만 실행되며 검토하지
-않은 업데이트는 fail closed합니다. 공식 native Grok
-`0.2.111`의 macOS arm64 대표 격리 device-code smoke는 2026-07-23에 통과했지만, Grok은
-계속 Preview이고 서버 모드는 비활성입니다. 첫 요청 전에 문서의 native snapshot과
-`configure_extension_provider(...)` 등록이 필요합니다.
+먼저 해당 공식 vendor CLI를 설치하고 본인 계정으로 로그인해야 합니다. 확장은 lazy
+load되므로 자동 선택되지 않고 Core 기본 provider를 바꾸지 않으며 HTTP 서버에서는
+계속 비활성입니다. Preview 프로세스는 전용 provider home에서 실행됩니다. vendor가
+로그인을 일반 home에만 저장한다면
+[확장 가이드](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.ko.md)에
+나온 전용 home에서 해당 vendor의 공식 로그인을 한 번 더 진행해야 합니다. Grok은
+가이드의 검증된 격리 로그인 절차를 사용합니다.
 
-Grok의 기본 공식 native 설치 경로는 `https://x.ai/cli/install.sh`이며
-`@xai-official/grok`은 공식 npm 대안입니다. 격리된 home과 fail-closed Preview 경계는
-[확장](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.ko.md)의 전체 native
-snapshot, 격리 home 로그인, 등록 절차를 따르세요. 일반 host 로그인을 재사용한다고
-가정하지 마세요. read-only 통제와 gitignore-aware 탐색은 defense in depth이며 완전한
-secret boundary가 아닙니다.
+> **Preview 호환성 안내:** Grok은 대표 로그인 실사용 검증을 마쳤습니다. 나머지는
+> 검증된 공통 프로토콜 계열을 재사용하므로 특정 vendor 버전·계정·출력 형식에서는
+> 수정이 필요할 수 있습니다. 실패하면 prompt를 포함하지 않는 제한된 진단 파일이
+> `~/.unified-cli/preview-diagnostics/`에 생성됩니다. 해당 파일을
+> [GitHub Issue](https://github.com/MinwooKim1990/unified_cli/issues/new)에 첨부해 주세요.
+> 진단 파일에는 prompt, 환경변수 값, 인증 정보, 토큰을 기록하지 않습니다.
 
-```bash
-# 위 링크의 설정을 완료한 뒤에만 실행합니다.
-unified-cli chat "이 프로젝트를 설명해줘" --provider grok --model grok-4.5
+Python에서도 같은 설치와 Registry를 사용합니다.
+
+```python
+from unified_cli import create
+import unified_cli_ext  # `pip install unified-cli`에 이미 포함됨
+
+client = create("grok", cwd="/프로젝트/절대경로")
+print(client.chat("이 프로젝트를 설명해줘").text)
 ```
 
-</details>
-
-provider 카탈로그, 상태 의미, 활성화 전 필요한 근거는
-[확장](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.ko.md)을 참고하세요.
+provider별 공식 설치 명령, Preview 제한, 프로토콜은
+[확장 문서](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.ko.md)를
+참고하세요.
 
 <a id="provider-usage-policy-ko"></a>
 

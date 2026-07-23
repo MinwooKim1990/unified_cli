@@ -1,7 +1,7 @@
 # unified-cli
 
-**One Python + CLI interface for Claude Code, OpenAI Codex, and Google
-Antigravity (`agy`).**
+**One Python + CLI interface for Claude Code, OpenAI Codex, Google
+Antigravity, Grok, and 17 more coding-agent CLIs.**
 
 [![PyPI version](https://img.shields.io/pypi/v/unified-cli)](https://pypi.org/project/unified-cli/)
 [![Python versions](https://img.shields.io/pypi/pyversions/unified-cli)](https://pypi.org/project/unified-cli/)
@@ -28,8 +28,9 @@ pip install "unified-cli[server]"
 > **Prerequisites — this package installs and authenticates _nothing_.**
 > `unified-cli` is a thin wrapper that shells out to the official agentic CLIs
 > you already have. It ships **no API keys and no credentials**, and it
-> **stores or transmits no credentials of its own** — every call reuses the
-> login already on your machine.
+> **stores or transmits no credentials of its own**. Stable Core calls reuse
+> the vendor login already on your machine; Preview providers may ask you to
+> repeat the vendor's official login inside their isolated provider home.
 >
 > Before using a provider you must have installed the corresponding CLI **and
 > signed in with your own subscription**:
@@ -42,77 +43,61 @@ pip install "unified-cli[server]"
 > **Any subset works** — you do not need all three. The wrapper simply uses
 > whichever of `claude` / `codex` / `agy` it finds on your `$PATH`.
 
-## Core and Extensions
+## Supported CLIs at a glance
 
-| | Core defaults | Bundled extensions |
+The normal `unified-cli` install includes Core and Extensions together. There is
+no second `unified-cli-ext` package to install.
+
+| Status | Supported coding CLIs (Provider ID) | What it means |
 |---|---|---|
-| Included providers | Claude, Codex, Gemini (`agy`) | 18-item catalog metadata: Grok, Kimi, Copilot, Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, Cline, OpenCode, Kilo Code, Factory Droid, Pi, Oh My Pi, Hermes, Poolside, Amp, GitLab Duo |
-| Default behavior | Existing defaults are unchanged | Never changes Core defaults or its server allowlist |
-| Current state | Core providers retain their existing behavior | Grok is a read-tool-limited **Preview**; Qoder, Kilo, and Poolside are runnable **Experimental** integrations; the other 14 entries are **Held**; extension server support is disabled |
+| **Stable Core** | Claude Code (`claude`), OpenAI Codex (`codex`), Google Antigravity (`gemini` / `agy`) | Existing behavior and defaults remain unchanged |
+| **Preview — runnable when explicitly selected** | Grok Build (`grok`), Kimi Code (`kimi`), GitHub Copilot CLI (`copilot`), Cursor Agent (`cursor`), CodeBuddy (`codebuddy`), Qoder (`qoder`), Mistral Vibe (`mistral-vibe`), Qwen Code (`qwen`), Cline (`cline`), OpenCode (`opencode`), Kilo Code (`kilo`), Factory Droid (`droid`), Pi (`pi`), Oh My Pi (`oh-my-pi`), Hermes Agent (`hermes`), Poolside Agent CLI (`poolside`), Amp (`amp`), GitLab Duo CLI (`gitlab-duo`) | Shared transports and fixtures are tested, but most vendor CLI/account combinations have not been live-tested |
 
-Core and Extensions are a feature boundary, not a package boundary: the planned
-0.5.1 `unified-cli` wheel contains both public namespaces, `unified_cli` and
-`unified_cli_ext`. Extensions still do not bundle vendor CLIs, sign you in,
-call a service, or create charges. Provider binaries and accounts remain yours
-to install and manage.
-
-<details>
-<summary>Inspect bundled extension catalog metadata</summary>
+Preview does **not** mean “catalog only.” Every listed Preview provider has an
+executable adapter and is attempted when you explicitly select it:
 
 ```bash
-python -m pip install "unified-cli==0.5.1"
-python -c "import unified_cli_ext; print(unified_cli_ext.__name__)"
 unified-cli providers --include-ext
+unified-cli chat "explain this project" --provider grok --cwd "$PWD"
+unified-cli chat "review this change" --provider kimi --cwd "$PWD"
+unified-cli chat "find the bug" --provider copilot --cwd "$PWD"
 ```
 
-The Python command confirms that the bundled extension namespace imports. The
-`providers` command lists installed entry-point metadata. It may list `grok`,
-`kimi`, `copilot`, `cursor`, `codebuddy`, `qoder`,
-`mistral-vibe`, `qwen`, `cline`, `opencode`, `kilo`, `droid`, `pi`,
-`oh-my-pi`, `hermes`, `poolside`, `amp`, and `gitlab-duo`. Listing metadata does
-not run a provider, locate a vendor binary, authenticate, or make a network
-request. Grok is a runnable Preview; Qoder, Kilo, and Poolside are runnable
-Experimental integrations; the other 14 entries are Held. All extension server
-policies remain disabled.
-
-If a developer or tester installed a legacy local or failed split wheel, clean
-it up before installing the planned unified release:
+ACP-based Preview providers (`qoder`, `kilo`, `hermes`, `poolside`) require
+Python 3.10+ and:
 
 ```bash
-python -m pip uninstall -y unified-cli-ext
-python -m pip install --force-reinstall "unified-cli==0.5.1"
+pip install "unified-cli[acp]"
 ```
 
-`unified-cli providers --include-ext` keeps discovery import-free, so a newly
-discovered extension first displays lifecycle `discovered` and support
-`unknown`. When a provider is explicitly requested, Core loads only that entry
-point. Held entries remain unavailable. Qoder, Kilo, and Poolside are
-Experimental explicit-request integrations. Grok runs only after the explicitly
-selected local binary passes its exact `0.2.111` version and feature probes;
-unreviewed updates fail closed. A
-representative isolated device-code smoke passed with official native Grok
-`0.2.111` on macOS arm64 on 2026-07-23; it remains Preview and disabled in
-server mode. The documented native snapshot and
-`configure_extension_provider(...)` registration are required before the first
-request.
+Install and sign in to the corresponding official vendor CLI first. Extensions
+are lazy: they are never auto-selected, never change the Core default provider,
+and remain disabled in HTTP server mode. Preview processes use a private
+provider home; if a vendor stores login only in its normal home, repeat that
+vendor's official login in the private home described in the
+[extension guide](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.md).
+Grok uses the guide's verified isolated login setup.
 
-Grok's primary official native installer is `https://x.ai/cli/install.sh`
-(`@xai-official/grok` is an official npm alternative); see
-[Extensions](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.md)
-for its complete native snapshot, isolated-home login, registration, and
-fail-closed Preview boundary. Do not assume it reuses a generic host login.
-The read-only controls and gitignore-aware traversal are defense in depth, not
-a complete secret boundary.
+> **Preview compatibility notice:** Grok has a representative authenticated
+> live test. The other Preview integrations reuse tested protocol families and
+> may need updates for a particular vendor version, account, or output schema.
+> A failed Preview run writes a bounded, prompt-free diagnostic under
+> `~/.unified-cli/preview-diagnostics/`. Please attach that file to a
+> [GitHub issue](https://github.com/MinwooKim1990/unified_cli/issues/new).
+> Reports intentionally omit prompts, environment values, auth data, and tokens.
 
-```bash
-# Run only after completing the linked setup.
-unified-cli chat "explain this project" --provider grok --model grok-4.5
+Python uses the same installed package and registry:
+
+```python
+from unified_cli import create
+import unified_cli_ext  # already included by `pip install unified-cli`
+
+client = create("grok", cwd="/absolute/path/to/project")
+print(client.chat("Explain this project").text)
 ```
 
-</details>
-
-See [Extensions](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.md) for the provider catalog, status meanings,
-and the evidence required before a provider can be enabled.
+See [Extensions](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.md)
+for provider-specific install commands, Preview limitations, and protocol details.
 
 <a id="provider-usage-policy"></a>
 

@@ -1,4 +1,4 @@
-"""Experimental ACP 0.11 adapter for the official Poolside Agent CLI."""
+"""Preview ACP 0.11 adapter for the official Poolside Agent CLI."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ from .contract import (
     TransportKind,
     VersionProbeSpec,
 )
+from .path_resolver import path_launch_resolver
 
 
 POOLSIDE_STAGE_6_VERSION = "1.0.13"
@@ -42,7 +43,7 @@ def _command(*argv: str) -> FixedCommandSpec:
 ADAPTER_SPEC = ProviderAdapterSpecV1(
     id="poolside",
     display_name="Poolside Agent CLI",
-    status=AdapterStatus.EXPERIMENTAL,
+    status=AdapterStatus.PREVIEW,
     binary=BinarySpec(
         executable="pool",
         expected_identity="pool",
@@ -94,6 +95,10 @@ ADAPTER_SPEC = ProviderAdapterSpecV1(
 
 PLUGIN = acp_plugin(
     ADAPTER_SPEC,
+    launch_resolver=path_launch_resolver(
+        provider_id=ADAPTER_SPEC.id,
+        executable=ADAPTER_SPEC.binary.executable,
+    ),
     home_preparer=partial(
         reject_provider_home_config,
         paths=((".config", "poolside", "settings.yaml"),),

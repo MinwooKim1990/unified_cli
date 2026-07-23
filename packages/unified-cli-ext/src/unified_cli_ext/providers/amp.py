@@ -1,61 +1,98 @@
-"""Inert Held metadata for a future Amp CLI integration."""
+"""Opt-in Preview adapter for the official Amp CLI."""
 
 from __future__ import annotations
 
-from .contract import PromptMode, TransportKind
-from .held import held_adapter_spec, held_plugin
+from .bridge import adapter_plugin
+from .contract import (
+    AdapterServerPolicy,
+    AdapterStatus,
+    BinarySpec,
+    DoctorProbeSpec,
+    EnvironmentPolicy,
+    ExitStatusProbeSpec,
+    FeatureProbeSpec,
+    FixedCommandSpec,
+    OperationLimits,
+    ProbeFormat,
+    PromptCommandSpec,
+    PromptMode,
+    ProviderAdapterSpecV1,
+    ProviderCapability,
+    TransportKind,
+    VersionProbeSpec,
+)
+from .path_resolver import path_launch_resolver
 
 
-# Official reference material (including the manual appendix):
-# https://ampcode.com/manual
-# https://ampcode.com/manual/appendix
-# Package-transition reference: https://www.npmjs.com/package/@ampcode/cli
-# These sources document the move to ``@ampcode/cli``; no unstable exact
-# current package or CLI version is asserted here.
+AMP_OFFICIAL_SOURCES = (
+    "https://ampcode.com/manual",
+    "https://ampcode.com/manual/appendix",
+)
+AMP_DEFAULT_MODEL = "default"
+AMP_OFFICIAL_PACKAGE = "@ampcode/cli"
+AMP_HEADLESS_FIXED_ARGV = ("--execute",)
 
-# Exact ``--version``/``--help`` output and binary provenance require captured
-# Stage 6 fixtures before the provisional markers below may be evaluated.
-AMP_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE = True
-AMP_INSTALL_CHANNEL_BINARY_IDENTITY_PROVENANCE_REQUIRES_STAGE_6_EVIDENCE = True
+_PROBE_LIMITS = OperationLimits(10.0, 64 * 1024, 16 * 1024, 8)
+_PROMPT_LIMITS = OperationLimits(120.0, 16 * 1024 * 1024, 1024 * 1024, 50_000)
 
-# The stream-json input/output schema, including text, tool-usage, errors, and
-# image normalization, must be captured before a protocol runner can exist.
-AMP_STREAM_JSON_INPUT_OUTPUT_SCHEMA_REQUIRES_STAGE_6_EVIDENCE = True
-AMP_TEXT_TOOL_USAGE_ERROR_IMAGE_NORMALIZATION_REQUIRES_STAGE_6_EVIDENCE = True
 
-# Login, logout, status, and billing behavior must be isolated and verified.
-AMP_AUTH_LOGIN_LOGOUT_STATUS_BILLING_REQUIRES_STAGE_6_EVIDENCE = True
+def _command(*argv: str) -> FixedCommandSpec:
+    return FixedCommandSpec(argv, limits=_PROBE_LIMITS)
 
-# Session continuation/resume semantics and persistence remain unverified.
-AMP_SESSION_CONTINUE_RESUME_PERSISTENCE_REQUIRES_STAGE_6_EVIDENCE = True
 
-# Held rationale: approvals are off by default, but workspace settings may
-# override the settings file; project/system plugins and MCP may load, and no
-# permission-request channel is available to the host.
-AMP_PERMISSION_TOOL_PLUGIN_MCP_CONFIG_ISOLATION_REQUIRES_STAGE_6_EVIDENCE = True
-
-# Cancellation, steering, stdin EOF, and process/child cleanup need lifecycle
-# fixtures before this integration can execute.
-AMP_CANCEL_STEER_STDIN_EOF_PROCESS_CHILD_CLEANUP_REQUIRES_STAGE_6_EVIDENCE = True
-
-# Update/removal behavior, settings/environment isolation, and SDK/CLI schema
-# drift require independent evidence before enablement.
-AMP_UPDATE_REMOVAL_SETTINGS_ENV_ISOLATION_REQUIRES_STAGE_6_EVIDENCE = True
-AMP_SDK_CLI_SCHEMA_DRIFT_REQUIRES_STAGE_6_EVIDENCE = True
-
-ADAPTER_SPEC = held_adapter_spec(
-    provider_id="amp",
+ADAPTER_SPEC = ProviderAdapterSpecV1(
+    id="amp",
     display_name="Amp CLI",
-    executable="amp",
-    prompt_argv=("--execute", "--stream-json", "--stream-json-input"),
-    prompt_mode=PromptMode.PROTOCOL,
-    prompt_option=None,
-    transport=TransportKind.JSONL,
-    # Static Held metadata only: no environment value is read or applied.
-    environment_keys=frozenset(("AMP_API_KEY", "AMP_SKIP_UPDATE_CHECK")),
-    # Provisional until Stage 6 captures isolated command output fixtures.
-    version_marker="amp ",
-    help_chat_marker="--stream-json-input",
+    status=AdapterStatus.PREVIEW,
+    binary=BinarySpec(
+        executable="amp",
+        expected_identity="amp",
+        version_probe=VersionProbeSpec(
+            _command("--version"),
+            minimum_version=(0,),
+            format=ProbeFormat.PLAIN_TEXT,
+            version_marker="amp ",
+        ),
+        feature_probe=FeatureProbeSpec(
+            _command("--help"),
+            required_features=frozenset(("chat",)),
+            format=ProbeFormat.PLAIN_TEXT,
+            feature_markers={"chat": "-x, --execute"},
+            identity_marker="-x, --execute",
+            marker_prefixes=True,
+            identity_prefix=True,
+        ),
+    ),
+    prompt=PromptCommandSpec(
+        fixed_argv=AMP_HEADLESS_FIXED_ARGV,
+        mode=PromptMode.STDIN,
+        limits=_PROMPT_LIMITS,
+    ),
+    transport=TransportKind.PLAIN,
+    environment=EnvironmentPolicy(
+        allowed_keys=frozenset(("AMP_API_KEY", "AMP_SKIP_UPDATE_CHECK"))
+    ),
+    doctor=DoctorProbeSpec(ExitStatusProbeSpec(_command("--version"))),
+    capabilities=frozenset((ProviderCapability.CHAT.value,)),
+    server_policy=AdapterServerPolicy(enabled=False),
 )
 
-PLUGIN = held_plugin(ADAPTER_SPEC)
+PLUGIN = adapter_plugin(
+    ADAPTER_SPEC,
+    default_model=AMP_DEFAULT_MODEL,
+    launch_resolver=path_launch_resolver(
+        provider_id="amp",
+        executable="amp",
+        package_names=(AMP_OFFICIAL_PACKAGE,),
+    ),
+)
+
+
+__all__ = [
+    "ADAPTER_SPEC",
+    "AMP_DEFAULT_MODEL",
+    "AMP_HEADLESS_FIXED_ARGV",
+    "AMP_OFFICIAL_PACKAGE",
+    "AMP_OFFICIAL_SOURCES",
+    "PLUGIN",
+]

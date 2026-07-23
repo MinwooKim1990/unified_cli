@@ -26,7 +26,7 @@ from unified_cli_ext import (
 
 
 def test_public_package_api_and_version():
-    assert unified_cli_ext.__version__ == "0.5.1"
+    assert unified_cli_ext.__version__ == "0.5.2"
     assert "JsonlProcess" in unified_cli_ext.__all__
     assert "EventNormalizer" in unified_cli_ext.__all__
     assert "AcpSdkAdapter" in unified_cli_ext.__all__
@@ -54,7 +54,7 @@ print(unified_cli_ext.__version__)
         text=True,
         timeout=5,
     )
-    assert result.stdout.strip() == "0.5.1"
+    assert result.stdout.strip() == "0.5.2"
 
 
 def test_optional_dependency_absent_errors_are_clear(monkeypatch):

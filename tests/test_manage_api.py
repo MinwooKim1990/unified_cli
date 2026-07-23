@@ -127,8 +127,8 @@ def test_bootstrap_one_time_replay_cookie_scope_and_safe_metadata(tmp_path, monk
             assert body["authenticated"] is True
             assert body["csrf_token"]
             assert body["versions"] == {
-                "unified_cli": "0.5.1",
-                "unified_cli_ext": "0.5.1",
+                "unified_cli": "0.5.2",
+                "unified_cli_ext": "0.5.2",
             }
             assert body["limits"]["image_total_bytes"] == 12 * 1024 * 1024
             assert body["providers"]

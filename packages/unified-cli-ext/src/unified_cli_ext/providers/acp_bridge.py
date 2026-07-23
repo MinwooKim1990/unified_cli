@@ -333,6 +333,7 @@ class AcpProviderBridge(BaseProvider):
         transport = AcpProcessTransportV1(
             self._binary.argv_prefix + self._spec.prompt.fixed_argv,
             executable_identity=identities[0],
+            launch_identities=identities,
             cwd=self.cwd,
             provider_namespace=self._spec.id,
             provider_env=self._provider_env,

@@ -5,17 +5,28 @@ It is not the changelog of an independently published package.
 
 ## [Unreleased]
 
-### Planned for unified-cli 0.5.1
+## [0.5.2] - 2026-07-23
 
-- Consolidates the extension source into the single `unified-cli` distribution;
-  the wheel will expose both `unified_cli` and `unified_cli_ext` namespaces.
-  Core defaults remain Claude, Codex, and Gemini only, while extensions remain
-  explicit and lazy. Grok stays Preview; Qoder, Kilo, and Poolside are runnable
-  Experimental integrations; and the other 14 providers stay Held. All Ext
-  server policies stay disabled.
-- Moves optional protocol installs to `unified-cli[acp]` and
-  `unified-cli[mcp]`. No extension-specific PyPI project or GitHub Release is
-  planned.
+- Makes every one of the 18 bundled provider entry points an explicitly
+  runnable Preview adapter. Grok has representative authenticated live-test
+  evidence; the remaining provider families have offline transport fixtures
+  and require vendor/account-specific compatibility reports.
+- Adds safe lazy PATH resolution for direct executables and allowlisted npm
+  launchers, plus bounded prompt-free diagnostic files and GitHub issue
+  guidance for Preview failures.
+- Keeps all extension providers explicit-only and disabled in HTTP server mode.
+- Verifies every ACP interpreter/target prefix entry through spawn and excludes
+  vendor stdout/stderr from persisted Preview diagnostics.
+
+## [0.5.1] - 2026-07-23
+
+- Consolidated the extension source into the single `unified-cli` distribution,
+  exposing both `unified_cli` and `unified_cli_ext` namespaces without a second
+  PyPI project.
+- Kept Grok Preview, made Qoder/Kilo/Poolside Experimental, and retained the
+  other 14 entries as Held metadata.
+- Moved optional protocol installs to `unified-cli[acp]` and
+  `unified-cli[mcp]`.
 
 ## [0.1.0] - 2026-07-23
 
@@ -61,7 +72,9 @@ Initial extension-foundation release for `unified-cli` 0.5.x.
   call a provider service.
 - The `ext-v0.1.0` tag was an aborted publishing attempt. It did not publish an
   extension package to public PyPI and did not create a GitHub Release. The
-  planned 0.5.1 unified distribution supersedes that split-release plan.
+  planned 0.5.2 unified distribution supersedes that split-release plan.
 
-[Unreleased]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.0...v0.5.1
 [0.1.0]: https://github.com/MinwooKim1990/unified_cli/tree/ext-v0.1.0

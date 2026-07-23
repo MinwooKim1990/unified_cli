@@ -38,22 +38,22 @@ def _provider_executable(tmp_path, name: str, version: str, help_text: str):
     return path
 
 
-def test_experimental_metadata_and_core_server_are_closed():
+def test_preview_metadata_and_core_server_are_closed():
     expected = {
         qoder: ("qodercli", ("--acp", "--permission-mode", "dont_ask")),
         kilo: ("kilo", ("acp", "--hostname", "127.0.0.1", "--port", "0")),
         poolside: ("pool", ("acp",)),
     }
     for module, (executable, argv) in expected.items():
-        assert module.ADAPTER_SPEC.status is AdapterStatus.EXPERIMENTAL
+        assert module.ADAPTER_SPEC.status is AdapterStatus.PREVIEW
         assert module.ADAPTER_SPEC.binary.executable == executable
         assert module.ADAPTER_SPEC.prompt.fixed_argv == argv
-        assert module.PLUGIN.support_status == "experimental"
+        assert module.PLUGIN.support_status == "preview"
         assert module.PLUGIN.capabilities == frozenset(("chat",))
         assert module.PLUGIN.model_lister()[0].id == "default"
         assert module.PLUGIN.server_policy.enabled is False
-    assert hermes.ADAPTER_SPEC.status is AdapterStatus.HELD
-    assert hermes.PLUGIN.support_status == "held"
+    assert hermes.ADAPTER_SPEC.status is AdapterStatus.PREVIEW
+    assert hermes.PLUGIN.support_status == "preview"
     assert hermes.PLUGIN.server_policy.enabled is False
 
 

@@ -1,44 +1,97 @@
-"""Inert Held metadata for a future Mistral Vibe CLI integration."""
+"""Opt-in Preview adapter for the official Mistral Vibe CLI."""
 
 from __future__ import annotations
 
-from .contract import PromptMode, TransportKind
-from .held import held_adapter_spec, held_plugin
+from .bridge import adapter_plugin
+from .contract import (
+    AdapterServerPolicy,
+    AdapterStatus,
+    BinarySpec,
+    DoctorProbeSpec,
+    EnvironmentPolicy,
+    ExitStatusProbeSpec,
+    FeatureProbeSpec,
+    FixedCommandSpec,
+    OperationLimits,
+    ProbeFormat,
+    PromptCommandSpec,
+    PromptMode,
+    ProviderAdapterSpecV1,
+    ProviderCapability,
+    TransportKind,
+    VersionProbeSpec,
+)
+from .path_resolver import path_launch_resolver
 
 
 MISTRAL_VIBE_OFFICIAL_SOURCES = (
-    "https://docs.mistral.ai/getting-started/quickstarts/vibe-code/install-cli",
+    "https://docs.mistral.ai/vibe/code/cli/work-with-cli",
     "https://github.com/mistralai/mistral-vibe",
 )
 MISTRAL_VIBE_DEFAULT_MODEL = "default"
-MISTRAL_VIBE_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE = True
-MISTRAL_VIBE_ACP_REQUIRES_SEPARATE_STAGE_6_EVIDENCE = True
 MISTRAL_VIBE_HEADLESS_FIXED_ARGV = (
     "--output",
-    "streaming",
+    "text",
     "--agent",
     "plan",
     "--disabled-tools",
     "*",
 )
 
+_PROBE_LIMITS = OperationLimits(10.0, 64 * 1024, 16 * 1024, 8)
+_PROMPT_LIMITS = OperationLimits(120.0, 16 * 1024 * 1024, 1024 * 1024, 50_000)
 
-ADAPTER_SPEC = held_adapter_spec(
-    provider_id="mistral-vibe",
+
+def _command(*argv: str) -> FixedCommandSpec:
+    return FixedCommandSpec(argv, limits=_PROBE_LIMITS)
+
+
+ADAPTER_SPEC = ProviderAdapterSpecV1(
+    id="mistral-vibe",
     display_name="Mistral Vibe",
-    executable="vibe",
-    prompt_argv=MISTRAL_VIBE_HEADLESS_FIXED_ARGV,
-    prompt_mode=PromptMode.OPTION_VALUE,
-    prompt_option="--prompt",
-    transport=TransportKind.JSONL,
-    # Static candidate metadata only.  MISTRAL_API_KEY is not read or applied
-    # while workspace hooks, MCP, prompts, and update behavior remain unisolated.
-    environment_keys=frozenset(),
-    version_marker="vibe ",
-    help_chat_marker="--prompt",
+    status=AdapterStatus.PREVIEW,
+    binary=BinarySpec(
+        executable="vibe",
+        expected_identity="vibe",
+        version_probe=VersionProbeSpec(
+            _command("--version"),
+            minimum_version=(0,),
+            format=ProbeFormat.PLAIN_TEXT,
+            version_marker="vibe ",
+        ),
+        feature_probe=FeatureProbeSpec(
+            _command("--help"),
+            required_features=frozenset(("chat",)),
+            format=ProbeFormat.PLAIN_TEXT,
+            feature_markers={"chat": "--prompt"},
+            identity_marker="--prompt",
+            marker_prefixes=True,
+            identity_prefix=True,
+        ),
+    ),
+    prompt=PromptCommandSpec(
+        fixed_argv=MISTRAL_VIBE_HEADLESS_FIXED_ARGV,
+        mode=PromptMode.OPTION_VALUE,
+        prompt_option="--prompt",
+        limits=_PROMPT_LIMITS,
+    ),
+    transport=TransportKind.PLAIN,
+    environment=EnvironmentPolicy(
+        allowed_keys=frozenset(("MISTRAL_API_KEY",))
+    ),
+    doctor=DoctorProbeSpec(ExitStatusProbeSpec(_command("--version"))),
+    capabilities=frozenset((ProviderCapability.CHAT.value,)),
+    server_policy=AdapterServerPolicy(enabled=False),
 )
 
-PLUGIN = held_plugin(ADAPTER_SPEC)
+PLUGIN = adapter_plugin(
+    ADAPTER_SPEC,
+    default_model=MISTRAL_VIBE_DEFAULT_MODEL,
+    launch_resolver=path_launch_resolver(
+        provider_id="mistral-vibe",
+        executable="vibe",
+    ),
+)
 
 
 __all__ = [

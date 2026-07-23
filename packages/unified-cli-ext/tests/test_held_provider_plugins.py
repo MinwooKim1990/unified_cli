@@ -1,4 +1,4 @@
-"""Stage 5B-5F contract checks for inert external provider entry points."""
+"""Legacy metadata checks plus the invariant that no shipped provider is Held."""
 
 from __future__ import annotations
 
@@ -55,16 +55,11 @@ ENTRY_POINTS = {
     "gitlab-duo": "unified_cli_ext.providers.gitlab_duo:PLUGIN",
 }
 
-NON_HELD_PROVIDER_IDS = (
-    "grok",
-    "qoder",
-    "kilo",
-    "poolside",
-)
+NON_HELD_PROVIDER_IDS = tuple(ENTRY_POINTS)
 HELD_PROVIDER_IDS = tuple(
     provider_id for provider_id in ENTRY_POINTS if provider_id not in NON_HELD_PROVIDER_IDS
 )
-HELD_RESEARCH_PROVIDER_IDS = ("kimi", "copilot", "cursor")
+HELD_RESEARCH_PROVIDER_IDS = ()
 
 EXPECTED_COMMANDS = {
     "grok": {
@@ -552,7 +547,7 @@ def test_held_specs_and_plugins_are_immutable_and_minimal(provider_id):
         doctor["available"] = True
 
 
-@pytest.mark.parametrize("provider_id", tuple(EVIDENCE_FLAGS))
+@pytest.mark.parametrize("provider_id", HELD_PROVIDER_IDS)
 def test_held_entries_record_every_remaining_evidence_gate(provider_id):
     module = _module(provider_id)
     expected = set(EVIDENCE_FLAGS[provider_id])
@@ -585,14 +580,14 @@ def test_held_factories_fail_before_provider_creation_or_execution(provider_id, 
     assert str(caught.value) == HELD_UNAVAILABLE_MESSAGE
 
 
-def test_pi_held_import_does_not_load_protocol_bridge():
+def test_pi_preview_import_does_not_load_unused_protocol_bridge():
     sys.modules.pop("unified_cli_ext.providers.pi", None)
     sys.modules.pop("unified_cli_ext.providers.protocol_bridge", None)
 
     module = importlib.import_module("unified_cli_ext.providers.pi")
 
-    assert module.ADAPTER_SPEC.status is AdapterStatus.HELD
-    assert module.PLUGIN.support_status == "held"
+    assert module.ADAPTER_SPEC.status is AdapterStatus.PREVIEW
+    assert module.PLUGIN.support_status == "preview"
     assert "unified_cli_ext.providers.protocol_bridge" not in sys.modules
 
 
@@ -859,14 +854,14 @@ def test_grok_requires_xai_identity_and_rejects_third_party_name_collision():
     assert dict(module.GROK_FIXED_ENVIRONMENT) == fixed_environment
 
 
-def test_kimi_documents_auto_approval_without_claiming_safe_execution():
+def test_kimi_preview_keeps_documented_one_shot_shape():
     module = _module("kimi")
     assert module.KIMI_OFFICIAL_PACKAGE == "@moonshot-ai/kimi-code"
     assert module.KIMI_NPM_MINIMUM_NODE_VERSION == "22.19"
-    assert module.KIMI_PROMPT_USES_OS_WORKING_DIRECTORY is True
-    assert module.KIMI_TUI_LOGOUT_COMMAND == "/logout"
-    assert module.KIMI_NONINTERACTIVE_AUTO_APPROVAL_REQUIRES_STAGE_6_EVIDENCE
-    assert module.PLUGIN.capabilities == frozenset()
+    assert module.ADAPTER_SPEC.status is AdapterStatus.PREVIEW
+    assert module.ADAPTER_SPEC.prompt.prompt_option == "-p"
+    assert module.PLUGIN.support_status == "preview"
+    assert module.PLUGIN.capabilities == frozenset(("chat",))
 
 
 def test_copilot_candidate_keeps_every_documented_containment_control():
@@ -889,20 +884,17 @@ def test_copilot_candidate_keeps_every_documented_containment_control():
     assert module.ADAPTER_SPEC.environment.allowed_keys == frozenset(
         ("COPILOT_HOME",)
     )
-    assert module.ADAPTER_SPEC.status is AdapterStatus.HELD
-    assert module.PLUGIN.support_status == "held"
-    assert module.PLUGIN.capabilities == frozenset()
+    assert module.ADAPTER_SPEC.status is AdapterStatus.PREVIEW
+    assert module.PLUGIN.support_status == "preview"
+    assert module.PLUGIN.capabilities == frozenset(("chat",))
 
 
-def test_cursor_records_that_stage_6_must_establish_prompt_framing():
+def test_cursor_preview_uses_documented_print_framing():
     module = _module("cursor")
-    assert module.CURSOR_PROMPT_FORM_REQUIRES_STAGE_6_EVIDENCE is True
-    assert module.CURSOR_PROMPT_COMMAND_IS_ABI_REPRESENTABLE is False
     assert module.CURSOR_PRIMARY_EXECUTABLE == "agent"
     assert module.CURSOR_LEGACY_EXECUTABLE == "cursor-agent"
-    assert module.CURSOR_LEGACY_ALIAS_SINCE == "2026-01-08"
     assert module.ADAPTER_SPEC.binary.executable == "agent"
-    assert module.ADAPTER_SPEC.prompt.fixed_argv == module.CURSOR_INERT_PROMPT_PLACEHOLDER
-    assert module.CURSOR_DOCUMENTED_PRINT_OPTIONS != module.ADAPTER_SPEC.prompt.fixed_argv
+    assert module.ADAPTER_SPEC.prompt.fixed_argv == module.CURSOR_DOCUMENTED_PRINT_OPTIONS
+    assert module.ADAPTER_SPEC.status is AdapterStatus.PREVIEW
+    assert module.PLUGIN.support_status == "preview"
     assert "CURSOR_API_KEY" not in module.ADAPTER_SPEC.prompt.fixed_argv
-    assert "--" not in module.ADAPTER_SPEC.prompt.fixed_argv

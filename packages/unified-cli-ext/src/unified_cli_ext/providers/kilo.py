@@ -1,4 +1,4 @@
-"""Experimental ACP 0.11 adapter for the official Kilo Code CLI."""
+"""Preview ACP 0.11 adapter for the official Kilo Code CLI."""
 
 from __future__ import annotations
 
@@ -24,6 +24,7 @@ from .contract import (
     TransportKind,
     VersionProbeSpec,
 )
+from .path_resolver import path_launch_resolver
 
 
 KILO_OFFICIAL_PACKAGE = "@kilocode/cli"
@@ -50,7 +51,7 @@ def _command(*argv: str) -> FixedCommandSpec:
 ADAPTER_SPEC = ProviderAdapterSpecV1(
     id="kilo",
     display_name="Kilo Code",
-    status=AdapterStatus.EXPERIMENTAL,
+    status=AdapterStatus.PREVIEW,
     binary=BinarySpec(
         executable="kilo",
         expected_identity="kilo",
@@ -93,6 +94,11 @@ ADAPTER_SPEC = ProviderAdapterSpecV1(
 
 PLUGIN = acp_plugin(
     ADAPTER_SPEC,
+    launch_resolver=path_launch_resolver(
+        provider_id=ADAPTER_SPEC.id,
+        executable=ADAPTER_SPEC.binary.executable,
+        package_names=(KILO_OFFICIAL_PACKAGE,),
+    ),
     workspace_guard=partial(
         reject_workspace_config,
         names=(
