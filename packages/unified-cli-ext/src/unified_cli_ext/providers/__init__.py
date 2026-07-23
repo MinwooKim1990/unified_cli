@@ -39,29 +39,33 @@ from .contract import (
     valid_provider_id,
 )
 from .registry import ProviderAdapterRegistryV1
-from .installation import (
-    INSTALLATION_RECEIPT_ABI_V1,
-    ArtifactIdentityV1,
-    DirectoryIdentityV1,
-    DistributionTypeV1,
-    InstallationReceiptKindV1,
-    InstallationReceiptV1,
-    SymlinkIdentityV1,
-    VerifiedLaunchV1,
-    installation_receipt_from_record,
-    installation_receipt_to_record,
-)
-from .runtime import (
-    AdapterInspectionV1,
-    BinaryProvenance,
-    InteractiveAuthSessionV1,
-    OpenedProcessTransportV1,
-    ProtocolLaunchBoundaryV1,
-    ProviderAdapterV1,
-    drain_pending_cleanups,
-)
 
 
+_INSTALLATION_EXPORTS = frozenset(
+    (
+        "INSTALLATION_RECEIPT_ABI_V1",
+        "ArtifactIdentityV1",
+        "DirectoryIdentityV1",
+        "DistributionTypeV1",
+        "InstallationReceiptKindV1",
+        "InstallationReceiptV1",
+        "SymlinkIdentityV1",
+        "VerifiedLaunchV1",
+        "installation_receipt_from_record",
+        "installation_receipt_to_record",
+    )
+)
+_RUNTIME_EXPORTS = frozenset(
+    (
+        "AdapterInspectionV1",
+        "BinaryProvenance",
+        "InteractiveAuthSessionV1",
+        "OpenedProcessTransportV1",
+        "ProtocolLaunchBoundaryV1",
+        "ProviderAdapterV1",
+        "drain_pending_cleanups",
+    )
+)
 _BRIDGE_EXPORTS = frozenset(
     (
         "AdapterLaunchResolverV1",
@@ -81,13 +85,19 @@ _BRIDGE_EXPORTS = frozenset(
 
 
 def __getattr__(name):
-    """Load the Core-facing bridge only when explicitly requested."""
+    """Load heavyweight provider helpers only when explicitly requested."""
 
-    if name not in _BRIDGE_EXPORTS:
+    if name in _INSTALLATION_EXPORTS:
+        module_name = ".installation"
+    elif name in _RUNTIME_EXPORTS:
+        module_name = ".runtime"
+    elif name in _BRIDGE_EXPORTS:
+        module_name = ".bridge"
+    else:
         raise AttributeError(name)
     import importlib
 
-    module = importlib.import_module(".bridge", __name__)
+    module = importlib.import_module(module_name, __name__)
     value = getattr(module, name)
     globals()[name] = value
     return value

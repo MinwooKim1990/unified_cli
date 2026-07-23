@@ -53,6 +53,11 @@
       "warmups": 3
     },
     "ext_import": {
+      "normalization": {
+        "anchor_milliseconds": 52.066,
+        "kind": "paired_same_metric_ratio",
+        "metric": "ext_import"
+      },
       "samples": 15,
       "statistic": "p95",
       "threshold": {
@@ -64,7 +69,7 @@
     "ext_passive_registry": {
       "normalization": {
         "anchor_milliseconds": 195.661,
-        "kind": "paired_same_metric_reference",
+        "kind": "paired_same_metric_ratio",
         "metric": "ext_passive_registry"
       },
       "samples": 61,
