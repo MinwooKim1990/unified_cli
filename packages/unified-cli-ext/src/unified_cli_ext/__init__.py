@@ -1,4 +1,4 @@
-"""Import-safe public API for ``unified-cli-ext``.
+"""Import-safe extension API bundled in the ``unified-cli`` distribution.
 
 Importing this module performs no subprocess probes and does not import the ACP
 or MCP optional dependencies.
@@ -55,7 +55,7 @@ from .transports import (
 )
 
 
-__version__ = "0.1.0"
+__version__ = "0.5.1"
 
 __all__ = [
     "__version__",

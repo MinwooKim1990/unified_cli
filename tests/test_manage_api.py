@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import json
 import os
 import stat
@@ -95,7 +96,26 @@ def test_manage_disabled_is_404_but_plain_dashboard_remains_available():
     run(scenario())
 
 
-def test_bootstrap_one_time_replay_cookie_scope_and_safe_metadata(tmp_path):
+def test_bootstrap_one_time_replay_cookie_scope_and_safe_metadata(tmp_path, monkeypatch):
+    import_extension_calls = []
+    metadata_calls = []
+    original_import = builtins.__import__
+
+    def reject_extension_import(name, *args, **kwargs):
+        if name == "unified_cli_ext" or name.startswith("unified_cli_ext."):
+            import_extension_calls.append(name)
+            raise AssertionError("bootstrap imported the Ext namespace")
+        return original_import(name, *args, **kwargs)
+
+    def reject_ext_distribution(name):
+        metadata_calls.append(name)
+        raise AssertionError("bootstrap queried distribution metadata")
+
+    for module_name in tuple(sys.modules):
+        if module_name == "unified_cli_ext" or module_name.startswith("unified_cli_ext."):
+            monkeypatch.delitem(sys.modules, module_name)
+    monkeypatch.setattr(builtins, "__import__", reject_extension_import)
+    monkeypatch.setattr(manage.importlib_metadata, "version", reject_ext_distribution)
     token = server.prepare_manage([str(tmp_path)])
 
     async def scenario():
@@ -106,7 +126,10 @@ def test_bootstrap_one_time_replay_cookie_scope_and_safe_metadata(tmp_path):
             assert body["mode"] == "manage"
             assert body["authenticated"] is True
             assert body["csrf_token"]
-            assert body["versions"]["unified_cli"] == "0.5.0"
+            assert body["versions"] == {
+                "unified_cli": "0.5.1",
+                "unified_cli_ext": "0.5.1",
+            }
             assert body["limits"]["image_total_bytes"] == 12 * 1024 * 1024
             assert body["providers"]
             assert body["workspaces"][0]["id"].startswith("ws_")
@@ -128,6 +151,8 @@ def test_bootstrap_one_time_replay_cookie_scope_and_safe_metadata(tmp_path):
             assert rejected.status_code == 401
             assert token not in rejected.text
     run(scenario())
+    assert import_extension_calls == []
+    assert metadata_calls == []
 
 
 def test_manage_cookie_alone_is_not_an_authenticated_browser_proof(tmp_path):

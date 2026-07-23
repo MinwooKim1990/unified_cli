@@ -1,71 +1,102 @@
-"""Inert Held metadata for a future Poolside Agent CLI integration."""
+"""Experimental ACP 0.11 adapter for the official Poolside Agent CLI."""
 
 from __future__ import annotations
 
-from .contract import PromptMode, TransportKind
-from .held import held_adapter_spec, held_plugin
+from functools import partial
 
-
-# Official proprietary native installer/release, current release v1.0.13.
-# https://docs.poolside.ai/cli/install
-# https://docs.poolside.ai/cli/cli-reference
-# https://github.com/poolsideai/pool/releases/tag/v1.0.13
-# https://github.com/poolsideai/pool
-# https://github.com/agentclientprotocol/registry/blob/main/poolside/agent.json
-# The documented Unix installation location is ``~/.local/bin/pool``; Held
-# metadata never resolves, installs, or executes that binary.
-
-# Exact version and help output must be captured in isolated fixtures before
-# these provisional markers can be trusted.
-POOLSIDE_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE = True
-
-# The native release channel, resolved executable identity, and available
-# provenance evidence must be captured before the binary can be selected.
-POOLSIDE_INSTALL_CHANNEL_BINARY_IDENTITY_PROVENANCE_REQUIRES_STAGE_6_EVIDENCE = True
-
-# ACP handshake and event framing require separate protocol fixtures.
-POOLSIDE_ACP_HANDSHAKE_EVENT_SCHEMA_REQUIRES_STAGE_6_EVIDENCE = True
-
-# Authentication, model selection, and session lifecycle remain unverified.
-POOLSIDE_AUTH_MODEL_SESSION_REQUIRES_STAGE_6_EVIDENCE = True
-
-# Permission behavior, tool and MCP controls, and configuration isolation must
-# be proven safe before any execution path is enabled.
-POOLSIDE_PERMISSION_TOOL_MCP_CONFIG_ISOLATION_REQUIRES_STAGE_6_EVIDENCE = True
-
-# Image handling, usage accounting, and error schemas are not supported claims
-# until captured evidence establishes their behavior.
-POOLSIDE_IMAGE_USAGE_ERROR_SCHEMA_REQUIRES_STAGE_6_EVIDENCE = True
-
-# Process lifecycle and child cleanup require isolated lifecycle evidence.
-POOLSIDE_PROCESS_CHILD_CLEANUP_REQUIRES_STAGE_6_EVIDENCE = True
-
-# A direct ``pool`` execution JSONL surface needs evidence separate from ACP.
-POOLSIDE_EXEC_JSONL_SEPARATE_REQUIRES_STAGE_6_EVIDENCE = True
-
-# Update behavior and removal/cleanup procedures require separate evidence.
-POOLSIDE_UPDATE_REMOVAL_REQUIRES_STAGE_6_EVIDENCE = True
-
-ADAPTER_SPEC = held_adapter_spec(
-    provider_id="poolside",
-    display_name="Poolside Agent CLI",
-    executable="pool",
-    prompt_argv=("acp",),
-    prompt_mode=PromptMode.PROTOCOL,
-    prompt_option=None,
-    transport=TransportKind.ACP,
-    # Static Held metadata only: no environment value is read or applied.
-    environment_keys=frozenset(
-        (
-            "POOLSIDE_API_KEY",
-            "POOLSIDE_TOKEN",
-            "POOLSIDE_API_URL",
-            "POOLSIDE_STANDALONE_BASE_URL",
-            "POOLSIDE_STANDALONE_MODEL",
-        )
-    ),
-    version_marker="pool ",
-    help_chat_marker="pool acp",
+from .acp_bridge import (
+    acp_plugin,
+    reject_provider_home_config,
+    reject_workspace_config,
+)
+from .contract import (
+    AdapterServerPolicy,
+    AdapterStatus,
+    BinarySpec,
+    DoctorProbeSpec,
+    EnvironmentPolicy,
+    ExitStatusProbeSpec,
+    FeatureProbeSpec,
+    FixedCommandSpec,
+    OperationLimits,
+    ProbeFormat,
+    PromptCommandSpec,
+    PromptMode,
+    ProviderAdapterSpecV1,
+    ProviderCapability,
+    TransportKind,
+    VersionProbeSpec,
 )
 
-PLUGIN = held_plugin(ADAPTER_SPEC)
+
+POOLSIDE_STAGE_6_VERSION = "1.0.13"
+POOLSIDE_ACP_FIXED_ARGV = ("acp",)
+_PROBE_LIMITS = OperationLimits(10.0, 64 * 1024, 16 * 1024, 8)
+_PROMPT_LIMITS = OperationLimits(120.0, 16 * 1024 * 1024, 1024 * 1024, 50_000)
+
+
+def _command(*argv: str) -> FixedCommandSpec:
+    return FixedCommandSpec(argv, limits=_PROBE_LIMITS)
+
+
+ADAPTER_SPEC = ProviderAdapterSpecV1(
+    id="poolside",
+    display_name="Poolside Agent CLI",
+    status=AdapterStatus.EXPERIMENTAL,
+    binary=BinarySpec(
+        executable="pool",
+        expected_identity="pool",
+        version_probe=VersionProbeSpec(
+            _command("acp", "--version"),
+            minimum_version=(1, 0, 13),
+            format=ProbeFormat.PLAIN_TEXT,
+            version_marker="pool ",
+            identity_marker="pool 1.0.13",
+            version_is_first_token=True,
+            identity_prefix=True,
+        ),
+        feature_probe=FeatureProbeSpec(
+            _command("acp", "--help"),
+            required_features=frozenset(("acp", "chat", "version")),
+            format=ProbeFormat.PLAIN_TEXT,
+            feature_markers={
+                "acp": "Agent Client Protocol",
+                "chat": "standard input",
+                "version": "--version",
+            },
+            identity_marker="pool acp",
+            marker_prefixes=True,
+            identity_prefix=True,
+        ),
+    ),
+    prompt=PromptCommandSpec(
+        fixed_argv=POOLSIDE_ACP_FIXED_ARGV,
+        mode=PromptMode.PROTOCOL,
+        prompt_option=None,
+        limits=_PROMPT_LIMITS,
+    ),
+    transport=TransportKind.ACP,
+    environment=EnvironmentPolicy(
+        allowed_keys=frozenset(
+            (
+                "POOLSIDE_API_KEY",
+                "POOLSIDE_TOKEN",
+                "POOLSIDE_API_URL",
+                "POOLSIDE_STANDALONE_BASE_URL",
+                "POOLSIDE_STANDALONE_MODEL",
+            )
+        )
+    ),
+    doctor=DoctorProbeSpec(ExitStatusProbeSpec(_command("acp", "--version"))),
+    capabilities=frozenset((ProviderCapability.CHAT.value,)),
+    server_policy=AdapterServerPolicy(enabled=False),
+)
+
+PLUGIN = acp_plugin(
+    ADAPTER_SPEC,
+    home_preparer=partial(
+        reject_provider_home_config,
+        paths=((".config", "poolside", "settings.yaml"),),
+    ),
+    workspace_guard=partial(reject_workspace_config, names=(".poolside",)),
+)

@@ -24,12 +24,10 @@ jobs:
         os: [ubuntu-latest]
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
         include:
-          # macOS is the primary target OS — cover it on the min + max Pythons.
           - os: macos-latest
             python-version: "3.9"
           - os: macos-latest
             python-version: "3.14"
-
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -41,31 +39,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Upgrade pip and install packaging tools
-        run: python -m pip install --upgrade pip build twine
-
-      - name: Install package (dev + server extras)
-        run: pip install -e ".[dev,server]"
-
-      # NOTE: The package shells out to external CLIs (claude / codex / agy),
-      # which are not installed in CI and require subscription auth. We run
-      # ONLY the offline/unit test suite here — no live provider calls.
-      - name: Run tests
-        run: pytest -q
-
-      - name: Build sdist and wheel
-        run: python -m build
-
-      - name: Check distribution metadata
-        run: python -m twine check dist/*
-
-      - name: Smoke test the built wheel in a clean virtual environment
+      - name: Install the unified development environment
         run: |
-          python -m venv /tmp/unified-cli-wheel-smoke
-          /tmp/unified-cli-wheel-smoke/bin/python -m pip install --upgrade pip
-          /tmp/unified-cli-wheel-smoke/bin/python -m pip install dist/*.whl
-          /tmp/unified-cli-wheel-smoke/bin/unified-cli --version
-          /tmp/unified-cli-wheel-smoke/bin/python -c "import unified_cli; print(unified_cli.__version__)"
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev,server]"
+
+      - name: Run Core offline tests
+        run: python -m pytest -q
 
   performance:
     name: Pinned-reference offline performance gate
@@ -98,7 +78,7 @@ jobs:
           --reference-root performance-reference
 
   ext-test:
-    name: Ext (${{ matrix.os }} · Python ${{ matrix.python-version }})
+    name: Bundled extensions (${{ matrix.os }} · Python ${{ matrix.python-version }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -110,7 +90,6 @@ jobs:
             python-version: "3.9"
           - os: macos-latest
             python-version: "3.14"
-
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -122,44 +101,42 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install Core and Ext test environments
+      - name: Install the one project
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev,server]"
-          python -m pip install -e "packages/unified-cli-ext[dev]"
 
-      - name: Check generated Ext provider support tables
+      - name: Check generated extension provider support tables
         if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.9'
         run: python scripts/check_ext_provider_support.py --check
 
-      - name: Run Ext offline fixture suite
-        run: pytest -q packages/unified-cli-ext/tests
+      - name: Run bundled extension offline fixtures
+        run: python -m pytest -q packages/unified-cli-ext/tests
 
       - name: Exercise macOS libc waitid compatibility path
         if: matrix.os == 'macos-latest' && matrix.python-version == '3.9'
         env:
           UNIFIED_CLI_EXT_TEST_DARWIN_LIBC_WAITID: "1"
         run: |
-          pytest -q \
+          python -m pytest -q \
             packages/unified-cli-ext/tests/test_process_portability.py \
             packages/unified-cli-ext/tests/test_jsonl_jsonrpc.py \
             packages/unified-cli-ext/tests/test_provider_adapters.py \
             -k "darwin_libc_waitid or group_signals_never_follow_leader_reap or timeout_and_explicit_cancellation_cleanup or escaped_descendant_inherited_pipes_cannot_block_cleanup or early_close_kills_descendant_process_group or fixed_process_timeout_cancel_flood_and_term_ignore_cleanup or fixed_process_kills_descendants_and_falls_back_when_killpg_fails or fixed_process_detached_inherited_pipe_cannot_deadlock_close or post_popen_runtime_error_reaps_and_cleans_environment"
 
-      - name: Verify Core and Ext imports are independent
+      - name: Verify namespace versions share the release
         run: |
-          python -c "import unified_cli; assert unified_cli.__version__ == '0.5.0'"
-          python -c "import unified_cli_ext; assert unified_cli_ext.__version__ == '0.1.0'"
+          python -c "import unified_cli; assert unified_cli.__version__ == '0.5.1'"
+          python -c "import unified_cli_ext; assert unified_cli_ext.__version__ == '0.5.1'"
 
   ext-optional-extras:
-    name: Ext optional ${{ matrix.extra }} · Python ${{ matrix.python-version }}
+    name: Optional ${{ matrix.extra }} · Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.14"]
         extra: [acp, mcp]
-
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -171,14 +148,13 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install one optional integration
+      - name: Install one optional integration from the unified project
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e .
-          python -m pip install -e "packages/unified-cli-ext[dev,${{ matrix.extra }}]"
+          python -m pip install -e ".[dev,${{ matrix.extra }}]"
 
-      - name: Run Ext tests with the optional dependency present
-        run: pytest -q packages/unified-cli-ext/tests
+      - name: Run extension tests with the optional dependency present
+        run: python -m pytest -q packages/unified-cli-ext/tests
 
       - name: Check the environment
         run: python -m pip check
@@ -196,7 +172,6 @@ jobs:
             python-version: "3.9"
           - os: macos-latest
             python-version: "3.14"
-
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -214,15 +189,21 @@ jobs:
       - name: Run the source-only lab fixture suite
         run: python -m pytest -q tools/unified_ext_lab/tests
 
-  distribution-pair:
-    name: Core + Ext distribution boundary
+  unified-distribution:
+    name: One wheel · two namespaces
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
+      - name: Checkout candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      - name: Checkout the legacy split source for migration-only smoke
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: legacy-source
+          persist-credentials: false
+          ref: 7abb7ebc36a4668b3cc9634fd65af5c75b30c758
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -232,87 +213,57 @@ jobs:
       - name: Install packaging tools
         run: python -m pip install --upgrade pip build twine
 
-      - name: Build both distributions independently
+      - name: Build exactly one distribution
+        run: python -m build --outdir dist/unified .
+
+      - name: Verify exact unified artifacts
         run: |
-          python -m build --outdir dist/core .
-          python -m build --outdir dist/ext packages/unified-cli-ext
+          python -m twine check dist/unified/*
+          python scripts/verify_unified_release_artifacts.py \
+            dist/unified --version 0.5.1
 
-      - name: Verify sdists have no source-only repository tests
+      - name: Rebuild the wheel from the verified sdist
         run: |
-          python - <<'PY'
-          import tarfile
-          from pathlib import Path, PurePosixPath
+          python -m pip wheel --no-deps --wheel-dir dist/rebuilt \
+            dist/unified/unified_cli-0.5.1.tar.gz
+          mkdir dist/rebuilt-pair
+          cp dist/rebuilt/unified_cli-0.5.1-py3-none-any.whl \
+            dist/rebuilt-pair/
+          cp dist/unified/unified_cli-0.5.1.tar.gz dist/rebuilt-pair/
+          python scripts/verify_unified_release_artifacts.py \
+            dist/rebuilt-pair --version 0.5.1
 
-          def is_ext_lab_launcher(name):
-              parts = PurePosixPath(name).parts
-              return (
-                  len(parts) >= 2
-                  and parts[-2] == "scripts"
-                  and parts[-1].startswith("unified-ext-lab")
-              )
-
-          checks = (
-              ("core", "tests/test_distribution_pair.py"),
-              ("core", "tests/test_performance_contract.py"),
-              ("core", "tests/test_release_artifacts.py"),
-              ("core", "tests/test_release_contract.py"),
-              ("ext", "tests/test_ext_provider_support_docs.py"),
-          )
-          for distribution, suffix in checks:
-              archive_path = next(Path("dist", distribution).glob("*.tar.gz"))
-              with tarfile.open(archive_path, "r:gz") as archive:
-                  names = archive.getnames()
-              if any(name.endswith("/" + suffix) for name in names):
-                  raise SystemExit(
-                      distribution + " sdist contains a source-only repository test"
-                  )
-              if any(
-                  "/tools/unified_ext_lab/" in name
-                  or is_ext_lab_launcher(name)
-                  for name in names
-              ):
-                  raise SystemExit(
-                      distribution + " sdist contains the source-only Ext lab"
-                  )
-          PY
-
-      - name: Check metadata and wheel path separation
+      - name: Smoke test the clean unified wheel and uninstall
         run: |
-          python -m twine check dist/core/* dist/ext/*
-          python scripts/verify_release_artifacts.py dist/core \
-            --name unified-cli --version 0.5.0 \
-            --package-root unified_cli --forbid-package-root unified_cli_ext \
-            --requires-dist "rich>=13" \
-            --requires-dist "prompt-toolkit>=3.0.43"
-          python scripts/verify_release_artifacts.py dist/ext \
-            --name unified-cli-ext --version 0.1.0 \
-            --package-root unified_cli_ext --forbid-package-root unified_cli \
-            --requires-dist "unified-cli>=0.5,<0.6"
-          python scripts/verify_distribution_pair.py \
-            dist/core/*.whl dist/ext/*.whl \
-            --core-version 0.5.0 --ext-version 0.1.0
+          python -m venv /tmp/unified-wheel-smoke
+          /tmp/unified-wheel-smoke/bin/python -m pip install --upgrade pip
+          /tmp/unified-wheel-smoke/bin/python -m pip install \
+            dist/unified/unified_cli-0.5.1-py3-none-any.whl
+          test "$(/tmp/unified-wheel-smoke/bin/unified-cli --version)" = "0.5.1"
+          /tmp/unified-wheel-smoke/bin/unified-cli --help >/dev/null
+          /tmp/unified-wheel-smoke/bin/python \
+            scripts/verify_single_distribution.py --version 0.5.1
+          /tmp/unified-wheel-smoke/bin/python -m pip check
+          /tmp/unified-wheel-smoke/bin/python -m pip uninstall -y unified-cli
+          /tmp/unified-wheel-smoke/bin/python -c \
+            "import importlib.util; assert importlib.util.find_spec('unified_cli') is None; assert importlib.util.find_spec('unified_cli_ext') is None"
 
-      - name: Smoke test Core-only wheel
+      - name: Smoke test legacy local split cleanup and unified reinstall
         run: |
-          python -m venv /tmp/unified-core-only
-          /tmp/unified-core-only/bin/python -m pip install --upgrade pip
-          /tmp/unified-core-only/bin/python -m pip install dist/core/*.whl
-          /tmp/unified-core-only/bin/unified-cli --version
-          /tmp/unified-core-only/bin/python -c "import importlib.util, unified_cli; assert importlib.util.find_spec('unified_cli_ext') is None"
-          /tmp/unified-core-only/bin/python -m pip check
-
-      - name: Smoke test pair and Ext removal recovery
-        run: |
-          python -m venv /tmp/unified-core-ext
-          /tmp/unified-core-ext/bin/python -m pip install --upgrade pip
-          /tmp/unified-core-ext/bin/python -m pip install dist/core/*.whl dist/ext/*.whl
-          /tmp/unified-core-ext/bin/python -c "import unified_cli, unified_cli_ext; assert unified_cli.__version__ == '0.5.0'; assert unified_cli_ext.__version__ == '0.1.0'"
-          /tmp/unified-core-ext/bin/python -m pip check
-
-          /tmp/unified-core-ext/bin/python -m pip uninstall -y unified-cli-ext
-          /tmp/unified-core-ext/bin/unified-cli --version
-          /tmp/unified-core-ext/bin/python -c "import importlib.util, unified_cli; assert importlib.util.find_spec('unified_cli_ext') is None"
-          /tmp/unified-core-ext/bin/python -m pip check
+          python -m build --wheel --outdir dist/legacy-ext \
+            legacy-source/packages/unified-cli-ext
+          python -m venv /tmp/unified-migration-smoke
+          /tmp/unified-migration-smoke/bin/python -m pip install --upgrade pip
+          /tmp/unified-migration-smoke/bin/python -m pip install \
+            "unified-cli==0.5.0" dist/legacy-ext/unified_cli_ext-0.1.0-py3-none-any.whl
+          /tmp/unified-migration-smoke/bin/python -m pip uninstall -y \
+            unified-cli-ext
+          /tmp/unified-migration-smoke/bin/python -m pip install \
+            --force-reinstall \
+            dist/unified/unified_cli-0.5.1-py3-none-any.whl
+          /tmp/unified-migration-smoke/bin/python \
+            scripts/verify_single_distribution.py --version 0.5.1
+          /tmp/unified-migration-smoke/bin/python -m pip check
 
   browser-e2e:
     name: Browser dashboard (opt-in)
@@ -345,7 +296,7 @@ jobs:
   required-ci:
     name: Required CI gate
     if: always()
-    needs: [test, performance, ext-test, ext-optional-extras, ext-lab-fixture, distribution-pair]
+    needs: [test, performance, ext-test, ext-optional-extras, ext-lab-fixture, unified-distribution]
     runs-on: ubuntu-latest
     steps:
       - name: Fail closed unless every required job succeeded
@@ -355,4 +306,4 @@ jobs:
           test "${{ needs.ext-test.result }}" = "success"
           test "${{ needs.ext-optional-extras.result }}" = "success"
           test "${{ needs.ext-lab-fixture.result }}" = "success"
-          test "${{ needs.distribution-pair.result }}" = "success"
+          test "${{ needs.unified-distribution.result }}" = "success"

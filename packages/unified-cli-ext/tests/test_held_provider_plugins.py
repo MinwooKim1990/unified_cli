@@ -55,9 +55,14 @@ ENTRY_POINTS = {
     "gitlab-duo": "unified_cli_ext.providers.gitlab_duo:PLUGIN",
 }
 
-PREVIEW_PROVIDER_IDS = ("grok",)
+NON_HELD_PROVIDER_IDS = (
+    "grok",
+    "qoder",
+    "kilo",
+    "poolside",
+)
 HELD_PROVIDER_IDS = tuple(
-    provider_id for provider_id in ENTRY_POINTS if provider_id not in PREVIEW_PROVIDER_IDS
+    provider_id for provider_id in ENTRY_POINTS if provider_id not in NON_HELD_PROVIDER_IDS
 )
 HELD_RESEARCH_PROVIDER_IDS = ("kimi", "copilot", "cursor")
 
@@ -373,7 +378,6 @@ EVIDENCE_FLAGS = {
         "CODEBUDDY_NO_TOOLS_CONFIG_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
         "CODEBUDDY_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE",
     ),
-    "qoder": ("QODER_REQUIRES_STAGE_6_EVIDENCE",),
     "mistral-vibe": (
         "MISTRAL_VIBE_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE",
         "MISTRAL_VIBE_ACP_REQUIRES_SEPARATE_STAGE_6_EVIDENCE",
@@ -394,13 +398,6 @@ EVIDENCE_FLAGS = {
         "OPENCODE_HTTP_SSE_SEPARATE_REQUIRES_STAGE_6_EVIDENCE",
         "OPENCODE_ACP_SEPARATE_REQUIRES_STAGE_6_EVIDENCE",
     ),
-    "kilo": (
-        "KILO_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE",
-        "KILO_ACP_LIFECYCLE_REQUIRES_STAGE_6_EVIDENCE",
-        "KILO_LOOPBACK_PROCESS_CLEANUP_REQUIRES_STAGE_6_EVIDENCE",
-        "KILO_PERMISSION_CONFIG_MCP_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
-        "KILO_AUTH_SESSION_MODEL_EVENT_SCHEMA_REQUIRES_STAGE_6_EVIDENCE",
-    ),
     "droid": (
         "DROID_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE",
         "DROID_STREAM_JSONRPC_ENVELOPE_PROTOCOL_VERSION_REQUIRES_STAGE_6_EVIDENCE",
@@ -420,6 +417,7 @@ EVIDENCE_FLAGS = {
         "PI_TOOL_RESOURCE_PERMISSION_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
         "PI_OFFLINE_UPDATE_PACKAGE_TELEMETRY_CONTAINMENT_REQUIRES_STAGE_6_EVIDENCE",
         "PI_RPC_CANCEL_STDIN_EOF_PROCESS_CLEANUP_REQUIRES_STAGE_6_EVIDENCE",
+        "PI_PLATFORM_PROCESS_CONTAINMENT_REQUIRES_STAGE_6_EVIDENCE",
         "PI_SESSION_RESUME_IMAGE_REQUIRES_STAGE_6_EVIDENCE",
     ),
     "oh-my-pi": (
@@ -443,17 +441,6 @@ EVIDENCE_FLAGS = {
         "HERMES_ACP_NON_TEXT_IMAGE_LIMIT_REQUIRES_STAGE_6_EVIDENCE",
         "HERMES_TUI_JSONRPC_AND_HTTP_SSE_REQUIRE_SEPARATE_STAGE_6_EVIDENCE",
         "HERMES_INSTALL_CHANNEL_UPDATE_POSTINSTALL_PROVENANCE_REQUIRES_STAGE_6_EVIDENCE",
-    ),
-    "poolside": (
-        "POOLSIDE_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE",
-        "POOLSIDE_INSTALL_CHANNEL_BINARY_IDENTITY_PROVENANCE_REQUIRES_STAGE_6_EVIDENCE",
-        "POOLSIDE_ACP_HANDSHAKE_EVENT_SCHEMA_REQUIRES_STAGE_6_EVIDENCE",
-        "POOLSIDE_AUTH_MODEL_SESSION_REQUIRES_STAGE_6_EVIDENCE",
-        "POOLSIDE_PERMISSION_TOOL_MCP_CONFIG_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
-        "POOLSIDE_IMAGE_USAGE_ERROR_SCHEMA_REQUIRES_STAGE_6_EVIDENCE",
-        "POOLSIDE_PROCESS_CHILD_CLEANUP_REQUIRES_STAGE_6_EVIDENCE",
-        "POOLSIDE_EXEC_JSONL_SEPARATE_REQUIRES_STAGE_6_EVIDENCE",
-        "POOLSIDE_UPDATE_REMOVAL_REQUIRES_STAGE_6_EVIDENCE",
     ),
     "amp": (
         "AMP_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE",
@@ -496,7 +483,10 @@ def _module(provider_id):
 
 def test_pyproject_registers_all_provider_entry_points_exactly():
     package_root = pathlib.Path(__file__).resolve().parents[1]
-    text = (package_root / "pyproject.toml").read_text(encoding="utf-8")
+    project_file = package_root / "pyproject.toml"
+    if not project_file.exists():
+        project_file = package_root.parents[1] / "pyproject.toml"
+    text = project_file.read_text(encoding="utf-8")
     group = '[project.entry-points."unified_cli.providers.v1"]'
     assert group in text
     section = text.split(group, 1)[1].split("\n[", 1)[0]
@@ -593,6 +583,17 @@ def test_held_factories_fail_before_provider_creation_or_execution(provider_id, 
     with pytest.raises(HeldProviderUnavailableError) as caught:
         module.PLUGIN.factory(model="ignored")
     assert str(caught.value) == HELD_UNAVAILABLE_MESSAGE
+
+
+def test_pi_held_import_does_not_load_protocol_bridge():
+    sys.modules.pop("unified_cli_ext.providers.pi", None)
+    sys.modules.pop("unified_cli_ext.providers.protocol_bridge", None)
+
+    module = importlib.import_module("unified_cli_ext.providers.pi")
+
+    assert module.ADAPTER_SPEC.status is AdapterStatus.HELD
+    assert module.PLUGIN.support_status == "held"
+    assert "unified_cli_ext.providers.protocol_bridge" not in sys.modules
 
 
 @pytest.mark.parametrize("provider_id", HELD_PROVIDER_IDS)
@@ -884,9 +885,13 @@ def test_copilot_candidate_keeps_every_documented_containment_control():
         "--output-format=text",
     ):
         assert control in fixed
+    assert module.COPILOT_READ_ONLY_TOOLS == ("view", "glob", "grep")
     assert module.ADAPTER_SPEC.environment.allowed_keys == frozenset(
         ("COPILOT_HOME",)
     )
+    assert module.ADAPTER_SPEC.status is AdapterStatus.HELD
+    assert module.PLUGIN.support_status == "held"
+    assert module.PLUGIN.capabilities == frozenset()
 
 
 def test_cursor_records_that_stage_6_must_establish_prompt_framing():

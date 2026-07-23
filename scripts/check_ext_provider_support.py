@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Generate and verify the Ext provider support tables in the documentation.
 
-This tool intentionally loads only the explicit Ext entry points declared in
-``packages/unified-cli-ext/pyproject.toml``.  It reads plugin metadata and
-never constructs a provider or invokes a provider callback.
+This tool intentionally loads only the explicit extension entry points declared
+in the root ``pyproject.toml``.  It reads plugin metadata and never constructs a
+provider or invokes a provider callback.
 """
 
 from __future__ import annotations
@@ -19,8 +19,8 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXT_PROJECT = ROOT / "packages" / "unified-cli-ext"
-PYPROJECT_PATH = EXT_PROJECT / "pyproject.toml"
+EXT_SOURCE = ROOT / "packages" / "unified-cli-ext" / "src"
+PYPROJECT_PATH = ROOT / "pyproject.toml"
 ENTRY_POINT_GROUP = '[project.entry-points."unified_cli.providers.v1"]'
 BEGIN_MARKER = "<!-- BEGIN GENERATED EXT PROVIDER SUPPORT -->"
 END_MARKER = "<!-- END GENERATED EXT PROVIDER SUPPORT -->"
@@ -36,7 +36,7 @@ class SupportTableError(RuntimeError):
 
 def _add_source_paths() -> None:
     """Make this repository's Core and Ext sources importable for local use."""
-    for source_path in (ROOT / "src", EXT_PROJECT / "src"):
+    for source_path in (ROOT / "src", EXT_SOURCE):
         source_text = str(source_path)
         if source_text not in sys.path:
             sys.path.insert(0, source_text)

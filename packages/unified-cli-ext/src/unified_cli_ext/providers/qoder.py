@@ -1,28 +1,105 @@
-"""Held metadata for a future Qoder CLI integration."""
+"""Experimental ACP 0.11 adapter for the official Qoder CLI."""
 
 from __future__ import annotations
 
-from .contract import PromptMode, TransportKind
-from .held import held_adapter_spec, held_plugin
+import os
+from functools import partial
 
-
-# Stage 6 must establish version/help identity, ACP event framing, and
-# permission/config isolation from captured fixtures before this adapter can
-# become executable.  The marker strings below are provisional inert metadata;
-# Qoder does not officially specify their exact output text.
-QODER_REQUIRES_STAGE_6_EVIDENCE = True
-
-ADAPTER_SPEC = held_adapter_spec(
-    provider_id="qoder",
-    display_name="Qoder CLI",
-    executable="qodercli",
-    prompt_argv=("--acp",),
-    prompt_mode=PromptMode.PROTOCOL,
-    prompt_option=None,
-    transport=TransportKind.ACP,
-    environment_keys=frozenset(("QODER_PERSONAL_ACCESS_TOKEN",)),
-    version_marker="qodercli ",
-    help_chat_marker="--acp",
+from .acp_bridge import acp_plugin, reject_workspace_config, write_private_json
+from .contract import (
+    AdapterServerPolicy,
+    AdapterStatus,
+    BinarySpec,
+    DoctorProbeSpec,
+    EnvironmentPolicy,
+    ExitStatusProbeSpec,
+    FeatureProbeSpec,
+    FixedCommandSpec,
+    OperationLimits,
+    ProbeFormat,
+    PromptCommandSpec,
+    PromptMode,
+    ProviderAdapterSpecV1,
+    ProviderCapability,
+    TransportKind,
+    VersionProbeSpec,
 )
 
-PLUGIN = held_plugin(ADAPTER_SPEC)
+
+QODER_OFFICIAL_PACKAGE = "@qoder-ai/qodercli"
+QODER_STAGE_6_VERSION = "1.1.1"
+QODER_ACP_FIXED_ARGV = ("--acp", "--permission-mode", "dont_ask")
+_PROBE_LIMITS = OperationLimits(10.0, 64 * 1024, 16 * 1024, 8)
+_PROMPT_LIMITS = OperationLimits(120.0, 16 * 1024 * 1024, 1024 * 1024, 50_000)
+
+
+def _command(*argv: str) -> FixedCommandSpec:
+    return FixedCommandSpec(argv, limits=_PROBE_LIMITS)
+
+
+def _prepare_home(home: str) -> None:
+    write_private_json(
+        os.path.join(home, ".qoder", "settings.json"),
+        {
+            "general": {
+                "enableAutoUpdate": False,
+                "defaultPermissionMode": "dont_ask",
+            },
+            "permissions": {"allow": [], "ask": [], "deny": ["*"]},
+        },
+    )
+
+
+ADAPTER_SPEC = ProviderAdapterSpecV1(
+    id="qoder",
+    display_name="Qoder CLI",
+    status=AdapterStatus.EXPERIMENTAL,
+    binary=BinarySpec(
+        executable="qodercli",
+        expected_identity="qodercli",
+        version_probe=VersionProbeSpec(
+            _command("--version"),
+            minimum_version=(1, 1, 1),
+            format=ProbeFormat.PLAIN_TEXT,
+            version_marker="qodercli ",
+            identity_marker="qodercli 1.1.1",
+            version_is_first_token=True,
+            identity_prefix=True,
+        ),
+        feature_probe=FeatureProbeSpec(
+            _command("--help"),
+            required_features=frozenset(("acp", "chat", "permission")),
+            format=ProbeFormat.PLAIN_TEXT,
+            feature_markers={
+                "acp": "--acp",
+                "chat": "Agent Client Protocol",
+                "permission": "--permission-mode",
+            },
+            identity_marker="Usage: qodercli",
+            marker_prefixes=True,
+            identity_prefix=True,
+        ),
+    ),
+    prompt=PromptCommandSpec(
+        fixed_argv=QODER_ACP_FIXED_ARGV,
+        mode=PromptMode.PROTOCOL,
+        prompt_option=None,
+        limits=_PROMPT_LIMITS,
+    ),
+    transport=TransportKind.ACP,
+    environment=EnvironmentPolicy(
+        allowed_keys=frozenset(("QODER_PERSONAL_ACCESS_TOKEN",))
+    ),
+    doctor=DoctorProbeSpec(ExitStatusProbeSpec(_command("--version"))),
+    capabilities=frozenset((ProviderCapability.CHAT.value,)),
+    server_policy=AdapterServerPolicy(enabled=False),
+)
+
+PLUGIN = acp_plugin(
+    ADAPTER_SPEC,
+    home_preparer=_prepare_home,
+    workspace_guard=partial(
+        reject_workspace_config,
+        names=(".qoder", ".mcp.json"),
+    ),
+)

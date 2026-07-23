@@ -1,4 +1,4 @@
-"""Source-level release workflow and runbook drift checks."""
+"""Fail-closed source contracts for the unified 0.5.1 release path."""
 
 from __future__ import annotations
 
@@ -13,22 +13,27 @@ import pytest
 
 
 ROOT = Path(__file__).parents[1]
-CORE_WORKFLOW = ROOT / ".github" / "workflows" / "publish.yml"
-EXT_WORKFLOW = ROOT / ".github" / "workflows" / "publish-ext.yml"
 CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+PUBLISH_WORKFLOW = ROOT / ".github" / "workflows" / "publish.yml"
+EXT_WORKFLOW = ROOT / ".github" / "workflows" / "publish-ext.yml"
 PERFORMANCE_REQUIREMENTS = ROOT / "scripts" / "performance-requirements.txt"
 RELEASE_ASSET_SCRIPT = ROOT / "scripts" / "verify_github_release_assets.py"
+
 _RELEASE_ASSET_SPEC = importlib.util.spec_from_file_location(
     "verify_github_release_assets", RELEASE_ASSET_SCRIPT
 )
-assert _RELEASE_ASSET_SPEC is not None and _RELEASE_ASSET_SPEC.loader is not None
-verify_github_release_assets = importlib.util.module_from_spec(_RELEASE_ASSET_SPEC)
+assert _RELEASE_ASSET_SPEC is not None
+assert _RELEASE_ASSET_SPEC.loader is not None
+verify_github_release_assets = importlib.util.module_from_spec(
+    _RELEASE_ASSET_SPEC
+)
 sys.modules[_RELEASE_ASSET_SPEC.name] = verify_github_release_assets
 _RELEASE_ASSET_SPEC.loader.exec_module(verify_github_release_assets)
 
-CORE_WHEEL = "unified_cli-0.5.0-py3-none-any.whl"
-CORE_SDIST = "unified_cli-0.5.0.tar.gz"
+WHEEL = "unified_cli-0.5.1-py3-none-any.whl"
+SDIST = "unified_cli-0.5.1.tar.gz"
 PERFORMANCE_REFERENCE_SHA = "be1478884735c862e894959944ba53e149ea4210"
+LEGACY_SPLIT_SHA = "7abb7ebc36a4668b3cc9634fd65af5c75b30c758"
 PERFORMANCE_INSTALL_COMMAND = (
     "PIP_CONFIG_FILE=/dev/null python -m pip install --isolated --no-cache-dir "
     "--require-hashes --only-binary=:all: --index-url https://pypi.org/simple "
@@ -57,105 +62,139 @@ PERFORMANCE_DEPENDENCIES = {
 }
 
 
-def _text(path):
+def _text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def _job_section(workflow, job_name):
+def _job_section(workflow: str, job_name: str) -> str:
     start = workflow.index("  " + job_name + ":\n")
-    following = re.search(r"^  [a-z][a-z0-9-]*:\n", workflow[start + 1:], re.M)
-    return workflow[start:] if following is None else workflow[start:start + 1 + following.start()]
+    following = re.search(
+        r"^  [a-z][a-z0-9-]*:\n", workflow[start + 1 :], re.M
+    )
+    if following is None:
+        return workflow[start:]
+    return workflow[start : start + 1 + following.start()]
 
 
-def _assert_hash_locked_performance_dependencies(lock):
+def _checkout_blocks(workflow: str):
+    for match in re.finditer(
+        r"^        uses: actions/checkout@[^\n]+$", workflow, re.M
+    ):
+        next_step = workflow.find("\n      - name:", match.end())
+        yield (
+            workflow[match.start() :]
+            if next_step == -1
+            else workflow[match.start() : next_step]
+        )
+
+
+def _assert_hash_locked_performance_dependencies(lock: str) -> None:
     for name, version in PERFORMANCE_DEPENDENCIES.items():
         pattern = (
-            r"^" + re.escape(name + "==" + version)
+            r"^"
+            + re.escape(name + "==" + version)
             + r" \\\n    --hash=sha256:[0-9a-f]{64}(?: \\)?$"
         )
-        assert re.search(pattern, lock, re.M), name + " must be exact and hash pinned"
+        assert re.search(pattern, lock, re.M), (
+            name + " must be exact and hash pinned"
+        )
     assert lock.count("--hash=sha256:") == len(PERFORMANCE_DEPENDENCIES) + 1
     assert ">=" not in lock and "~=" not in lock
 
 
-def _checkout_blocks(workflow):
-    for match in re.finditer(r"^        uses: actions/checkout@[^\n]+$", workflow, re.M):
-        next_step = workflow.find("\n      - name:", match.end())
-        yield workflow[match.start():] if next_step == -1 else workflow[match.start():next_step]
-
-
-def _release_asset_fixture(tmp_path):
+def _release_asset_fixture(tmp_path: Path):
     assets = tmp_path / "assets"
     assets.mkdir()
-    payloads = {CORE_WHEEL: b"wheel", CORE_SDIST: b"sdist"}
+    payloads = {WHEEL: b"wheel", SDIST: b"sdist"}
     records = []
     for name, payload in payloads.items():
         (assets / name).write_bytes(payload)
-        records.append({
-            "name": name,
-            "size": len(payload),
-            "digest": "sha256:" + hashlib.sha256(payload).hexdigest(),
-        })
+        records.append(
+            {
+                "name": name,
+                "size": len(payload),
+                "digest": "sha256:" + hashlib.sha256(payload).hexdigest(),
+            }
+        )
     release = {
         "assets": records,
         "isDraft": False,
         "isPrerelease": False,
-        "tagName": "v0.5.0",
+        "tagName": "v0.5.1",
     }
     release_json = tmp_path / "release.json"
     release_json.write_text(json.dumps(release), encoding="utf-8")
     return release_json, assets, release
 
 
-def test_release_versions_and_changelogs_stay_aligned():
-    core_init = _text(ROOT / "src" / "unified_cli" / "__init__.py")
+def test_one_project_owns_both_namespace_versions_and_release_record():
+    core_init = _text(ROOT / "src/unified_cli/__init__.py")
     ext_init = _text(
-        ROOT / "packages" / "unified-cli-ext" / "src" / "unified_cli_ext" / "__init__.py"
+        ROOT
+        / "packages/unified-cli-ext/src/unified_cli_ext/__init__.py"
     )
-    ext_project = _text(ROOT / "packages" / "unified-cli-ext" / "pyproject.toml")
+    pyproject = _text(ROOT / "pyproject.toml")
 
-    assert '__version__ = "0.5.0"' in core_init
-    assert '__version__ = "0.1.0"' in ext_init
-    assert 'version = "0.1.0"' in ext_project
-    assert '"unified-cli>=0.5,<0.6"' in ext_project
+    assert '__version__ = "0.5.1"' in core_init
+    assert '__version__ = "0.5.1"' in ext_init
+    assert 'name = "unified-cli"' in pyproject
+    assert 'where = ["src", "packages/unified-cli-ext/src"]' in pyproject
+    assert pyproject.count(
+        '[project.entry-points."unified_cli.providers.v1"]'
+    ) == 1
+    assert len(
+        re.findall(
+            r'^[a-z][a-z0-9-]* = "unified_cli_ext\.providers\.[^"]+:PLUGIN"$',
+            pyproject,
+            re.M,
+        )
+    ) == 18
+    assert '"unified-cli-ext' not in pyproject
+    assert "### Planned for 0.5.1" in _text(ROOT / "CHANGELOG.md")
     assert "## [0.5.0]" in _text(ROOT / "CHANGELOG.md")
-    assert "## [0.1.0]" in _text(
-        ROOT / "packages" / "unified-cli-ext" / "CHANGELOG.md"
-    )
 
 
-def test_source_only_release_tests_are_not_shipped_in_the_core_sdist():
+def test_no_second_build_or_publish_surface_exists():
+    assert not (ROOT / "packages/unified-cli-ext/pyproject.toml").exists()
+    assert not (ROOT / "packages/unified-cli-ext/MANIFEST.in").exists()
+    assert not EXT_WORKFLOW.exists()
+    assert not (ROOT / "scripts/verify_distribution_pair.py").exists()
+    assert not (ROOT / "tests/test_distribution_pair.py").exists()
+
+
+def test_source_only_release_tests_are_not_shipped_in_sdist():
     manifest = _text(ROOT / "MANIFEST.in")
     for name in (
-        "test_distribution_pair.py",
+        "test_single_distribution.py",
         "test_performance_contract.py",
         "test_release_artifacts.py",
         "test_release_contract.py",
     ):
         assert "exclude tests/" + name in manifest
+    assert "prune tools" in manifest
+    assert "exclude scripts/unified-ext-lab*" in manifest
 
 
-def test_publish_workflows_require_exact_clean_main_not_ancestry_only():
-    core = _text(CORE_WORKFLOW)
-    ext = _text(EXT_WORKFLOW)
+def test_publish_requires_exact_clean_main_and_exact_version_tag():
+    workflow = _text(PUBLISH_WORKFLOW)
+    assert 'main_commit="$(git rev-parse \'refs/remotes/origin/main^{commit}\')"' in workflow
+    assert 'test "$tag_commit" = "$main_commit"' in workflow
+    assert "git status --porcelain=v1 --untracked-files=all" in workflow
+    assert "merge-base --is-ancestor" not in workflow
+    assert "skip-existing" not in workflow
+    assert "workflow_dispatch" not in workflow
+    assert 'RELEASE_VERSION: "0.5.1"' in workflow
+    assert 'os.environ["RELEASE_TAG"] != "v" + expected' in workflow
+    assert workflow.count("namespace version source is ambiguous or wrong") == 1
+    assert "legacy Ext project still exists" in workflow
+    assert "legacy Ext publisher still exists" in workflow
 
-    for workflow in (core, ext):
-        assert 'main_commit="$(git rev-parse \'refs/remotes/origin/main^{commit}\')"' in workflow
-        assert 'test "$tag_commit" = "$main_commit"' in workflow
-        assert "git status --porcelain=v1 --untracked-files=all" in workflow
-        assert "merge-base --is-ancestor" not in workflow
-        assert "skip-existing" not in workflow
-        assert "workflow_dispatch" not in workflow
-    assert 'core_commit="$(git rev-parse "refs/tags/v${CORE_VERSION}^{commit}")"' in ext
-    assert 'test "$tag_commit" = "$core_commit"' in ext
 
-
-def test_performance_jobs_share_a_hash_locked_server_runtime():
+def test_performance_jobs_share_the_immutable_hash_locked_reference():
     lock = _text(PERFORMANCE_REQUIREMENTS)
     _assert_hash_locked_performance_dependencies(lock)
-
     install_commands = []
-    for workflow_path in (CI_WORKFLOW, CORE_WORKFLOW, EXT_WORKFLOW):
+    for workflow_path in (CI_WORKFLOW, PUBLISH_WORKFLOW):
         workflow = _text(workflow_path)
         performance = _job_section(workflow, "performance")
         assert "runs-on: ubuntu-24.04" in performance
@@ -173,148 +212,132 @@ def test_performance_jobs_share_a_hash_locked_server_runtime():
         )
         assert install is not None
         install_commands.append(install.group("command"))
-
-    assert install_commands == [PERFORMANCE_INSTALL_COMMAND] * 3
-
-    broken_lock = lock.replace("fastapi==0.139.2", "fastapi>=0.139.2", 1)
-    with pytest.raises(AssertionError):
-        _assert_hash_locked_performance_dependencies(broken_lock)
+    assert install_commands == [PERFORMANCE_INSTALL_COMMAND] * 2
 
 
-def test_every_checkout_drops_persisted_credentials_and_ci_has_fixed_required_gate():
-    ci = _text(CI_WORKFLOW)
-    core = _text(CORE_WORKFLOW)
-    ext = _text(EXT_WORKFLOW)
-
-    for workflow in (ci, core, ext):
+def test_every_checkout_is_credential_free_and_actions_are_commit_pinned():
+    expected_actions = {
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        "pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247",
+    }
+    for workflow_path in (CI_WORKFLOW, PUBLISH_WORKFLOW):
+        workflow = _text(workflow_path)
         blocks = tuple(_checkout_blocks(workflow))
         assert blocks
         assert all("persist-credentials: false" in block for block in blocks)
+        uses = re.findall(
+            r"^\s*uses:\s*([^\s]+)", workflow, flags=re.MULTILINE
+        )
+        assert uses
+        assert all(re.fullmatch(r"[^@]+@[0-9a-f]{40}", item) for item in uses)
+        assert set(uses).issubset(expected_actions)
+    assert "RELEASE_TAG: ${{ github.ref_name }}" in _text(PUBLISH_WORKFLOW)
+    assert "refs/tags/${{ github.ref_name }}" not in _text(PUBLISH_WORKFLOW)
 
-    required = _job_section(ci, "required-ci")
-    assert "name: Required CI gate" in required
-    assert "if: always()" in required
-    assert (
-        "needs: [test, performance, ext-test, ext-optional-extras, "
-        "ext-lab-fixture, distribution-pair]"
-    ) in required
-    for job in (
+
+def test_ci_required_gate_covers_every_required_job():
+    required = _job_section(_text(CI_WORKFLOW), "required-ci")
+    jobs = (
         "test",
         "performance",
         "ext-test",
         "ext-optional-extras",
         "ext-lab-fixture",
-        "distribution-pair",
-    ):
+        "unified-distribution",
+    )
+    assert "name: Required CI gate" in required
+    assert "if: always()" in required
+    assert (
+        "needs: [test, performance, ext-test, ext-optional-extras, "
+        "ext-lab-fixture, unified-distribution]"
+    ) in required
+    for job in jobs:
         assert 'test "${{ needs.' + job + '.result }}" = "success"' in required
 
 
-def test_release_artifacts_and_public_smokes_cannot_mix_core_and_ext():
-    core = _text(CORE_WORKFLOW)
-    ext = _text(EXT_WORKFLOW)
-
-    assert "python -m build --outdir dist/core ." in core
-    assert "name: core-dist-${{ github.sha }}" in core
-    assert "packages-dir: dist/core/" in core
-    assert "--package-root unified_cli --forbid-package-root unified_cli_ext" in core
-    assert '--requires-dist "rich>=13"' in core
-    assert '--requires-dist "prompt-toolkit>=3.0.43"' in core
-    assert "unified_cli_ext.__version__" not in core
-
-    assert 'python -m build --outdir dist/ext "${EXT_PACKAGE_DIR}"' in ext
-    assert "name: ext-dist-${{ github.sha }}" in ext
-    assert "packages-dir: dist/ext/" in ext
-    assert "--package-root unified_cli_ext --forbid-package-root unified_cli" in ext
-    assert '--requires-dist "unified-cli>=0.5,<0.6"' in ext
-    assert 'assert unified_cli.__version__ == os.environ["CORE_VERSION"]' in ext
-    assert 'assert unified_cli_ext.__version__ == os.environ["EXT_VERSION"]' in ext
+def test_ci_builds_one_artifact_and_tests_legacy_split_cleanup():
+    ci = _text(CI_WORKFLOW)
+    unified = _job_section(ci, "unified-distribution")
+    assert "python -m build --outdir dist/unified ." in unified
+    assert "python -m build --outdir dist/ext" not in unified
+    assert "dist/unified_cli_ext" not in unified
+    assert "verify_unified_release_artifacts.py" in unified
+    assert "verify_single_distribution.py" in unified
+    assert "Rebuild the wheel from the verified sdist" in unified
+    assert "pip uninstall -y \\\n            unified-cli-ext" in unified
+    assert "--force-reinstall" in unified
+    assert '"unified-cli==0.5.0"' in unified
+    assert "ref: " + LEGACY_SPLIT_SHA in unified
+    assert "unified_cli_ext-0.1.0-py3-none-any.whl" in unified
+    assert "find_spec('unified_cli_ext') is None" in unified
 
 
-def test_github_releases_are_mandatory_and_only_follow_public_pypi_smoke():
-    core = _text(CORE_WORKFLOW)
-    ext = _text(EXT_WORKFLOW)
-
-    for workflow in (core, ext):
-        assert workflow.index("  publish:") < workflow.index("  pypi-smoke:")
-        assert workflow.index("  pypi-smoke:") < workflow.index("  github-release:")
-        release_job = workflow[workflow.index("  github-release:"):]
-        assert "needs: pypi-smoke" in release_job
-        assert "contents: write" in release_job
-        assert 'gh release create "$RELEASE_TAG"' in release_job
-        assert "--verify-tag" in release_job
-        assert '"$EXPECTED_WHEEL" "$EXPECTED_SDIST"' in release_job
-        assert 'gh release view "$RELEASE_TAG"' in release_job
-        assert 'gh release download "$RELEASE_TAG"' in release_job
-        assert 'payload.get("isDraft") is not False' in release_job
-        assert 'payload.get("isPrerelease") is not False' in release_job
-        assert 'cmp "$EXPECTED_WHEEL"' in release_job
-        assert 'cmp "$EXPECTED_SDIST"' in release_job
-    assert '"unified-cli==${CORE_VERSION}"' in core
-    assert '"unified-cli-ext==${EXT_VERSION}"' in ext
-
-
-def test_github_release_jobs_redownload_only_the_verified_build_artifacts():
-    core = _text(CORE_WORKFLOW)
-    ext = _text(EXT_WORKFLOW)
-    core_release = core[core.index("  github-release:"):]
-    ext_release = ext[ext.index("  github-release:"):]
-
-    download_pin = (
-        "actions/download-artifact@"
-        "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c"
+def test_release_build_publish_smoke_and_release_order_is_fail_closed():
+    workflow = _text(PUBLISH_WORKFLOW)
+    assert workflow.index("  build:") < workflow.index("  publish:")
+    assert workflow.index("  publish:") < workflow.index("  pypi-smoke:")
+    assert workflow.index("  pypi-smoke:") < workflow.index(
+        "  github-release:"
     )
-    assert download_pin in core_release
-    assert "name: core-dist-${{ github.sha }}" in core_release
-    assert "path: dist/core/" in core_release
-    assert "unified_cli-${{ env.CORE_VERSION }}-py3-none-any.whl" in core_release
-    assert "unified_cli-${{ env.CORE_VERSION }}.tar.gz" in core_release
-
-    assert download_pin in ext_release
-    assert "name: ext-dist-${{ github.sha }}" in ext_release
-    assert "path: dist/ext/" in ext_release
-    assert "unified_cli_ext-${{ env.EXT_VERSION }}-py3-none-any.whl" in ext_release
-    assert "unified_cli_ext-${{ env.EXT_VERSION }}.tar.gz" in ext_release
-
-
-def test_ext_requires_the_final_core_github_release_before_testing_or_building():
-    ext = _text(EXT_WORKFLOW)
-    verify = ext[ext.index("  verify-release:"):ext.index("  test-and-build:")]
-
-    assert 'CORE_RELEASE_TAG: v${{ env.CORE_VERSION }}' in verify
-    assert "EXPECTED_CORE_WHEEL:" in verify and "EXPECTED_CORE_SDIST:" in verify
-    assert 'gh release view "$CORE_RELEASE_TAG"' in verify
-    assert "--json tagName,isDraft,isPrerelease,assets" in verify
-    assert 'test ! -e "$core_assets_dir"' in verify
-    assert "python scripts/verify_github_release_assets.py" in verify
-    assert "--manifest-only" in verify
-    assert 'gh release download "$CORE_RELEASE_TAG"' in verify
-    assert '--pattern "$EXPECTED_CORE_WHEEL"' in verify
-    assert '--pattern "$EXPECTED_CORE_SDIST"' in verify
-    assert 'python scripts/verify_release_artifacts.py "$core_assets_dir"' in verify
-    assert '--requires-dist "rich>=13"' in verify
-    assert '--requires-dist "prompt-toolkit>=3.0.43"' in verify
-    assert verify.index("--manifest-only") < verify.index("gh release download")
-    assert verify.index("gh release download") < verify.rindex(
-        "python scripts/verify_github_release_assets.py"
-    )
-    assert verify.rindex("python scripts/verify_github_release_assets.py") < verify.index(
-        'python scripts/verify_release_artifacts.py "$core_assets_dir"'
-    )
+    build = _job_section(workflow, "build")
+    assert "needs: [verify-release, test, performance]" in build
+    assert "python -m build --outdir dist/unified ." in build
+    assert "verify_unified_release_artifacts.py" in build
+    assert "verify_single_distribution.py" in build
+    assert "python -m twine check dist/unified/*" in build
+    publish = _job_section(workflow, "publish")
+    assert "environment: pypi" in publish
+    assert "packages-dir: dist/unified/" in publish
+    smoke = _job_section(workflow, "pypi-smoke")
+    assert '"unified-cli==${RELEASE_VERSION}"' in smoke
+    assert "verify_single_distribution.py" in smoke
+    release = _job_section(workflow, "github-release")
+    assert "needs: pypi-smoke" in release
+    assert 'gh release create "$RELEASE_TAG"' in release
+    assert "--verify-tag" in release
+    assert "verify_github_release_assets.py" in release
+    assert "verify_unified_release_artifacts.py" in release
+    assert 'cmp "$EXPECTED_WHEEL"' in release
+    assert 'cmp "$EXPECTED_SDIST"' in release
 
 
-def test_final_core_release_asset_manifest_and_downloaded_bytes_pass(tmp_path):
-    release_json, assets, _release = _release_asset_fixture(tmp_path)
+def test_public_pypi_smoke_ignores_private_indexes_and_local_links():
+    smoke = _job_section(_text(PUBLISH_WORKFLOW), "pypi-smoke")
+    assert "PIP_CONFIG_FILE: /dev/null" in smoke
+    assert 'PIP_EXTRA_INDEX_URL: ""' in smoke
+    assert 'PIP_FIND_LINKS: ""' in smoke
+    assert "PIP_INDEX_URL: https://pypi.org/simple" in smoke
+    assert 'PIP_NO_INDEX: "false"' in smoke
+    assert '--index-url "${PIP_INDEX_URL}"' in smoke
+    assert "--no-cache-dir" in smoke
 
+
+def test_oidc_permission_is_confined_to_artifact_only_publish_job():
+    workflow = _text(PUBLISH_WORKFLOW)
+    publish = _job_section(workflow, "publish")
+    after_publish = workflow[workflow.index("  pypi-smoke:") :]
+    assert workflow.count("id-token: write") == 1
+    assert publish.count("id-token: write") == 1
+    assert publish.count("uses:") == 2
+    assert "pytest" not in publish
+    assert "pip install" not in publish
+    assert "id-token: write" not in after_publish
+
+
+def test_final_release_asset_manifest_and_downloaded_bytes_pass(tmp_path):
+    release_json, assets, _ = _release_asset_fixture(tmp_path)
     wheel, sdist = verify_github_release_assets.verify_release_assets(
         release_json,
         assets,
-        expected_tag="v0.5.0",
-        wheel_name=CORE_WHEEL,
-        sdist_name=CORE_SDIST,
+        expected_tag="v0.5.1",
+        wheel_name=WHEEL,
+        sdist_name=SDIST,
     )
-
-    assert wheel == assets / CORE_WHEEL
-    assert sdist == assets / CORE_SDIST
+    assert wheel == assets / WHEEL
+    assert sdist == assets / SDIST
 
 
 @pytest.mark.parametrize(
@@ -332,19 +355,24 @@ def test_final_core_release_asset_manifest_and_downloaded_bytes_pass(tmp_path):
         "zero-byte",
     ),
 )
-def test_final_core_release_asset_corruption_fails_closed(tmp_path, corruption):
+def test_final_release_asset_corruption_fails_closed(tmp_path, corruption):
     release_json, assets, release = _release_asset_fixture(tmp_path)
-    wheel_record = next(item for item in release["assets"] if item["name"] == CORE_WHEEL)
+    wheel_record = next(
+        item for item in release["assets"] if item["name"] == WHEEL
+    )
     if corruption == "draft":
         release["isDraft"] = True
     elif corruption == "extra-asset":
         payload = b"extra"
         (assets / "unexpected.whl").write_bytes(payload)
-        release["assets"].append({
-            "name": "unexpected.whl",
-            "size": len(payload),
-            "digest": "sha256:" + hashlib.sha256(payload).hexdigest(),
-        })
+        release["assets"].append(
+            {
+                "name": "unexpected.whl",
+                "size": len(payload),
+                "digest": "sha256:"
+                + hashlib.sha256(payload).hexdigest(),
+            }
+        )
     elif corruption == "extra-downloaded-file":
         (assets / "unexpected.txt").write_text("extra", encoding="utf-8")
     elif corruption == "missing-digest":
@@ -352,140 +380,44 @@ def test_final_core_release_asset_corruption_fails_closed(tmp_path, corruption):
     elif corruption == "prerelease":
         release["isPrerelease"] = True
     elif corruption == "wrong-bytes":
-        (assets / CORE_WHEEL).write_bytes(b"WHEEL")
+        (assets / WHEEL).write_bytes(b"WHEEL")
     elif corruption == "wrong-digest":
         wheel_record["digest"] = "sha256:" + ("0" * 64)
     elif corruption == "wrong-size":
         wheel_record["size"] += 1
     elif corruption == "wrong-tag":
-        release["tagName"] = "v0.5.1"
+        release["tagName"] = "v0.5.0"
     elif corruption == "zero-byte":
-        (assets / CORE_WHEEL).write_bytes(b"")
+        (assets / WHEEL).write_bytes(b"")
         wheel_record["size"] = 0
-        wheel_record["digest"] = "sha256:" + hashlib.sha256(b"").hexdigest()
-    else:
-        raise AssertionError("unknown corruption")
+        wheel_record["digest"] = (
+            "sha256:" + hashlib.sha256(b"").hexdigest()
+        )
     release_json.write_text(json.dumps(release), encoding="utf-8")
-
     with pytest.raises(
         verify_github_release_assets.ReleaseAssetVerificationError
     ):
         verify_github_release_assets.verify_release_assets(
             release_json,
             assets,
-            expected_tag="v0.5.0",
-            wheel_name=CORE_WHEEL,
-            sdist_name=CORE_SDIST,
+            expected_tag="v0.5.1",
+            wheel_name=WHEEL,
+            sdist_name=SDIST,
         )
 
 
-def test_public_pypi_smokes_ignore_private_indexes_links_and_no_index_config():
-    for path in (CORE_WORKFLOW, EXT_WORKFLOW):
-        workflow = _text(path)
-        smoke = workflow[workflow.index("  pypi-smoke:"):workflow.index("  github-release:")]
-        assert "PIP_CONFIG_FILE: /dev/null" in smoke
-        assert 'PIP_EXTRA_INDEX_URL: ""' in smoke
-        assert 'PIP_FIND_LINKS: ""' in smoke
-        assert "PIP_INDEX_URL: https://pypi.org/simple" in smoke
-        assert 'PIP_NO_INDEX: "false"' in smoke
-        assert '--index-url "${PIP_INDEX_URL}"' in smoke
-        assert "--no-cache-dir" in smoke
-
-
-def test_actions_are_commit_pinned_and_context_values_enter_shell_via_env():
-    expected_actions = {
-        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-        "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
-        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
-        "pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247",
-    }
-    for path in (CORE_WORKFLOW, EXT_WORKFLOW):
-        workflow = _text(path)
-        uses = re.findall(r"^\s*uses:\s*([^\s]+)", workflow, flags=re.MULTILINE)
-        assert uses
-        assert all(re.fullmatch(r"[^@]+@[0-9a-f]{40}", item) for item in uses)
-        assert set(uses).issubset(expected_actions)
-        assert "RELEASE_TAG: ${{ github.ref_name }}" in workflow
-        assert 'refs/tags/${{ github.ref_name }}' not in workflow
-
-
-def test_oidc_permission_is_confined_to_the_artifact_only_publish_job():
-    for path in (CORE_WORKFLOW, EXT_WORKFLOW):
-        workflow = _text(path)
-        publish = workflow[workflow.index("  publish:"):workflow.index("  pypi-smoke:")]
-        smoke_and_release = workflow[workflow.index("  pypi-smoke:"):]
-        assert publish.count("id-token: write") == 1
-        assert publish.count("uses:") == 2
-        assert "pytest" not in publish and "pip install" not in publish
-        assert "id-token: write" not in smoke_and_release
-
-
-def test_ci_uses_current_immutable_checkout_and_python_action_pins():
-    ci = _text(ROOT / ".github" / "workflows" / "ci.yml")
-    uses = set(re.findall(r"^\s*uses:\s*([^\s]+)", ci, flags=re.MULTILINE))
-    assert uses == {
-        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-        "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97",
-    }
-
-
-def test_performance_is_a_dedicated_exact_pinned_reference_job():
-    ci = _text(ROOT / ".github" / "workflows" / "ci.yml")
-    core = _text(CORE_WORKFLOW)
-    ext = _text(EXT_WORKFLOW)
-    reference = "be1478884735c862e894959944ba53e149ea4210"
-
-    matrix_job = ci[ci.index("  test:"):ci.index("  performance:")]
-    assert "check_performance.py" not in matrix_job
-    for workflow in (ci, core, ext):
-        performance = workflow[workflow.index("  performance:"):]
-        if "  build:" in performance:
-            performance = performance[:performance.index("  build:")]
-        elif "  test-and-build:" in performance:
-            performance = performance[:performance.index("  test-and-build:")]
-        elif "  ext-test:" in performance:
-            performance = performance[:performance.index("  ext-test:")]
-        assert "runs-on: ubuntu-24.04" in performance
-        assert 'python-version: "3.14.6"' in performance
-        assert "ref: " + reference in performance
-        assert "persist-credentials: false" in performance
-        assert "--reference-root performance-reference" in performance
-        assert PERFORMANCE_INSTALL_COMMAND in performance
-
-    core_build = core[core.index("  build:"):core.index("  publish:")]
-    assert "needs: [verify-release, test, performance]" in core_build
-    ext_build = ext[ext.index("  test-and-build:"):ext.index("  publish:")]
-    assert "needs: [verify-release, performance]" in ext_build
-
-
-def test_ci_and_runbook_preserve_the_ordered_offline_readiness_contract():
-    ci = _text(ROOT / ".github" / "workflows" / "ci.yml")
+def test_runbook_describes_one_immutable_release_and_aborted_ext_marker():
     runbook = _text(ROOT / "RELEASING.md")
-
-    assert "python scripts/check_performance.py" in ci
-    assert "python scripts/verify_release_artifacts.py dist/core" in ci
-    assert "python scripts/verify_release_artifacts.py dist/ext" in ci
-    assert '--requires-dist "rich>=13"' in ci
-    assert '--requires-dist "prompt-toolkit>=3.0.43"' in ci
-    assert '--requires-dist "unified-cli>=0.5,<0.6"' in ci
-    core_release = runbook.index("## Release 1 of 2: Core 0.5.0")
-    ext_release = runbook.index("## Release 2 of 2: Ext 0.1.0")
-    rollback = runbook.index("## Failure and rollback rules")
-    assert core_release < ext_release < rollback
-    assert "same exact clean commit at the tip of `main`" in runbook
+    assert "one distribution, one PyPI project, one immutable" in runbook
+    assert "tag: `v0.5.1`" in runbook
+    assert "environment, workflow, or GitHub Release for extensions" in runbook
+    assert "`ext-v0.1.0` tag was an aborted publishing attempt" in runbook
+    assert "Never rerun its historical" in runbook
     assert "Never move, delete, or reuse a release tag" in runbook
-    assert "Never upload the same version twice" in runbook
-    assert "two GitHub Releases are mandatory" in runbook
-    assert "`rich>=13`" in runbook and "`prompt-toolkit>=3.0.43`" in runbook
-    assert "recorded sizes and SHA-256 digests" in runbook
-    assert "exactly one default-runtime dependency" in runbook
-    assert "yank only `unified-cli-ext` 0.1.0" in runbook
-    assert "Leave Core 0.5.0" in runbook
-    assert "publish.yml" in runbook and "environment `pypi`" in runbook
-    assert "publish-ext.yml" in runbook and "environment `pypi-ext`" in runbook
-    assert "git worktree add --detach" in runbook
-    assert "--reference-root \"$REFERENCE_ROOT\"" in runbook
-    assert "scripts/performance-requirements.txt" in runbook
-    assert "git merge-base --is-ancestor \"$REFERENCE_SHA\" origin/main" in runbook
-    assert "`Required CI gate`" in runbook
+    assert "Never upload the same version" in runbook
+    assert "exactly one `unified-cli` wheel and one sdist" in runbook
+    assert "public-PyPI smoke passes" in runbook
+    assert "new `unified-cli` version" in runbook
+    assert "`pypi` environment" in runbook
+    assert "pypi-ext" not in runbook
+    assert "publish-ext.yml" not in runbook

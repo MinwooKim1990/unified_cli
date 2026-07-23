@@ -35,8 +35,10 @@ from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Seque
 SCHEMA_VERSION = 1
 DEFAULT_BASELINE = Path(__file__).with_name("performance-baseline-v1.json")
 ROOT = Path(__file__).resolve().parents[1]
-CORE_VERSION = "0.5.0"
-EXT_VERSION = "0.1.0"
+CANDIDATE_CORE_VERSION = "0.5.1"
+CANDIDATE_EXT_VERSION = "0.5.1"
+REFERENCE_CORE_VERSION = "0.5.0"
+REFERENCE_EXT_VERSION = "0.1.0"
 _METRIC_NAMES = (
     "calibration_process_startup",
     "core_import",
@@ -1087,8 +1089,31 @@ def _scan_manifest_directory(
             raise MeasurementError("source tree contains a special file")
 
 
-def _read_source_manifest(root: Path) -> SourceManifest:
+def _require_expected_version_pair(
+    expected_core_version: object, expected_ext_version: object,
+) -> Tuple[str, str]:
+    pair = (expected_core_version, expected_ext_version)
+    if (
+        type(expected_core_version) is not str
+        or type(expected_ext_version) is not str
+        or (
+            pair != (CANDIDATE_CORE_VERSION, CANDIDATE_EXT_VERSION)
+            and pair != (REFERENCE_CORE_VERSION, REFERENCE_EXT_VERSION)
+        )
+    ):
+        raise MeasurementError("source version expectation is invalid")
+    return expected_core_version, expected_ext_version
+
+
+def _read_source_manifest(
+    root: Path, *,
+    expected_core_version: str,
+    expected_ext_version: str,
+) -> SourceManifest:
     """Capture verified bytes using no-follow descriptor-relative traversal."""
+    expected_core_version, expected_ext_version = _require_expected_version_pair(
+        expected_core_version, expected_ext_version,
+    )
     root = root.absolute()
     try:
         root_lstat = os.lstat(root)
@@ -1140,12 +1165,12 @@ def _read_source_manifest(root: Path) -> SourceManifest:
         os.close(root_fd)
     manifest = SourceManifest(tuple(entries), _manifest_digest(entries))
     _require_manifest_version(
-        manifest, "src/unified_cli/__init__.py", CORE_VERSION,
+        manifest, "src/unified_cli/__init__.py", expected_core_version,
     )
     _require_manifest_version(
         manifest,
         "packages/unified-cli-ext/src/unified_cli_ext/__init__.py",
-        EXT_VERSION,
+        expected_ext_version,
     )
     return manifest
 
@@ -1178,19 +1203,31 @@ def _require_manifest_version(
         raise MeasurementError("source version proof failed")
 
 
-def source_tree_digest(root: Path) -> str:
+def source_tree_digest(
+    root: Path, *,
+    expected_core_version: str,
+    expected_ext_version: str,
+) -> str:
     """Hash sorted POSIX paths and file bytes from the two versioned trees.
 
     ``sha256-path-content-v1`` writes ``D\\0<path>\\0`` for directories and
     ``F\\0<path>\\0<size>\\0<bytes>`` for regular files. Cache/bytecode and
     packaging metadata directories are excluded from both hashing and copying.
     """
-    return _read_source_manifest(root).digest
+    return _read_source_manifest(
+        root,
+        expected_core_version=expected_core_version,
+        expected_ext_version=expected_ext_version,
+    ).digest
 
 
 def _safe_source_tree(root: Path) -> Path:
     """Compatibility validator backed by the descriptor-safe manifest reader."""
-    _read_source_manifest(root)
+    _read_source_manifest(
+        root,
+        expected_core_version=CANDIDATE_CORE_VERSION,
+        expected_ext_version=CANDIDATE_EXT_VERSION,
+    )
     return root.absolute()
 
 
@@ -1237,7 +1274,11 @@ def _validate_reference_manifest(
     root = root.absolute()
     if _reference_head_sha(root) != expected_sha:
         raise MeasurementError("reference checkout SHA mismatch")
-    manifest = _read_source_manifest(root)
+    manifest = _read_source_manifest(
+        root,
+        expected_core_version=REFERENCE_CORE_VERSION,
+        expected_ext_version=REFERENCE_EXT_VERSION,
+    )
     if manifest.digest != expected_digest:
         raise MeasurementError("reference source-tree digest mismatch")
     return manifest
@@ -1304,7 +1345,13 @@ def _materialize_manifest(
 
 def _build_registry_sandbox(root: Path, destination: Path) -> Path:
     return _materialize_manifest(
-        _read_source_manifest(root), destination, registry=True,
+        _read_source_manifest(
+            root,
+            expected_core_version=CANDIDATE_CORE_VERSION,
+            expected_ext_version=CANDIDATE_EXT_VERSION,
+        ),
+        destination,
+        registry=True,
     )
 
 
@@ -1918,7 +1965,15 @@ def _measure_core_import(
 ) -> Tuple[
     List[float], Optional[float], Dict[str, Any], List[float], List[float],
 ]:
-    def once(env: Mapping[str, str]) -> float:
+    def once(
+        env: Mapping[str, str],
+        expected_core_version: str,
+        expected_ext_version: str,
+    ) -> float:
+        expected_core_version, _ = _require_expected_version_pair(
+            expected_core_version, expected_ext_version,
+        )
+        version_literal = repr(expected_core_version)
         child_env = dict(env)
         child_env["UNIFIED_PERF_FORBID_EXT_IMPORTS"] = "1"
         child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
@@ -1932,7 +1987,7 @@ import time
 start = time.perf_counter_ns()
 import unified_cli
 elapsed = (time.perf_counter_ns() - start) / 1e6
-assert unified_cli.__version__ == "0.5.0"
+assert unified_cli.__version__ == ''' + version_literal + r'''
 ''' + _ORIGIN_PROOF + r'''
 _perf_prove_origins(
     "unified_cli", os.path.realpath(os.environ["UNIFIED_PERF_DESIGNATED_CORE_ROOT"])
@@ -1946,9 +2001,15 @@ print(elapsed)
 
     samples, before, after, details = _repeat_same_metric_reference(
         metric,
-        lambda: once(candidate_env),
+        lambda: once(
+            candidate_env, CANDIDATE_CORE_VERSION, CANDIDATE_EXT_VERSION,
+        ),
         lambda: _fresh_reference_once(
-            reference_manifest, base_env, once,
+            reference_manifest,
+            base_env,
+            lambda env: once(
+                env, REFERENCE_CORE_VERSION, REFERENCE_EXT_VERSION,
+            ),
         ),
     )
     _assert_guard_marker_clear(marker)
@@ -1961,7 +2022,15 @@ def _measure_core_version(
 ) -> Tuple[
     List[float], Optional[float], Dict[str, Any], List[float], List[float],
 ]:
-    def once(env: Mapping[str, str]) -> float:
+    def once(
+        env: Mapping[str, str],
+        expected_core_version: str,
+        expected_ext_version: str,
+    ) -> float:
+        expected_core_version, _ = _require_expected_version_pair(
+            expected_core_version, expected_ext_version,
+        )
+        version_literal = repr(expected_core_version)
         child_env = dict(env)
         child_env["UNIFIED_PERF_FORBID_EXT_IMPORTS"] = "1"
         child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
@@ -1982,20 +2051,26 @@ _perf_prove_origins(
 output = io.StringIO()
 with contextlib.redirect_stdout(output):
     status = unified_cli.cli.main(["--version"])
-assert status == 0 and output.getvalue().strip() == "0.5.0"
+assert status == 0 and output.getvalue().strip() == ''' + version_literal + r'''
 print(output.getvalue().strip())
 '''
         elapsed, payload = _run(_python_argv(code), child_env)
-        if payload.decode("ascii", "strict").strip() != CORE_VERSION:
+        if payload.decode("ascii", "strict").strip() != expected_core_version:
             raise MeasurementError("Core version fast path returned the wrong version")
         _assert_guard_marker_clear(marker)
         return elapsed
 
     samples, before, after, details = _repeat_same_metric_reference(
         metric,
-        lambda: once(candidate_env),
+        lambda: once(
+            candidate_env, CANDIDATE_CORE_VERSION, CANDIDATE_EXT_VERSION,
+        ),
         lambda: _fresh_reference_once(
-            reference_manifest, base_env, once,
+            reference_manifest,
+            base_env,
+            lambda env: once(
+                env, REFERENCE_CORE_VERSION, REFERENCE_EXT_VERSION,
+            ),
         ),
     )
     _assert_guard_marker_clear(marker)
@@ -2008,7 +2083,15 @@ def _measure_ext_import(
 ) -> Tuple[
     List[float], Optional[float], Dict[str, Any], List[float], List[float],
 ]:
-    def once(env: Mapping[str, str]) -> float:
+    def once(
+        env: Mapping[str, str],
+        expected_core_version: str,
+        expected_ext_version: str,
+    ) -> float:
+        _, expected_ext_version = _require_expected_version_pair(
+            expected_core_version, expected_ext_version,
+        )
+        version_literal = repr(expected_ext_version)
         child_env = dict(env)
         child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
         child_env["UNIFIED_PERF_FORBID_CTYPES"] = "1"
@@ -2021,7 +2104,7 @@ import time
 start = time.perf_counter_ns()
 import unified_cli_ext
 elapsed = (time.perf_counter_ns() - start) / 1e6
-assert unified_cli_ext.__version__ == "''' + EXT_VERSION + r'''"
+assert unified_cli_ext.__version__ == ''' + version_literal + r'''
 ''' + _ORIGIN_PROOF + r'''
 _perf_prove_origins(
     "unified_cli_ext",
@@ -2036,8 +2119,16 @@ print(elapsed)
 
     samples, before, after, details = _repeat_same_metric_reference(
         metric,
-        lambda: once(candidate_env),
-        lambda: _fresh_reference_once(reference_manifest, base_env, once),
+        lambda: once(
+            candidate_env, CANDIDATE_CORE_VERSION, CANDIDATE_EXT_VERSION,
+        ),
+        lambda: _fresh_reference_once(
+            reference_manifest,
+            base_env,
+            lambda env: once(
+                env, REFERENCE_CORE_VERSION, REFERENCE_EXT_VERSION,
+            ),
+        ),
     )
     _assert_guard_marker_clear(marker)
     return samples, None, details, before, after
@@ -2049,7 +2140,18 @@ def _measure_ext_registry(
 ) -> Tuple[
     List[float], Optional[float], Dict[str, Any], List[float], List[float],
 ]:
-    def once(env: Mapping[str, str]) -> float:
+    def once(
+        env: Mapping[str, str],
+        expected_core_version: str,
+        expected_ext_version: str,
+    ) -> float:
+        expected_core_version, expected_ext_version = (
+            _require_expected_version_pair(
+                expected_core_version, expected_ext_version,
+            )
+        )
+        core_version_literal = repr(expected_core_version)
+        ext_version_literal = repr(expected_ext_version)
         child_env = dict(env)
         child_env["UNIFIED_CLI_DISABLE_PLUGINS"] = "0"
         child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
@@ -2065,7 +2167,11 @@ import time
 guard_root = os.path.realpath(os.environ["UNIFIED_PERF_GUARD_ROOT"])
 start = time.perf_counter_ns()
 from unified_cli_ext.providers import ProviderAdapterRegistryV1
+import unified_cli
+import unified_cli_ext
 from unified_cli.registry import list_providers
+assert unified_cli.__version__ == ''' + core_version_literal + r'''
+assert unified_cli_ext.__version__ == ''' + ext_version_literal + r'''
 registry = ProviderAdapterRegistryV1()
 assert registry.descriptors() == ()
 descriptors = list_providers(include_ext=True)
@@ -2111,9 +2217,16 @@ print(elapsed)
 
     samples, before, after, details = _repeat_same_metric_reference(
         metric,
-        lambda: once(candidate_env),
+        lambda: once(
+            candidate_env, CANDIDATE_CORE_VERSION, CANDIDATE_EXT_VERSION,
+        ),
         lambda: _fresh_reference_once(
-            reference_manifest, base_env, once, registry=True,
+            reference_manifest,
+            base_env,
+            lambda env: once(
+                env, REFERENCE_CORE_VERSION, REFERENCE_EXT_VERSION,
+            ),
+            registry=True,
         ),
     )
     _assert_guard_marker_clear(marker)
@@ -2448,7 +2561,11 @@ def run_checks(
     config: Mapping[str, Any], reference_root: Path, root: Path = ROOT,
 ) -> Dict[str, Any]:
     root = root.absolute()
-    candidate_manifest = _read_source_manifest(root)
+    candidate_manifest = _read_source_manifest(
+        root,
+        expected_core_version=CANDIDATE_CORE_VERSION,
+        expected_ext_version=CANDIDATE_EXT_VERSION,
+    )
     reference_manifest = load_reference_manifest(reference_root, config)
     metrics = config["metrics"]
     results: Dict[str, Any] = {}

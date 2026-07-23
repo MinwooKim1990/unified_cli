@@ -8,15 +8,18 @@ include CHANGELOG.md
 
 # Typed marker
 include src/unified_cli/py.typed
+recursive-include packages/unified-cli-ext/src/unified_cli_ext *.py py.typed
 
 # Keep the test suite in the sdist
 recursive-include tests *.py
+recursive-include packages/unified-cli-ext/tests *.py
 # Repository-release tests depend on source-only scripts, workflows, or release
-# docs and are not part of the installable Core sdist test contract.
-exclude tests/test_distribution_pair.py
+# docs and are not part of the installable sdist test contract.
+exclude tests/test_single_distribution.py
 exclude tests/test_performance_contract.py
 exclude tests/test_release_artifacts.py
 exclude tests/test_release_contract.py
+exclude packages/unified-cli-ext/tests/test_ext_provider_support_docs.py
 
 # Exclude internal development docs
 exclude FIX_PLAN.md
@@ -24,8 +27,8 @@ exclude PHASE0_VERIFICATION.md
 exclude UX_TEST_REPORT.md
 exclude simulation.md
 
-# The extension labs are source-checkout development harnesses, not Core
-# package content. Keep every lab module and launcher out of the Core archive.
+# The extension labs are source-checkout development harnesses, not package
+# content. Keep every lab module and launcher out of the unified archive.
 prune tools
 exclude scripts/unified-ext-lab*
 

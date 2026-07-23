@@ -36,7 +36,7 @@ Error handling:
         e.hint  # 사용자용 복구 힌트
 """
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 from .base import BaseProvider
 from .conversation import UnifiedConversation

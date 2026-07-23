@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Planned for 0.5.1
+
+- Consolidate Core and extensions into one `unified-cli` distribution. The
+  wheel will provide public namespaces `unified_cli` and `unified_cli_ext`; this
+  is a feature boundary, not a second package. Core defaults remain Claude,
+  Codex, and Gemini only and stay inert/lazy for extensions. Grok remains
+  Preview; Qoder, Kilo, and Poolside are runnable Experimental integrations;
+  the other 14 extension providers remain Held. All Ext server policies remain
+  disabled.
+- Optional protocol SDK installs will use `unified-cli[acp]` and
+  `unified-cli[mcp]`. A legacy local or failed split wheel can be removed with
+  `python -m pip uninstall -y unified-cli-ext` before force-reinstalling
+  `unified-cli==0.5.1`.
+- The historical `ext-v0.1.0` tag was an aborted publishing attempt: no
+  extension PyPI project and no extension GitHub Release were published. This
+  supersedes the split-release plan without changing the 0.5.0 record below.
+
 ## [0.5.0] - 2026-07-23
 
 ### Added

@@ -937,12 +937,13 @@ class ManageRuntime:
     def _bootstrap_payload_locked(self, session: BrowserSession) -> Dict[str, Any]:
         settings = self.safe_settings()
         default_workspace = self._workspace_by_id.get(settings["workspace_id"])
-        versions = {"unified_cli": self._core_version()}
-        try:
-            versions["unified_cli_ext"] = importlib_metadata.version(
-                "unified-cli-ext")
-        except importlib_metadata.PackageNotFoundError:
-            pass
+        release_version = self._core_version()
+        versions = {
+            "unified_cli": release_version,
+            # The extension namespace ships in the same distribution.  Do not
+            # import it or perform entry-point discovery during bootstrap.
+            "unified_cli_ext": release_version,
+        }
         return {
             "version": 1,
             "versions": versions,
