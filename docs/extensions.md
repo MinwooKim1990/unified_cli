@@ -6,7 +6,8 @@ Ext does not change those defaults, does not add an extension to Core's local
 server allowlist, and does not install or configure any vendor software.
 
 Ext installs 18 explicit provider entry points. Grok Build is a read-tool-limited
-**Preview** backed by offline fixtures. The other 17 entries are **Held** and
+**Preview** backed by offline fixtures and one representative authenticated
+native smoke. The other 17 entries are **Held** and
 stop before provider construction, binary lookup, or command execution. No Ext
 provider is enabled in Core server mode.
 
@@ -28,7 +29,7 @@ Core keeps this discovery import-free. `unified-cli providers --include-ext`
 therefore reports a new entry as lifecycle `discovered` and support `unknown`.
 An explicit request loads only that provider's entry point. Held providers stop
 before any provider callback. Grok continues only after its explicitly selected
-local binary passes bounded version and feature probes.
+local binary passes the exact `0.2.111` version and bounded feature probes.
 
 ## Grok Preview setup and boundary
 
@@ -36,66 +37,241 @@ Grok Build Preview is the sole runnable Ext provider. Its primary official
 native installer is `https://x.ai/cli/install.sh`; the official npm package
 `@xai-official/grok` is a vendor alternative, but this 0.1 Preview setup uses
 the native install layout only. The known unrelated
-`@vibe-kit/grok-cli` CLI shape is rejected. The minimum supported version is
-`0.2.110`. Run the vendor installer in your normal user home, then copy its
-resolved platform binary into the private canonical path expected by Ext:
+`@vibe-kit/grok-cli` CLI shape is rejected. The only reviewed version is
+`0.2.111`; other versions fail closed. The only verified platform is macOS
+arm64. Run the vendor installer in your normal user home, then use the
+fail-closed recipe below. It accepts only the native installer's owned,
+non-writable `~/.grok` layout, requires its `bin/grok` symlink to resolve
+directly to a single-link regular file in `downloads`, verifies the exact
+reviewed SHA-256, and copies it into a fresh version/platform-qualified private
+snapshot. It also creates the exact safe configuration before any login.
+Unsupported OS/architecture, path shape, ownership, link type/count, mode,
+digest, or version output is refused:
 
 ```bash
 curl -fsSL https://x.ai/cli/install.sh | bash
-python - <<'PY'
+python -I - <<'PY'
+import hashlib
 import os
-import shutil
+import platform
+import re
 import stat
+import subprocess
+import sys
 from pathlib import Path
+from unified_cli_ext.providers.grok import GROK_FIXED_ENVIRONMENT, GROK_SAFE_CONFIG
 
-source = (Path.home() / ".grok" / "bin" / "grok").resolve(strict=True)
-downloads = (Path.home() / ".grok" / "downloads").resolve(strict=True)
-metadata = source.stat()
+DIGEST = "e1fafdfffe14f339460befaf194360e8f90bfd02efe8a4f24cfa1c7aea657ffe"
+VERSION = b"0.2.111"
+SNAPSHOT = "native-0.2.111-darwin-arm64"
+NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+
+if sys.platform != "darwin" or platform.machine().lower() != "arm64":
+    raise SystemExit("verified only on macOS arm64")
+if not NOFOLLOW or not DIRECTORY:
+    raise SystemExit("required no-follow operations are unavailable")
+
+def directory(parent, name, *, create=False, private=True):
+    if create:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent)
+            os.fsync(parent)
+        except FileExistsError:
+            pass
+    meta = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    mode = stat.S_IMODE(meta.st_mode)
+    if (
+        not stat.S_ISDIR(meta.st_mode)
+        or meta.st_uid != os.getuid()
+        or mode & 0o022
+        or (private and mode != 0o700)
+    ):
+        raise SystemExit(f"refusing unsafe directory {name!r}")
+    return os.open(name, os.O_RDONLY | DIRECTORY | NOFOLLOW, dir_fd=parent)
+
+def sha256(fd):
+    value = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while block := os.read(fd, 1024 * 1024):
+        value.update(block)
+    os.lseek(fd, 0, os.SEEK_SET)
+    return value.hexdigest()
+
+def environment(home, tmp):
+    # GROK_FIXED_ENVIRONMENT includes GROK_MANAGED_MCPS_ENABLED=false,
+    # GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED=false, and GROK_RESPECT_GITIGNORE=1.
+    return {
+        "HOME": str(home),
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "LANG": "en_US.UTF-8",
+        "LC_ALL": "en_US.UTF-8",
+        "TMPDIR": str(tmp),
+        **dict(GROK_FIXED_ENVIRONMENT),
+    }
+
+def require_version(binary, cwd, env):
+    result = subprocess.run(
+        [str(binary), "--version"],
+        cwd=str(cwd),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=10,
+        check=False,
+    )
+    match = re.fullmatch(
+        rb"grok ([0-9]+\.[0-9]+\.[0-9]+)(?: [^\r\n]*)?\r?\n?",
+        result.stdout,
+    )
+    if (
+        result.returncode != 0
+        or len(result.stdout) > 4096
+        or match is None
+        or match.group(1) != VERSION
+    ):
+        raise SystemExit("refusing unexpected Grok version output")
+
+home_path = Path.home()
+home_fd = os.open(home_path, os.O_RDONLY | DIRECTORY | NOFOLLOW)
+home_meta = os.fstat(home_fd)
+if (
+    not stat.S_ISDIR(home_meta.st_mode)
+    or home_meta.st_uid != os.getuid()
+    or stat.S_IMODE(home_meta.st_mode) & 0o022
+):
+    raise SystemExit("refusing unsafe home directory")
+
+vendor_fd = directory(home_fd, ".grok", private=False)
+vendor_bin_fd = directory(vendor_fd, "bin", private=False)
+downloads_fd = directory(vendor_fd, "downloads", private=False)
+alias = os.stat("grok", dir_fd=vendor_bin_fd, follow_symlinks=False)
+if not stat.S_ISLNK(alias.st_mode) or alias.st_uid != os.getuid():
+    raise SystemExit("refusing unexpected ~/.grok/bin/grok")
+link = os.readlink("grok", dir_fd=vendor_bin_fd)
+source = Path(os.path.abspath(os.path.join(home_path, ".grok", "bin", link)))
+downloads = home_path / ".grok" / "downloads"
 if (
     source.parent != downloads
-    or not source.name.startswith("grok-")
-    or not stat.S_ISREG(metadata.st_mode)
-    or metadata.st_uid != os.getuid()
-    or metadata.st_mode & 0o022
+    or re.fullmatch(r"grok-[A-Za-z0-9._-]+", source.name) is None
 ):
-    raise SystemExit("refusing an unexpected Grok installer target")
+    raise SystemExit("refusing unexpected Grok download path")
+source_fd = os.open(source.name, os.O_RDONLY | NOFOLLOW, dir_fd=downloads_fd)
+source_meta = os.fstat(source_fd)
+if (
+    not stat.S_ISREG(source_meta.st_mode)
+    or source_meta.st_uid != os.getuid()
+    or source_meta.st_nlink != 1
+    or not (source_meta.st_mode & stat.S_IXUSR)
+    or stat.S_IMODE(source_meta.st_mode) & 0o022
+    or sha256(source_fd) != DIGEST
+):
+    raise SystemExit("refusing unsafe or unreviewed Grok download")
 
-root = Path.home() / ".unified-cli" / "providers" / "grok"
-binary_dir = root / "bin"
-provider_home = root / "home"
-for directory in (root, binary_dir, provider_home):
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    directory.chmod(0o700)
-target = binary_dir / "grok"
-temporary = binary_dir / ".grok.new"
-temporary.unlink(missing_ok=True)
+os.umask(0o077)
+unified_fd = directory(home_fd, ".unified-cli", create=True)
+providers_fd = directory(unified_fd, "providers", create=True)
+grok_fd = directory(providers_fd, "grok", create=True)
 try:
-    with source.open("rb") as incoming, temporary.open("xb") as outgoing:
-        shutil.copyfileobj(incoming, outgoing)
-        outgoing.flush()
-        os.fsync(outgoing.fileno())
-    temporary.chmod(0o500)
-    os.replace(temporary, target)
-finally:
-    temporary.unlink(missing_ok=True)
-print(target)
+    os.mkdir(SNAPSHOT, 0o700, dir_fd=grok_fd)
+    os.fsync(grok_fd)
+except FileExistsError as exc:
+    raise SystemExit("snapshot already exists; refusing reuse") from exc
+root_fd = directory(grok_fd, SNAPSHOT)
+bin_fd = directory(root_fd, "bin", create=True)
+provider_home_fd = directory(root_fd, "home", create=True)
+state_fd = directory(provider_home_fd, ".grok", create=True)
+login_fd = directory(root_fd, "login-cwd", create=True)
+tmp_fd = directory(root_fd, "tmp", create=True)
+
+target_fd = os.open(
+    "grok",
+    os.O_RDWR | os.O_CREAT | os.O_EXCL | NOFOLLOW,
+    0o500,
+    dir_fd=bin_fd,
+)
+target_meta = os.fstat(target_fd)
+if (
+    not stat.S_ISREG(target_meta.st_mode)
+    or target_meta.st_uid != os.getuid()
+    or target_meta.st_nlink != 1
+    or stat.S_IMODE(target_meta.st_mode) != 0o500
+):
+    raise SystemExit("refusing unsafe snapshot binary")
+while block := os.read(source_fd, 1024 * 1024):
+    while block:
+        written = os.write(target_fd, block)
+        block = block[written:]
+os.fsync(target_fd)
+os.fsync(bin_fd)
+if sha256(target_fd) != DIGEST:
+    raise SystemExit("snapshot digest verification failed")
+
+config = GROK_SAFE_CONFIG.encode("utf-8")
+config_fd = os.open(
+    "config.toml",
+    os.O_WRONLY | os.O_CREAT | os.O_EXCL | NOFOLLOW,
+    0o600,
+    dir_fd=state_fd,
+)
+config_meta = os.fstat(config_fd)
+if (
+    not stat.S_ISREG(config_meta.st_mode)
+    or config_meta.st_uid != os.getuid()
+    or config_meta.st_nlink != 1
+    or stat.S_IMODE(config_meta.st_mode) != 0o600
+):
+    raise SystemExit("refusing unsafe config target")
+while config:
+    written = os.write(config_fd, config)
+    config = config[written:]
+os.fsync(config_fd)
+os.fsync(state_fd)
+
+root = home_path / ".unified-cli" / "providers" / "grok" / SNAPSHOT
+binary = root / "bin" / "grok"
+provider_home = root / "home"
+login_cwd = root / "login-cwd"
+tmp = root / "tmp"
+if os.listdir(login_fd):
+    raise SystemExit("refusing non-empty login cwd")
+fixed_environment = environment(provider_home, tmp)
+require_version(binary, login_cwd, fixed_environment)
+os.fchdir(login_fd)
+os.execve(
+    str(binary),
+    [str(binary), "login", "--device-auth"],
+    fixed_environment,
+)
 PY
 ```
 
-Do not reuse a generic host login. Authenticate only that snapshot in its
-isolated home, then register the same canonical binary and home through Core's
-public extension-configuration API:
+Do not reuse a generic host login. The single setup invocation creates the
+config and copied binary with no-follow exclusive opens, verifies their
+single-link regular metadata, fsyncs both, rechecks the copied digest and exact
+parsed `0.2.111` version, confirms the login cwd is empty, then `execve`s the
+fixed login argv with a minimal fixed environment. It never truncates or
+replaces a pre-existing snapshot or config, follows a pre-existing path, uses
+shell interpolation, inspects auth contents, or prints credentials. If the
+qualified snapshot already exists, setup refuses rather than silently reusing
+it; use the already-authenticated snapshot or inspect/remove it manually before
+an intentional fresh setup.
+After authenticating that snapshot, register the same canonical binary and home
+through Core's public extension-configuration API:
 
 ```bash
-GROK_ROOT="$HOME/.unified-cli/providers/grok"
-GROK_MANAGED_MCPS_ENABLED=false \
-GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED=false \
-HOME="$GROK_ROOT/home" "$GROK_ROOT/bin/grok" login --device-auth
 python - <<'PY'
 from pathlib import Path
 from unified_cli import ExtensionLaunchOverridesV1, configure_extension_provider
 
-root = Path.home() / ".unified-cli" / "providers" / "grok"
+root = (
+    Path.home()
+    / ".unified-cli"
+    / "providers"
+    / "grok"
+    / "native-0.2.111-darwin-arm64"
+)
 configure_extension_provider(
     "grok",
     ExtensionLaunchOverridesV1(
@@ -104,28 +280,41 @@ configure_extension_provider(
     ),
 )
 PY
-unified-cli chat "explain this project" --provider grok --model grok-build
+unified-cli chat "explain this project" --provider grok --model grok-4.5
 ```
 
 These are copy-only instructions; Ext never runs installation or login itself.
 Repeat the snapshot and registration after an intentional vendor CLI update.
 
 For each prompt, the adapter fixes `--no-auto-update`, strict sandboxing,
-`dontAsk`, and permits only `read_file`, `grep`, and `list_dir`. Plan,
-subagents, memory, web search, and managed MCP initialization are off; the two
-managed-MCP environment controls are fixed to `false` and caller values cannot
-override them. Immediately before every turn it fails closed if it finds
+`dontAsk`, and permits only `read_file`, `grep`, and `list_dir`. Its fixed
+process environment disables the updater, write, tool-search, LSP, memory,
+subagents, web, and Claude/Cursor/Codex skills, rules, agents, MCPs, hooks, and
+sessions, and requires gitignore-aware traversal. Managed MCP and official
+marketplace auto-registration are off, and marketplace packages require a SHA;
+callers cannot override these controls.
+Immediately before every turn it fails closed if it finds
 `.grok`, `.envrc`, `.mcp.json`, `.cursor/mcp.json`,
 `.cursor/hooks.json`, or `.claude` from the cwd up to the Git root (or at the
 cwd only when it is outside a Git repository);
-provider-home runtime config, plugins, hook directories or hook-path files; or
-provider-home shell startup files, runtime config, plugins, hook directories or
-hook-path files; or managed `/etc/grok` configuration. An otherwise empty,
-auth-only isolated provider `HOME` is allowed.
+provider-home shell startup files, runtime config (except the exact safe `0600`
+template above), plugins, hook directories or hook-path files; or managed
+`/etc/grok` configuration. The provider home must be an owned real `0700`
+directory; `.grok` must be an owned real directory without group/other write,
+and config/auth state must be private regular single-link files. Auth contents
+are never parsed by this validation. An otherwise isolated provider `HOME` with
+the safe template and vendor runtime state is allowed.
 
-Offline fixtures verify the adapter, but the real authenticated CLI smoke is
-pending. Grok is therefore Preview, not Stable, and remains disabled in server
-mode.
+These controls are defense in depth around a read-only Preview, not a complete
+secret boundary. Gitignore-aware traversal reduces accidental exposure but does
+not make ignored or workspace-readable files secret from the vendor process.
+
+Offline fixtures verify the adapter. A representative isolated device-code
+smoke of official native Grok `0.2.111` (commit marker `94172f2aa4e5`) passed on
+macOS arm64 on 2026-07-23; its sanitized results are recorded in
+[the smoke evidence](development/grok-0.2.111-smoke.md). This is one
+version/platform/auth sample, not a release-wide compatibility claim. Grok is
+therefore still Preview, not Stable, and remains disabled in server mode.
 
 ## Local installation receipts
 
@@ -184,14 +373,14 @@ adapter is later enabled; no Held metadata executes it today.
 
 The Grok, Kimi, Copilot, and Cursor rows record current official-documentation
 research and pinned compatibility targets. Prompts are argv values and must not
-be logged. Grok has an offline-fixture-verified one-shot bridge, but its real
-authenticated CLI smoke is pending. Kimi, Copilot, and Cursor remain Held and
+be logged. Grok has an offline-fixture-verified one-shot bridge and one
+representative authenticated native smoke. Kimi, Copilot, and Cursor remain Held and
 their factories refuse before binary resolution, environment reads, or
 execution. ACP candidates are not enabled bridges.
 
 | Provider ID | Official binary/package | Candidate transport | Provisional adapter target | Status | Auto-update containment | Official documentation |
 |---|---|---|---|---|---|---|
-| `grok` | xAI Grok Build (`grok`): primary native installer `https://x.ai/cli/install.sh`; official npm `@xai-official/grok` is alternative; rejects unrelated `@vibe-kit/grok-cli` CLI shape | Streaming JSONL | Explicit `-p` one-shot with `chat`, `stream`, `sessions`; minimum `0.2.110` | Preview | Fixed no-auto-update, strict sandbox, `dontAsk`, web/plan/subagent/memory/managed-MCP off, and only `read_file`, `grep`, `list_dir`; fail-closed workspace/home/system configuration preflight; offline fixtures pass, authenticated CLI smoke pending | [Repository](https://github.com/xai-org/grok-build) · [Overview](https://docs.x.ai/build/overview) · [CLI reference](https://docs.x.ai/build/cli/reference) · [Headless scripting](https://docs.x.ai/build/cli/headless-scripting) |
+| `grok` | xAI Grok Build (`grok`): primary native installer `https://x.ai/cli/install.sh`; official npm `@xai-official/grok` is alternative; rejects unrelated `@vibe-kit/grok-cli` CLI shape | Streaming JSONL | Explicit `-p` one-shot with `chat`, `stream`, `sessions`; exact `0.2.111`; default `grok-4.5` | Preview | Fixed no-auto-update, strict sandbox, `dontAsk`, write/tool-search/LSP/memory/subagents/web, compatibility scanners, managed MCP, marketplace auto-registration off; marketplace SHA and gitignore-aware traversal required; exact private safe config and fail-closed workspace/home/system preflight; defense in depth, not a complete secret boundary; offline fixtures plus one representative authenticated native `0.2.111` macOS arm64 smoke | [Repository](https://github.com/xai-org/grok-build) · [Overview](https://docs.x.ai/build/overview) · [CLI reference](https://docs.x.ai/build/cli/reference) · [Headless scripting](https://docs.x.ai/build/cli/headless-scripting) |
 | `kimi` | Kimi Code CLI (`kimi`, `@moonshot-ai/kimi-code`), not legacy Python `kimi-cli` | Stream JSON candidate | `-p` one-shot auto-approves normal tools; Core capability none | Held | Candidate `KIMI_CODE_NO_AUTO_UPDATE=1` and `KIMI_DISABLE_TELEMETRY=1`; no per-run read-only/no-tools/web-off/MCP-off contract | [Getting started](https://moonshotai.github.io/kimi-code/en/guides/getting-started.html) · [Kimi command](https://moonshotai.github.io/kimi-code/en/reference/kimi-command.html) · [Kimi ACP](https://moonshotai.github.io/kimi-code/en/reference/kimi-acp.html) |
 | `copilot` | GitHub Copilot CLI (`copilot`, `@github/copilot`) | Plain-text one-shot candidate | Explicit read-only tool candidate; Core capability none | Held | Candidate `--no-auto-update` plus tool/MCP controls; JSONL schema and complete user/workspace MCP and dedicated-home isolation remain unverified | [Install](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli) · [CLI command reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference) · [ACP server](https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server) |
 | `cursor` | Cursor Agent CLI (`agent` primary; `cursor-agent` legacy alias since 2026-01-08) | Final/stream JSON schema candidates | Positional-prompt ABI is not safely representable; Core capability none | Held | No verified read-only, MCP, or update containment; `CURSOR_API_KEY` is env-only and never argv | [Install](https://cursor.com/docs/cli/installation) · [Parameters](https://cursor.com/docs/cli/reference/parameters) · [Output format](https://cursor.com/docs/cli/reference/output-format) · [ACP](https://cursor.com/docs/cli/acp) |

@@ -29,8 +29,9 @@ only the documented official CLI shape, rejects the known unrelated
 `@vibe-kit/grok-cli` shape, disables auto-update/web/plan/subagents/memory, and
 exposes only `read_file`, `grep`, and `list_dir`. Offline fixtures cover exact
 argv construction, stream/session normalization, malformed output, cancellation,
-and output limits. A real authenticated Grok smoke test is still pending, so it
-remains Preview and server-disabled. Kimi `-p` auto-approves normal tools;
+and output limits. One representative isolated device-code smoke of official
+native Grok `0.2.111` passed on macOS arm64 on 2026-07-23. It remains Preview
+and server-disabled because that is one version/platform/auth sample. Kimi `-p` auto-approves normal tools;
 Copilot still lacks the required local provenance capture; and Cursor still
 needs its positional prompt and configuration boundaries verified. Those three
 and every remaining catalog entry stay Held.
@@ -65,23 +66,31 @@ official-native-binary snapshot, isolated login, and
 Then the Preview can be selected explicitly:
 
 ```bash
-unified-cli chat "explain this project" --provider grok --model grok-build
+unified-cli chat "explain this project" --provider grok --model grok-4.5
 ```
 
 The 0.1 Preview setup uses the native layout installed by
 `https://x.ai/cli/install.sh`; `@xai-official/grok` is an official vendor
 alternative but is not registered by that setup recipe, while
-`@vibe-kit/grok-cli` is rejected. Require Grok `0.2.110` or later.
+`@vibe-kit/grok-cli` is rejected. Require exactly Grok `0.2.111`; unreviewed
+patch and minor versions fail closed. The default and only model observed in
+the representative smoke was `grok-4.5`.
 Authentication uses an isolated provider `HOME`, not an assumed reusable host
-login.
-The fixed adapter boundary disables auto-update, plan, subagents, memory, web,
-and managed MCP initialization, uses strict sandbox and `dontAsk`, and permits
-only `read_file`, `grep`, and `list_dir`.
+login, and requires the exact private (`0600`) safe config template before
+login; a missing config or other provider config is rejected. The fixed adapter
+boundary disables auto-update, write, tool search, LSP, plan, subagents, memory,
+web, managed MCP, official marketplace auto-registration, and
+Claude/Cursor/Codex skills, rules, agents, MCPs, hooks, and sessions;
+marketplace packages require a SHA and traversal must respect gitignore. It
+uses strict sandbox and `dontAsk`, and permits only `read_file`, `grep`, and
+`list_dir`.
 
 The adapter may read files in the selected working directory and the vendor CLI
 may maintain its own account/configuration files. Use it only in a trusted
-workspace. See the root [Extensions guide](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.md) for the
-full catalog and official vendor documentation.
+workspace. These controls are defense in depth, not a complete secret boundary;
+gitignore does not make readable files secret from the vendor process. See the
+root [Extensions guide](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.md)
+for the full catalog and official vendor documentation.
 
 ## Optional protocol dependencies
 
@@ -138,6 +147,6 @@ records, and none of this imports a plugin or probes a provider at startup.
 ## Status
 
 This is a foundation release with one offline-fixture-verified Grok Preview and
-17 Held entries. Grok's authenticated real-CLI validation is intentionally a
-separate representative smoke step; until that passes it is not Stable. No Ext
+17 Held entries. A representative authenticated native smoke has passed, but it
+does not establish broad provider compatibility; Grok is not Stable. No Ext
 provider is exposed through Core's local server.
