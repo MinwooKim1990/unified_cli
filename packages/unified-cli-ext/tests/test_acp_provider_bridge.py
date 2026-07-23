@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 
 import pytest
@@ -26,7 +27,7 @@ def _provider_executable(tmp_path, name: str, version: str, help_text: str):
     quoted_help = " ".join("'{}'".format(line.replace("'", "'\\''")) for line in help_text.splitlines())
     quoted_version = "'{}'".format(version.replace("'", "'\\''"))
     path.write_text(
-        "#!/bin/sh\n"
+        f"#!{os.path.realpath('/bin/sh')}\n"
         'case "$*" in\n'
         '  *"--help"*) printf "%s\\n" ' + quoted_help + " ;;\n"
         '  *) printf "%s\\n" ' + quoted_version + " ;;\n"
