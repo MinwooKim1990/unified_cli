@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+import ast
+import string
 from pathlib import Path
 
 import pytest
@@ -73,6 +75,42 @@ def test_ko_falls_back_to_en_for_missing_key(monkeypatch):
     assert i18n.t("_test.only_en") == "english-only"
 
 
-def test_every_ko_key_exists_in_en():
-    missing = [k for k in i18n.MESSAGES["ko"] if k not in i18n.MESSAGES["en"]]
-    assert not missing, f"ko keys missing from en: {missing}"
+def test_message_catalogs_have_identical_keys():
+    assert i18n.MESSAGES["ko"].keys() == i18n.MESSAGES["en"].keys()
+
+
+def _fields(template):
+    return {
+        name.split(".", 1)[0].split("[", 1)[0]
+        for _literal, name, _spec, _conversion in string.Formatter().parse(template)
+        if name
+    }
+
+
+def test_message_catalogs_have_identical_placeholders():
+    for key, english in i18n.MESSAGES["en"].items():
+        assert _fields(english) == _fields(i18n.MESSAGES["ko"][key]), key
+
+
+def test_catalog_source_has_no_duplicate_literal_keys():
+    source = Path(i18n.__file__).read_text(encoding="utf-8")
+    module = ast.parse(source)
+    catalogs = {
+        node.targets[0].id: node.value
+        for node in module.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id in {"_EN", "_KO"}
+    }
+    for name, value in catalogs.items():
+        assert isinstance(value, ast.Dict)
+        keys = [key.value for key in value.keys if isinstance(key, ast.Constant)]
+        assert len(keys) == len(set(keys)), name
+
+
+def test_stage3_korean_messages_are_localized():
+    i18n.set_lang("ko")
+    assert "권한" in i18n.t("repl.permissions.confirm", old="read_only", new="workspace_write")
+    assert "추론 요약" in i18n.t("repl.renderer.reasoning_summary", text="safe")
+    assert "추가 디렉터리" in i18n.t("repl.add_dir.added")

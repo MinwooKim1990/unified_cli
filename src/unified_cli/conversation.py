@@ -12,23 +12,66 @@ Inside a single provider, resumption uses that provider's native session.
 from __future__ import annotations
 
 import time
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Iterator, Optional
 
 from .base import BaseProvider
-from .core import Message, ProviderName, Response
+from .core import Message, ProviderId, Response
 from .errors import UnifiedError
-from .factory import create
+from .extension_config import ExtensionLaunchOverridesV1
+from .factory import PROVIDERS, create
 from .i18n import t
 
 
 @dataclass
 class Turn:
-    provider: ProviderName
+    provider: ProviderId
     prompt: str
     text: str
     timestamp: float = field(default_factory=time.time)
+
+
+_FINAL_TEXT_ENVELOPES = frozenset((
+    "assistant", "message.completed", "response.completed",
+))
+_EXTENSION_LAUNCH_OPTION_KEYS = frozenset((
+    "bin_path", "receipt", "provider_home", "extra_env", "extension_launch",
+))
+
+
+def _append_novel_stream_text(chunks: list[str], message: Message) -> None:
+    """Accumulate text while reconciling explicit cumulative final envelopes.
+
+    Most provider messages are deltas and are always retained.  A small set of
+    raw markers identifies authoritative final text; only then do we remove an
+    already-recorded prefix.  Prefix comparison walks the existing chunks so
+    it does not build an extra unbounded copy of the transcript.
+    """
+    text = message.text
+    if not isinstance(text, str) or not text:
+        return
+    raw = message.raw
+    explicitly_final = isinstance(raw, dict) and (
+        raw.get("final") is True
+        or raw.get("partial") is False
+        or raw.get("type") in _FINAL_TEXT_ENVELOPES
+    )
+    if not explicitly_final or not chunks:
+        chunks.append(text)
+        return
+
+    offset = 0
+    for chunk in chunks:
+        end = offset + len(chunk)
+        if end > len(text) or text[offset:end] != chunk:
+            # This is a separate final block, not a cumulative replay.
+            chunks.append(text)
+            return
+        offset = end
+    if offset < len(text):
+        chunks.append(text[offset:])
 
 
 class UnifiedConversation:
@@ -43,12 +86,16 @@ class UnifiedConversation:
     def __init__(
         self,
         *,
-        default_provider: ProviderName = "claude",
+        default_provider: ProviderId = "claude",
         default_model: Optional[str] = None,
         sticky: bool = False,
         context_window: int = 8,
+        cross_provider_context: bool = True,
         provider_opts: Optional[dict] = None,
-        provider_opts_by_provider: Optional[dict[ProviderName, dict]] = None,
+        provider_opts_by_provider: Optional[dict[ProviderId, dict]] = None,
+        extension_launch_by_provider: Optional[
+            dict[ProviderId, ExtensionLaunchOverridesV1]
+        ] = None,
         max_turns: Optional[int] = None,
         max_turn_chars: Optional[int] = None,
         max_clients: Optional[int] = None,
@@ -61,10 +108,13 @@ class UnifiedConversation:
         ):
             if value is not None and value < 1:
                 raise ValueError(f"{name} must be at least 1 when set")
+        if type(cross_provider_context) is not bool:
+            raise ValueError("cross_provider_context must be a boolean")
         self.default_provider = default_provider
         self.default_model = default_model
         self.sticky = sticky
         self.context_window = context_window
+        self.cross_provider_context = cross_provider_context
         self.provider_opts = provider_opts or {}
         # Global provider_opts remain the backwards-compatible default. A
         # caller with genuinely provider-specific flags (notably the local
@@ -74,6 +124,23 @@ class UnifiedConversation:
             provider: dict(options)
             for provider, options in (provider_opts_by_provider or {}).items()
         }
+        self.extension_launch_by_provider = {}
+        for provider, launch in (extension_launch_by_provider or {}).items():
+            if provider in PROVIDERS:
+                raise UnifiedError(
+                    kind="config",
+                    provider=provider,
+                    message=(
+                        "Built-in providers do not accept extension launch "
+                        "configuration."
+                    ),
+                )
+            if type(launch) is not ExtensionLaunchOverridesV1:
+                raise ValueError(
+                    "extension_launch_by_provider values must be "
+                    "ExtensionLaunchOverridesV1"
+                )
+            self.extension_launch_by_provider[provider] = launch
         # Public conversations deliberately remain unbounded by default. The
         # local HTTP server opts into these limits so an arbitrary persistent
         # user id cannot retain an unlimited transcript/client cache.
@@ -81,14 +148,14 @@ class UnifiedConversation:
         self.max_turn_chars = max_turn_chars
         self.max_clients = max_clients
 
-        self.sessions: dict[ProviderName, str] = {}
+        self.sessions: dict[ProviderId, str] = {}
         self.turns: list[Turn] = []
-        self._clients: "OrderedDict[tuple[ProviderName, Optional[str]], BaseProvider]" = OrderedDict()
-        self._locked_provider: Optional[ProviderName] = None
+        self._clients: "OrderedDict[tuple[ProviderId, Optional[str]], BaseProvider]" = OrderedDict()
+        self._locked_provider: Optional[ProviderId] = None
 
     # ----- helpers -----
 
-    def _get_client(self, provider: ProviderName, model: Optional[str]) -> BaseProvider:
+    def _get_client(self, provider: ProviderId, model: Optional[str]) -> BaseProvider:
         key = (provider, model)
         if key not in self._clients:
             if self.max_clients is not None and len(self._clients) >= self.max_clients:
@@ -100,20 +167,38 @@ class UnifiedConversation:
                 **self.provider_opts,
                 **self.provider_opts_by_provider.get(provider, {}),
             }
+            if provider not in PROVIDERS and _EXTENSION_LAUNCH_OPTION_KEYS.intersection(opts):
+                raise UnifiedError(
+                    kind="config",
+                    provider=provider,
+                    message=(
+                        "Extension launch values must use the typed "
+                        "extension_launch_by_provider mapping."
+                    ),
+                )
             if provider != "claude":
                 # `terse` is a Claude-only constructor option; passing it to
                 # codex/gemini would raise TypeError (unexpected kwarg).
                 opts.pop("terse", None)
-            self._clients[key] = create(provider, model=model, **opts)
+            launch = self.extension_launch_by_provider.get(provider)
+            if launch is None:
+                self._clients[key] = create(provider, model=model, **opts)
+            else:
+                self._clients[key] = create(
+                    provider,
+                    model=model,
+                    extension_launch=launch,
+                    **opts,
+                )
         else:
             self._clients.move_to_end(key)
         return self._clients[key]
 
     def _resolve(
         self,
-        provider: Optional[ProviderName],
+        provider: Optional[ProviderId],
         model: Optional[str],
-    ) -> tuple[ProviderName, Optional[str]]:
+    ) -> tuple[ProviderId, Optional[str]]:
         prov = provider or self._locked_provider or self.default_provider
         if self.sticky:
             if self._locked_provider is None:
@@ -127,9 +212,9 @@ class UnifiedConversation:
         mdl = model or self.default_model
         return prov, mdl
 
-    def _context_prefix_if_switch(self, provider: ProviderName) -> str:
+    def _context_prefix_if_switch(self, provider: ProviderId) -> str:
         """Build a short '<prior-context>' prefix when switching providers."""
-        if not self.turns:
+        if not self.cross_provider_context or not self.turns:
             return ""
         last_provider = self.turns[-1].provider
         if last_provider == provider:
@@ -152,7 +237,7 @@ class UnifiedConversation:
         lines.append("---")
         return "\n".join(lines) + "\n"
 
-    def _use_native_session(self, provider: ProviderName) -> Optional[str]:
+    def _use_native_session(self, provider: ProviderId) -> Optional[str]:
         """Return the stored session_id iff the previous turn was this provider."""
         if not self.turns or self.turns[-1].provider != provider:
             return None
@@ -164,9 +249,10 @@ class UnifiedConversation:
         self,
         prompt: str,
         *,
-        provider: Optional[ProviderName] = None,
+        provider: Optional[ProviderId] = None,
         model: Optional[str] = None,
         images: Optional[list] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Response:
         prov, mdl = self._resolve(provider, model)
         client = self._get_client(prov, mdl)
@@ -174,11 +260,13 @@ class UnifiedConversation:
         prefix = self._context_prefix_if_switch(prov)
         native_session = self._use_native_session(prov)
 
-        resp = client.chat(
-            prefix + prompt if prefix else prompt,
-            session_id=native_session,
-            images=images,
-        )
+        call_kwargs = {"session_id": native_session, "images": images}
+        # Third-party/test provider doubles may implement the historical
+        # method shape without **kwargs. Preserve that boundary unless a
+        # caller explicitly opts into cancellation.
+        if cancel_event is not None:
+            call_kwargs["cancel_event"] = cancel_event
+        resp = client.chat(prefix + prompt if prefix else prompt, **call_kwargs)
         self._record(prov, prompt, resp.text, resp.session_id)
         return resp
 
@@ -186,9 +274,10 @@ class UnifiedConversation:
         self,
         prompt: str,
         *,
-        provider: Optional[ProviderName] = None,
+        provider: Optional[ProviderId] = None,
         model: Optional[str] = None,
         images: Optional[list] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Iterator[Message]:
         prov, mdl = self._resolve(provider, model)
         client = self._get_client(prov, mdl)
@@ -199,13 +288,14 @@ class UnifiedConversation:
         chunks: list[str] = []
         session_id: Optional[str] = None
         try:
+            call_kwargs = {"session_id": native_session, "images": images}
+            if cancel_event is not None:
+                call_kwargs["cancel_event"] = cancel_event
             for msg in client.stream(
-                prefix + prompt if prefix else prompt,
-                session_id=native_session,
-                images=images,
+                prefix + prompt if prefix else prompt, **call_kwargs
             ):
-                if msg.kind == "text" and msg.text:
-                    chunks.append(msg.text)
+                if msg.kind == "text":
+                    _append_novel_stream_text(chunks, msg)
                 if msg.kind == "session" and msg.session_id:
                     session_id = msg.session_id
                     # Persist immediately: a consumer that stops early (Ctrl+C,
@@ -224,9 +314,10 @@ class UnifiedConversation:
         self,
         prompt: str,
         *,
-        provider: Optional[ProviderName] = None,
+        provider: Optional[ProviderId] = None,
         model: Optional[str] = None,
         images: Optional[list] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Response:
         prov, mdl = self._resolve(provider, model)
         client = self._get_client(prov, mdl)
@@ -234,11 +325,11 @@ class UnifiedConversation:
         prefix = self._context_prefix_if_switch(prov)
         native_session = self._use_native_session(prov)
 
+        call_kwargs = {"session_id": native_session, "images": images}
+        if cancel_event is not None:
+            call_kwargs["cancel_event"] = cancel_event
         resp = await client.achat(
-            prefix + prompt if prefix else prompt,
-            session_id=native_session,
-            images=images,
-        )
+            prefix + prompt if prefix else prompt, **call_kwargs)
         self._record(prov, prompt, resp.text, resp.session_id)
         return resp
 
@@ -246,9 +337,10 @@ class UnifiedConversation:
         self,
         prompt: str,
         *,
-        provider: Optional[ProviderName] = None,
+        provider: Optional[ProviderId] = None,
         model: Optional[str] = None,
         images: Optional[list] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> AsyncIterator[Message]:
         prov, mdl = self._resolve(provider, model)
         client = self._get_client(prov, mdl)
@@ -259,13 +351,14 @@ class UnifiedConversation:
         chunks: list[str] = []
         session_id: Optional[str] = None
         try:
+            call_kwargs = {"session_id": native_session, "images": images}
+            if cancel_event is not None:
+                call_kwargs["cancel_event"] = cancel_event
             async for msg in client.astream(
-                prefix + prompt if prefix else prompt,
-                session_id=native_session,
-                images=images,
+                prefix + prompt if prefix else prompt, **call_kwargs
             ):
-                if msg.kind == "text" and msg.text:
-                    chunks.append(msg.text)
+                if msg.kind == "text":
+                    _append_novel_stream_text(chunks, msg)
                 if msg.kind == "session" and msg.session_id:
                     session_id = msg.session_id
                     self.sessions[prov] = session_id  # persist eagerly (see stream())
@@ -280,7 +373,7 @@ class UnifiedConversation:
 
     def _record(
         self,
-        provider: ProviderName,
+        provider: ProviderId,
         prompt: str,
         text: str,
         session_id: Optional[str],

@@ -71,7 +71,7 @@ where = ["src"]
 include = ["unified_cli*"]
 
 [tool.setuptools.package-data]
-unified_cli = ["py.typed"]
+unified_cli = ["py.typed", "web/dashboard.html", "web/app.css", "web/app.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

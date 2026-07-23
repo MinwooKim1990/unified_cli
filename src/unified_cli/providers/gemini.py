@@ -40,9 +40,15 @@ from typing import AsyncIterator, Iterator, Optional
 
 from ..base import (
     BaseProvider,
+    _CombinedCancelEvent,
+    _RETRY_MAX_ATTEMPTS,
     _StreamReader,
-    _drain_into,
+    _cancel_requested,
+    _cancelled_error,
+    _close_popen_pipes,
+    _drain_binary_into,
     _popen_process_group_kwargs,
+    _retry_evidence_proves_no_side_effects,
     _terminate_process_tree,
 )
 from ..core import Message, Response, Usage
@@ -324,36 +330,49 @@ class GeminiProvider(BaseProvider):
 
     # ----- streaming (plain text, line-buffered) -----
 
-    def _stream_run(
-        self, args: list[str], stdin_data: Optional[str] = None
+    def _stream_once_plain(
+        self,
+        args: list[str],
+        stdin_data: Optional[str] = None,
+        *,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Iterator[Message]:
+        if _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
         proc = subprocess.Popen(
             args,
             stdin=subprocess.PIPE if stdin_data else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace",
-            cwd=self.cwd, env=self._env(), bufsize=1,
+            cwd=self.cwd, env=self._env(),
             **_popen_process_group_kwargs(),
         )
         if stdin_data and proc.stdin:
             try:
-                proc.stdin.write(stdin_data)
+                proc.stdin.write(stdin_data.encode("utf-8"))
                 proc.stdin.flush()
                 proc.stdin.close()
-            except BrokenPipeError:
+            except (BrokenPipeError, OSError, ValueError):
                 pass
         assert proc.stdout is not None
         # Drain stderr concurrently (pipe-deadlock guard — see base._stream_once).
-        _stderr_chunks: list[str] = []
+        _stderr_chunks: list[bytes] = []
         _stderr_overflow = threading.Event()
+        _stderr_sources: list[str] = []
+        _stderr_failures: list[BaseException] = []
+        _stderr_stop = threading.Event()
         _stderr_thread = threading.Thread(
-            target=_drain_into,
+            target=_drain_binary_into,
             kwargs={
                 "pipe": proc.stderr,
                 "sink": _stderr_chunks,
                 "max_bytes": self.max_stderr_bytes,
                 "overflow": _stderr_overflow,
+                "source": _stderr_sources,
+                "source_name": "stderr",
                 "terminate": lambda: _terminate_process_tree(proc),
+                "stop": _stderr_stop,
+                "process_exited": lambda: proc.poll() is not None,
+                "failure": _stderr_failures,
             },
             daemon=True,
         )
@@ -370,15 +389,25 @@ class GeminiProvider(BaseProvider):
             max_events=self.max_stream_events,
             max_line_bytes=self.max_stream_line_bytes,
             terminate=lambda: _terminate_process_tree(proc),
+            cancel_event=cancel_event,
         ).start()
         produced = False
         collected: list[str] = []
         loop_done = False
         try:
             for line in reader:
+                if _cancel_requested(cancel_event):
+                    _terminate_process_tree(proc)
+                    raise _cancelled_error(self.name)
                 collected.append(line)
                 if line.strip():
+                    if _cancel_requested(cancel_event):
+                        _terminate_process_tree(proc)
+                        raise _cancelled_error(self.name)
                     produced = True
+                    if _cancel_requested(cancel_event):
+                        _terminate_process_tree(proc)
+                        raise _cancelled_error(self.name)
                     yield Message(kind="text", provider="gemini",
                                   text=line, raw={"line": line})
             loop_done = True
@@ -389,6 +418,7 @@ class GeminiProvider(BaseProvider):
             # rather than wait it out.
             if not loop_done:
                 _terminate_process_tree(proc, force_group=True)
+            wait_error = None
             try:
                 proc.wait(timeout=self.stream_timeout)
             except subprocess.TimeoutExpired:
@@ -397,18 +427,37 @@ class GeminiProvider(BaseProvider):
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
-                raise UnifiedError(
+                wait_error = UnifiedError(
                     kind="network", provider="gemini",
                     message=t("err.gemini.stream_timeout", timeout=self.stream_timeout),
                     hint=t("err.gemini.stream_timeout.hint"),
                 )
             _terminate_process_tree(proc, force_group=True)
-            _stderr_thread.join(timeout=5)
-            stderr_text = "".join(_stderr_chunks)
+            reader.wait_closed(timeout=0.2)
+            _stderr_thread.join(timeout=0.2)
+            _stderr_stop.set()
+            reader.wait_closed(timeout=1)
+            if _stderr_thread.is_alive():
+                _stderr_thread.join(timeout=1)
+            live_pipes = []
+            if not reader.is_closed():
+                live_pipes.append(proc.stdout)
+            if _stderr_thread.is_alive():
+                live_pipes.append(proc.stderr)
+            _close_popen_pipes(proc, skip=tuple(live_pipes))
+            stderr_text = b"".join(_stderr_chunks).decode("utf-8", "replace")
+            if wait_error is not None:
+                raise wait_error
 
         full = "".join(collected)
         if reader.overflow_reason:
             raise self._output_limit_error(reader.overflow_reason)
+        if reader.cancelled or _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
+        if reader.read_error is not None:
+            raise self._pipe_reader_error("stdout", reader.read_error)
+        if _stderr_failures:
+            raise self._pipe_reader_error("stderr", _stderr_failures[0])
         if _stderr_overflow.is_set():
             raise self._output_limit_error("stderr")
         if reader.fired:
@@ -417,6 +466,12 @@ class GeminiProvider(BaseProvider):
             self._check_ineligible(full + "\n" + stderr_text)
             err = classify(self.name, stderr_text, full, proc.returncode)
             err._produced_any = produced  # type: ignore[attr-defined]
+            err._retry_evidence_safe = bool(  # type: ignore[attr-defined]
+                not produced
+                and _retry_evidence_proves_no_side_effects(
+                    full, stderr_text, err,
+                )
+            )
             raise err
 
         self._check_ineligible(full)
@@ -426,10 +481,56 @@ class GeminiProvider(BaseProvider):
                 message=t("err.gemini.empty_response"),
                 hint=t("err.gemini.empty_response.hint"),
             )
+        if _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
         sid = self._resolve_session_id()
         if sid:
+            if _cancel_requested(cancel_event):
+                raise _cancelled_error(self.name)
             yield Message(kind="session", provider="gemini", session_id=sid, raw={})
+        if _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
         yield Message(kind="done", provider="gemini", raw={})
+
+    def _stream_run(
+        self,
+        args: list[str],
+        stdin_data: Optional[str] = None,
+        *,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> Iterator[Message]:
+        """Plain-text sync stream with the same pre-output retry boundary."""
+        scheduled_delay = 0.0
+        for attempt in range(_RETRY_MAX_ATTEMPTS):
+            emitted = False
+            try:
+                for message in self._stream_once_plain(
+                    args, stdin_data=stdin_data, cancel_event=cancel_event,
+                ):
+                    if _cancel_requested(cancel_event):
+                        raise _cancelled_error(self.name)
+                    emitted = True
+                    if _cancel_requested(cancel_event):
+                        raise _cancelled_error(self.name)
+                    yield message
+                return
+            except UnifiedError as err:
+                evidence_safe = bool(
+                    not emitted
+                    and not getattr(err, "_produced_any", False)
+                    and getattr(err, "_retry_evidence_safe", False)
+                )
+                if self._retryable(err, evidence_safe=evidence_safe) and (
+                    attempt + 1 < _RETRY_MAX_ATTEMPTS
+                ):
+                    waited = self._wait_for_retry(
+                        err, attempt, scheduled=scheduled_delay,
+                        cancel_event=cancel_event,
+                    )
+                    if waited is not None:
+                        scheduled_delay = waited
+                        continue
+                raise
 
     async def astream(
         self,
@@ -439,23 +540,41 @@ class GeminiProvider(BaseProvider):
         resume_last: bool = False,
         model: Optional[str] = None,
         images: Optional[list] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> AsyncIterator[Message]:
         # agy has no async event stream; run the blocking call in an executor
         # and surface the result as text → session → done.
-        loop = asyncio.get_event_loop()
-        resp = await loop.run_in_executor(
+        loop = asyncio.get_running_loop()
+        task_cancel = threading.Event()
+        combined_cancel = _CombinedCancelEvent(cancel_event, task_cancel)
+        future = loop.run_in_executor(
             None,
             lambda: self.chat(
                 prompt, session_id=session_id, resume_last=resume_last,
-                model=model, images=images,
+                model=model, images=images, cancel_event=combined_cancel,
             ),
         )
+        try:
+            resp = await future
+        except asyncio.CancelledError:
+            # run_in_executor cannot stop an already-running worker, so signal
+            # the subprocess/retry wait before returning cancellation promptly.
+            task_cancel.set()
+            raise
         if resp.text:
+            if _cancel_requested(combined_cancel):
+                raise _cancelled_error(self.name)
             yield Message(kind="text", provider="gemini", text=resp.text, raw={})
         if resp.session_id:
+            if _cancel_requested(combined_cancel):
+                raise _cancelled_error(self.name)
             yield Message(kind="session", provider="gemini",
                           session_id=resp.session_id, raw={})
+        if _cancel_requested(combined_cancel):
+            raise _cancelled_error(self.name)
         yield Message(kind="done", provider="gemini", raw={})
+        if _cancel_requested(combined_cancel):
+            raise _cancelled_error(self.name)
 
     # ----- session listing -----
 

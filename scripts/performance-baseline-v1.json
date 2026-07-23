@@ -1,0 +1,122 @@
+{
+  "baseline_id": "platform-next-stage0-reference-be147888",
+  "baseline_source": "docs/development/platform-next-stage0-baseline.md",
+  "reference": {
+    "digest_algorithm": "sha256-path-content-v1",
+    "sha": "be1478884735c862e894959944ba53e149ea4210",
+    "source_tree_digest": "7f21edae7ab640afb342261ef4092586101edc9549661e391032ce6906fc04f4",
+    "source_trees": [
+      "src/unified_cli",
+      "packages/unified-cli-ext/src/unified_cli_ext"
+    ]
+  },
+  "metrics": {
+    "calibration_process_startup": {
+      "samples": 9,
+      "statistic": "p95",
+      "threshold": {
+        "kind": "fixed",
+        "milliseconds": 250.0
+      },
+      "warmups": 2
+    },
+    "core_import": {
+      "baseline_milliseconds": 48.606,
+      "normalization": {
+        "anchor_milliseconds": 48.606,
+        "kind": "paired_same_metric_reference",
+        "metric": "core_import"
+      },
+      "samples": 15,
+      "statistic": "median",
+      "threshold": {
+        "absolute_slack_milliseconds": 50.0,
+        "kind": "baseline_regression",
+        "relative_slack": 0.1
+      },
+      "warmups": 3
+    },
+    "core_version": {
+      "baseline_milliseconds": 94.635,
+      "normalization": {
+        "anchor_milliseconds": 94.635,
+        "kind": "paired_same_metric_reference",
+        "metric": "core_version"
+      },
+      "samples": 15,
+      "statistic": "median",
+      "threshold": {
+        "absolute_slack_milliseconds": 50.0,
+        "kind": "baseline_regression",
+        "relative_slack": 0.1
+      },
+      "warmups": 3
+    },
+    "ext_import": {
+      "samples": 15,
+      "statistic": "p95",
+      "threshold": {
+        "kind": "fixed",
+        "milliseconds": 250.0
+      },
+      "warmups": 3
+    },
+    "ext_passive_registry": {
+      "normalization": {
+        "anchor_milliseconds": 195.661,
+        "kind": "paired_same_metric_reference",
+        "metric": "ext_passive_registry"
+      },
+      "samples": 61,
+      "statistic": "p95",
+      "threshold": {
+        "kind": "fixed",
+        "milliseconds": 250.0
+      },
+      "warmups": 3
+    },
+    "fake_cli_wrapper_overhead": {
+      "samples": 21,
+      "statistic": "median",
+      "threshold": {
+        "absolute_slack_milliseconds": 50.0,
+        "kind": "raw_overhead",
+        "relative_slack": 0.1
+      },
+      "warmups": 3
+    },
+    "manage_bootstrap": {
+      "samples": 31,
+      "statistic": "p95",
+      "threshold": {
+        "kind": "fixed",
+        "milliseconds": 100.0
+      },
+      "warmups": 5
+    },
+    "repl_first_prompt": {
+      "normalization": {
+        "anchor_milliseconds": 164.551,
+        "kind": "paired_same_metric_reference",
+        "metric": "repl_first_prompt"
+      },
+      "samples": 31,
+      "statistic": "p95",
+      "threshold": {
+        "kind": "fixed",
+        "milliseconds": 300.0
+      },
+      "warmups": 3
+    },
+    "stream_relay": {
+      "samples": 31,
+      "statistic": "p95",
+      "threshold": {
+        "kind": "fixed",
+        "milliseconds": 10.0
+      },
+      "warmups": 5
+    }
+  },
+  "schema_version": 1
+}

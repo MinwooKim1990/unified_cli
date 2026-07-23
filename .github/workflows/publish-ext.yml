@@ -1,0 +1,361 @@
+name: Publish Ext to PyPI and GitHub
+
+# Ext is released only after Core 0.5.0 is live. Trusted Publisher identity:
+# MinwooKim1990/unified_cli, publish-ext.yml, environment pypi-ext.
+on:
+  push:
+    tags:
+      - "ext-v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-ext-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CORE_VERSION: "0.5.0"
+  EXT_PACKAGE_DIR: packages/unified-cli-ext
+  EXT_VERSION: "0.1.0"
+
+jobs:
+  verify-release:
+    name: Verify exact Ext and Core provenance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout the Ext release tag with complete history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Require Ext and released Core tags on the exact clean main commit
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          git fetch --no-tags origin \
+            "+refs/tags/v${CORE_VERSION}:refs/tags/v${CORE_VERSION}"
+
+          tag_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          core_commit="$(git rev-parse "refs/tags/v${CORE_VERSION}^{commit}")"
+          checkout_commit="$(git rev-parse 'HEAD^{commit}')"
+          event_commit="$(git rev-parse "${RELEASE_SHA}^{commit}")"
+          main_commit="$(git rev-parse 'refs/remotes/origin/main^{commit}')"
+          test "$tag_commit" = "$checkout_commit"
+          test "$tag_commit" = "$event_commit"
+          test "$tag_commit" = "$main_commit" || {
+            echo "refusing Ext publish: release tag is not the exact origin/main commit" >&2
+            exit 1
+          }
+          test "$tag_commit" = "$core_commit" || {
+            echo "refusing Ext publish: Ext and released Core tags are not the same commit" >&2
+            exit 1
+          }
+          test -z "$(git status --porcelain=v1 --untracked-files=all)" || {
+            echo "refusing Ext publish: release checkout is not clean" >&2
+            exit 1
+          }
+
+          python - <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          project = tomllib.loads(
+              (Path(os.environ["EXT_PACKAGE_DIR"]) / "pyproject.toml").read_text(encoding="utf-8")
+          )["project"]
+          if project.get("name") != "unified-cli-ext":
+              raise SystemExit("refusing Ext publish: distribution name is wrong")
+          if project.get("version") != os.environ["EXT_VERSION"]:
+              raise SystemExit("refusing Ext publish: package version is wrong")
+          if os.environ["RELEASE_TAG"] != "ext-v" + os.environ["EXT_VERSION"]:
+              raise SystemExit("refusing Ext publish: tag does not exactly match the package version")
+          expected_core = "unified-cli>=0.5,<0.6"
+          if project.get("dependencies") != [expected_core]:
+              raise SystemExit("refusing Ext publish: Core dependency contract drifted")
+          PY
+
+      - name: Require the final Core GitHub Release and verified assets
+        env:
+          CORE_RELEASE_TAG: v${{ env.CORE_VERSION }}
+          EXPECTED_CORE_SDIST: unified_cli-${{ env.CORE_VERSION }}.tar.gz
+          EXPECTED_CORE_WHEEL: unified_cli-${{ env.CORE_VERSION }}-py3-none-any.whl
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          core_release_json="${RUNNER_TEMP}/core-release.json"
+          core_assets_dir="${RUNNER_TEMP}/core-release-assets"
+          test ! -e "$core_assets_dir"
+          gh release view "$CORE_RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,assets > "$core_release_json"
+          python scripts/verify_github_release_assets.py "$core_release_json" \
+            --manifest-only --tag "$CORE_RELEASE_TAG" \
+            --wheel-name "$EXPECTED_CORE_WHEEL" \
+            --sdist-name "$EXPECTED_CORE_SDIST"
+          mkdir "$core_assets_dir"
+          gh release download "$CORE_RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" --dir "$core_assets_dir" \
+            --pattern "$EXPECTED_CORE_WHEEL" --pattern "$EXPECTED_CORE_SDIST"
+          python scripts/verify_github_release_assets.py \
+            "$core_release_json" "$core_assets_dir" \
+            --tag "$CORE_RELEASE_TAG" \
+            --wheel-name "$EXPECTED_CORE_WHEEL" \
+            --sdist-name "$EXPECTED_CORE_SDIST"
+          python scripts/verify_release_artifacts.py "$core_assets_dir" \
+            --name unified-cli --version "$CORE_VERSION" \
+            --package-root unified_cli --forbid-package-root unified_cli_ext \
+            --requires-dist "rich>=13" \
+            --requires-dist "prompt-toolkit>=3.0.43"
+
+  performance:
+    name: Pinned-reference Ext release performance gate
+    needs: verify-release
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout the exact Ext release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Checkout immutable performance reference
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: performance-reference
+          persist-credentials: false
+          ref: be1478884735c862e894959944ba53e149ea4210
+
+      - name: Set up exact performance Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14.6"
+
+      - name: Install hash-locked performance dependencies
+        run: >-
+          PIP_CONFIG_FILE=/dev/null python -m pip install --isolated --no-cache-dir --require-hashes --only-binary=:all: --index-url https://pypi.org/simple -r scripts/performance-requirements.txt
+
+      - name: Run pinned-reference offline performance gate
+        run: >-
+          python scripts/check_performance.py
+          --reference-root performance-reference
+
+  test-and-build:
+    name: Test against released Core and build Ext artifacts
+    needs: [verify-release, performance]
+    runs-on: ubuntu-latest
+    env:
+      PIP_CONFIG_FILE: /dev/null
+      PIP_EXTRA_INDEX_URL: ""
+      PIP_FIND_LINKS: ""
+      PIP_INDEX_URL: https://pypi.org/simple
+      PIP_NO_INDEX: "false"
+      PIP_REQUIRE_VIRTUALENV: "false"
+    steps:
+      - name: Checkout the Ext release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Install the released Core and Ext test/build dependencies
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m pip install --index-url "${PIP_INDEX_URL}" \
+            "unified-cli==${CORE_VERSION}"
+          python -m pip install -e "${EXT_PACKAGE_DIR}[dev]"
+          python -m pip check
+
+      - name: Run the complete offline Ext suite
+        run: python -m pytest -q "${EXT_PACKAGE_DIR}/tests"
+
+      - name: Build exactly one Ext wheel and one Ext sdist
+        run: python -m build --outdir dist/ext "${EXT_PACKAGE_DIR}"
+
+      - name: Verify Ext metadata, package separation, and Core compatibility
+        run: |
+          python -m twine check dist/ext/*
+          python scripts/verify_release_artifacts.py dist/ext \
+            --name unified-cli-ext --version "${EXT_VERSION}" \
+            --package-root unified_cli_ext --forbid-package-root unified_cli \
+            --requires-dist "unified-cli>=0.5,<0.6"
+          python -m pip download --no-deps --only-binary=:all: \
+            --disable-pip-version-check --index-url "${PIP_INDEX_URL}" \
+            "unified-cli==${CORE_VERSION}" --dest dist/core
+          python scripts/verify_distribution_pair.py \
+            dist/core/*.whl dist/ext/*.whl \
+            --core-version "${CORE_VERSION}" --ext-version "${EXT_VERSION}"
+
+      - name: Smoke test built Ext with the released Core
+        run: |
+          python -m venv /tmp/unified-ext-release-smoke
+          /tmp/unified-ext-release-smoke/bin/python -m pip install --upgrade pip
+          /tmp/unified-ext-release-smoke/bin/python -m pip install \
+            --index-url "${PIP_INDEX_URL}" "unified-cli==${CORE_VERSION}"
+          /tmp/unified-ext-release-smoke/bin/python -m pip install --no-deps dist/ext/*.whl
+          /tmp/unified-ext-release-smoke/bin/python - <<'PY'
+          import os
+          import unified_cli
+          import unified_cli_ext
+
+          assert unified_cli.__version__ == os.environ["CORE_VERSION"]
+          assert unified_cli_ext.__version__ == os.environ["EXT_VERSION"]
+          PY
+          /tmp/unified-ext-release-smoke/bin/python -m pip check
+
+      - name: Upload Ext distributions only
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ext-dist-${{ github.sha }}
+          path: dist/ext/
+          if-no-files-found: error
+
+  publish:
+    name: Publish Ext to PyPI
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    environment: pypi-ext
+    permissions:
+      id-token: write
+    steps:
+      - name: Download verified Ext distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ext-dist-${{ github.sha }}
+          path: dist/ext/
+
+      - name: Publish Ext with PyPI Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
+        with:
+          packages-dir: dist/ext/
+
+  pypi-smoke:
+    name: Smoke test released Core and Ext from PyPI
+    needs: publish
+    runs-on: ubuntu-latest
+    env:
+      PIP_CONFIG_FILE: /dev/null
+      PIP_EXTRA_INDEX_URL: ""
+      PIP_FIND_LINKS: ""
+      PIP_INDEX_URL: https://pypi.org/simple
+      PIP_NO_INDEX: "false"
+      PIP_REQUIRE_VIRTUALENV: "false"
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Wait for PyPI and verify both released versions
+        run: |
+          set -euo pipefail
+          python -m venv /tmp/unified-ext-pypi-smoke
+          for attempt in $(seq 1 12); do
+            if /tmp/unified-ext-pypi-smoke/bin/python -m pip install \
+              --disable-pip-version-check --no-cache-dir \
+              --index-url "${PIP_INDEX_URL}" \
+              "unified-cli==${CORE_VERSION}" "unified-cli-ext==${EXT_VERSION}"; then
+              break
+            fi
+            if test "$attempt" = 12; then
+              echo "released Ext did not become installable from PyPI" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+          /tmp/unified-ext-pypi-smoke/bin/python - <<'PY'
+          import os
+          import unified_cli
+          import unified_cli_ext
+
+          assert unified_cli.__version__ == os.environ["CORE_VERSION"]
+          assert unified_cli_ext.__version__ == os.environ["EXT_VERSION"]
+          PY
+          /tmp/unified-ext-pypi-smoke/bin/python -m pip check
+
+  github-release:
+    name: Create mandatory Ext GitHub Release
+    needs: pypi-smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the verified Ext wheel and sdist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ext-dist-${{ github.sha }}
+          path: dist/ext/
+
+      - name: Create or verify the immutable Ext GitHub Release and assets
+        env:
+          EXPECTED_SDIST: dist/ext/unified_cli_ext-${{ env.EXT_VERSION }}.tar.gz
+          EXPECTED_WHEEL: dist/ext/unified_cli_ext-${{ env.EXT_VERSION }}-py3-none-any.whl
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          test -f "$EXPECTED_WHEEL"
+          test -f "$EXPECTED_SDIST"
+          test "$(find dist/ext -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" = 2
+
+          if ! gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" \
+              "$EXPECTED_WHEEL" "$EXPECTED_SDIST" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "unified-cli-ext ${EXT_VERSION}" \
+              --generate-notes
+          fi
+
+          release_json="${RUNNER_TEMP}/ext-release.json"
+          assets_dir="${RUNNER_TEMP}/ext-release-assets"
+          export release_json assets_dir
+          gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,assets > "$release_json"
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          payload = json.loads(Path(os.environ["release_json"]).read_text(encoding="utf-8"))
+          expected = {
+              Path(os.environ["EXPECTED_WHEEL"]).name: Path(os.environ["EXPECTED_WHEEL"]),
+              Path(os.environ["EXPECTED_SDIST"]).name: Path(os.environ["EXPECTED_SDIST"]),
+          }
+          if payload.get("tagName") != os.environ["RELEASE_TAG"]:
+              raise SystemExit("Ext GitHub Release tag does not match")
+          if payload.get("isDraft") is not False or payload.get("isPrerelease") is not False:
+              raise SystemExit("Ext GitHub Release must be final")
+          assets = payload.get("assets")
+          if not isinstance(assets, list) or {item.get("name") for item in assets} != set(expected):
+              raise SystemExit("Ext GitHub Release assets do not match")
+          for item in assets:
+              local = expected[item["name"]]
+              if item.get("size") != local.stat().st_size:
+                  raise SystemExit("Ext GitHub Release asset size does not match")
+              digest = item.get("digest")
+              if digest:
+                  local_digest = "sha256:" + hashlib.sha256(local.read_bytes()).hexdigest()
+                  if digest != local_digest:
+                      raise SystemExit("Ext GitHub Release asset digest does not match")
+          PY
+          mkdir "$assets_dir"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" --dir "$assets_dir"
+          cmp "$EXPECTED_WHEEL" "$assets_dir/$(basename "$EXPECTED_WHEEL")"
+          cmp "$EXPECTED_SDIST" "$assets_dir/$(basename "$EXPECTED_SDIST")"

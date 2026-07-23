@@ -1,4 +1,4 @@
-"""BaseProvider ABC with shared subprocess execution, retry, and fallback."""
+"""BaseProvider ABC with shared subprocess execution and safe retry policy."""
 
 from __future__ import annotations
 
@@ -8,6 +8,9 @@ import contextvars
 import json
 import os
 import queue
+import random
+import re
+import selectors
 import signal
 import subprocess
 import sys
@@ -17,7 +20,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Callable, ClassVar, Iterator, Optional, Union
 
-from .core import Message, ModelInfo, ProviderName, Response, Usage
+from .core import Message, ModelInfo, ProviderId, Response, Usage
 from .errors import UnifiedError, classify
 from .i18n import t
 from .usage import tracker as _usage_tracker
@@ -48,8 +51,16 @@ def _cleanup_global_temp_files() -> None:
             pass
 
 
-# Max 2 retries (0.5s, 1.5s) for network errors; 1 retry for auth fallback.
-_NETWORK_BACKOFF = (0.5, 1.5)
+# At most three executions of one turn. Delay limits are Core-owned rather than
+# provider-configurable so provider quotas and denials cannot be bypassed by
+# increasing a retry knob.
+_RETRY_MAX_ATTEMPTS = 3
+_RETRY_BACKOFF_BASE = 0.5
+_RETRY_MAX_WAIT = 5.0
+_RETRY_MAX_TOTAL_DELAY = 8.0
+_RETRY_EVIDENCE_BYTES = 128 * 1024
+_RETRY_EVIDENCE_MAX_DEPTH = 16
+_RETRY_EVIDENCE_MAX_NODES = 256
 
 # Default subprocess timeouts. The wrapped CLIs occasionally hang (network
 # stalls, OAuth refresh edge cases, etc); without timeouts a REPL or HTTP
@@ -74,14 +85,30 @@ DEFAULT_MAX_STREAM_BUFFER_BYTES = 4 * 1024 * 1024
 DEFAULT_MAX_STREAM_EVENTS = 50_000
 DEFAULT_MAX_STREAM_LINE_BYTES = 1 * 1024 * 1024
 
+# After the direct provider process exits, pipe EOF can be delayed forever by
+# an inherited descriptor in a detached descendant. Give already-written bytes
+# one short, absolute grace window, then close our read side.
+_PIPE_EXIT_GRACE = 0.1
+_PIPE_POLL_INTERVAL = 0.05
+
 
 class _ProcessTimedOut(Exception):
+    pass
+
+
+class _ProcessCancelled(Exception):
     pass
 
 
 class _ProcessOutputLimit(Exception):
     def __init__(self, source: str):
         self.source = source
+
+
+class _ProcessPipeError(Exception):
+    def __init__(self, source: str, cause: BaseException):
+        self.source = source
+        self.cause = cause
 
 
 def _popen_process_group_kwargs() -> dict:
@@ -101,7 +128,163 @@ def _process_is_running(proc) -> bool:
             return poll() is None
         except (ProcessLookupError, OSError):
             return False
+    get_returncode = getattr(proc, "get_returncode", None)
+    if get_returncode is not None:
+        try:
+            return get_returncode() is None
+        except (ProcessLookupError, OSError):
+            return False
     return getattr(proc, "returncode", None) is None
+
+
+def _cancel_requested(cancel_event: Optional[threading.Event]) -> bool:
+    """Read an optional cooperative-cancellation flag defensively."""
+    if cancel_event is None:
+        return False
+    try:
+        return bool(cancel_event.is_set())
+    except Exception:
+        # A caller-supplied flag that cannot be read must never weaken the
+        # ordinary subprocess lifecycle or turn into an arbitrary exception.
+        return False
+
+
+class _CombinedCancelEvent:
+    """Small Event-compatible OR view used by async executor bridges."""
+
+    def __init__(self, *events: Optional[threading.Event]):
+        self._events = tuple(event for event in events if event is not None)
+
+    def is_set(self) -> bool:
+        return any(_cancel_requested(event) for event in self._events)
+
+    def wait(self, timeout: Optional[float] = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        wake = threading.Event()
+        while not self.is_set():
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                wake.wait(min(remaining, 0.05))
+            else:
+                wake.wait(0.05)
+        return True
+
+
+_TOOL_EVIDENCE_RE = re.compile(
+    r"\btool[_ .-]?(?:use|start|result|call)\b|\bfunction[_ .-]?call\b"
+    r"|\bcommand[_ .-]?execution\b|\bweb[_ .-]?search\b|\bmcp[_ .-]?call\b",
+    re.I,
+)
+_PUBLIC_JSON_EVIDENCE_RE = re.compile(
+    r'(?i)"(?:assistant|output|content|text|session(?:_id)?|usage|reasoning'
+    r'|tool(?:_use|_result|_calls?)?|function_call|command_execution|done'
+    r'|result|response|delta|item|role|event)"\s*:'
+    r'|"(?:type|kind)"\s*:\s*"(?:error|done|session|usage|reasoning|text'
+    r'|assistant|tool(?:_use|_result|_call)?|function_call|command_execution)"',
+    re.I,
+)
+_PRETURN_ERROR_TOP_KEYS = {
+    "error", "errors", "message", "code", "status", "status_code",
+    "http_status", "retry_after", "retry-after", "retryafter",
+    "retry_delay", "retrydelay", "retry_delay_seconds", "request_id",
+    "trace_id", "headers",
+}
+_PRETURN_ERROR_NESTED_KEYS = _PRETURN_ERROR_TOP_KEYS | {
+    "type", "@type", "param", "details", "detail", "reason", "metadata",
+    "retry_info", "retryinfo", "violations", "x-request-id",
+}
+_PRETURN_ERROR_MARKERS = {
+    "error", "errors", "code", "status", "status_code", "http_status",
+}
+
+
+def _is_pre_turn_error_envelope(value: object) -> bool:
+    """Validate a small, non-event error envelope with bounded traversal."""
+    if not isinstance(value, dict) or not value:
+        return False
+    top_keys = {str(key).lower() for key in value}
+    if not top_keys.issubset(_PRETURN_ERROR_TOP_KEYS):
+        return False
+    if not top_keys.intersection(_PRETURN_ERROR_MARKERS):
+        return False
+
+    stack: list[tuple[object, int, bool]] = [(value, 0, True)]
+    visited = 0
+    while stack:
+        item, depth, is_top = stack.pop()
+        visited += 1
+        if visited > _RETRY_EVIDENCE_MAX_NODES or depth > _RETRY_EVIDENCE_MAX_DEPTH:
+            return False
+        if isinstance(item, dict):
+            allowed = (_PRETURN_ERROR_TOP_KEYS if is_top
+                       else _PRETURN_ERROR_NESTED_KEYS)
+            for key, child in item.items():
+                key_text = str(key).lower()
+                if key_text not in allowed or _TOOL_EVIDENCE_RE.search(key_text):
+                    return False
+                stack.append((child, depth + 1, False))
+        elif isinstance(item, list):
+            for child in item:
+                stack.append((child, depth + 1, False))
+        elif isinstance(item, str):
+            if _TOOL_EVIDENCE_RE.search(item):
+                return False
+        elif item is not None and not isinstance(item, (bool, int, float)):
+            return False
+    return True
+
+
+def _json_line_is_pre_turn_error(line: str) -> bool:
+    try:
+        value = json.loads(line)
+    except (json.JSONDecodeError, ValueError, RecursionError):
+        return False
+    return _is_pre_turn_error_envelope(value)
+
+
+def _retry_evidence_proves_no_side_effects(
+    stdout: str, stderr: str, error: UnifiedError
+) -> bool:
+    """Conservatively decide whether replay can occur before any tool work."""
+    encoded_size = len(stdout.encode("utf-8")) + len(stderr.encode("utf-8"))
+    if encoded_size > _RETRY_EVIDENCE_BYTES:
+        return False
+    combined = stdout + "\n" + stderr
+    if (_TOOL_EVIDENCE_RE.search(combined)
+            or _PUBLIC_JSON_EVIDENCE_RE.search(combined)):
+        return False
+    reason = getattr(error, "_retry_reason", "permanent")
+    if reason == "transient_network" and not getattr(
+        error, "_retry_pre_request", False
+    ):
+        # A reset/timeout after request dispatch can occur after remote tools.
+        return False
+    if reason not in {"transient_network", "transient_rate_limit"}:
+        return False
+    for line in stdout.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        if not _json_line_is_pre_turn_error(text):
+            return False
+    for line in stderr.splitlines():
+        text = line.strip()
+        if text.startswith(("{", "[")) and not _json_line_is_pre_turn_error(text):
+            return False
+    return True
+
+
+def _cancelled_error(provider: str) -> UnifiedError:
+    error = UnifiedError(
+        kind="internal", provider=provider,  # type: ignore[arg-type]
+        message="Provider request was cancelled.",
+    )
+    # Private marker for trusted boundaries such as the browser manage API.
+    # Public Message/Response ABI remains unchanged.
+    error._cancelled = True  # type: ignore[attr-defined]
+    return error
 
 
 def _terminate_process_tree(proc, *, force_group: bool = False) -> None:
@@ -114,6 +297,13 @@ def _terminate_process_tree(proc, *, force_group: bool = False) -> None:
     """
     if os.name == "posix":
         pid = getattr(proc, "pid", None)
+        if pid is None:
+            get_pid = getattr(proc, "get_pid", None)
+            if get_pid is not None:
+                try:
+                    pid = get_pid()
+                except (ProcessLookupError, OSError):
+                    pid = None
         if pid and (force_group or _process_is_running(proc)):
             try:
                 os.killpg(pid, signal.SIGKILL)
@@ -219,28 +409,318 @@ def _drain_binary_into(
     source: list[str],
     source_name: str,
     terminate: Callable[[], None],
+    stop: Optional[threading.Event] = None,
+    process_exited: Optional[Callable[[], bool]] = None,
+    failure: Optional[list[BaseException]] = None,
 ) -> None:
     """Binary capture used by non-streaming chat with a strict byte ceiling."""
     if pipe is None:
         return
     total = 0
+
+    def retain(chunk: bytes) -> bool:
+        nonlocal total
+        if total + len(chunk) > max_bytes:
+            remaining = max(0, max_bytes - total)
+            if remaining:
+                sink.append(chunk[:remaining])
+            source.append(source_name)
+            overflow.set()
+            terminate()
+            return False
+        sink.append(chunk)
+        total += len(chunk)
+        return True
+
     try:
+        if os.name == "posix":
+            # BufferedReader.read() can hold its internal lock indefinitely
+            # when an unrelated detached descendant inherits the pipe.  Read
+            # the descriptor directly instead: select makes the loop
+            # stop-aware and os.read avoids the buffered object's lock.  Once
+            # the direct child exits, drain only bytes already available and
+            # return even if another process still owns a write descriptor.
+            try:
+                fd = pipe.fileno()
+            except (AttributeError, OSError, ValueError):
+                fd = None
+            if fd is not None:
+                try:
+                    os.set_blocking(fd, False)
+                except OSError:
+                    # A readiness selector + os.read remains bounded on a
+                    # readable pipe even if O_NONBLOCK is unavailable.
+                    pass
+                with selectors.DefaultSelector() as selector:
+                    selector.register(fd, selectors.EVENT_READ)
+                    exit_deadline: Optional[float] = None
+                    while stop is None or not stop.is_set():
+                        now = time.monotonic()
+                        exited = bool(process_exited and process_exited())
+                        if exited and exit_deadline is None:
+                            exit_deadline = now + _PIPE_EXIT_GRACE
+                        if exit_deadline is not None and now >= exit_deadline:
+                            return
+                        timeout = _PIPE_POLL_INTERVAL
+                        if exit_deadline is not None:
+                            timeout = min(timeout, exit_deadline - now)
+                        if not selector.select(timeout):
+                            continue
+                        if (not exited and process_exited is not None
+                                and process_exited()):
+                            exited = True
+                            if exit_deadline is None:
+                                exit_deadline = (
+                                    time.monotonic() + _PIPE_EXIT_GRACE)
+                        try:
+                            chunk = os.read(fd, 64 * 1024)
+                        except BlockingIOError:
+                            continue
+                        if not chunk:
+                            return
+                        if total + len(chunk) > max_bytes and exited:
+                            # Bytes arriving only after the provider leader has
+                            # exited belong to an inherited descriptor holder,
+                            # not the completed provider response. Cut off
+                            # without turning a successful response into a
+                            # detached-child resource-limit failure.
+                            remaining = max(0, max_bytes - total)
+                            if remaining:
+                                sink.append(chunk[:remaining])
+                            return
+                        if not retain(chunk):
+                            return
+                return
+
         while True:
             chunk = pipe.read(64 * 1024)
             if not chunk:
                 return
-            if total + len(chunk) > max_bytes:
-                remaining = max(0, max_bytes - total)
-                if remaining:
-                    sink.append(chunk[:remaining])
-                source.append(source_name)
-                overflow.set()
-                terminate()
+            if not retain(chunk):
                 return
-            sink.append(chunk)
-            total += len(chunk)
-    except Exception:
-        pass
+    except Exception as exc:
+        if failure is not None:
+            failure.append(exc)
+            terminate()
+    finally:
+        # The reader owns this file object and closes it from the same thread,
+        # after all descriptor reads have stopped. This avoids both buffered
+        # lock races and leaks in shared callers such as manage verification.
+        try:
+            pipe.close()
+        except (OSError, ValueError):
+            pass
+
+
+def _close_popen_pipes(proc, *, skip: tuple = ()) -> None:
+    """Close wrapper-owned ``subprocess.Popen`` pipes without masking errors."""
+    for pipe in (proc.stdin, proc.stdout, proc.stderr):
+        if pipe is None or pipe in skip or getattr(pipe, "closed", False):
+            continue
+        try:
+            pipe.close()
+        except (OSError, ValueError):
+            pass
+
+
+class _AsyncJsonlProtocol(asyncio.SubprocessProtocol):
+    """Bounded public-API subprocess protocol for async JSONL streaming.
+
+    ``asyncio.Process.wait()`` is coupled to pipe EOF and can therefore wait
+    forever when a detached descendant inherits stdout/stderr. The low-level
+    public protocol API reports leader exit independently via ``process_exited``.
+    That callback starts one absolute grace window for already-written pipe data;
+    the public transport is closed at the cutoff even if bytes keep arriving.
+    """
+
+    def __init__(
+        self,
+        loop,
+        *,
+        max_output_bytes: int,
+        max_stderr_bytes: int,
+        max_buffer_bytes: int,
+        max_events: int,
+        max_line_bytes: int,
+    ):
+        self.loop = loop
+        self.max_output_bytes = max_output_bytes
+        self.max_stderr_bytes = max_stderr_bytes
+        self.max_buffer_bytes = max_buffer_bytes
+        self.max_events = max_events
+        self.max_line_bytes = max_line_bytes
+        self.transport = None
+        self.queue: "asyncio.Queue" = asyncio.Queue()
+        self.process_exited_event = asyncio.Event()
+        self.connection_lost_event = asyncio.Event()
+        self.stdin_writable = asyncio.Event()
+        self.stdin_writable.set()
+        self.returncode: Optional[int] = None
+        self.stdout_pending = bytearray()
+        self.stderr_chunks: list[bytes] = []
+        self.stderr_size = 0
+        self.total_bytes = 0
+        self.buffered_bytes = 0
+        self.event_count = 0
+        self.produced = False
+        self.last_output = time.monotonic()
+        self.overflow_reason = ""
+        self.read_error: Optional[BaseException] = None
+        self.leader_exited = False
+        self.stdout_finished = False
+        self.cutoff_started = False
+        self._cutoff_handle = None
+
+    def connection_made(self, transport) -> None:
+        self.transport = transport
+
+    def pause_writing(self) -> None:
+        self.stdin_writable.clear()
+
+    def resume_writing(self) -> None:
+        self.stdin_writable.set()
+
+    def process_exited(self) -> None:
+        if self.transport is not None:
+            self.returncode = self.transport.get_returncode()
+            _terminate_process_tree(self.transport, force_group=True)
+        self.leader_exited = True
+        self.process_exited_event.set()
+        if self._cutoff_handle is None:
+            self._cutoff_handle = self.loop.call_later(
+                _PIPE_EXIT_GRACE, self._cutoff)
+
+    def pipe_data_received(self, fd: int, data: bytes) -> None:
+        if self.cutoff_started:
+            return
+        try:
+            if fd == 1:
+                self._stdout_data(data)
+            elif fd == 2:
+                self._stderr_data(data)
+        except Exception as exc:
+            self._fail_reader(exc)
+
+    def pipe_connection_lost(self, fd: int, exc) -> None:
+        if exc is not None and not self.cutoff_started:
+            self._fail_reader(exc)
+            return
+        if fd == 1:
+            self._finish_stdout()
+
+    def connection_lost(self, exc) -> None:
+        if self._cutoff_handle is not None:
+            self._cutoff_handle.cancel()
+            self._cutoff_handle = None
+        if exc is not None and self.read_error is None:
+            self._fail_reader(exc)
+        self._finish_stdout()
+        self.connection_lost_event.set()
+
+    def _stdout_data(self, data: bytes) -> None:
+        if self.stdout_finished:
+            return
+        self.stdout_pending.extend(data)
+        while True:
+            newline = self.stdout_pending.find(b"\n")
+            if newline < 0:
+                break
+            raw = bytes(self.stdout_pending[:newline + 1])
+            del self.stdout_pending[:newline + 1]
+            if not self._accept_line(raw):
+                return
+        if len(self.stdout_pending) >= self.max_line_bytes:
+            self._limit("line")
+
+    def _stderr_data(self, data: bytes) -> None:
+        if self.stderr_size + len(data) > self.max_stderr_bytes:
+            if self.leader_exited:
+                self._cutoff()
+                return
+            remaining = max(0, self.max_stderr_bytes - self.stderr_size)
+            if remaining:
+                self.stderr_chunks.append(data[:remaining])
+            self._limit("stderr")
+            return
+        self.stderr_chunks.append(data)
+        self.stderr_size += len(data)
+
+    def _accept_line(self, raw: bytes) -> bool:
+        reason = ""
+        if (len(raw) > self.max_line_bytes
+                or (len(raw) >= self.max_line_bytes
+                    and not raw.endswith(b"\n"))):
+            reason = "line"
+        elif self.total_bytes + len(raw) > self.max_output_bytes:
+            reason = "stdout"
+        elif self.event_count >= self.max_events:
+            reason = "event_count"
+        elif self.buffered_bytes + len(raw) > self.max_buffer_bytes:
+            reason = "stream_buffer"
+        if reason:
+            self._limit(reason)
+            return False
+        self.total_bytes += len(raw)
+        self.event_count += 1
+        self.buffered_bytes += len(raw)
+        self.produced = True
+        self.last_output = time.monotonic()
+        self.queue.put_nowait(("line", raw))
+        return True
+
+    def _limit(self, reason: str) -> None:
+        if self.leader_exited:
+            # Once the provider leader is gone, additional inherited-pipe data
+            # is not provider output. Cut it off without converting a completed
+            # provider response into a detached-child limit error.
+            self._cutoff()
+            return
+        if self.overflow_reason:
+            return
+        self.overflow_reason = reason
+        self.queue.put_nowait(("limit", reason))
+        if self.transport is not None:
+            _terminate_process_tree(self.transport)
+
+    def _fail_reader(self, exc: BaseException) -> None:
+        if self.read_error is not None:
+            return
+        self.read_error = exc
+        self.queue.put_nowait(("reader_error", exc))
+        if self.transport is not None:
+            _terminate_process_tree(self.transport)
+        self._cutoff()
+
+    def _finish_stdout(self) -> None:
+        if self.stdout_finished:
+            return
+        self.stdout_finished = True
+        if self.stdout_pending:
+            raw = bytes(self.stdout_pending)
+            self.stdout_pending.clear()
+            self._accept_line(raw)
+        self.queue.put_nowait(("eof", None))
+
+    def _cutoff(self) -> None:
+        if self.cutoff_started:
+            return
+        self.cutoff_started = True
+        self._finish_stdout()
+        if self.transport is not None and not self.transport.is_closing():
+            self.transport.close()
+
+    def consume_line(self, size: int) -> None:
+        self.buffered_bytes = max(0, self.buffered_bytes - size)
+
+    async def close(self) -> None:
+        if self._cutoff_handle is not None:
+            self._cutoff_handle.cancel()
+            self._cutoff_handle = None
+        self._cutoff()
+        try:
+            await asyncio.wait_for(self.connection_lost_event.wait(), timeout=0.5)
+        except asyncio.TimeoutError:
+            pass
 
 
 class _StreamReader:
@@ -274,6 +754,7 @@ class _StreamReader:
         max_events: int,
         max_line_bytes: int,
         terminate: Optional[Callable[[], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ):
         self._proc = proc
         self._first = first_output
@@ -284,6 +765,7 @@ class _StreamReader:
         self._max_events = max_events
         self._max_line_bytes = max_line_bytes
         self._terminate = terminate or (lambda: _terminate_process_tree(proc))
+        self._cancel_event = cancel_event
         self._counter_lock = threading.Lock()
         self._buffered_bytes = 0
         self._total_bytes = 0
@@ -293,7 +775,9 @@ class _StreamReader:
         self._stop = threading.Event()
         self.fired = False
         self.fired_before_output = False
+        self.cancelled = False
         self.overflow_reason = ""
+        self.read_error: Optional[BaseException] = None
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._watch = threading.Thread(target=self._watch_loop, daemon=True)
 
@@ -304,47 +788,122 @@ class _StreamReader:
 
     def _read_loop(self) -> None:
         try:
+            if os.name == "posix":
+                self._read_posix_loop()
+                return
             while True:
                 # The size argument stops an unterminated giant JSON line from
                 # allocating unbounded memory before we can reject it.
                 line = self._proc.stdout.readline(self._max_line_bytes + 1)
                 if not line:
                     break
-                size = _bytes_len(line)
-                over_limit = (
-                    size > self._max_line_bytes
-                    or (len(line) >= self._max_line_bytes and not line.endswith("\n"))
-                )
-                with self._counter_lock:
-                    if not over_limit:
-                        if self._total_bytes + size > self._max_output_bytes:
-                            over_limit = True
-                            self.overflow_reason = "stdout"
-                        elif self._event_count >= self._max_events:
-                            over_limit = True
-                            self.overflow_reason = "event_count"
-                        elif self._buffered_bytes + size > self._max_buffer_bytes:
-                            over_limit = True
-                            self.overflow_reason = "stream_buffer"
-                        else:
-                            self._total_bytes += size
-                            self._event_count += 1
-                            self._buffered_bytes += size
-                    elif not self.overflow_reason:
-                        self.overflow_reason = "line"
-                if over_limit:
-                    self._terminate()
+                raw = line if isinstance(line, bytes) else line.encode(
+                    "utf-8", "replace")
+                if not self._queue_line(raw):
                     break
-                self._last = time.monotonic()
-                self._produced = True
-                self._q.put((line, size))
-        except Exception:
-            pass
+        except Exception as exc:
+            self.read_error = exc
+            self._terminate()
         finally:
             self._q.put((self._EOF, 0))
 
+    def _read_posix_loop(self) -> None:
+        """Read complete UTF-8 lines without blocking on a buffered object."""
+        fd = self._proc.stdout.fileno()
+        try:
+            os.set_blocking(fd, False)
+        except OSError:
+            pass
+        pending = bytearray()
+        exit_deadline: Optional[float] = None
+        with selectors.DefaultSelector() as selector:
+            selector.register(fd, selectors.EVENT_READ)
+            while not self._stop.is_set():
+                now = time.monotonic()
+                exited = self._proc.poll() is not None
+                if exited and exit_deadline is None:
+                    exit_deadline = now + _PIPE_EXIT_GRACE
+                if exit_deadline is not None and now >= exit_deadline:
+                    break
+                timeout = _PIPE_POLL_INTERVAL
+                if exit_deadline is not None:
+                    timeout = min(timeout, exit_deadline - now)
+                if not selector.select(timeout):
+                    continue
+                if not exited and self._proc.poll() is not None:
+                    exited = True
+                    if exit_deadline is None:
+                        exit_deadline = time.monotonic() + _PIPE_EXIT_GRACE
+                try:
+                    chunk = os.read(fd, 64 * 1024)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    break
+                pending.extend(chunk)
+                while True:
+                    newline = pending.find(b"\n")
+                    if newline < 0:
+                        break
+                    raw = bytes(pending[:newline + 1])
+                    del pending[:newline + 1]
+                    if not self._queue_line(raw, after_exit=exited):
+                        return
+                # Match BufferedReader.readline(limit + 1): an unterminated
+                # line reaching the configured limit is already too long.
+                if len(pending) >= self._max_line_bytes:
+                    if exited:
+                        return
+                    self.overflow_reason = "line"
+                    self._terminate()
+                    return
+        if pending and not self._stop.is_set():
+            self._queue_line(
+                bytes(pending), after_exit=exit_deadline is not None)
+
+    def _queue_line(self, raw: bytes, *, after_exit: bool = False) -> bool:
+        """Apply byte/event limits and enqueue one decoded JSONL line."""
+        size = len(raw)
+        reason = ""
+        if (size > self._max_line_bytes
+                or (size >= self._max_line_bytes
+                    and not raw.endswith(b"\n"))):
+            reason = "line"
+        with self._counter_lock:
+            if not reason:
+                if self._total_bytes + size > self._max_output_bytes:
+                    reason = "stdout"
+                elif self._event_count >= self._max_events:
+                    reason = "event_count"
+                elif self._buffered_bytes + size > self._max_buffer_bytes:
+                    reason = "stream_buffer"
+            if reason:
+                # Bytes accepted only during the bounded post-leader grace are
+                # not provider output. Stop without manufacturing or replacing
+                # a pre-exit overflow reason that outer sync/Gemini code would
+                # incorrectly surface as resource_limit.
+                if after_exit:
+                    return False
+                if not self.overflow_reason:
+                    self.overflow_reason = reason
+            else:
+                self._total_bytes += size
+                self._event_count += 1
+                self._buffered_bytes += size
+        if reason:
+            self._terminate()
+            return False
+        self._last = time.monotonic()
+        self._produced = True
+        self._q.put((raw.decode("utf-8", "replace"), size))
+        return True
+
     def _watch_loop(self) -> None:
-        while not self._stop.wait(0.5):
+        while not self._stop.wait(0.05):
+            if _cancel_requested(self._cancel_event):
+                self.cancelled = True
+                self._terminate()
+                return
             if self._proc.poll() is not None:
                 return  # child exited on its own; reader will emit EOF
             deadline = self._idle if self._produced else self._first
@@ -367,6 +926,13 @@ class _StreamReader:
         self._stop.set()
         self._watch.join(timeout=1)
 
+    def wait_closed(self, timeout: float) -> None:
+        """Wait until the stdout reader has observed EOF."""
+        self._reader.join(timeout=timeout)
+
+    def is_closed(self) -> bool:
+        return not self._reader.is_alive()
+
 
 class BaseProvider(ABC):
     """Base class for a single-provider CLI wrapper.
@@ -378,12 +944,11 @@ class BaseProvider(ABC):
       - `_default_env()` → dict of env vars to set (subclass-specific)
     """
 
-    name: ClassVar[ProviderName]
+    name: ClassVar[ProviderId]
     default_model: ClassVar[str]
     api_key_env: ClassVar[str]       # e.g., "ANTHROPIC_API_KEY"
-    # Some subscription CLIs are OAuth-only. Such providers still expose an
-    # API-key environment variable for UI/status compatibility, but must never
-    # retry an OAuth failure by injecting that key into a different CLI.
+    # Retained for source compatibility with provider subclasses. Authentication
+    # failures are never replayed with an inherited credential.
     allow_api_key_fallback: ClassVar[bool] = True
 
     @classmethod
@@ -409,6 +974,10 @@ class BaseProvider(ABC):
         max_stream_buffer_bytes: int = DEFAULT_MAX_STREAM_BUFFER_BYTES,
         max_stream_events: int = DEFAULT_MAX_STREAM_EVENTS,
         max_stream_line_bytes: int = DEFAULT_MAX_STREAM_LINE_BYTES,
+        _retry_wait: Optional[Callable[[float, Optional[threading.Event]], bool]] = None,
+        _retry_random: Optional[Callable[[], float]] = None,
+        _retry_clock: Optional[Callable[[], float]] = None,
+        _retry_async_wait: Optional[Callable[[float], object]] = None,
     ):
         self.model = model or self.default_model
         self.cwd = cwd
@@ -439,6 +1008,10 @@ class BaseProvider(ABC):
         self.max_stream_buffer_bytes = max_stream_buffer_bytes
         self.max_stream_events = max_stream_events
         self.max_stream_line_bytes = max_stream_line_bytes
+        self._retry_wait = _retry_wait or self._default_retry_wait
+        self._retry_random = _retry_random or random.SystemRandom().random
+        self._retry_clock = _retry_clock or time.monotonic
+        self._retry_async_wait = _retry_async_wait or asyncio.sleep
         # Materialized attachment files are tied to an explicit invocation
         # scope, not a thread. Async streams can interleave on one event-loop
         # thread, so thread-local tracking could delete another task's image.
@@ -574,9 +1147,10 @@ class BaseProvider(ABC):
         OAuth, not per-token API billing. So by default we STRIP any inherited
         vendor API key (e.g. an exported ANTHROPIC_API_KEY) — otherwise the
         wrapped CLI would silently switch to metered API billing and defeat the
-        package's core value. Only the explicit auth-expired fallback path
-        (`fallback_api_key=True`) keeps the key. A deliberate key passed via
-        `extra_env` always wins (applied after the pop).
+        package's core value. ``fallback_api_key`` remains for compatibility
+        with private integrations, but automatic request paths never enable it.
+        A deliberate key passed via `extra_env` always wins (applied after the
+        pop).
         """
         env = os.environ.copy()
         if not (fallback_api_key and self.allow_api_key_fallback):
@@ -627,8 +1201,11 @@ class BaseProvider(ABC):
         stdin_data: Optional[str],
         *,
         fallback_api_key: bool,
+        cancel_event: Optional[threading.Event] = None,
     ) -> tuple[str, str, int]:
         """Run one bounded non-streaming child and capture its output safely."""
+        if _cancel_requested(cancel_event):
+            raise _ProcessCancelled()
         proc = subprocess.Popen(
             args,
             stdin=subprocess.PIPE if stdin_data else subprocess.DEVNULL,
@@ -640,7 +1217,9 @@ class BaseProvider(ABC):
         )
         overflow = threading.Event()
         overflow_sources: list[str] = []
+        reader_failures: list[BaseException] = []
         terminate = lambda: _terminate_process_tree(proc)
+        reader_stop = threading.Event()
         stdout_chunks: list[bytes] = []
         stderr_chunks: list[bytes] = []
         stdout_thread = threading.Thread(
@@ -650,6 +1229,9 @@ class BaseProvider(ABC):
                 "max_bytes": self.max_output_bytes, "overflow": overflow,
                 "source": overflow_sources, "source_name": "stdout",
                 "terminate": terminate,
+                "stop": reader_stop,
+                "process_exited": lambda: proc.poll() is not None,
+                "failure": reader_failures,
             },
             daemon=True,
         )
@@ -660,6 +1242,9 @@ class BaseProvider(ABC):
                 "max_bytes": self.max_stderr_bytes, "overflow": overflow,
                 "source": overflow_sources, "source_name": "stderr",
                 "terminate": terminate,
+                "stop": reader_stop,
+                "process_exited": lambda: proc.poll() is not None,
+                "failure": reader_failures,
             },
             daemon=True,
         )
@@ -672,19 +1257,24 @@ class BaseProvider(ABC):
                 try:
                     proc.stdin.write(stdin_data.encode("utf-8"))
                     proc.stdin.flush()
-                except (BrokenPipeError, OSError):
+                except (BrokenPipeError, OSError, ValueError):
                     pass
                 finally:
                     try:
                         proc.stdin.close()
-                    except OSError:
+                    except (OSError, ValueError):
                         pass
             stdin_thread = threading.Thread(target=write_stdin, daemon=True)
             stdin_thread.start()
 
         timed_out = False
+        cancelled = False
         deadline = time.monotonic() + self.timeout
         while proc.poll() is None:
+            if _cancel_requested(cancel_event):
+                terminate()
+                cancelled = True
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
@@ -704,14 +1294,34 @@ class BaseProvider(ABC):
         # A completed headless provider call must not leave a background
         # descendant in its dedicated process group.
         _terminate_process_tree(proc, force_group=True)
+        for thread in (stdout_thread, stderr_thread):
+            thread.join(timeout=0.2)
+        reader_stop.set()
         for thread in (stdout_thread, stderr_thread, stdin_thread):
-            if thread is not None:
-                thread.join(timeout=5)
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=1)
+        # Never close a buffered file object while another thread may hold its
+        # lock. POSIX readers above are stop-aware and normally always finish;
+        # the skip is a bounded fallback for platforms without pollable pipes.
+        live_pipes = []
+        if stdout_thread.is_alive():
+            live_pipes.append(proc.stdout)
+        if stderr_thread.is_alive():
+            live_pipes.append(proc.stderr)
+        if stdin_thread is not None and stdin_thread.is_alive():
+            live_pipes.append(proc.stdin)
+        _close_popen_pipes(proc, skip=tuple(live_pipes))
 
+        if cancelled:
+            raise _ProcessCancelled()
         if timed_out:
             raise _ProcessTimedOut()
         if overflow.is_set():
             raise _ProcessOutputLimit(overflow_sources[0] if overflow_sources else "output")
+        if reader_failures:
+            raise _ProcessPipeError("stdout/stderr", reader_failures[0])
+        if _cancel_requested(cancel_event):
+            raise _ProcessCancelled()
         return (
             b"".join(stdout_chunks).decode("utf-8", "replace"),
             b"".join(stderr_chunks).decode("utf-8", "replace"),
@@ -726,22 +1336,137 @@ class BaseProvider(ABC):
             cause=f"{source} exceeded configured output limit",
         )
 
-    def _run(self, args: list[str], stdin_data: Optional[str] = None) -> str:
+    def _pipe_reader_error(
+        self, source: str, cause: Optional[BaseException]
+    ) -> UnifiedError:
+        return UnifiedError(
+            kind="internal", provider=self.name,
+            message=f"{self.name} subprocess output reader failed.",
+            hint=t("err.base.output_limit.hint"),
+            cause=f"{source}: {cause!r}",
+        )
+
+    @staticmethod
+    def _default_retry_wait(
+        delay: float, cancel_event: Optional[threading.Event]
+    ) -> bool:
+        if cancel_event is not None:
+            try:
+                return bool(cancel_event.wait(delay))
+            except Exception:
+                pass
+        waiter = threading.Event()
+        return bool(waiter.wait(delay))
+
+    def _retry_delay(
+        self, error: UnifiedError, retry_index: int, remaining: float
+    ) -> Optional[float]:
+        retry_after = getattr(error, "_retry_after", None)
+        if isinstance(retry_after, (int, float)) and not isinstance(retry_after, bool):
+            requested = float(retry_after)
+        else:
+            try:
+                sample = float(self._retry_random())
+            except (TypeError, ValueError, OverflowError):
+                sample = 0.5
+            if sample != sample:
+                sample = 0.5
+            sample = min(1.0, max(0.0, sample))
+            requested = (
+                _RETRY_BACKOFF_BASE * (2 ** retry_index) * (0.75 + 0.5 * sample)
+            )
+        delay = min(requested, _RETRY_MAX_WAIT, remaining)
+        return delay if delay > 0 else None
+
+    def _wait_for_retry(
+        self,
+        error: UnifiedError,
+        retry_index: int,
+        *,
+        scheduled: float,
+        cancel_event: Optional[threading.Event],
+    ) -> Optional[float]:
+        if _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
+        delay = self._retry_delay(
+            error, retry_index, max(0.0, _RETRY_MAX_TOTAL_DELAY - scheduled),
+        )
+        if delay is None:
+            return None
+        wait_started = self._retry_clock()
+        if self._retry_wait(delay, cancel_event) or _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
+        try:
+            elapsed = max(0.0, float(self._retry_clock()) - wait_started)
+        except (TypeError, ValueError, OverflowError):
+            elapsed = delay
+        return scheduled + max(delay, elapsed)
+
+    async def _await_retry(
+        self,
+        error: UnifiedError,
+        retry_index: int,
+        *,
+        scheduled: float,
+        cancel_event: Optional[threading.Event],
+    ) -> Optional[float]:
+        if _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
+        delay = self._retry_delay(
+            error, retry_index, max(0.0, _RETRY_MAX_TOTAL_DELAY - scheduled),
+        )
+        if delay is None:
+            return None
+        wait_started = self._retry_clock()
+        if cancel_event is None:
+            await self._retry_async_wait(delay)  # type: ignore[misc]
+        else:
+            loop = asyncio.get_running_loop()
+            cancelled = await loop.run_in_executor(None, cancel_event.wait, delay)
+            if cancelled:
+                raise _cancelled_error(self.name)
+        if _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
+        try:
+            elapsed = max(0.0, float(self._retry_clock()) - wait_started)
+        except (TypeError, ValueError, OverflowError):
+            elapsed = delay
+        return scheduled + max(delay, elapsed)
+
+    @staticmethod
+    def _retryable(error: UnifiedError, *, evidence_safe: bool) -> bool:
+        return bool(
+            evidence_safe
+            and getattr(error, "_retry_reason", "permanent")
+            in {"transient_network", "transient_rate_limit"}
+        )
+
+    def _run(
+        self,
+        args: list[str],
+        stdin_data: Optional[str] = None,
+        *,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> str:
         """Run subprocess with non-streaming output. Returns stdout on success.
 
         `stdin_data` (if given) is piped to the child's stdin — used by
         Claude's stream-json image input mode.
 
-        Handles auth-expired fallback (retry once with API key env) and network
-        retries (up to 2 with exponential backoff).
+        Replays only bounded, provably pre-side-effect transient failures.
         """
-        tried_api_fallback = False
         last_err: Optional[UnifiedError] = None
+        scheduled_delay = 0.0
 
-        for attempt in range(len(_NETWORK_BACKOFF) + 1):
+        for attempt in range(_RETRY_MAX_ATTEMPTS):
             try:
+                run_kwargs = {"fallback_api_key": False}
+                if cancel_event is not None:
+                    run_kwargs["cancel_event"] = cancel_event
                 stdout, stderr, returncode = self._run_once(
-                    args, stdin_data, fallback_api_key=False)
+                    args, stdin_data, **run_kwargs)
+            except _ProcessCancelled:
+                raise _cancelled_error(self.name)
             except _ProcessTimedOut:
                 raise UnifiedError(
                     kind="network", provider=self.name,
@@ -752,37 +1477,29 @@ class BaseProvider(ABC):
                 )
             except _ProcessOutputLimit as exc:
                 raise self._output_limit_error(exc.source)
+            except _ProcessPipeError as exc:
+                raise self._pipe_reader_error(exc.source, exc.cause)
             if returncode == 0:
+                if _cancel_requested(cancel_event):
+                    raise _cancelled_error(self.name)
                 return stdout
 
             err = classify(self.name, stderr, stdout, returncode)
             last_err = err
 
-            if err.kind == "auth_expired" and not tried_api_fallback:
-                if (self.allow_api_key_fallback
-                        and self.api_key_env in os.environ):
-                    tried_api_fallback = True
-                    try:
-                        stdout, stderr, returncode = self._run_once(
-                            args, stdin_data, fallback_api_key=True,
-                        )
-                    except _ProcessTimedOut:
-                        raise UnifiedError(
-                            kind="network", provider=self.name,
-                            message=t("err.base.timeout_fallback", provider=self.name),
-                            hint=t("err.base.timeout_fallback.hint"),
-                        )
-                    except _ProcessOutputLimit as exc:
-                        raise self._output_limit_error(exc.source)
-                    if returncode == 0:
-                        return stdout
-                    err = classify(self.name, stderr, stdout, returncode)
-                    last_err = err
-                raise err  # no key available or fallback also failed
-
-            if err.kind == "network" and attempt < len(_NETWORK_BACKOFF):
-                time.sleep(_NETWORK_BACKOFF[attempt])
-                continue
+            evidence_safe = _retry_evidence_proves_no_side_effects(
+                stdout, stderr, err,
+            )
+            if self._retryable(err, evidence_safe=evidence_safe) and (
+                attempt + 1 < _RETRY_MAX_ATTEMPTS
+            ):
+                waited = self._wait_for_retry(
+                    err, attempt, scheduled=scheduled_delay,
+                    cancel_event=cancel_event,
+                )
+                if waited is not None:
+                    scheduled_delay = waited
+                    continue
 
             raise err
 
@@ -799,6 +1516,7 @@ class BaseProvider(ABC):
         resume_last: bool = False,
         model: Optional[str] = None,
         images: Optional[list] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Response:
         _reject_empty_prompt(prompt, self.name)
         scope = self._new_temp_scope()
@@ -809,9 +1527,14 @@ class BaseProvider(ABC):
             )
             t0 = time.time()
             try:
-                stdout = self._run(args, stdin_data=stdin_data)
+                run_kwargs = {"stdin_data": stdin_data}
+                if cancel_event is not None:
+                    run_kwargs["cancel_event"] = cancel_event
+                stdout = self._run(args, **run_kwargs)
                 resp = self._parse_json_response(stdout, model or self.model)
                 _check_session_match(self.name, session_id, resp.session_id)
+                if _cancel_requested(cancel_event):
+                    raise _cancelled_error(self.name)
             except UnifiedError as e:
                 _usage_tracker.record(
                     self.name, model or self.model,
@@ -828,6 +1551,8 @@ class BaseProvider(ABC):
                 session_id=resp.session_id,
                 prompt_preview=prompt,
             )
+            if _cancel_requested(cancel_event):
+                raise _cancelled_error(self.name)
             return resp
         finally:
             self._cleanup_temp_files(scope)
@@ -840,6 +1565,7 @@ class BaseProvider(ABC):
         resume_last: bool = False,
         model: Optional[str] = None,
         images: Optional[list] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Iterator[Message]:
         _reject_empty_prompt(prompt, self.name)
         scope = self._new_temp_scope()
@@ -853,7 +1579,12 @@ class BaseProvider(ABC):
             final_session = ""
             session_checked = False
             try:
-                for msg in self._stream_run(args, stdin_data=stdin_data):
+                run_kwargs = {"stdin_data": stdin_data}
+                if cancel_event is not None:
+                    run_kwargs["cancel_event"] = cancel_event
+                for msg in self._stream_run(args, **run_kwargs):
+                    if _cancel_requested(cancel_event):
+                        raise _cancelled_error(self.name)
                     if msg.kind == "usage" and msg.usage:
                         final_usage = msg.usage
                     if msg.kind == "session" and msg.session_id:
@@ -861,6 +1592,8 @@ class BaseProvider(ABC):
                         if not session_checked:
                             _check_session_match(self.name, session_id, msg.session_id)
                             session_checked = True
+                    if _cancel_requested(cancel_event):
+                        raise _cancelled_error(self.name)
                     yield msg
             except UnifiedError as e:
                 _usage_tracker.record(
@@ -869,6 +1602,8 @@ class BaseProvider(ABC):
                     prompt_preview=prompt, error_kind=e.kind,
                 )
                 raise
+            if _cancel_requested(cancel_event):
+                raise _cancelled_error(self.name)
             _usage_tracker.record(
                 self.name, model or self.model,
                 input_tokens=final_usage.input_tokens or 0,
@@ -878,12 +1613,30 @@ class BaseProvider(ABC):
                 session_id=final_session,
                 prompt_preview=prompt,
             )
+            if _cancel_requested(cancel_event):
+                raise _cancelled_error(self.name)
         finally:
             self._cleanup_temp_files(scope)
 
     async def achat(self, prompt: str, **kw) -> Response:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, lambda: self.chat(prompt, **kw))
+        loop = asyncio.get_running_loop()
+        task_cancel = threading.Event()
+        call_kw = dict(kw)
+        combined_cancel = _CombinedCancelEvent(
+            kw.get("cancel_event"), task_cancel,
+        )
+        call_kw["cancel_event"] = combined_cancel
+        future = loop.run_in_executor(
+            None, lambda: self.chat(prompt, **call_kw),
+        )
+        try:
+            resp = await future
+        except asyncio.CancelledError:
+            task_cancel.set()
+            raise
+        if _cancel_requested(combined_cancel):
+            raise _cancelled_error(self.name)
+        return resp
 
     async def astream(
         self,
@@ -893,10 +1646,10 @@ class BaseProvider(ABC):
         resume_last: bool = False,
         model: Optional[str] = None,
         images: Optional[list] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> AsyncIterator[Message]:
         _reject_empty_prompt(prompt, self.name)
         scope = self._new_temp_scope()
-        stream_state = self._new_stream_state()
         token = self._temp_scope.set(scope)
         try:
             args, stdin_data = self._build_args(
@@ -912,179 +1665,51 @@ class BaseProvider(ABC):
         final_usage = Usage()
         final_session = ""
         session_checked = False
+        scheduled_delay = 0.0
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                stdin=asyncio.subprocess.PIPE if stdin_data else asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=self.cwd, env=self._env(),
-                limit=self.max_stream_line_bytes,
-                **_popen_process_group_kwargs(),
-            )
-        except BaseException:
-            self._cleanup_temp_files(scope)
-            raise
-        if stdin_data and proc.stdin:
-            try:
-                proc.stdin.write(stdin_data.encode())
-                await asyncio.wait_for(proc.stdin.drain(), timeout=self.timeout)
-            except BaseException:
-                _terminate_process_tree(proc)
+            for attempt in range(_RETRY_MAX_ATTEMPTS):
+                emitted = False
                 try:
-                    await asyncio.wait_for(proc.wait(), timeout=5)
-                except Exception:
-                    pass
-                self._cleanup_temp_files(scope)
-                raise
-            finally:
-                proc.stdin.close()
-        assert proc.stdout is not None
-        # Drain stderr concurrently so a chatty child cannot fill the stderr
-        # pipe. Retain only a bounded diagnostic capture.
-        _stderr_chunks: list[bytes] = []
-        _stderr_size = 0
-        _stderr_overflow = False
-
-        async def _drain_stderr():
-            nonlocal _stderr_size, _stderr_overflow
-            if proc.stderr is None:
-                return
-            try:
-                while True:
-                    chunk = await proc.stderr.read(64 * 1024)
-                    if not chunk:
-                        return
-                    if _stderr_size + len(chunk) > self.max_stderr_bytes:
-                        remaining = max(0, self.max_stderr_bytes - _stderr_size)
-                        if remaining:
-                            _stderr_chunks.append(chunk[:remaining])
-                        _stderr_overflow = True
-                        _terminate_process_tree(proc)
-                        return
-                    _stderr_chunks.append(chunk)
-                    _stderr_size += len(chunk)
-            except Exception:
-                pass
-
-        _drain_task = asyncio.ensure_future(_drain_stderr())
-        # Reader task drains stdout into a queue, decoupling the child's output
-        # cadence from consumer backpressure: a slow `async for` consumer only
-        # parks us at the `yield` below while the reader keeps pulling, so the
-        # queue stays non-empty and the wait_for deadline never mistakes a slow
-        # consumer for a hung child. `produced` flips after the first line so the
-        # short first-output deadline applies only before any output.
-        _EOF = object()
-        _line_q: "asyncio.Queue" = asyncio.Queue()
-        state = {
-            "produced": False,
-            "buffered": 0,
-            "total": 0,
-            "events": 0,
-            "overflow": "",
-        }
-
-        async def _read_stdout():
-            while True:
-                try:
-                    raw = await proc.stdout.readline()
-                except (ValueError, asyncio.LimitOverrunError):
-                    await _line_q.put(("err", None))
-                    return
-                if not raw:
-                    await _line_q.put((_EOF, None))
-                    return
-                if state["total"] + len(raw) > self.max_output_bytes:
-                    state["overflow"] = "stdout"
-                    _terminate_process_tree(proc)
-                    await _line_q.put(("limit", None))
-                    return
-                if state["events"] >= self.max_stream_events:
-                    state["overflow"] = "event_count"
-                    _terminate_process_tree(proc)
-                    await _line_q.put(("limit", None))
-                    return
-                if state["buffered"] + len(raw) > self.max_stream_buffer_bytes:
-                    state["overflow"] = "stream_buffer"
-                    _terminate_process_tree(proc)
-                    await _line_q.put(("limit", None))
-                    return
-                state["produced"] = True
-                state["total"] += len(raw)
-                state["events"] += 1
-                state["buffered"] += len(raw)
-                await _line_q.put(("line", raw))
-
-        _read_task = asyncio.ensure_future(_read_stdout())
-        try:
-            while True:
-                deadline = (self.stream_timeout if state["produced"]
-                            else self.first_output_timeout)
-                try:
-                    kind, raw = await asyncio.wait_for(_line_q.get(), timeout=deadline)
-                except asyncio.TimeoutError:
-                    # Queue empty for `deadline` with the child alive → the CHILD
-                    # is silent (the consumer only ever fills the queue, never
-                    # drains it) — a wedged process, e.g. claude blocked on the
-                    # Keychain under launchd. Kill it and surface a hang error.
-                    _terminate_process_tree(proc)
-                    err = self._hang_error(before_output=not state["produced"])
-                    _usage_tracker.record(
-                        self.name, model or self.model,
-                        latency_ms=int((time.time() - t0) * 1000),
-                        prompt_preview=prompt, error_kind=err.kind,
-                    )
-                    raise err
-                if kind is _EOF:
+                    async for msg in self._astream_once(
+                        args,
+                        stdin_data=stdin_data,
+                        stream_state=self._new_stream_state(),
+                        cancel_event=cancel_event,
+                    ):
+                        if _cancel_requested(cancel_event):
+                            raise _cancelled_error(self.name)
+                        emitted = True
+                        if msg.kind == "usage" and msg.usage:
+                            final_usage = msg.usage
+                        if (msg.kind == "session" and msg.session_id
+                                and not session_checked):
+                            final_session = msg.session_id
+                            _check_session_match(
+                                self.name, session_id, msg.session_id,
+                            )
+                            session_checked = True
+                        if _cancel_requested(cancel_event):
+                            raise _cancelled_error(self.name)
+                        yield msg
                     break
-                if kind == "limit":
-                    raise self._output_limit_error(state["overflow"] or "output")
-                if kind == "err":
-                    _terminate_process_tree(proc)
-                    raise UnifiedError(
-                        kind="internal", provider=self.name,
-                        message=t("err.base.line_too_long", provider=self.name),
-                        hint=t("err.base.line_too_long.hint"),
+                except UnifiedError as err:
+                    evidence_safe = bool(
+                        not emitted
+                        and getattr(err, "_retry_evidence_safe", False)
                     )
-                state["buffered"] = max(0, state["buffered"] - len(raw))
-                line = raw.decode("utf-8", "replace").strip()
-                if not line or not line.startswith("{"):
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                for msg in self._stream_normalize(obj, stream_state):
-                    if msg.kind == "usage" and msg.usage:
-                        final_usage = msg.usage
-                    if (msg.kind == "session" and msg.session_id
-                            and not session_checked):
-                        final_session = msg.session_id
-                        _check_session_match(self.name, session_id, msg.session_id)
-                        session_checked = True
-                    yield msg
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=self.stream_timeout)
-            except asyncio.TimeoutError:
-                _terminate_process_tree(proc)
-                raise self._hang_error(before_output=False)
-            try:
-                await asyncio.wait_for(_drain_task, timeout=5)
-            except Exception:
-                pass
-            if _stderr_overflow:
-                raise self._output_limit_error("stderr")
-            if proc.returncode != 0:
-                err_bytes = b"".join(_stderr_chunks)
-                err = classify(self.name, err_bytes.decode(), "", proc.returncode)
-                # Mirror sync stream(): record the error turn before raising.
-                _usage_tracker.record(
-                    self.name, model or self.model,
-                    latency_ms=int((time.time() - t0) * 1000),
-                    prompt_preview=prompt, error_kind=err.kind,
-                )
-                raise err
-            # Success — record usage parity with sync stream().
+                    if self._retryable(err, evidence_safe=evidence_safe) and (
+                        attempt + 1 < _RETRY_MAX_ATTEMPTS
+                    ):
+                        waited = await self._await_retry(
+                            err, attempt, scheduled=scheduled_delay,
+                            cancel_event=cancel_event,
+                        )
+                        if waited is not None:
+                            scheduled_delay = waited
+                            continue
+                    raise
+            if _cancel_requested(cancel_event):
+                raise _cancelled_error(self.name)
             _usage_tracker.record(
                 self.name, model or self.model,
                 input_tokens=final_usage.input_tokens or 0,
@@ -1094,24 +1719,154 @@ class BaseProvider(ABC):
                 session_id=final_session,
                 prompt_preview=prompt,
             )
+            if _cancel_requested(cancel_event):
+                raise _cancelled_error(self.name)
+        except UnifiedError as err:
+            _usage_tracker.record(
+                self.name, model or self.model,
+                latency_ms=int((time.time() - t0) * 1000),
+                prompt_preview=prompt, error_kind=err.kind,
+            )
+            raise
         finally:
-            # Abort/error mid-stream may leave a descendant after the direct
-            # leader exits. Always retire the short-lived, dedicated process
-            # group before tearing down reader tasks.
-            _terminate_process_tree(proc, force_group=True)
-            if proc.returncode is None:
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=5)
-                except Exception:
-                    pass
-            for _task in (_read_task, _drain_task):
-                if not _task.done():
-                    _task.cancel()
-                try:
-                    await _task
-                except (asyncio.CancelledError, Exception):
-                    pass
             self._cleanup_temp_files(scope)
+
+    async def _astream_once(
+        self,
+        args: list[str],
+        *,
+        stream_state: object,
+        stdin_data: Optional[str] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> AsyncIterator[Message]:
+        """Run one async subprocess stream and retain pre-turn retry evidence."""
+        if _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
+        loop = asyncio.get_running_loop()
+        factory = lambda: _AsyncJsonlProtocol(
+            loop,
+            max_output_bytes=self.max_output_bytes,
+            max_stderr_bytes=self.max_stderr_bytes,
+            max_buffer_bytes=self.max_stream_buffer_bytes,
+            max_events=self.max_stream_events,
+            max_line_bytes=self.max_stream_line_bytes,
+        )
+        transport = None
+        protocol: Optional[_AsyncJsonlProtocol] = None
+        retry_evidence_safe = True
+        try:
+            transport, protocol = await loop.subprocess_exec(
+                factory, *args,
+                stdin=(asyncio.subprocess.PIPE if stdin_data
+                       else asyncio.subprocess.DEVNULL),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self.cwd, env=self._env(),
+                **_popen_process_group_kwargs(),
+            )
+            if stdin_data:
+                stdin_transport = transport.get_pipe_transport(0)
+                try:
+                    if stdin_transport is None:
+                        raise BrokenPipeError(
+                            "subprocess stdin transport unavailable"
+                        )
+                    stdin_transport.write(stdin_data.encode("utf-8"))
+                    await asyncio.wait_for(
+                        protocol.stdin_writable.wait(), timeout=self.timeout,
+                    )
+                finally:
+                    if stdin_transport is not None:
+                        stdin_transport.close()
+            while True:
+                if _cancel_requested(cancel_event):
+                    _terminate_process_tree(transport)
+                    raise _cancelled_error(self.name)
+                deadline = (self.stream_timeout if protocol.produced
+                            else self.first_output_timeout)
+                try:
+                    kind, payload = await asyncio.wait_for(
+                        protocol.queue.get(), timeout=min(deadline, 0.1),
+                    )
+                except asyncio.TimeoutError:
+                    if _cancel_requested(cancel_event):
+                        _terminate_process_tree(transport)
+                        raise _cancelled_error(self.name)
+                    if protocol.process_exited_event.is_set():
+                        continue
+                    if time.monotonic() - protocol.last_output <= deadline:
+                        continue
+                    _terminate_process_tree(transport)
+                    raise self._hang_error(before_output=not protocol.produced)
+                if _cancel_requested(cancel_event):
+                    _terminate_process_tree(transport)
+                    raise _cancelled_error(self.name)
+                if kind == "eof":
+                    break
+                if kind == "limit":
+                    raise self._output_limit_error(str(payload or "output"))
+                if kind == "reader_error":
+                    raise self._pipe_reader_error("async pipe", payload)
+                raw = payload
+                protocol.consume_line(len(raw))
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                if not line.startswith("{"):
+                    retry_evidence_safe = False
+                    continue
+                try:
+                    obj = json.loads(line)
+                except (json.JSONDecodeError, ValueError, RecursionError):
+                    retry_evidence_safe = False
+                    continue
+                try:
+                    messages = list(self._stream_normalize(obj, stream_state))
+                except RecursionError:
+                    retry_evidence_safe = False
+                    continue
+                if _cancel_requested(cancel_event):
+                    _terminate_process_tree(transport)
+                    raise _cancelled_error(self.name)
+                if messages or not _is_pre_turn_error_envelope(obj):
+                    retry_evidence_safe = False
+                for msg in messages:
+                    if _cancel_requested(cancel_event):
+                        _terminate_process_tree(transport)
+                        raise _cancelled_error(self.name)
+                    yield msg
+            if not protocol.process_exited_event.is_set():
+                try:
+                    await asyncio.wait_for(
+                        protocol.process_exited_event.wait(),
+                        timeout=self.stream_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    _terminate_process_tree(transport)
+                    raise self._hang_error(before_output=False)
+            if protocol.read_error is not None:
+                raise self._pipe_reader_error("async pipe", protocol.read_error)
+            if protocol.overflow_reason:
+                raise self._output_limit_error(protocol.overflow_reason)
+            if protocol.returncode != 0:
+                stderr_text = b"".join(protocol.stderr_chunks).decode(
+                    "utf-8", "replace",
+                )
+                err = classify(
+                    self.name, stderr_text, "", protocol.returncode,
+                )
+                err._retry_evidence_safe = bool(  # type: ignore[attr-defined]
+                    retry_evidence_safe
+                    and _retry_evidence_proves_no_side_effects(
+                        "", stderr_text, err,
+                    )
+                )
+                raise err
+        finally:
+            if transport is not None:
+                _terminate_process_tree(transport, force_group=True)
+            if protocol is not None:
+                await protocol.close()
 
     def _stream_once(
         self,
@@ -1120,37 +1875,47 @@ class BaseProvider(ABC):
         fallback: bool,
         stream_state: object,
         stdin_data: Optional[str] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Iterator[Message]:
         """Run subprocess once, yield normalized messages, raise on failure."""
+        if _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
         proc = subprocess.Popen(
             args,
             stdin=subprocess.PIPE if stdin_data else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace", cwd=self.cwd,
-            env=self._env(fallback_api_key=fallback), bufsize=1,
+            cwd=self.cwd, env=self._env(fallback_api_key=fallback),
             **_popen_process_group_kwargs(),
         )
         if stdin_data and proc.stdin:
             try:
-                proc.stdin.write(stdin_data)
+                proc.stdin.write(stdin_data.encode("utf-8"))
                 proc.stdin.flush()
                 proc.stdin.close()
-            except BrokenPipeError:
+            except (BrokenPipeError, OSError, ValueError):
                 pass
         assert proc.stdout is not None
         # Drain stderr concurrently: if the child writes more than the OS pipe
         # buffer (~64 KB) to stderr while still streaming stdout, an undrained
         # stderr pipe blocks the child, which stalls our stdout loop forever.
-        _stderr_chunks: list[str] = []
+        _stderr_chunks: list[bytes] = []
         _stderr_overflow = threading.Event()
+        _stderr_sources: list[str] = []
+        _stderr_failures: list[BaseException] = []
+        _stderr_stop = threading.Event()
         _stderr_thread = threading.Thread(
-            target=_drain_into,
+            target=_drain_binary_into,
             kwargs={
                 "pipe": proc.stderr,
                 "sink": _stderr_chunks,
                 "max_bytes": self.max_stderr_bytes,
                 "overflow": _stderr_overflow,
+                "source": _stderr_sources,
+                "source_name": "stderr",
                 "terminate": lambda: _terminate_process_tree(proc),
+                "stop": _stderr_stop,
+                "process_exited": lambda: proc.poll() is not None,
+                "failure": _stderr_failures,
             },
             daemon=True,
         )
@@ -1168,20 +1933,45 @@ class BaseProvider(ABC):
             max_events=self.max_stream_events,
             max_line_bytes=self.max_stream_line_bytes,
             terminate=lambda: _terminate_process_tree(proc),
+            cancel_event=cancel_event,
         ).start()
         produced_any = False
+        retry_evidence_safe = True
         loop_done = False
         try:
             for line in reader:
+                if _cancel_requested(cancel_event):
+                    _terminate_process_tree(proc)
+                    raise _cancelled_error(self.name)
                 line = line.strip()
-                if not line or not line.startswith("{"):
+                if not line:
+                    continue
+                if not line.startswith("{"):
+                    retry_evidence_safe = False
                     continue
                 try:
                     obj = json.loads(line)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, ValueError, RecursionError):
+                    retry_evidence_safe = False
                     continue
-                for msg in self._stream_normalize(obj, stream_state):
+                try:
+                    messages = list(self._stream_normalize(obj, stream_state))
+                except RecursionError:
+                    retry_evidence_safe = False
+                    continue
+                if _cancel_requested(cancel_event):
+                    _terminate_process_tree(proc)
+                    raise _cancelled_error(self.name)
+                if messages or not _is_pre_turn_error_envelope(obj):
+                    retry_evidence_safe = False
+                for msg in messages:
+                    if _cancel_requested(cancel_event):
+                        _terminate_process_tree(proc)
+                        raise _cancelled_error(self.name)
                     produced_any = True
+                    if _cancel_requested(cancel_event):
+                        _terminate_process_tree(proc)
+                        raise _cancelled_error(self.name)
                     yield msg
             loop_done = True
         finally:
@@ -1190,6 +1980,7 @@ class BaseProvider(ABC):
             # possibly long-running child — kill it.
             if not loop_done:
                 _terminate_process_tree(proc, force_group=True)
+            wait_error = None
             try:
                 proc.wait(timeout=self.stream_timeout)
             except subprocess.TimeoutExpired:
@@ -1198,15 +1989,34 @@ class BaseProvider(ABC):
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
-                raise self._hang_error(before_output=False)
+                wait_error = self._hang_error(before_output=False)
             # The leader may have exited before an inherited-child process.
             # Clean the wrapper-owned group after every completed invocation.
             _terminate_process_tree(proc, force_group=True)
-            _stderr_thread.join(timeout=5)
-            stderr_text = "".join(_stderr_chunks)
+            reader.wait_closed(timeout=0.2)
+            _stderr_thread.join(timeout=0.2)
+            _stderr_stop.set()
+            reader.wait_closed(timeout=1)
+            if _stderr_thread.is_alive():
+                _stderr_thread.join(timeout=1)
+            live_pipes = []
+            if not reader.is_closed():
+                live_pipes.append(proc.stdout)
+            if _stderr_thread.is_alive():
+                live_pipes.append(proc.stderr)
+            _close_popen_pipes(proc, skip=tuple(live_pipes))
+            stderr_text = b"".join(_stderr_chunks).decode("utf-8", "replace")
+            if wait_error is not None:
+                raise wait_error
 
         if reader.overflow_reason:
             raise self._output_limit_error(reader.overflow_reason)
+        if reader.cancelled or _cancel_requested(cancel_event):
+            raise _cancelled_error(self.name)
+        if reader.read_error is not None:
+            raise self._pipe_reader_error("stdout", reader.read_error)
+        if _stderr_failures:
+            raise self._pipe_reader_error("stderr", _stderr_failures[0])
         if _stderr_overflow.is_set():
             raise self._output_limit_error("stderr")
         if reader.fired:
@@ -1216,33 +2026,56 @@ class BaseProvider(ABC):
 
         if proc.returncode not in (0, None):
             err = classify(self.name, stderr_text, "", proc.returncode)
-            # attach a marker so the outer retry loop can decide
+            # Private markers let the outer loop enforce both public-output and
+            # raw tool-evidence boundaries without changing UnifiedError's ABI.
             err._produced_any = produced_any  # type: ignore[attr-defined]
+            err._retry_evidence_safe = bool(  # type: ignore[attr-defined]
+                retry_evidence_safe
+                and _retry_evidence_proves_no_side_effects("", stderr_text, err)
+            )
             raise err
 
     def _stream_run(
-        self, args: list[str], stdin_data: Optional[str] = None
+        self,
+        args: list[str],
+        stdin_data: Optional[str] = None,
+        *,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Iterator[Message]:
-        """Sync streaming with one auth-fallback retry on pre-stream failure."""
-        try:
-            yield from self._stream_once(
-                args,
-                fallback=False,
-                stream_state=self._new_stream_state(),
-                stdin_data=stdin_data,
-            )
-            return
-        except UnifiedError as err:
-            produced = getattr(err, "_produced_any", False)
-            if (err.kind == "auth_expired"
-                    and not produced
-                    and self.allow_api_key_fallback
-                    and self.api_key_env in os.environ):
-                yield from self._stream_once(
-                    args,
-                    fallback=True,
-                    stream_state=self._new_stream_state(),
-                    stdin_data=stdin_data,
-                )
+        """Sync streaming with bounded replay before any public event only."""
+        scheduled_delay = 0.0
+        for attempt in range(_RETRY_MAX_ATTEMPTS):
+            emitted = False
+            once_kwargs = {
+                "fallback": False,
+                "stream_state": self._new_stream_state(),
+                "stdin_data": stdin_data,
+            }
+            if cancel_event is not None:
+                once_kwargs["cancel_event"] = cancel_event
+            try:
+                for message in self._stream_once(args, **once_kwargs):
+                    if _cancel_requested(cancel_event):
+                        raise _cancelled_error(self.name)
+                    emitted = True
+                    if _cancel_requested(cancel_event):
+                        raise _cancelled_error(self.name)
+                    yield message
                 return
-            raise
+            except UnifiedError as err:
+                evidence_safe = bool(
+                    not emitted
+                    and not getattr(err, "_produced_any", False)
+                    and getattr(err, "_retry_evidence_safe", False)
+                )
+                if self._retryable(err, evidence_safe=evidence_safe) and (
+                    attempt + 1 < _RETRY_MAX_ATTEMPTS
+                ):
+                    waited = self._wait_for_retry(
+                        err, attempt, scheduled=scheduled_delay,
+                        cancel_event=cancel_event,
+                    )
+                    if waited is not None:
+                        scheduled_delay = waited
+                        continue
+                raise

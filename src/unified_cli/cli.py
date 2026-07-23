@@ -7,8 +7,10 @@ import json
 import os
 import sys
 import time
+import unicodedata
 from dataclasses import asdict
 from typing import Optional
+from urllib.parse import quote
 
 from rich.console import Console
 from rich.live import Live
@@ -16,7 +18,7 @@ from rich.markup import escape
 from rich.table import Table
 
 from . import i18n, settings
-from .core import ProviderName
+from .core import ProviderId, ProviderName
 from .errors import UnifiedError
 from .factory import create, route
 from .i18n import t
@@ -180,7 +182,11 @@ def _cmd_status(args: argparse.Namespace) -> int:
 # ----- models -----
 
 def _cmd_models(args: argparse.Namespace) -> int:
-    mods = list_models(args.provider, force_refresh=args.refresh)
+    try:
+        mods = list_models(args.provider, force_refresh=args.refresh)
+    except UnifiedError as exc:
+        err_console.print(f"[red]{escape(str(exc))}[/red]")
+        return 2
     if args.json:
         print(json.dumps(
             [{"id": m.id, "provider": m.provider, "display_name": m.display_name,
@@ -203,13 +209,62 @@ def _cmd_models(args: argparse.Namespace) -> int:
     return 0
 
 
+# ----- providers -----
+
+def _cmd_providers(args: argparse.Namespace) -> int:
+    # Registry import is intentionally command-local.  Parser construction,
+    # --help, and --version therefore cannot trigger entry-point discovery.
+    from .registry import list_providers
+
+    try:
+        descriptors = list_providers(include_ext=args.include_ext)
+    except UnifiedError as exc:
+        err_console.print(f"[red]{escape(str(exc))}[/red]")
+        return 2
+    if args.json:
+        print(json.dumps([
+            {
+                "id": item.id,
+                "source": item.source,
+                "status": item.status,
+                "lifecycle_status": item.lifecycle_status,
+                "support_status": item.support_status,
+                "default_model": item.default_model,
+                "capabilities": sorted(item.capabilities),
+                "route_prefixes": list(item.route_prefixes),
+                "server_policy": (
+                    asdict(item.server_policy) if item.server_policy else None
+                ),
+                "error": item.error,
+            }
+            for item in descriptors
+        ], ensure_ascii=False, indent=2))
+        return 0
+
+    tbl = Table(title=t("cli.providers.title"), show_lines=False,
+                header_style="bold cyan")
+    tbl.add_column(t("cli.providers.col.id"), style="bold")
+    tbl.add_column(t("cli.providers.col.source"))
+    tbl.add_column(t("cli.providers.col.status"))
+    tbl.add_column(t("cli.providers.col.support"))
+    tbl.add_column(t("cli.providers.col.default"))
+    for item in descriptors:
+        tbl.add_row(
+            escape(item.id), item.source, item.lifecycle_status,
+            item.support_status,
+            escape(item.default_model or "-"),
+        )
+    console.print(tbl)
+    return 0
+
+
 # ----- chat -----
 
 def _resolve_session_flags(
     args: argparse.Namespace,
-    routed_provider: Optional[ProviderName],
+    routed_provider: Optional[ProviderId],
     routed_model: Optional[str],
-) -> tuple[Optional[ProviderName], Optional[str], Optional[str], Optional[str]]:
+) -> tuple[Optional[ProviderId], Optional[str], Optional[str], Optional[str]]:
     """Resolve session flags to (provider, model, session_id, saved_cwd).
 
     Rules:
@@ -276,6 +331,41 @@ def _effective_cwd(explicit_cwd: Optional[str], saved_cwd: Optional[str]) -> str
     return resolve_cwd(os.getcwd()) or os.getcwd()
 
 
+def _valid_explicit_provider_id(value: object) -> bool:
+    """Validate an exact CLI selection without reflecting unbounded input."""
+
+    from .plugin import _valid_provider_id
+
+    return _valid_provider_id(value)
+
+
+_ROUTE_ERROR_MAX_CHARS = 1_024
+
+
+def _bounded_route_error_text(error: UnifiedError, model: str) -> str:
+    """Bound only adversarial route errors; preserve ordinary text exactly."""
+
+    text = str(error)
+    unsafe_model = len(model) > 512 or any(
+        unicodedata.category(char).startswith("C")
+        or unicodedata.category(char) in {"Zl", "Zp"}
+        for char in model
+    )
+    if not unsafe_model:
+        # Core route errors of ordinary size retain their historical bytes.
+        return text
+    rendered = []
+    for char in text[:_ROUTE_ERROR_MAX_CHARS]:
+        category = unicodedata.category(char)
+        rendered.append(
+            "�" if category.startswith("C") or category in {"Zl", "Zp"}
+            else char
+        )
+    if len(text) > _ROUTE_ERROR_MAX_CHARS:
+        rendered.append("…")
+    return "".join(rendered)
+
+
 def _print_session_panel(
     resp, resumed_from: Optional[str], latency_ms: int
 ) -> None:
@@ -301,13 +391,21 @@ def _print_session_panel(
 def _cmd_chat(args: argparse.Namespace) -> int:
     import time as _t
 
-    # Route -m flag first.
-    provider, model = (None, args.model)
-    if args.model:
+    if args.provider is not None and not _valid_explicit_provider_id(args.provider):
+        err_console.print(f"[red]{t('cli.provider.invalid')}[/red]")
+        return 2
+
+    # An explicit provider owns the model string literally, including `/`.
+    # Without it, retain the historical model-routing path byte-for-byte.
+    provider, model = (args.provider, args.model)
+    if args.provider is None and args.model:
         try:
             provider, model = route(args.model)
         except UnifiedError as e:
-            err_console.print(f"[red]{t('cli.chat.route_failed')}[/red] {escape(str(e))}")
+            route_error = _bounded_route_error_text(e, args.model)
+            err_console.print(
+                f"[red]{t('cli.chat.route_failed')}[/red] {escape(route_error)}"
+            )
             return 2
 
     # Resolve session flags (may override provider/model from state file).
@@ -327,11 +425,56 @@ def _cmd_chat(args: argparse.Namespace) -> int:
 
     provider = provider or _configured_default_provider()
 
+    images = getattr(args, "images", None) or None
+    if provider not in {"claude", "codex", "gemini"}:
+        try:
+            # Exact, support-gated metadata snapshot.  This loads no provider
+            # callback and lets capability failures stop before construction.
+            from .registry import snapshot_provider_descriptor
+
+            descriptor = snapshot_provider_descriptor(provider)
+        except UnifiedError as e:
+            err_console.print(f"[red]{escape(str(e))}[/red]")
+            return 3
+        if args.terse:
+            err_console.print(f"[red]{t('cli.chat.terse_unsupported')}[/red]")
+            return 2
+        if model is not None:
+            from .plugin import _valid_model_id
+
+            if not _valid_model_id(model):
+                err_console.print(f"[red]{t('cli.model.invalid_extension')}[/red]")
+                return 2
+        required = []
+        if session_id:
+            required.append("sessions")
+        if images:
+            required.append("images")
+        missing = next(
+            (capability for capability in required
+             if capability not in descriptor.capabilities),
+            None,
+        )
+        if missing is not None:
+            err_console.print(
+                "[red]"
+                + t(
+                    "cli.chat.capability_required",
+                    provider=provider,
+                    capability=missing,
+                )
+                + "[/red]"
+            )
+            return 2
+
     create_kwargs: dict = {
         "model": model,
-        "web_search": args.web_search,
         "cwd": effective_cwd,
     }
+    # Core historically receives this option.  Extensions never receive the
+    # Core-only web_search keyword, for either CLI flag state.
+    if provider in {"claude", "codex", "gemini"}:
+        create_kwargs["web_search"] = args.web_search
     # --terse is Claude-specific (others already default to concise replies).
     if args.terse and provider == "claude":
         create_kwargs["terse"] = True
@@ -352,7 +495,6 @@ def _cmd_chat(args: argparse.Namespace) -> int:
         err_console.print(f"[yellow]{t('cli.chat.need_prompt')}[/yellow]")
         return 2
 
-    images = getattr(args, "images", None) or None
     t0 = _t.time()
     try:
         if args.stream:
@@ -498,11 +640,34 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     """Launch the localhost dashboard + OpenAI-compatible server."""
     try:
         from .server import run  # lazy (fastapi/uvicorn — optional extra)
+        if getattr(args, "manage", False):
+            from .server import prepare_manage
     except ImportError:
         console.print(f"[red]{t('cli.serve.missing_deps')}[/red]")
         console.print(t("cli.serve.install_hint"))
         return 3
+
+    manage = getattr(args, "manage", False)
+    workspaces = tuple(getattr(args, "workspace", ()) or ())
+    if workspaces and not manage:
+        err_console.print(f"[red]{t('cli.serve.workspace_requires_manage')}[/red]")
+        return 2
+
     url = f"http://127.0.0.1:{args.port}/dashboard"
+    if manage:
+        try:
+            token = prepare_manage(workspaces)
+        except UnifiedError as e:
+            err_console.print(f"[red]{escape(str(e))}[/red]")
+            return 2
+        except (OSError, TypeError, ValueError):
+            # The backend validates paths as its final authority.  Keep a
+            # malformed workspace from becoming a CLI traceback if a backend
+            # implementation raises a built-in validation error instead.
+            err_console.print(f"[red]{t('cli.serve.invalid_workspace')}[/red]")
+            return 2
+        url = f"{url}#bootstrap={quote(token, safe='')}"
+
     console.print(t("cli.serve.starting", url=url))
     if args.open:
         try:
@@ -511,9 +676,18 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         except Exception:  # noqa: BLE001 - opening a browser is best-effort
             pass
     try:
-        run(host="127.0.0.1", port=args.port)
+        if manage:
+            run(host="127.0.0.1", port=args.port,
+                manage=True, workspaces=workspaces)
+        else:
+            run(host="127.0.0.1", port=args.port)
     except UnifiedError as e:
         console.print(f"[red]{escape(str(e))}[/red]")
+        return 2
+    except OSError:
+        # `run()` failures occur after workspace preparation; report them as
+        # bind/start failures instead of incorrectly blaming a workspace.
+        err_console.print(f"[red]{t('cli.serve.server_start_failed')}[/red]")
         return 2
     return 0
 
@@ -558,7 +732,7 @@ def _prescan_lang(raw: list[str]) -> None:
             pass  # let the parser surface the invalid-choice error
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     raw = list(sys.argv[1:] if argv is None else argv)
 
     # Keep version probing automation-friendly: no parser construction, Rich
@@ -619,12 +793,22 @@ def main(argv: list[str] | None = None) -> int:
     p_stat.set_defaults(func=_cmd_status)
 
     p_mod = _add("models", help=t("cli.help.models"))
-    p_mod.add_argument("provider", nargs="?", choices=["claude", "codex", "gemini"],
+    p_mod.add_argument("provider", nargs="?",
                        help=t("cli.help.models.provider"))
     p_mod.add_argument("--refresh", action="store_true",
                        help=t("cli.help.models.refresh"))
     p_mod.add_argument("--json", action="store_true", help=t("cli.help.models.json"))
     p_mod.set_defaults(func=_cmd_models)
+
+    p_providers = _add("providers", help=t("cli.help.providers"))
+    p_providers.add_argument(
+        "--include-ext", action="store_true",
+        help=t("cli.help.providers.include_ext"),
+    )
+    p_providers.add_argument(
+        "--json", action="store_true", help=t("cli.help.providers.json"),
+    )
+    p_providers.set_defaults(func=_cmd_providers)
 
     p_config = _add("config", help=t("cli.help.config"))
     config_sub = p_config.add_subparsers(dest="config_cmd", required=True)
@@ -647,6 +831,8 @@ def main(argv: list[str] | None = None) -> int:
                         help=t("cli.help.chat.prompt"))
     p_chat.add_argument("-m", "--model",
                         help=t("cli.help.chat.model"))
+    p_chat.add_argument("--provider",
+                        help=t("cli.help.chat.provider"))
     p_chat.add_argument("--stream", action="store_true",
                         help=t("cli.help.chat.stream"))
     p_chat.add_argument("--no-web-search", dest="web_search",
@@ -673,8 +859,8 @@ def main(argv: list[str] | None = None) -> int:
     p_chat.set_defaults(func=_cmd_chat)
 
     p_repl = _add("repl", help=t("cli.help.repl"))
-    p_repl.add_argument("--provider", choices=["claude", "codex", "gemini"],
-                        default=None, help=t("cli.help.repl.provider"))
+    p_repl.add_argument("--provider", default=None,
+                        help=t("cli.help.repl.provider"))
     p_repl.add_argument("-m", "--model",
                         help=t("cli.help.repl.model"))
     p_repl.add_argument("--no-web-search", dest="web_search",
@@ -692,9 +878,15 @@ def main(argv: list[str] | None = None) -> int:
                          help=t("cli.help.serve.port"))
     p_serve.add_argument("--open", action="store_true",
                          help=t("cli.help.serve.open"))
+    p_serve.add_argument("--manage", action="store_true",
+                         help=t("cli.help.serve.manage"))
+    p_serve.add_argument("--workspace", action="append", default=[], metavar="PATH",
+                         help=t("cli.help.serve.workspace"))
     p_serve.set_defaults(func=_cmd_serve)
 
     ns = parser.parse_args(raw)
+    if ns.cmd == "serve" and ns.workspace and not ns.manage:
+        parser.error(t("cli.serve.workspace_requires_manage"))
     # Apply --lang from the parsed namespace too (covers `--lang=ko` placed
     # after the subcommand, which the prescan above still catches, plus keeps
     # the override authoritative for the command body).

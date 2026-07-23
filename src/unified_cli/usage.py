@@ -16,13 +16,13 @@ from collections import deque
 from dataclasses import asdict, dataclass, field
 from typing import Optional
 
-from .core import ProviderName
+from .core import ProviderId
 
 
 @dataclass
 class CallRecord:
     ts: float                # unix epoch
-    provider: ProviderName
+    provider: ProviderId
     model: str
     input_tokens: int
     output_tokens: int
@@ -36,7 +36,7 @@ class CallRecord:
 
 @dataclass
 class ProviderAggregate:
-    provider: ProviderName
+    provider: ProviderId
     calls: int = 0
     errors: int = 0
     input_tokens: int = 0
@@ -56,12 +56,12 @@ class UsageTracker:
 
     def __init__(self, history_size: int = 100):
         self._history: deque[CallRecord] = deque(maxlen=history_size)
-        self._agg: dict[ProviderName, ProviderAggregate] = {}
+        self._agg: dict[ProviderId, ProviderAggregate] = {}
         self._lock = threading.Lock()
 
     def record(
         self,
-        provider: ProviderName,
+        provider: ProviderId,
         model: str,
         input_tokens: int = 0,
         output_tokens: int = 0,

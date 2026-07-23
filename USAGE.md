@@ -63,6 +63,18 @@ By default the wrapper runs on your subscription OAuth and strips any inherited
 silently switch you to per-token billing). See the README section “Running under
 launchd / cron / a server” for the full recipe.
 
+For an intentionally metered call, create a new Python provider/request and
+pass the key explicitly; a failed OAuth turn is never replayed with it:
+
+```python
+from unified_cli import create
+
+metered = create(
+    "claude", extra_env={"ANTHROPIC_API_KEY": "<key-from-secret-store>"},
+)
+metered.chat("new request")
+```
+
 ## The four daily usage patterns
 
 | Goal | Tool |
@@ -129,6 +141,9 @@ unified-cli chat "hi" --no-web-search
 # read prompt from stdin (long content)
 cat error.log | unified-cli chat "diagnose this error" -m sonnet
 
+# exact extension selection; the slash-containing model ID stays literal
+unified-cli chat "hello" --provider exact-extension-id --model vendor/family/model
+
 # image input (one or many; works for all 3 providers)
 unified-cli chat "what's in this photo?" --image cat.png -m haiku
 unified-cli chat "compare these two charts" --image a.png --image b.png -m gpt-5.4-mini
@@ -139,6 +154,7 @@ unified-cli chat "compare these two charts" --image a.png --image b.png -m gpt-5
 ```bash
 unified-cli repl                              # configured default (Claude until changed)
 unified-cli repl --provider codex -m gpt-5.4-mini
+unified-cli repl --provider exact-extension-id -m vendor/family/model
 unified-cli repl --no-web-search              # disable web search
 unified-cli repl --lang ko                    # Korean UI
 ```
@@ -155,15 +171,15 @@ Inside the REPL, slash commands let you change context without restarting:
 | Command | What it does |
 |---|---|
 | `/help` | List all commands (localized to the current language) |
-| `/model [name]` | No argument → **picker** listing each provider's latest models (default marked ★); `/model <name>` switches model within the current provider (multi-word `agy` display names supported) |
-| `/provider [name]` | No argument → **picker** to choose a provider; either way the previous 8 turns are auto-injected as context |
-| `/status` | Live, auto-refreshing status panel inside the REPL (Ctrl+C returns to the prompt) |
+| `/model [literal\|--refresh]` | A literal sets the current provider's model without probing. Core's no-argument picker uses its in-memory cache/fallback; an extension uses only its descriptor default and last successful explicit refresh snapshot. |
+| `/provider [exact-id]` | An exact ID loads only that extension's metadata. The no-argument picker shows Core plus extension descriptors already loaded in this process. |
+| `/status` | Show a process-local state/session/usage/descriptor snapshot without provider probes. |
 | `/lang <en\|ko>` | Switch the UI language live and persist it to `~/.unified-cli/settings.json` |
 | `/new` | Reset the conversation (drop history) |
 | `/save` | Show current `session_id` + how to resume from CLI |
 | `/history [N]` | Show last N turns (default 10) |
 | `/tokens` | Per-provider usage aggregate for this REPL session |
-| `/doctor` | One-line health for each provider |
+| `/doctor` | With Core selected, show only the existing Core health table. With an extension selected, call only that extension's explicit doctor; arbitrary return data is never rendered. |
 | `/image <path>` | Attach an image for the next user message (repeatable) |
 | `/images` | List currently pending image attachments |
 | `/clear-images` | Drop pending attachments |
@@ -585,11 +601,11 @@ Every failure is a `UnifiedError` with a `kind` field:
 
 | kind | Meaning | What to do |
 |---|---|---|
-| `auth_expired` | OAuth token expired | Re-run the provider's login. Claude/Codex may retry once with configured `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`; `agy` is OAuth-only. |
-| `rate_limit` | Weekly/daily quota hit | Switch providers or wait |
+| `auth_expired` | OAuth token expired | Re-run the provider's login. Authentication failures are never replayed with a different credential. |
+| `rate_limit` | Transient 429 or weekly/daily quota hit | A pre-turn transient 429 may retry within strict delay caps; quota exhaustion does not. Otherwise switch providers or wait. |
 | `model_not_allowed` | Model rejected for your account | Check `unified-cli models` |
 | `not_found` | Session/resource not found (e.g., wrong cwd for Gemini) | Use a fresh session |
-| `network` | DNS/ECONNRESET | Already retried 2x — check connectivity |
+| `network` | DNS/connection failure | Only clearly pre-turn transient failures retry automatically. Failures after output or possible tool execution do not. |
 | `resource_limit` | A local output, stream, or HTTP safety ceiling was reached | Reduce the request/output; raise an explicit limit only for a trusted workload |
 | `config` | Bad provider name or routing | Error message + hint |
 | `internal` | Unknown — check `.cause` field | Raw stderr first line |
@@ -602,7 +618,7 @@ try:
     create("claude").chat("...")
 except UnifiedError as e:
     if e.kind == "auth_expired":
-        print("Run `claude /login` or set ANTHROPIC_API_KEY:", e.hint)
+        print("Run `claude /login`:", e.hint)
     elif e.kind == "rate_limit":
         create("codex").chat("...")             # try the next provider
     else:
@@ -632,14 +648,21 @@ the request — useful for debugging cross-provider routing.
 **Q. How do I deploy this headless (CI / server)?**
 → Use the provider's supported headless auth first: for Claude, create a
 `CLAUDE_CODE_OAUTH_TOKEN` with `claude setup-token`; Codex uses its own CLI
-login state. `agy` requires an existing OAuth session and has no API-key
-fallback. `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` are intentional metered
-fallbacks only when you explicitly want that billing mode:
+login state. `agy` requires an existing OAuth session. The wrapper never swaps
+credentials to replay a failed turn. If you intentionally want metered API
+billing, pass the provider key explicitly through `extra_env` for that provider
+instance and issue a new request:
 ```bash
 export CLAUDE_CODE_OAUTH_TOKEN=<token>
-# Optional, intentional metered fallbacks:
-# export ANTHROPIC_API_KEY=sk-ant-...
-# export OPENAI_API_KEY=...
+```
+
+```python
+from unified_cli import create
+
+metered = create(
+    "claude", extra_env={"ANTHROPIC_API_KEY": "<key-from-secret-store>"},
+)
+metered.chat("new request")
 ```
 
 **Q. Can I fork / modify / redistribute?**
@@ -650,7 +673,7 @@ export CLAUDE_CODE_OAUTH_TOKEN=<token>
 ```
 factory.create(provider, ...)          ← simplest entry point
     └→ ClaudeProvider / CodexProvider / GeminiProvider
-         └→ BaseProvider._run / _stream_run   ← subprocess + retry + api-key fallback
+         └→ BaseProvider._run / _stream_run   ← subprocess + side-effect-aware retry
               └→ errors.classify              ← converts any failure to UnifiedError
 
 UnifiedConversation                    ← multi-provider chat

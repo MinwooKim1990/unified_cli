@@ -216,11 +216,14 @@ def test_turn_error_does_not_crash_repl(monkeypatch):
     assert rc == 0  # turn error degraded, then clean EOF exit
 
 
-# round-9: dashboard model-bar map must be prototype-safe (model ids are user-controlled).
+# Dashboard model-bar map must be prototype-safe (model ids are user-controlled).
 def test_dashboard_model_map_is_prototype_safe():
-    from unified_cli.dashboard_tpl import DASHBOARD_HTML
-    assert "Object.create(null)" in DASHBOARD_HTML
-    assert "var merged = {}" not in DASHBOARD_HTML
+    from unified_cli.dashboard_tpl import load_dashboard_asset
+    app_js, mime = load_dashboard_asset("app.js")
+    assert mime == "text/javascript; charset=utf-8"
+    assert "new Map()" in app_js
+    assert "Object.create(null)" not in app_js
+    assert "var merged = {}" not in app_js
 
 
 # round-7: the prompt_toolkit history file must be 0o600 (REPL prompts may hold secrets).

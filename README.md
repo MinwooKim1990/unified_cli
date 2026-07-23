@@ -16,7 +16,7 @@ pip install unified-cli
 ```
 
 This includes the full interactive REPL (live `/` slash-menu, model/provider
-pickers, live `/status`) — `prompt_toolkit` ships as a core dependency, so no
+pickers, snapshot-only `/status`) — `prompt_toolkit` ships as a core dependency, so no
 extra is needed for it.
 
 For the OpenAI-compatible HTTP server, install the optional `server` extra:
@@ -42,11 +42,71 @@ pip install "unified-cli[server]"
 > **Any subset works** — you do not need all three. The wrapper simply uses
 > whichever of `claude` / `codex` / `agy` it finds on your `$PATH`.
 
-## ⚠️ Terms of Service & account-ban risk — read before using
+## Core and Ext
+
+| | Core: `unified-cli` | Ext: [`unified-cli-ext`](https://pypi.org/project/unified-cli-ext/) |
+|---|---|---|
+| Included providers | Claude, Codex, Gemini (`agy`) | 18-item catalog metadata: Grok, Kimi, Copilot, Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, Cline, OpenCode, Kilo Code, Factory Droid, Pi, Oh My Pi, Hermes, Poolside, Amp, GitLab Duo |
+| Default behavior | Existing defaults are unchanged | Never changes Core defaults or its server allowlist |
+| Current state | Core providers retain their existing behavior | Grok is a read-tool-limited **Preview** with offline fixtures and one representative authenticated native smoke; the other 17 entries are **Held**; extension server support is disabled |
+
+Ext is a separate PyPI distribution and Python module (`unified_cli_ext`). It
+does not bundle vendor CLIs, sign you in, call a service, or create charges.
+Provider binaries and accounts remain yours to install and manage.
+
+<details>
+<summary>Install Ext and check its catalog metadata</summary>
+
+```bash
+python -m pip install unified-cli-ext
+python -c "import importlib.metadata as m; print([e.name for e in m.distribution('unified-cli-ext').entry_points if e.group == 'unified_cli.providers.v1'])"
+```
+
+The check lists installed provider entry-point metadata. In Stages 5B–5F it
+may list `grok`, `kimi`, `copilot`, `cursor`, `codebuddy`, `qoder`,
+`mistral-vibe`, `qwen`, `cline`, `opencode`, `kilo`, `droid`, `pi`,
+`oh-my-pi`, `hermes`, `poolside`, `amp`, and `gitlab-duo`. Listing metadata does
+not run a provider, locate a vendor binary, authenticate, or make a network
+request. Grok is the only runnable Preview; the other 17 entries are Held.
+
+`unified-cli providers --include-ext` keeps discovery import-free, so a newly
+discovered extension first displays lifecycle `discovered` and support
+`unknown`. When a provider is explicitly requested, Core loads only that entry
+point. Held entries remain unavailable. Grok runs only after the explicitly
+selected local binary passes its exact `0.2.111` version and feature probes;
+unreviewed updates fail closed. A
+representative isolated device-code smoke passed with official native Grok
+`0.2.111` on macOS arm64 on 2026-07-23; it remains Preview and disabled in
+server mode. The documented native snapshot and
+`configure_extension_provider(...)` registration are required before the first
+request.
+
+Grok's primary official native installer is `https://x.ai/cli/install.sh`
+(`@xai-official/grok` is an official npm alternative); see
+[Extensions](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.md)
+for its complete native snapshot, isolated-home login, registration, and
+fail-closed Preview boundary. Do not assume it reuses a generic host login.
+The read-only controls and gitignore-aware traversal are defense in depth, not
+a complete secret boundary.
+
+```bash
+# Run only after completing the linked setup.
+unified-cli chat "explain this project" --provider grok --model grok-4.5
+```
+
+</details>
+
+See [Extensions](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.md) for the provider catalog, status meanings,
+and the evidence required before a provider can be enabled.
+
+<a id="provider-usage-policy"></a>
+
+## Terms of Service & provider usage policy — read before using
 
 > **You are responsible for complying with each provider's Terms of Service.**
-> Automating these CLIs may breach them — **use at your own risk**. Terms are
-> evolving (clarified Feb 2026); this is not legal advice.
+> Automation may not be permitted for every account or use case, and service
+> access may be restricted. Terms are evolving (clarified Feb 2026); this is
+> not legal advice.
 
 - **Intended safe pattern = personal, local, individual use with your OWN
   subscription.** Anthropic officially supports headless `claude -p` /
@@ -54,12 +114,13 @@ pip install "unified-cli[server]"
   other people.
 - **Do NOT:** run the OpenAI-compatible server on a public/network interface,
   route other people's requests through your subscription, share credentials,
-  or resell/proxy access. These violate the providers' ToS and **risk account
-  suspension or a permanent ban**.
-- **Antigravity (`agy` / the `gemini` provider) is the riskiest.** Google has
-  **banned individual accounts** for automating it (the ban cascaded across
-  Gemini CLI / Code Assist). For that reason the `gemini` provider is now
-  **disabled by default** — enable it at your own risk by setting
+  or resell/proxy access. These may conflict with provider policies and can
+  result in service access being restricted.
+- **Antigravity (`agy` / the `gemini` provider) requires additional policy
+  review.** Google has reported access restrictions for individual accounts
+  that automate it, including related Gemini CLI / Code Assist access. For
+  that reason the `gemini` provider is **disabled by default** — enable it
+  only after reviewing the applicable policy by setting
   `UNIFIED_CLI_ENABLE_GEMINI=1`.
 - **The `unified-cli serve` and `python -m unified_cli.server` launchers bind to
   `127.0.0.1` (localhost) by default** and **refuse a non-loopback host unless**
@@ -80,13 +141,13 @@ interface, both as a **terminal CLI** and as a **Python library you can
 
 > The provider key for the Google side is still `"gemini"` (and `-m
 > gemini-3.5-flash` etc. still route to it), but it now wraps the **Antigravity
-> `agy` CLI** — Google blocked the old `gemini` CLI for individual accounts in
-> 2026. See the migration note below.
+> `agy` CLI** — access to the old `gemini` CLI was restricted for individual
+> accounts in 2026. See the migration note below.
 >
 > ⚠️ **The `gemini` provider is disabled by default** because automating `agy`
-> has gotten individual Google accounts banned. Set
-> `UNIFIED_CLI_ENABLE_GEMINI=1` to enable it, at your own risk — see
-> [Terms of Service & account-ban risk](#️-terms-of-service--account-ban-risk--read-before-using).
+> can result in Google service access restrictions. Set
+> `UNIFIED_CLI_ENABLE_GEMINI=1` only after reviewing the applicable policy — see
+> [Terms of Service & provider usage policy](#provider-usage-policy).
 
 ```bash
 # CLI
@@ -104,8 +165,8 @@ conv.send("Continue", provider="gemini")   # needs UNIFIED_CLI_ENABLE_GEMINI=1
 ```
 
 > The `gemini` provider is **disabled by default** (Antigravity `agy` automation
-> has gotten Google accounts banned). Export `UNIFIED_CLI_ENABLE_GEMINI=1` before
-> any `gemini` example below will work.
+> can result in Google service access restrictions). Export
+> `UNIFIED_CLI_ENABLE_GEMINI=1` before any `gemini` example below will work.
 
 ## Why this exists
 
@@ -123,8 +184,8 @@ can import**.
 - **Dual mode**: full-featured CLI (`unified-cli chat`, `repl`, `status`, ...)
   AND clean Python API (`from unified_cli import ...`) — same code, same state
 - **Subscription-aware**: uses your existing `claude` / `codex login` / `agy`
-  OAuth. Claude/Codex fall back automatically to `ANTHROPIC_API_KEY` /
-  `OPENAI_API_KEY` if OAuth expires (agy is OAuth-only)
+  OAuth. Inherited vendor API keys are stripped, and authentication failures
+  never replay a turn under a different credential
 - **Multi-turn history**: CLI via `--continue` / `--resume`, Python via
   `session_id=` or `UnifiedConversation`
 - **Cross-provider conversation**: one `UnifiedConversation` can switch providers
@@ -155,8 +216,8 @@ can import**.
 - **Rich terminal UI**: `doctor` health table, `status --watch` live dashboard,
   `setup` interactive wizard, streaming spinner
 - **Interactive REPL** (`unified-cli repl`): live `/` slash-command menu,
-  `/model` and `/provider` pickers (latest models listed, default marked ★),
-  live `/status`, cross-provider switching — powered by `prompt_toolkit`
+  `/model` and `/provider` snapshot pickers (default marked ★),
+  snapshot-only `/status`, cross-provider switching — powered by `prompt_toolkit`
 - **Localized (i18n)**: English by default, Korean with `--lang ko` (or
   `/lang ko` in the REPL, or `UNIFIED_CLI_LANG=ko`)
 
@@ -172,7 +233,21 @@ Override via `-m <name>`. The wrapper passes any model ID straight through to
 the underlying CLI; `unified-cli models` shows the available list as a starting
 point. For the absolute fastest interactive feel use `-m gpt-5.3-codex-spark`.
 
-> **Gemini → Antigravity migration**: As of 2026, Google blocked the old
+Model discovery is explicit and uses a one-hour, monotonic in-process cache;
+imports, server startup, management bootstrap, and REPL startup do not populate
+it. Cache and flight keys retain only SHA-256 context fingerprints: normalized
+Claude credentials plus proxy/TLS inputs, the canonical Codex HOME/cache-file
+identity, or Gemini opt-in/PATH/override plus passive `agy` metadata. No binary
+is executed to build a fingerprint. Same-context concurrent refreshes share one
+probe. Context entries use LRU bounds of eight per provider and 24 globally;
+active refreshes are bounded to four per provider and 12 globally, with a
+retryable `resource_limit` error when full. Use
+`list_models(provider, force_refresh=True)` or `unified-cli models --refresh`
+to refresh explicitly, and `invalidate_model_cache(provider)` (or no argument
+for all built-ins) to discard cached records. Returned `ModelInfo` objects are
+copies, so caller mutation never changes later results.
+
+> **Gemini → Antigravity migration**: As of 2026, Google restricted the old
 > `gemini` CLI for individual accounts (`IneligibleTierError: ... migrate to
 > the Antigravity suite`). The `gemini` provider now wraps the **Antigravity
 > `agy` CLI** (`~/.local/bin/agy`). `agy` is fully agentic (web search,
@@ -184,13 +259,13 @@ point. For the absolute fastest interactive feel use `-m gpt-5.3-codex-spark`.
 > silently fall back to the default. Note: `agy` headless mode outputs plain
 > text (no token-usage reporting).
 >
-> ⚠️ **Disabled by default.** Because automating `agy` has gotten individual
-> Google accounts banned, the `gemini` provider only activates when
+> ⚠️ **Disabled by default.** Because automating `agy` can lead to Google
+> service access restrictions, the `gemini` provider only activates when
 > `UNIFIED_CLI_ENABLE_GEMINI=1` is set. Without it, direct `gemini`/`agy` calls
 > (and the `gemini-*` model examples above) raise a config error. The HTTP server
 > is stricter still: it returns HTTP 403 for Gemini until its separate agentic
-> provider opt-in is enabled inside an external sandbox. Enable direct use at
-> your own risk.
+> provider opt-in is enabled inside an external sandbox. Review the applicable
+> provider policy before enabling direct use.
 
 ## Install from source (development)
 
@@ -238,12 +313,16 @@ unified-cli chat "continue from earlier" --resume <session_id>
 
 # Interactive REPL — type `/` for a live menu (/model & /provider pickers, /status, /lang, ...)
 unified-cli repl
+unified-cli repl --provider exact-extension-id --model vendor/family/model
 
 # Stream + web-search (both defaults)
 unified-cli chat "latest Python release?" --stream
 
 # Cheapest fast query
 unified-cli chat "quick q" -m gpt-5.3-codex-spark
+
+# Exact extension selection; --model stays literal even with slashes
+unified-cli chat "hello" --provider exact-extension-id --model vendor/family/model
 
 # Image input (works with all 3 providers — see Features above for details)
 unified-cli chat "what's in this photo?" --image cat.png -m haiku
@@ -265,9 +344,9 @@ them.
 ```text
 [claude/haiku] > hello
 [claude/haiku] > /                         # live dropdown of all slash commands
-[claude/haiku] > /model                    # picker: latest models per provider (default ★)
+[claude/haiku] > /model                    # Core cache/fallback or loaded Ext snapshot (default ★)
 [claude/sonnet] > /provider                # picker: choose a provider (context auto-injected)
-[codex/gpt-5.4-mini] > /status             # live status panel (Ctrl+C → back to prompt)
+[codex/gpt-5.4-mini] > /status             # process-local snapshot; no provider probe
 [codex/gpt-5.4-mini] > /lang ko            # switch the UI to Korean (persists)
 [codex/gpt-5.4-mini] > /image photo.png    # attach image for the next turn
 [codex/gpt-5.4-mini] > describe this
@@ -275,14 +354,21 @@ them.
 [codex/gpt-5.4-mini] > /exit               # state saved → `chat --continue` from here
 ```
 
-- **`/model`** with no argument opens a picker of each provider's latest models
-  (default marked ★) — `/model <name>` still works too.
-- **`/provider`** likewise opens a picker.
-- **`/status`** shows a live, auto-refreshing status panel inside the REPL.
+- **`/model`** with no argument opens a picker. Core uses its in-memory
+  cache/fallback; an explicitly loaded extension shows only its descriptor
+  default and last successful `/model --refresh` snapshot. `/model <literal>`
+  sets the literal model ID without probing.
+- **`/provider <exact-id>`** loads only that extension's metadata. The picker
+  shows Core plus extension descriptors already loaded in this process.
+- **`/status`** shows a process-local snapshot and never probes providers.
+- **`/doctor`** shows the existing Core health table when Core is selected. For
+  a selected extension it calls only that extension's explicit doctor and
+  renders only a Core-owned generic result.
 - **`/lang en` / `/lang ko`** switches the UI language live and persists it.
 
 Slash commands: `/help` `/model` `/provider` `/status` `/lang` `/new` `/save`
-`/history` `/tokens` `/doctor` `/image` `/images` `/clear-images` `/exit`.
+`/history` `/tokens` `/doctor` `/image` `/images` `/clear-images` `/exit`
+(`/quit` alias).
 When stdin/stdout isn't a TTY, the REPL falls back to a plain `input()` loop
 with the same commands.
 
@@ -377,8 +463,8 @@ uvicorn unified_cli.server:app --port 8000
 > Raw `uvicorn ... --host 0.0.0.0` can still open a listener, but the app's ASGI
 > guard returns HTTP 403 for that non-loopback bind, peer, or Host until the same
 > opt-in is set. It also logs a personal-use warning on startup. Exposing your
-> personal subscription to other people / over a network violates the providers'
-> ToS and **risks an account ban** — keep it local.
+> personal subscription to other people / over a network can violate provider
+> terms and lead to service-access restrictions, so keep it local.
 
 > **External mode is not a public-service mode.** If an independently managed
 > deployment must bind outside loopback, it needs both
@@ -387,6 +473,25 @@ uvicorn unified_cli.server:app --port 8000
 > requires `Authorization: Bearer <token>`, including diagnostics. Use a TLS
 > reverse proxy and a single trusted client; a Bearer token provides neither
 > HTTPS nor per-user isolation. The browser dashboard is intended for local use.
+
+The opt-in management dashboard never verifies providers or loads models during
+bootstrap. Those probes begin only after the corresponding explicit action.
+Within that runtime, successful version/auth and non-empty model results use
+separate five-minute/15-second/one-minute TTLs. Same-context model misses share
+one Manage flight; explicit invalidation and shutdown fence both the Manage and
+Core model generations. A forced verification queued behind an ordinary one
+waits for it, after which concurrent forced callers share one new generation;
+different providers remain independent. Version/auth entries are keyed by the
+exact executable selected from `PATH`; Gemini model entries fingerprint the
+effective `agy` selected by Core discovery, including `AGY_CLI_PATH`. Claude
+models use the HTTP API and Codex models use `~/.codex/models_cache.json`, so
+those two model paths execute no CLI and have no fabricated binary identity.
+Auth and model data are additionally isolated by hashed HOME/provider-
+environment context. Executable identity is local invocation/canonical-target
+metadata, not vendor/package provenance. The verifier API also has no provider
+account identifier, so an account changed by an external process may remain
+visible for at most the short auth TTL. Observed binary replacement invalidates
+all of that provider's probe records.
 
 > **HTTP trust boundary.** By default the server accepts only Claude models,
 > using Claude safe mode with no agent tools for text requests and a scoped
@@ -469,14 +574,24 @@ path):
 claude setup-token                         # run ONCE in a real terminal
 # → copy the token into your service environment:
 export CLAUDE_CODE_OAUTH_TOKEN=<token>     # OAuth-equivalent, NOT metered
-# (or, to use metered API billing instead:  export ANTHROPIC_API_KEY=sk-...)
 ```
 
 > By default the wrapper runs on your **subscription OAuth** and **strips any
 > inherited `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`** from the child env, so an
 > exported key can't silently switch you to per-token billing. Set
-> `CLAUDE_CODE_OAUTH_TOKEN` for headless auth; only export the API key if you
-> *want* metered billing.
+> `CLAUDE_CODE_OAUTH_TOKEN` for headless auth. If you intentionally want a
+> metered call, make a **new Python request** and pass the key explicitly:
+
+```python
+from unified_cli import create
+
+metered = create(
+    "claude", extra_env={"ANTHROPIC_API_KEY": "<key-from-secret-store>"},
+)
+metered.chat("new request")
+```
+
+The wrapper never retries a failed OAuth turn with this credential.
 
 **Prove it before you ship.** Run the preflight **from the same context** as
 your service (e.g. inside the launchd job) — it makes a tiny real call per
@@ -571,7 +686,7 @@ unified_cli/
 │   ├── core.py          # Message, Response, Usage, ModelInfo dataclasses
 │   ├── errors.py        # UnifiedError + classify() per-provider matchers
 │   ├── discovery.py     # find_{claude,codex,gemini}_bin()
-│   ├── base.py          # BaseProvider ABC + retry/fallback
+│   ├── base.py          # BaseProvider ABC + side-effect-aware retry
 │   ├── providers/       # claude.py, codex.py, gemini.py
 │   ├── conversation.py  # UnifiedConversation (cross-provider context)
 │   ├── state.py         # ~/.unified-cli/state.json read/write

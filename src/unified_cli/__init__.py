@@ -36,15 +36,44 @@ Error handling:
         e.hint  # 사용자용 복구 힌트
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 from .base import BaseProvider
 from .conversation import UnifiedConversation
-from .core import Message, ModelInfo, ProviderName, Response, Usage
+from .core import Message, ModelInfo, ProviderId, ProviderName, Response, Usage
 from .errors import ErrorKind, UnifiedError, classify
+from .extension_config import ExtensionLaunchOverridesV1, StoredExtensionLaunchV1
 from .factory import PROVIDERS, create, route
-from .models import DEFAULT_MODELS, list_models
+from .models import DEFAULT_MODELS, invalidate_model_cache, list_models
+from .plugin import (
+    PROVIDER_CONFIGURATION_ABI_V1,
+    PROVIDER_PLUGIN_ABI_V1,
+    BoundProviderOperationsV1,
+    ProviderBoundFactoryV1,
+    ProviderCreateRequestV1,
+    ProviderDoctorV1,
+    ProviderFactoryV1,
+    ProviderLaunchBinderV1,
+    ProviderLaunchContextV1,
+    ProviderModelListerV1,
+    ProviderPluginV1,
+    ProviderReceiptEnvelopeV1,
+    ProviderServerPolicyV1,
+    ProviderSupportStatusV1,
+)
 from .providers import ClaudeProvider, CodexProvider, GeminiProvider
+from .registry import (
+    ENTRY_POINT_GROUP,
+    ProviderDescriptor,
+    ProviderDescriptorV1,
+    bind_extension_provider,
+    clear_extension_provider_configuration,
+    configure_extension_provider,
+    doctor_provider,
+    list_providers,
+    load_provider_plugin,
+    snapshot_provider_descriptor,
+)
 from .state import SessionState, load_last_session, save_last_session
 from .usage import UsageTracker, tracker
 
@@ -61,16 +90,44 @@ __all__ = [
     "ErrorKind",
     "Message",
     "ModelInfo",
+    "PROVIDER_CONFIGURATION_ABI_V1",
+    "PROVIDER_PLUGIN_ABI_V1",
+    "BoundProviderOperationsV1",
+    "ENTRY_POINT_GROUP",
+    "ExtensionLaunchOverridesV1",
+    "ProviderBoundFactoryV1",
+    "ProviderDescriptor",
+    "ProviderDescriptorV1",
+    "ProviderCreateRequestV1",
+    "ProviderDoctorV1",
+    "ProviderFactoryV1",
+    "ProviderId",
+    "ProviderLaunchBinderV1",
+    "ProviderLaunchContextV1",
     "ProviderName",
+    "ProviderModelListerV1",
+    "ProviderPluginV1",
+    "ProviderReceiptEnvelopeV1",
+    "ProviderServerPolicyV1",
+    "ProviderSupportStatusV1",
     "Response",
+    "StoredExtensionLaunchV1",
     "Usage",
     "DEFAULT_MODELS",
     "PROVIDERS",
+    "bind_extension_provider",
     "classify",
+    "clear_extension_provider_configuration",
+    "configure_extension_provider",
     "create",
+    "doctor_provider",
+    "invalidate_model_cache",
     "list_models",
+    "list_providers",
+    "load_provider_plugin",
     "load_last_session",
     "route",
     "save_last_session",
+    "snapshot_provider_descriptor",
     "tracker",
 ]

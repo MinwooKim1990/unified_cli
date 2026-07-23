@@ -8,9 +8,9 @@
 
 Claude Code / OpenAI Codex / Google Antigravity(`agy`) 세 CLI를 **하나의 Python API + CLI** 로 통합.
 
-> Google 쪽 provider 키는 여전히 `"gemini"` (그리고 `-m gemini-3.5-flash` 등도 그대로 라우팅) 이지만, 내부적으로 **Antigravity `agy` CLI** 를 래핑합니다 — 2026년 구 `gemini` CLI 가 개인 계정에서 차단됐기 때문. 아래 마이그레이션 노트 참고.
+> Google 쪽 provider 키는 여전히 `"gemini"` (그리고 `-m gemini-3.5-flash` 등도 그대로 라우팅) 이지만, 내부적으로 **Antigravity `agy` CLI** 를 래핑합니다 — 2026년 구 `gemini` CLI 의 개인 계정 접근이 제한됐기 때문입니다. 아래 마이그레이션 노트 참고.
 >
-> ⚠️ **`gemini` provider 는 기본 비활성화** 입니다. `agy` 자동화로 Google 개인 계정이 차단된 사례가 있어, `UNIFIED_CLI_ENABLE_GEMINI=1` 을 설정해야만 본인 책임 하에 켜집니다 — [이용약관 & 계정 정지 위험](#️-이용약관--계정-정지-위험--사용-전-반드시-읽기) 참고.
+> ⚠️ **`gemini` provider 는 기본 비활성화** 입니다. `agy` 자동화는 Google 서비스 이용 제한으로 이어질 수 있어, 적용되는 정책을 확인한 뒤에만 `UNIFIED_CLI_ENABLE_GEMINI=1` 을 설정하세요 — [이용약관 및 Provider 사용 정책](#provider-usage-policy-ko) 참고.
 
 ## 설치
 
@@ -19,7 +19,7 @@ pip install unified-cli
 ```
 
 여기엔 완전한 대화형 REPL(라이브 `/` 슬래시 메뉴, 모델/provider 선택기,
-라이브 `/status`)이 포함됩니다 — `prompt_toolkit` 이 코어 의존성이라 별도
+probe 없는 `/status` 스냅샷)이 포함됩니다 — `prompt_toolkit` 이 코어 의존성이라 별도
 옵션 설치가 필요 없습니다.
 
 OpenAI 호환 HTTP 서버까지 쓰려면 `server` 옵션 의존성을 함께 설치:
@@ -44,12 +44,66 @@ pip install "unified-cli[server]"
 > 셋 다 필요하지 않습니다 — **일부만 있어도 동작**합니다. 래퍼는 `$PATH` 에서
 > 발견되는 `claude` / `codex` / `agy` 만 사용합니다.
 
-## ⚠️ 이용약관 & 계정 정지 위험 — 사용 전 반드시 읽기
+## Core와 Ext
 
-> **각 provider 의 이용약관(ToS) 준수 책임은 사용자 본인에게 있습니다.** 이
-> CLI 들을 자동화하면 약관을 위반할 수 있으니 **사용에 따른 위험은 본인이
-> 부담**합니다. 약관은 계속 바뀌고 있으며(2026년 2월 명확화), 이 문서는 법률
-> 자문이 아닙니다.
+| | Core: `unified-cli` | Ext: [`unified-cli-ext`](https://pypi.org/project/unified-cli-ext/) |
+|---|---|---|
+| 포함 provider | Claude, Codex, Gemini (`agy`) | 18개 카탈로그 메타데이터: Grok, Kimi, Copilot, Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, Cline, OpenCode, Kilo Code, Factory Droid, Pi, Oh My Pi, Hermes, Poolside, Amp, GitLab Duo |
+| 기본 동작 | 기존 기본값은 바뀌지 않음 | Core 기본값과 서버 허용 목록을 절대 변경하지 않음 |
+| 현재 상태 | Core provider는 기존 동작을 유지 | Grok은 오프라인 fixture와 대표 인증 native smoke를 거친 읽기 도구 제한 **Preview**, 나머지 17개는 **Held**, 확장 서버 지원은 비활성화 |
+
+Ext는 별도 PyPI 배포판이자 Python 모듈(`unified_cli_ext`)입니다. vendor CLI를
+포함하지 않고, 로그인·서비스 호출·과금 발생을 하지 않습니다. provider 바이너리와
+계정은 사용자가 직접 설치하고 관리합니다.
+
+<details>
+<summary>Ext 설치 및 카탈로그 메타데이터 확인</summary>
+
+```bash
+python -m pip install unified-cli-ext
+python -c "import importlib.metadata as m; print([e.name for e in m.distribution('unified-cli-ext').entry_points if e.group == 'unified_cli.providers.v1'])"
+```
+
+이 확인은 설치된 provider 엔트리포인트 메타데이터만 나열합니다. Stage 5B–5F에서는
+`grok`, `kimi`, `copilot`, `cursor`, `codebuddy`, `qoder`, `mistral-vibe`, `qwen`,
+`cline`, `opencode`, `kilo`, `droid`, `pi`, `oh-my-pi`, `hermes`, `poolside`, `amp`,
+`gitlab-duo`가 표시될 수 있습니다. 이 메타데이터 목록 조회는 provider 실행, vendor
+바이너리 탐색, 인증, 네트워크 요청을 하지 않습니다. 실행 가능한 Preview는 Grok 하나이며
+나머지 17개 항목은 Held입니다.
+
+`unified-cli providers --include-ext`는 import 없이 탐색하므로 처음에는 수명 주기
+`discovered`, 지원 상태 `unknown`으로 표시합니다. 해당 provider를 명시적으로 요청할
+때만 그 엔트리포인트 하나를 로드합니다. Held 항목은 실행되지 않습니다. Grok은 명시적으로
+선택한 로컬 바이너리가 정확한 `0.2.111` 버전·기능 probe를 통과해야만 실행되며 검토하지
+않은 업데이트는 fail closed합니다. 공식 native Grok
+`0.2.111`의 macOS arm64 대표 격리 device-code smoke는 2026-07-23에 통과했지만, Grok은
+계속 Preview이고 서버 모드는 비활성입니다. 첫 요청 전에 문서의 native snapshot과
+`configure_extension_provider(...)` 등록이 필요합니다.
+
+Grok의 기본 공식 native 설치 경로는 `https://x.ai/cli/install.sh`이며
+`@xai-official/grok`은 공식 npm 대안입니다. 격리된 home과 fail-closed Preview 경계는
+[확장](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.ko.md)의 전체 native
+snapshot, 격리 home 로그인, 등록 절차를 따르세요. 일반 host 로그인을 재사용한다고
+가정하지 마세요. read-only 통제와 gitignore-aware 탐색은 defense in depth이며 완전한
+secret boundary가 아닙니다.
+
+```bash
+# 위 링크의 설정을 완료한 뒤에만 실행합니다.
+unified-cli chat "이 프로젝트를 설명해줘" --provider grok --model grok-4.5
+```
+
+</details>
+
+provider 카탈로그, 상태 의미, 활성화 전 필요한 근거는
+[확장](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.ko.md)을 참고하세요.
+
+<a id="provider-usage-policy-ko"></a>
+
+## 이용약관 및 Provider 사용 정책 — 사용 전 확인
+
+> **각 provider 의 이용약관(ToS) 준수 책임은 사용자 본인에게 있습니다.** 자동화가
+> 모든 계정이나 사용 사례에서 허용되는 것은 아니며 서비스 이용이 제한될 수 있습니다.
+> 약관은 계속 바뀌고 있으며(2026년 2월 명확화), 이 문서는 법률 자문이 아닙니다.
 
 - **권장되는 안전한 사용 방식 = 본인 구독으로 하는 개인·로컬·단독 사용.**
   Anthropic 은 헤드리스 `claude -p` / 프로그래밍 방식 사용을 **공식적으로
@@ -57,12 +111,11 @@ pip install "unified-cli[server]"
   마세요.
 - **하지 말 것:** OpenAI 호환 서버를 공개/네트워크 인터페이스로 띄우기, 다른
   사람의 요청을 본인 구독으로 처리하기, 자격증명 공유, 접근 권한 재판매/프록시.
-  이것들은 provider 의 ToS 위반이며 **계정 정지 또는 영구 차단 위험**이 있습니다.
-- **Antigravity (`agy` / `gemini` provider) 가 가장 위험합니다.** Google 은
-  이를 자동화한 **개인 계정을 실제로 차단**했습니다(차단이 Gemini CLI / Code
-  Assist 까지 연쇄 적용). 그래서 `gemini` provider 는 이제 **기본 비활성화**
-  되어 있으며, 환경변수 `UNIFIED_CLI_ENABLE_GEMINI=1` 을 설정해야만 본인 책임
-  하에 켜집니다.
+  이는 provider 정책과 충돌할 수 있으며 서비스 이용이 제한될 수 있습니다.
+- **Antigravity (`agy` / `gemini` provider)는 추가 정책 확인이 필요합니다.** Google은
+  이를 자동화한 개인 계정에서 관련 Gemini CLI / Code Assist 접근을 포함한 이용 제한
+  사례를 알린 바 있습니다. 그래서 `gemini` provider는 **기본 비활성화**되어 있으며,
+  적용되는 정책을 확인한 뒤에만 환경변수 `UNIFIED_CLI_ENABLE_GEMINI=1`을 설정하세요.
 - **`unified-cli serve` 및 `python -m unified_cli.server` 런처는 기본적으로
   `127.0.0.1`(localhost)에 바인딩**되며, `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1`을
   설정하지 않는 한 **loopback 이 아닌 호스트를 거부**합니다. raw `uvicorn`은
@@ -75,10 +128,11 @@ pip install "unified-cli[server]"
   가져오며, 어떤 자격증명도 대신 저장·전송하지 않습니다.
 
 - 구독 OAuth (Pro/Max, ChatGPT Plus/Pro, Antigravity) 로 로그인되어 있으면 **구독 크레딧으로** 실행
-- Claude/Codex 는 API 키 환경변수로 **자동 폴백** (agy 는 OAuth 전용)
+- 상속된 provider API 키는 자식 환경에서 제거하며, 인증 실패 턴을 다른
+  credential로 자동 재생하지 않음
 - **이미지 입력 멀티모달** — 3 provider 전부. Claude 는 Read 도구, Codex 는 `-i` 플래그, Gemini(`agy`) 는 `@<path>` 참조를 사용합니다. 권한 우회는 자동으로 켜지지 않습니다.
 - 히스토리 · 스트리밍 · 도구 사용 · **웹서치 기본 ON** · OpenAI 호환 HTTP 서버
-- 대화형 **REPL** (`unified-cli repl`): `/` 입력 시 라이브 슬래시 메뉴, `/model`·`/provider` 선택기(최신 모델 표시, 기본값 ★), 라이브 `/status` — `prompt_toolkit` 기반
+- 대화형 **REPL** (`unified-cli repl`): `/` 입력 시 라이브 슬래시 메뉴, `/model`·`/provider` 선택기, probe 없는 `/status` 스냅샷 — `prompt_toolkit` 기반
 - **다국어(i18n)**: 기본 영어, `--lang ko`(또는 REPL 의 `/lang ko`, 또는 `UNIFIED_CLI_LANG=ko`)로 한국어
 - 리디자인된 자동 갱신 **웹 대시보드** `/dashboard` (`/` 접속 시 자동 리다이렉트)
 - 명시적 에러 분류 (auth_expired / rate_limit / model_not_allowed / not_found / network / resource_limit / config / internal)
@@ -151,19 +205,21 @@ provider 별 처리:
 ```bash
 unified-cli repl                          # 설정된 기본 provider (설정 전 Claude)로 시작
 unified-cli repl --provider codex -m gpt-5.4-mini
+unified-cli repl --provider exact-extension-id -m vendor/family/model
 ```
 
 ```text
 [claude/haiku] > /                         # 모든 슬래시 명령 라이브 드롭다운
-[claude/haiku] > /model                    # 선택기: provider 별 최신 모델 (기본값 ★)
+[claude/haiku] > /model                    # Core cache/fallback 또는 로드된 확장 snapshot (기본값 ★)
 [claude/sonnet] > /provider                # 선택기: provider 선택 (컨텍스트 자동 주입)
-[codex/gpt-5.4-mini] > /status             # 라이브 상태 패널 (Ctrl+C → 프롬프트로 복귀)
+[codex/gpt-5.4-mini] > /status             # provider probe 없는 프로세스 로컬 스냅샷
 [codex/gpt-5.4-mini] > /lang ko            # UI 를 한국어로 전환 (저장됨)
 ```
 
-- **`/model`** (인자 없이) → provider 별 최신 모델 선택기(기본값 ★). `/model <name>` 도 그대로 동작.
-- **`/provider`** (인자 없이) → provider 선택기.
-- **`/status`** → REPL 안에서 자동 갱신되는 라이브 상태 패널.
+- **`/model`** (인자 없이) → Core는 메모리 cache/fallback, 명시적으로 불러온 확장은 descriptor 기본 모델과 마지막 성공 refresh 스냅샷만 표시. `/model <literal>`은 probe 없이 그대로 설정.
+- **`/provider <정확한-id>`** → 해당 확장 metadata 하나만 로드. 인자 없는 선택기는 Core와 이미 로드된 확장 snapshot만 표시.
+- **`/status`** → provider probe 없는 프로세스 로컬 스냅샷.
+- **`/doctor`** → Core 선택 시 기존 Core health 표만 표시. 확장 선택 시 해당 확장의 명시적 doctor만 호출하고 Core가 정한 일반 결과만 표시.
 - **`/lang en` / `/lang ko`** → UI 언어 즉시 전환 + 저장.
 
 슬래시 명령:
@@ -171,19 +227,19 @@ unified-cli repl --provider codex -m gpt-5.4-mini
 | 명령 | 동작 |
 |---|---|
 | `/help` | 명령 목록 (현재 언어로) |
-| `/model [name]` | 인자 없으면 모델 선택기, 있으면 같은 provider 에서 모델 변경 |
-| `/provider [name]` | 인자 없으면 provider 선택기, 있으면 전환 (이전 8턴 컨텍스트 자동 주입) |
-| `/status` | REPL 안 라이브 상태 패널 (Ctrl+C 로 복귀) |
+| `/model [literal\|--refresh]` | literal은 probe 없이 그대로 설정; 확장 refresh는 명시적으로만 실행 |
+| `/provider [정확한-id]` | 정확한 확장 metadata 하나만 로드; 선택기는 Core + 이미 로드된 snapshot |
+| `/status` | provider probe 없는 프로세스 로컬 상태 스냅샷 |
 | `/lang <en\|ko>` | UI 언어 전환 + 저장 |
 | `/new` | 대화 초기화 |
 | `/save` | 현재 session_id + 이어쓰기 명령 표시 |
 | `/history [N]` | 최근 N 턴 표시 |
 | `/tokens` | 누적 사용량 |
-| `/doctor` | provider 헬스 한 줄 |
+| `/doctor` | Core 선택 시 Core health 표만, 확장 선택 시 해당 확장의 명시적 doctor만 실행(임의 반환값은 표시 안 함) |
 | `/image <path>` | 다음 prompt 에 이미지 첨부 (반복 가능) |
 | `/images` | 첨부 목록 |
 | `/clear-images` | 첨부 비우기 |
-| `/exit` or Ctrl+D | 종료 (마지막 session_id 자동 저장) |
+| `/exit`, `/quit`, Ctrl+D | 종료 (마지막 session_id 자동 저장) |
 
 TTY 가 아니면(파이프 등) 같은 명령을 쓰는 평범한 `input()` 루프로 폴백합니다.
 REPL 종료 후 `unified-cli chat "..." --continue` 로도 대화가 이어집니다.
@@ -280,7 +336,7 @@ conv.send("내 이름 뭐였지?", provider="codex")     # ← 자동으로 Clau
 conv.send("내 이름 한 번 더 말해", provider="gemini")  # UNIFIED_CLI_ENABLE_GEMINI=1 필요
 ```
 
-> `gemini` provider 는 **기본 비활성화** 입니다(Antigravity `agy` 자동화로 Google 계정이 차단된 사례 있음). 위·아래 `gemini` 예제는 `UNIFIED_CLI_ENABLE_GEMINI=1` 을 먼저 설정해야 동작합니다.
+> `gemini` provider 는 **기본 비활성화** 입니다(Antigravity `agy` 자동화는 Google 서비스 이용 제한으로 이어질 수 있음). 적용되는 정책을 확인한 뒤 `UNIFIED_CLI_ENABLE_GEMINI=1` 을 설정해야 위·아래 `gemini` 예제가 동작합니다.
 
 같은 provider 로 연속 호출하면 native session (`--resume`) 으로 처리되어 효율적.
 `sticky=True` 로 생성하면 첫 provider 에 고정되고 전환 시 에러.
@@ -301,9 +357,9 @@ for msg in cli.stream("오늘 최신 Python 버전은?"):
 cli = create("claude", web_search=False)
 ```
 
-> Gemini provider는 이제 Antigravity `agy` CLI를 래핑합니다. agy는 에이전틱이라 웹서치를 스스로 판단해 수행하며 on/off 토글이 없습니다 (`web_search=`는 사실상 no-op). 단, **기본 비활성화**라 `UNIFIED_CLI_ENABLE_GEMINI=1` 을 설정해야 사용할 수 있습니다(`agy` 자동화 계정 차단 위험).
+> Gemini provider는 이제 Antigravity `agy` CLI를 래핑합니다. agy는 에이전틱이라 웹서치를 스스로 판단해 수행하며 on/off 토글이 없습니다 (`web_search=`는 사실상 no-op). 단, **기본 비활성화**라 `UNIFIED_CLI_ENABLE_GEMINI=1` 을 설정해야 사용할 수 있습니다(`agy` 자동화 시 서비스 이용 제한 가능성).
 
-## 에러 분류 + 자동 복구
+## 에러 분류 + 제한된 안전 재시도
 
 ```python
 from unified_cli import UnifiedError
@@ -318,9 +374,10 @@ except UnifiedError as e:
 ```
 
 동작:
-- **auth_expired**: Claude/Codex 는 `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` 환경변수가 있으면 **자동으로 1회 재시도**. 없으면 hint 포함한 에러 raise. Gemini provider(Antigravity `agy`)는 **OAuth 전용**이라 API 키 폴백이 없으니 `agy` 재로그인이 필요
-- **network**: exponential backoff (0.5s, 1.5s) 로 최대 2회 재시도
-- **rate_limit / model_not_allowed / not_found**: 즉시 raise
+- **auth_expired / 403 authorization / quota / policy denial**: credential을 바꾸거나 턴을 재생하지 않고 즉시 raise
+- **network / rate_limit**: 턴 및 tool 실행 전임이 출력 증거로 확인되는 일시적 네트워크 실패와 429만 최대 2회 재시도. 유효한 `Retry-After`를 우선 적용하고, 없으면 bounded exponential backoff + jitter 사용
+- **tool 실행 가능성이 있거나 streaming event가 하나라도 공개된 뒤의 실패**: 중복 side effect/output 방지를 위해 자동 재시도하지 않음
+- **model_not_allowed / not_found**: 즉시 raise
 
 ## CLI
 
@@ -369,8 +426,8 @@ uvicorn unified_cli.server:app --port 8000
 > (`0.0.0.0` 등)를 **거부**합니다. raw `uvicorn ... --host 0.0.0.0`은 listener를
 > 열 수 있지만, 같은 옵트인 전에는 앱의 ASGI 가드가 non-loopback bind·peer·Host를
 > HTTP 403으로 거부합니다. 기동 시 개인용 경고 로그도 출력합니다. 본인 구독을
-> 다른 사람/네트워크에 노출하면 provider ToS 위반이며 **계정 차단 위험**이 있으니
-> 로컬에서만 사용하세요.
+> 다른 사람이나 네트워크에 노출하면 provider 이용 약관에 맞지 않아 서비스 이용이
+> 제한될 수 있으니 로컬에서만 사용하세요.
 
 > **외부 모드는 공개 서비스 모드가 아닙니다.** 독립 관리 배포에서 loopback 밖으로
 > 바인딩해야 한다면 `UNIFIED_CLI_ALLOW_EXTERNAL_BIND=1`과 공백 없는 32 UTF-8
@@ -378,6 +435,25 @@ uvicorn unified_cli.server:app --port 8000
 > route(진단 포함)에 `Authorization: Bearer <token>`이 필요합니다. TLS reverse
 > proxy 뒤의 단일 신뢰 클라이언트에만 쓰세요. Bearer 토큰은 HTTPS나 사용자별 격리를
 > 제공하지 않으며 브라우저 대시보드는 로컬 사용용입니다.
+
+opt-in 관리 대시보드는 bootstrap 중 provider 검증이나 모델 로드를 실행하지 않습니다.
+각 probe는 사용자가 해당 동작을 명시적으로 요청한 뒤에만 시작됩니다. 같은 runtime
+안에서 성공한 version/auth 결과와 비어 있지 않은 model 결과는 각각
+5분/15초/1분 TTL을 사용합니다.
+같은 컨텍스트의 model cache miss는 하나의 Manage flight를 공유하며, 명시적
+invalidation과 shutdown은 Manage/Core 양쪽 model generation을 모두 fence합니다.
+ordinary verification 뒤에 들어온 force verification은 앞 요청이 끝날 때까지 기다린
+뒤 동시 force 호출끼리 하나의 새 generation을 공유하고, 서로 다른 provider는 독립적으로
+진행됩니다.
+version/auth는 `PATH`에서 선택된 정확한 실행 파일에 연결되고, Gemini 모델 결과는
+`AGY_CLI_PATH`를 포함한 Core discovery가 실제 선택한 `agy`를 fingerprint합니다.
+Claude 모델은 HTTP API, Codex 모델은 `~/.codex/models_cache.json`을 사용하므로 이 두
+모델 경로는 CLI를 실행하지 않으며 가상의 binary identity를 만들지 않습니다.
+auth/model 데이터는 해시된 HOME/provider 환경 컨텍스트로도 분리됩니다. 실행 파일
+식별 정보는 로컬 invocation/canonical target 메타데이터이지 vendor/package
+provenance는 아닙니다. verifier API에는 provider account identifier도 없으므로 외부
+프로세스가 계정을 바꾸면 짧은 auth TTL 동안 이전 상태가 보일 수 있습니다. 관찰된 실행
+파일 교체는 해당 provider의 모든 probe 레코드를 무효화합니다.
 
 > **HTTP 신뢰 경계.** 서버는 기본적으로 Claude 모델만 받습니다. 텍스트 요청은
 > Claude safe mode + 도구 없음으로, 이미지 요청은 전달된 이미지 바이트만 읽을 수
@@ -483,13 +559,24 @@ export CODEX_CLI_PATH=/opt/homebrew/bin/codex
 claude setup-token                         # 실제 터미널에서 한 번만 실행
 # → 나온 토큰을 서비스 환경변수로:
 export CLAUDE_CODE_OAUTH_TOKEN=<token>     # OAuth 등가, 종량 과금 아님
-# (종량 API 과금을 원하면 대신:  export ANTHROPIC_API_KEY=sk-...)
 ```
 
 > 기본적으로 래퍼는 **구독 OAuth**로 실행되며, 상속된
 > `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`를 자식 환경에서 **제거**합니다 — export된 키
 > 때문에 몰래 종량 과금으로 바뀌지 않게 하기 위함입니다. 헤드리스 인증은
-> `CLAUDE_CODE_OAUTH_TOKEN`을 쓰고, 종량 과금을 *원할 때만* API 키를 export 하세요.
+> `CLAUDE_CODE_OAUTH_TOKEN`을 쓰세요. 의도적으로 종량 호출을 하려면 **새 Python
+> 요청**에만 키를 명시적으로 전달하세요:
+
+```python
+from unified_cli import create
+
+metered = create(
+    "claude", extra_env={"ANTHROPIC_API_KEY": "<보안 저장소에서 읽은 키>"},
+)
+metered.chat("새 요청")
+```
+
+실패한 OAuth 턴을 이 credential로 자동 재시도하지 않습니다.
 
 **배포 전에 증명하세요.** 서비스와 **동일한 컨텍스트**(예: launchd 잡 내부)에서
 preflight를 실행하면 provider마다 아주 작은 실제 호출을 해서 거기서 auth가 실제로
@@ -516,6 +603,19 @@ unified-cli doctor --headless
 | Codex | `~/.codex/models_cache.json` (Codex CLI가 5분마다 업데이트) | 파일 기준 |
 | Gemini (`agy`) | `agy models` 출력 (Antigravity CLI 가 직접 표시) | 1시간 |
 
+이 캐시는 monotonic 시계를 사용하며 import, 서버 시작, 관리 화면 bootstrap,
+REPL 시작 시에는 채워지지 않습니다. cache/flight key에는 SHA-256 context fingerprint만
+남습니다. Claude는 정규화한 credential과 proxy/TLS 입력, Codex는 canonical
+HOME/cache 파일 identity, Gemini는 opt-in/PATH/override와 수동 `agy` 메타데이터를
+반영하며 fingerprint를 만들기 위해 실행 파일을 실행하지 않습니다. 같은 context의 동시
+refresh는 한 번의 probe를 공유합니다. Context cache는 provider당 8개/전체 24개 LRU,
+active refresh는 provider당 4개/전체 12개로 제한되며 가득 차면 재시도 가능한
+`resource_limit` 오류를 반환합니다. `list_models(provider, force_refresh=True)` 또는
+`unified-cli models --refresh`로 명시적으로 갱신하고,
+`invalidate_model_cache(provider)`(인자 생략 시 모든 내장 provider)로 폐기할 수
+있습니다. 반환되는 `ModelInfo`는 복사본이므로 호출자가 수정해도 이후 결과는 바뀌지
+않습니다.
+
 `agy` 를 찾지 못하거나 호출에 실패하면 하드코딩된 주요 모델 리스트로 폴백.
 **임의 모델 ID 는 리스트에 없어도 그대로 CLI 에 전달** — allowlist 는 정보용.
 
@@ -530,7 +630,7 @@ cli-wrapper-unified/
     ├── core.py          # Message, Response, Usage, ModelInfo
     ├── errors.py        # UnifiedError + classify (정규식 매칭 테이블)
     ├── discovery.py     # find_{claude,codex,gemini}_bin()
-    ├── base.py          # BaseProvider (retry + api-key fallback 포함)
+    ├── base.py          # BaseProvider (side-effect-aware retry 포함)
     ├── models.py        # list_models() dispatcher
     ├── factory.py       # create() + route()
     ├── conversation.py  # UnifiedConversation
@@ -545,7 +645,7 @@ cli-wrapper-unified/
 ## 주의
 
 - 구독 기반 호출은 **3자 서비스로 재판매 금지** (각 provider ToS). 개인 로컬 자동화 전용
-- `auth_expired` 자동 복구는 API 키 환경변수 fallback 뿐. 브라우저 로그인은 수동으로
+- `auth_expired`는 자동 재생하지 않습니다. hint에 따라 provider CLI에 수동으로 다시 로그인하세요.
 - 호출당 Node/Rust 프로세스 spawn 오버헤드 ~수백 ms — 초저지연 시스템엔 부적합
 - Gemini(`agy`)는 헤드리스 출력이 평문이라 토큰 사용량 보고가 없음(usage=None). 세션은 `--conversation <UUID>`/`--continue`, id는 `~/.gemini/antigravity-cli/conversations/`의 최신 .db에서 복구. 에이전틱 루프라 기본 timeout 300s
 
