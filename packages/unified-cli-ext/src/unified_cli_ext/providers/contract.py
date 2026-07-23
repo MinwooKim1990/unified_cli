@@ -489,14 +489,18 @@ class EnvironmentPolicy:
 
     allowed_keys: FrozenSet[str] = frozenset()
     required_keys: FrozenSet[str] = frozenset()
+    fixed_values: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         allowed = self._keys(self.allowed_keys, "environment allowlist")
         required = self._keys(self.required_keys, "required environment keys")
+        fixed = self._fixed(self.fixed_values)
+        allowed = allowed.union(fixed)
         if not required <= allowed:
             raise ConfigurationError("required environment keys must be allowlisted")
         object.__setattr__(self, "allowed_keys", allowed)
         object.__setattr__(self, "required_keys", required)
+        object.__setattr__(self, "fixed_values", fixed)
 
     @staticmethod
     def _keys(values: Iterable[object], label: str) -> FrozenSet[str]:
@@ -512,6 +516,39 @@ class EnvironmentPolicy:
             raise ConfigurationError("{} contains an invalid key".format(label))
         return frozenset(keys)
 
+    @classmethod
+    def _fixed(cls, values: Mapping[str, str]) -> Mapping[str, str]:
+        if not isinstance(values, Mapping):
+            raise ConfigurationError("fixed environment must be a mapping")
+        entries = []
+        try:
+            for index, pair in enumerate(values.items()):
+                if index >= 64:
+                    raise ConfigurationError("fixed environment has too many entries")
+                try:
+                    key, value = pair
+                except (TypeError, ValueError):
+                    raise ConfigurationError("fixed environment is malformed") from None
+                if type(value) is not str:
+                    raise ConfigurationError("fixed environment value is invalid")
+                _safe_text(
+                    value,
+                    label="fixed environment value",
+                    maximum=64 * 1024,
+                    empty=True,
+                    newlines=False,
+                )
+                entries.append((key, value))
+        except ConfigurationError:
+            raise
+        except Exception:
+            raise ConfigurationError("fixed environment is malformed") from None
+        keys = tuple(key for key, _value in entries)
+        clean_keys = cls._keys(keys, "fixed environment keys")
+        if len(clean_keys) != len(keys):
+            raise ConfigurationError("fixed environment contains duplicate keys")
+        return MappingProxyType(dict(entries))
+
     def select(self, source: Optional[Mapping[str, str]]) -> Mapping[str, str]:
         if source is None:
             source = {}
@@ -519,7 +556,7 @@ class EnvironmentPolicy:
             raise ConfigurationError("provider environment must be a mapping")
         selected = {}
         try:
-            for key in self.allowed_keys:
+            for key in self.allowed_keys.difference(self.fixed_values):
                 if key not in source:
                     continue
                 value = source[key]
@@ -537,6 +574,7 @@ class EnvironmentPolicy:
             raise
         except Exception:
             raise ConfigurationError("provider environment is malformed") from None
+        selected.update(self.fixed_values)
         if not self.required_keys <= set(selected):
             raise ConfigurationError("required provider environment is unavailable")
         return MappingProxyType(selected)
@@ -590,6 +628,7 @@ class PlainTextFieldSpec:
     terminator: Optional[str] = "\n"
     max_chars: int = 1024
     presence_only: bool = False
+    first_token: bool = False
 
     def __post_init__(self) -> None:
         marker = _safe_text(
@@ -612,6 +651,12 @@ class PlainTextFieldSpec:
             raise ConfigurationError("plain-text field limit is invalid")
         if type(self.presence_only) is not bool:
             raise ConfigurationError("plain-text presence marker is invalid")
+        if type(self.first_token) is not bool:
+            raise ConfigurationError("plain-text first-token marker is invalid")
+        if self.presence_only and self.first_token:
+            raise ConfigurationError(
+                "plain-text presence markers cannot extract a first token"
+            )
         object.__setattr__(self, "marker", marker)
 
 
@@ -673,6 +718,8 @@ class PlainTextProbeSpec:
     fields: Mapping[str, PlainTextFieldSpec] = field(default_factory=dict)
     expected: Mapping[str, Any] = field(default_factory=dict)
     identity_marker: Optional[str] = None
+    marker_prefixes: bool = False
+    identity_prefix: bool = False
     format: ProbeFormat = field(default=ProbeFormat.PLAIN_TEXT, init=False)
 
     def __post_init__(self) -> None:
@@ -695,6 +742,14 @@ class PlainTextProbeSpec:
                 newlines=False,
             )
             object.__setattr__(self, "identity_marker", identity)
+        if type(self.marker_prefixes) is not bool:
+            raise ConfigurationError("plain-text marker prefix mode is invalid")
+        if type(self.identity_prefix) is not bool:
+            raise ConfigurationError("plain-text identity prefix mode is invalid")
+        if self.identity_prefix and self.identity_marker is None:
+            raise ConfigurationError(
+                "plain-text identity prefix requires an explicit marker"
+            )
         object.__setattr__(self, "required_markers", markers)
         object.__setattr__(self, "fields", _plain_fields(self.fields))
         object.__setattr__(self, "expected", _expected_mapping(self.expected))
@@ -725,6 +780,8 @@ class VersionProbeSpec:
     format: ProbeFormat = ProbeFormat.JSONL
     version_marker: Optional[str] = None
     identity_marker: Optional[str] = None
+    version_is_first_token: bool = False
+    identity_prefix: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.command, FixedCommandSpec):
@@ -771,7 +828,22 @@ class VersionProbeSpec:
                     newlines=False,
                 )
                 object.__setattr__(self, "identity_marker", identity)
-        elif self.version_marker is not None or self.identity_marker is not None:
+            for label, value in (
+                ("plain version first-token marker", self.version_is_first_token),
+                ("plain version identity-prefix flag", self.identity_prefix),
+            ):
+                if type(value) is not bool:
+                    raise ConfigurationError("{} is invalid".format(label))
+            if self.identity_prefix and self.identity_marker is None:
+                raise ConfigurationError(
+                    "plain version identity prefix requires an explicit marker"
+                )
+        elif (
+            self.version_marker is not None
+            or self.identity_marker is not None
+            or self.version_is_first_token
+            or self.identity_prefix
+        ):
             raise ConfigurationError("plain version markers require plain-text format")
         object.__setattr__(self, "minimum_version", minimum)
 
@@ -785,6 +857,8 @@ class FeatureProbeSpec:
     format: ProbeFormat = ProbeFormat.JSONL
     feature_markers: Mapping[str, str] = field(default_factory=dict)
     identity_marker: Optional[str] = None
+    marker_prefixes: bool = False
+    identity_prefix: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.command, FixedCommandSpec):
@@ -847,7 +921,22 @@ class FeatureProbeSpec:
                     newlines=False,
                 )
                 object.__setattr__(self, "identity_marker", identity)
-        elif markers or self.identity_marker is not None:
+            for label, value in (
+                ("plain feature marker-prefix mode", self.marker_prefixes),
+                ("plain feature identity-prefix mode", self.identity_prefix),
+            ):
+                if type(value) is not bool:
+                    raise ConfigurationError("{} is invalid".format(label))
+            if self.identity_prefix and self.identity_marker is None:
+                raise ConfigurationError(
+                    "plain feature identity prefix requires an explicit marker"
+                )
+        elif (
+            markers
+            or self.identity_marker is not None
+            or self.marker_prefixes
+            or self.identity_prefix
+        ):
             raise ConfigurationError("feature markers require plain-text format")
         object.__setattr__(self, "required_features", frozenset(features))
         object.__setattr__(self, "feature_markers", MappingProxyType(markers))

@@ -557,6 +557,22 @@ def test_environment_policy_strips_ambient_and_unlisted_secrets(adapter_binary, 
     ) is True
 
 
+def test_environment_policy_fixed_values_cannot_be_overridden():
+    policy = EnvironmentPolicy(
+        allowed_keys=frozenset(("FIXTURE_AUTH",)),
+        fixed_values={"FIXTURE_SAFE_MODE": "true"},
+    )
+
+    assert policy.allowed_keys == frozenset(
+        ("FIXTURE_AUTH", "FIXTURE_SAFE_MODE")
+    )
+    assert dict(
+        policy.select(
+            {"FIXTURE_AUTH": "ready", "FIXTURE_SAFE_MODE": "false"}
+        )
+    ) == {"FIXTURE_AUTH": "ready", "FIXTURE_SAFE_MODE": "true"}
+
+
 @pytest.mark.parametrize(
     "failure_type", (KeyboardInterrupt, SystemExit, InjectedBaseException)
 )

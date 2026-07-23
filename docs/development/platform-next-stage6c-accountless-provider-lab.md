@@ -23,8 +23,8 @@ network or invoking an installer.
 
 | Provider | Unverified candidate coordinate | Binary | Version form | Help form | Accountless status form | Real install gate |
 | --- | --- | --- | --- | --- | --- | --- |
-| `grok` | `@xai-official/grok@0.2.106` | `grok` | `grok --version` | `grok --help` | unavailable | pinned npm SRI closure and digest-pinned Node runtime absent |
-| `kimi` | `@moonshot-ai/kimi-code@0.28.1` | `kimi` | `kimi --version` | `kimi --help` | unavailable | pinned npm SRI closure and digest-pinned Node runtime absent |
+| `grok` | `@xai-official/grok@0.2.110` | `grok` | `grok --version` | `grok --help` | unavailable | pinned npm SRI closure and digest-pinned Node runtime absent |
+| `kimi` | `@moonshot-ai/kimi-code@0.29.0` | `kimi` | `kimi --version` | `kimi --help` | unavailable | pinned npm SRI closure and digest-pinned Node runtime absent |
 | `copilot` | `@github/copilot@1.0.73` | `copilot` | `copilot --version` | `copilot help` | unavailable | pinned npm SRI closure and digest-pinned Node runtime absent |
 | `cursor` | build `2026.07.20-8cc9c0b` | `agent` | `agent --version` | `agent --help` | `agent status` | source-evidenced artifact checksum unavailable |
 

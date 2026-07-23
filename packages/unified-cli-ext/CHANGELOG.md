@@ -4,13 +4,16 @@ All notable changes to `unified-cli-ext` are documented in this file.
 
 ## [Unreleased]
 
-- Refines the inert Grok Build, Kimi Code CLI, GitHub Copilot CLI, and Cursor
-  Agent CLI catalog entries with current official identities, documented
-  command candidates, frozen future-lab targets, and explicit Stage 6 evidence
-  gates. All four remain Held with zero Core capabilities and no executable or
-  ACP path.
-
 ## [0.1.0] - 2026-07-22
+
+- Adds a server-disabled Grok Build Preview with fixed read-only agent tools,
+  bounded official-CLI probes, streaming JSONL/session normalization, and
+  offline regressions for malformed output, cancellation, and output limits;
+  it requires Grok `0.2.110` or later, fixes managed-MCP controls off, and fails
+  closed on project, provider-home, and managed system configuration. Its
+  authenticated real-CLI smoke remains pending, so it is not Stable.
+- Refreshes the Kimi Code CLI target to 0.29.0 while keeping Kimi, GitHub
+  Copilot CLI, Cursor Agent CLI, and the other 14 catalog entries Held.
 
 Initial extension-foundation release for `unified-cli` 0.5.x.
 

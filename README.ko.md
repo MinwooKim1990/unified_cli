@@ -50,7 +50,7 @@ pip install "unified-cli[server]"
 |---|---|---|
 | 포함 provider | Claude, Codex, Gemini (`agy`) | 18개 카탈로그 메타데이터: Grok, Kimi, Copilot, Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, Cline, OpenCode, Kilo Code, Factory Droid, Pi, Oh My Pi, Hermes, Poolside, Amp, GitLab Duo |
 | 기본 동작 | 기존 기본값은 바뀌지 않음 | Core 기본값과 서버 허용 목록을 절대 변경하지 않음 |
-| 현재 상태 | Core provider는 기존 동작을 유지 | 정확히 18개의 비활성 항목이 **Held**: 발견 가능한 메타데이터일 뿐, 실행 가능한 어댑터가 아니며 확장 서버 지원은 비활성화됨 |
+| 현재 상태 | Core provider는 기존 동작을 유지 | Grok은 오프라인 fixture로 검증한 읽기 도구 제한 **Preview**, 나머지 17개는 **Held**, 확장 서버 지원은 비활성화 |
 
 Ext는 별도 PyPI 배포판이자 Python 모듈(`unified_cli_ext`)입니다. vendor CLI를
 포함하지 않고, 로그인·서비스 호출·과금 발생을 하지 않습니다. provider 바이너리와
@@ -67,14 +67,27 @@ python -c "import importlib.metadata as m; print([e.name for e in m.distribution
 이 확인은 설치된 provider 엔트리포인트 메타데이터만 나열합니다. Stage 5B–5F에서는
 `grok`, `kimi`, `copilot`, `cursor`, `codebuddy`, `qoder`, `mistral-vibe`, `qwen`,
 `cline`, `opencode`, `kilo`, `droid`, `pi`, `oh-my-pi`, `hermes`, `poolside`, `amp`,
-`gitlab-duo`가 표시될 수 있으며 Ext 카탈로그는 18개 항목을 모두
-**Held**로 분류합니다. provider 실행, vendor 바이너리 탐색, 인증, 네트워크 요청은 하지
-않습니다. 목록에
-이름이 있다는 사실을 채팅 명령으로 해석하면 안 됩니다.
+`gitlab-duo`가 표시될 수 있습니다. 이 메타데이터 목록 조회는 provider 실행, vendor
+바이너리 탐색, 인증, 네트워크 요청을 하지 않습니다. 실행 가능한 Preview는 Grok 하나이며
+나머지 17개 항목은 Held입니다.
 
 `unified-cli providers --include-ext`는 import 없이 탐색하므로 처음에는 수명 주기
 `discovered`, 지원 상태 `unknown`으로 표시합니다. 해당 provider를 명시적으로 요청할
-때만 그 엔트리포인트 하나를 로드해 지원 상태 `held`를 확인하며, 실행은 계속 비활성입니다.
+때만 그 엔트리포인트 하나를 로드합니다. Held 항목은 실행되지 않습니다. Grok은 명시적으로
+선택한 로컬 바이너리가 제한된 버전·기능 probe를 통과해야만 실행되며, 실제 인증 CLI
+smoke test는 아직 남아 있고 서버 모드는 계속 비활성입니다. 첫 요청 전에 문서의 native
+snapshot과 `configure_extension_provider(...)` 등록이 필요합니다.
+
+Grok의 기본 공식 native 설치 경로는 `https://x.ai/cli/install.sh`이며
+`@xai-official/grok`은 공식 npm 대안입니다. 격리된 home과 fail-closed Preview 경계는
+[확장](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.ko.md)의 전체 native
+snapshot, 격리 home 로그인, 등록 절차를 따르세요. 일반 host 로그인을 재사용한다고
+가정하지 마세요.
+
+```bash
+# 위 링크의 설정을 완료한 뒤에만 실행합니다.
+unified-cli chat "이 프로젝트를 설명해줘" --provider grok --model grok-build
+```
 
 </details>
 

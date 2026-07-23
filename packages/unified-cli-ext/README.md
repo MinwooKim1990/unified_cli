@@ -2,8 +2,8 @@
 
 `unified-cli-ext` is the extension foundation for
 [`unified-cli`](https://github.com/MinwooKim1990/unified_cli). Version 0.1.0
-ships transport and runtime contracts plus an inert Stage 5B–5F catalog. It does
-**not** include a working or enabled provider adapter.
+ships transport and runtime contracts, one bounded Grok Build Preview adapter,
+and 17 inert Held catalog entries.
 
 ## What this release does—and does not do
 
@@ -16,28 +16,30 @@ exposure for extensions remains off.
 The installed catalog has entry-point metadata for Grok, Kimi, Copilot,
 Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, Cline, OpenCode, Kilo Code,
 Factory Droid, Pi, Oh My Pi, Hermes Agent, Poolside Agent CLI, Amp, and GitLab
-Duo CLI. Exactly 18 inert entries are **Held**. The adapter metadata records `chat` only
-as a provisional target; the Core plugin advertises no executable capability and
-cannot construct a provider or execute a command. These are not working
-adapters and must not be presented as Preview or Stable.
+Duo CLI. Grok is a read-tool-limited **Preview** with `chat`, `stream`, and
+`sessions` capabilities. The other 17 entries are **Held**: their Core plugins
+advertise no executable capability and cannot construct a provider or execute a
+command.
 
 For Grok Build, Kimi Code CLI, GitHub Copilot CLI, and Cursor Agent CLI, the
 catalog now binds official source links, frozen future-lab targets, documented
 command candidates, and explicit remaining Stage 6 evidence gates. Those are
-research records, not captured provider output or install/auth instructions.
-Grok's generic binary name still needs exact xAI provenance; Kimi `-p`
-auto-approves normal tools; Copilot still lacks verified JSONL and complete
-MCP/home isolation; and Cursor's positional prompt cannot be represented safely
-by the current ABI, so its prompt metadata is an inert placeholder. All four
-Core plugins advertise zero capabilities, keep server mode disabled, and fail
-before resolving a binary, reading ambient environment, or executing anything.
+research records, not authenticated provider captures. The Grok adapter accepts
+only the documented official CLI shape, rejects the known unrelated
+`@vibe-kit/grok-cli` shape, disables auto-update/web/plan/subagents/memory, and
+exposes only `read_file`, `grep`, and `list_dir`. Offline fixtures cover exact
+argv construction, stream/session normalization, malformed output, cancellation,
+and output limits. A real authenticated Grok smoke test is still pending, so it
+remains Preview and server-disabled. Kimi `-p` auto-approves normal tools;
+Copilot still lacks the required local provenance capture; and Cursor still
+needs its positional prompt and configuration boundaries verified. Those three
+and every remaining catalog entry stay Held.
 
-There are no bundled credentials, authentication flows, provider calls, or
-paid-service calls in this release. Installation does not install vendor CLIs,
-log in, call a service, or incur charges. Provider binaries and accounts stay
-user-owned. Its validation uses offline fixtures only. Because no provider is
-enabled, this release does not participate in vendor sign-in or request
-handling and does not read or import account data.
+There are no bundled credentials, login flows, or paid-service calls in this
+release. Installation does not install vendor CLIs, log in, call a service, or
+incur charges. Provider binaries and accounts stay user-owned. Grok calls occur
+only after the user explicitly selects `grok`; passive discovery performs no
+probe or provider call.
 
 Extensions are installed Python code and run as trusted code in the host
 Python process when loaded.  Install only distributions you trust.
@@ -56,15 +58,35 @@ compatible Core release:
 python -m pip install "unified-cli~=0.5.0" unified-cli-ext
 ```
 
-The import package is `unified_cli_ext`. No provider chat command, adapter
-configuration, or authentication setup is documented because no live provider
-is enabled. See the root [Extensions guide](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.md) for the
-Held catalog and official vendor documentation.
+The import package is `unified_cli_ext`. Before selecting Grok, complete the
+official-native-binary snapshot, isolated login, and
+`configure_extension_provider(...)` registration in the root
+[Extensions guide](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.md).
+Then the Preview can be selected explicitly:
+
+```bash
+unified-cli chat "explain this project" --provider grok --model grok-build
+```
+
+The 0.1 Preview setup uses the native layout installed by
+`https://x.ai/cli/install.sh`; `@xai-official/grok` is an official vendor
+alternative but is not registered by that setup recipe, while
+`@vibe-kit/grok-cli` is rejected. Require Grok `0.2.110` or later.
+Authentication uses an isolated provider `HOME`, not an assumed reusable host
+login.
+The fixed adapter boundary disables auto-update, plan, subagents, memory, web,
+and managed MCP initialization, uses strict sandbox and `dontAsk`, and permits
+only `read_file`, `grep`, and `list_dir`.
+
+The adapter may read files in the selected working directory and the vendor CLI
+may maintain its own account/configuration files. Use it only in a trusted
+workspace. See the root [Extensions guide](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.md) for the
+full catalog and official vendor documentation.
 
 ## Optional protocol dependencies
 
 Protocol SDKs remain optional; they are not required to install the foundation
-and do not enable provider calls in 0.1.0. The available extras are
+and do not enable additional provider calls in 0.1.0. The available extras are
 `acp`, `mcp`, `all` (both protocol SDKs), and `dev` (test dependencies).
 
 ```bash
@@ -115,7 +137,7 @@ records, and none of this imports a plugin or probes a provider at startup.
 
 ## Status
 
-This is a foundation release with an inert Held catalog, not a catalog of
-supported external providers. Transport/runtime foundations are included, but
-enabled provider adapters, provider-specific verified sessions, authentication,
-and network-backed validation are deliberately out of scope for 0.1.0.
+This is a foundation release with one offline-fixture-verified Grok Preview and
+17 Held entries. Grok's authenticated real-CLI validation is intentionally a
+separate representative smoke step; until that passes it is not Stable. No Ext
+provider is exposed through Core's local server.

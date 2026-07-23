@@ -55,7 +55,11 @@ ENTRY_POINTS = {
     "gitlab-duo": "unified_cli_ext.providers.gitlab_duo:PLUGIN",
 }
 
-STAGE_6_RESEARCH_PROVIDER_IDS = ("grok", "kimi", "copilot", "cursor")
+PREVIEW_PROVIDER_IDS = ("grok",)
+HELD_PROVIDER_IDS = tuple(
+    provider_id for provider_id in ENTRY_POINTS if provider_id not in PREVIEW_PROVIDER_IDS
+)
+HELD_RESEARCH_PROVIDER_IDS = ("kimi", "copilot", "cursor")
 
 EXPECTED_COMMANDS = {
     "grok": {
@@ -66,6 +70,8 @@ EXPECTED_COMMANDS = {
             "strict",
             "--permission-mode",
             "dontAsk",
+            "--tools",
+            "read_file,grep,list_dir",
             "--allow",
             "Read",
             "--allow",
@@ -80,15 +86,15 @@ EXPECTED_COMMANDS = {
             "WebFetch",
             "--deny",
             "WebSearch",
-            "--disable-web-search",
+            "--no-plan",
             "--no-subagents",
             "--no-memory",
-            "--verbatim",
+            "--disable-web-search",
             "--output-format",
             "streaming-json",
         ),
         "transport": "jsonl",
-        "environment": frozenset(("GROK_DISABLE_AUTOUPDATER",)),
+        "environment": frozenset(("XAI_API_KEY",)),
         "mode": PromptMode.OPTION_VALUE,
         "prompt_option": "-p",
     },
@@ -329,17 +335,6 @@ EXPECTED_COMMANDS = {
 }
 
 EVIDENCE_FLAGS = {
-    "grok": (
-        "GROK_VERSION_HELP_IDENTITY_PROVENANCE_REQUIRES_STAGE_6_EVIDENCE",
-        "GROK_XAI_BINARY_NAME_COLLISION_REQUIRES_STAGE_6_EVIDENCE",
-        "GROK_PROMPT_OUTPUT_FRAMING_REQUIRES_STAGE_6_EVIDENCE",
-        "GROK_PERMISSION_TOOL_MCP_ISOLATION_REQUIRES_STAGE_6_EVIDENCE",
-        "GROK_AUTH_SESSION_MODEL_REQUIRES_STAGE_6_EVIDENCE",
-        "GROK_CANCELLATION_PROCESS_CLEANUP_REQUIRES_STAGE_6_EVIDENCE",
-        "GROK_UPDATE_REMOVAL_REQUIRES_STAGE_6_EVIDENCE",
-        "GROK_QUOTA_USAGE_ERROR_REQUIRES_STAGE_6_EVIDENCE",
-        "GROK_ACP_REQUIRES_SEPARATE_STAGE_6_EVIDENCE",
-    ),
     "kimi": (
         "KIMI_VERSION_HELP_IDENTITY_PROVENANCE_REQUIRES_STAGE_6_EVIDENCE",
         "KIMI_PROMPT_OUTPUT_FRAMING_REQUIRES_STAGE_6_EVIDENCE",
@@ -499,7 +494,7 @@ def _module(provider_id):
     return importlib.import_module(module_name)
 
 
-def test_pyproject_registers_all_held_provider_entry_points_exactly():
+def test_pyproject_registers_all_provider_entry_points_exactly():
     package_root = pathlib.Path(__file__).resolve().parents[1]
     text = (package_root / "pyproject.toml").read_text(encoding="utf-8")
     group = '[project.entry-points."unified_cli.providers.v1"]'
@@ -513,7 +508,7 @@ def test_pyproject_registers_all_held_provider_entry_points_exactly():
     assert declared == ENTRY_POINTS
 
 
-@pytest.mark.parametrize("provider_id", tuple(ENTRY_POINTS))
+@pytest.mark.parametrize("provider_id", HELD_PROVIDER_IDS)
 def test_held_specs_and_plugins_are_immutable_and_minimal(provider_id):
     module = _module(provider_id)
     spec = module.ADAPTER_SPEC
@@ -586,7 +581,7 @@ def test_held_entries_record_every_remaining_evidence_gate(provider_id):
         assert getattr(module, flag) is True
 
 
-@pytest.mark.parametrize("provider_id", tuple(ENTRY_POINTS))
+@pytest.mark.parametrize("provider_id", HELD_PROVIDER_IDS)
 def test_held_factories_fail_before_provider_creation_or_execution(provider_id, monkeypatch):
     module = _module(provider_id)
 
@@ -600,7 +595,7 @@ def test_held_factories_fail_before_provider_creation_or_execution(provider_id, 
     assert str(caught.value) == HELD_UNAVAILABLE_MESSAGE
 
 
-@pytest.mark.parametrize("provider_id", tuple(ENTRY_POINTS))
+@pytest.mark.parametrize("provider_id", HELD_PROVIDER_IDS)
 def test_core_held_gate_never_calls_plugin_callbacks(provider_id, monkeypatch):
     calls = {"factory": 0, "models": 0, "doctor": 0}
 
@@ -707,13 +702,12 @@ def test_core_builtins_are_unchanged_by_held_extension_metadata():
     assert create("claude", bin_path="/bin/echo").name == "claude"
 
 
-@pytest.mark.parametrize("provider_id", STAGE_6_RESEARCH_PROVIDER_IDS)
+@pytest.mark.parametrize("provider_id", HELD_RESEARCH_PROVIDER_IDS)
 def test_stage_6_research_metadata_is_static_and_not_capture_evidence(provider_id):
     module = _module(provider_id)
     prefix = provider_id.upper()
     expected_versions = {
-        "grok": "0.2.106",
-        "kimi": "0.28.1",
+        "kimi": "0.29.0",
         "copilot": "1.0.73",
         "cursor": "2026.07.20-8cc9c0b",
     }
@@ -732,7 +726,7 @@ def test_stage_6_research_metadata_is_static_and_not_capture_evidence(provider_i
     assert module.PLUGIN.server_policy.enabled is False
 
 
-@pytest.mark.parametrize("provider_id", STAGE_6_RESEARCH_PROVIDER_IDS)
+@pytest.mark.parametrize("provider_id", HELD_RESEARCH_PROVIDER_IDS)
 def test_researched_held_import_factory_doctor_and_models_are_ambient_free(
     provider_id,
 ):
@@ -814,10 +808,24 @@ def test_grok_requires_xai_identity_and_rejects_third_party_name_collision():
     module = _module("grok")
     assert module.GROK_OFFICIAL_PACKAGE == "@xai-official/grok"
     assert module.GROK_REJECTED_PACKAGE_IDENTITIES == ("@vibe-kit/grok-cli",)
-    assert module.GROK_BINARY_IDENTITY_IS_VERIFIED is False
+    assert module.GROK_STAGE_6_TARGET_VERSION == "0.2.110"
+    assert module.GROK_REAL_AUTHENTICATED_SMOKE_CAPTURED is False
     assert module.ADAPTER_SPEC.binary.executable == "grok"
-    assert module.GROK_XAI_BINARY_NAME_COLLISION_REQUIRES_STAGE_6_EVIDENCE is True
-    assert "GROK_DISABLE_AUTOUPDATER" in module.ADAPTER_SPEC.environment.allowed_keys
+    assert module.ADAPTER_SPEC.status is AdapterStatus.PREVIEW
+    assert module.PLUGIN.support_status == "preview"
+    assert module.PLUGIN.capabilities == frozenset(("chat", "sessions", "stream"))
+    assert module.PLUGIN.server_policy.enabled is False
+    assert module.ADAPTER_SPEC.environment.allowed_keys == frozenset(
+        (
+            "XAI_API_KEY",
+            "GROK_MANAGED_MCPS_ENABLED",
+            "GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED",
+        )
+    )
+    assert dict(module.ADAPTER_SPEC.environment.fixed_values) == {
+        "GROK_MANAGED_MCPS_ENABLED": "false",
+        "GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED": "false",
+    }
 
 
 def test_kimi_documents_auto_approval_without_claiming_safe_execution():
