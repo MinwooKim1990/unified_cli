@@ -56,12 +56,24 @@ def test_generated_ext_provider_support_check_is_clean(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize("filename", ("extensions.md", "extensions.ko.md"))
+def test_grok_preview_docs_include_the_runnable_canonical_setup(filename):
+    content = (ROOT / "docs" / filename).read_text(encoding="utf-8")
+    assert '"bin" / "grok"' in content
+    assert "configure_extension_provider" in content
+    assert 'provider_home=str(root / "home")' in content
+    assert "GROK_MANAGED_MCPS_ENABLED=false" in content
+    assert "GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED=false" in content
+    assert "`.envrc`" in content
+    assert "usage_is_incomplete" not in content
+
+
 def test_generated_ext_provider_support_check_detects_modified_block(tmp_path):
     docs_dir = _copy_docs(tmp_path)
     english_doc = docs_dir / "extensions.md"
     english_doc.write_text(
         english_doc.read_text(encoding="utf-8").replace(
-            "| `grok` | `held` | `none` | `disabled` |",
+            "| `grok` | `preview` | `chat, sessions, stream` | `disabled` |",
             "| `grok` | `stable` | `none` | `disabled` |",
         ),
         encoding="utf-8",

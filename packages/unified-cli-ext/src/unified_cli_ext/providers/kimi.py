@@ -13,7 +13,7 @@ KIMI_OFFICIAL_SOURCES = (
     "https://www.npmjs.com/package/@moonshot-ai/kimi-code",
 )
 KIMI_OFFICIAL_PACKAGE = "@moonshot-ai/kimi-code"
-KIMI_STAGE_6_TARGET_VERSION = "0.28.1"
+KIMI_STAGE_6_TARGET_VERSION = "0.29.0"
 KIMI_NPM_MINIMUM_NODE_VERSION = "22.19"
 KIMI_STAGE_6_EVIDENCE_CAPTURED = False
 

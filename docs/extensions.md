@@ -5,12 +5,10 @@ support Claude, Codex, and Gemini (`agy`) with its existing defaults. Installing
 Ext does not change those defaults, does not add an extension to Core's local
 server allowlist, and does not install or configure any vendor software.
 
-Stages 5B–5F install catalog metadata for exactly 18 inert Held providers. Each
-is discoverable through an explicit entry point, has status **Held**, and is
-incapable of starting a provider or external command. The adapter catalog
-records `chat` as a provisional design target, while the Core plugin advertises
-no executable capability. There is no supported provider chat command for
-these entries yet.
+Ext installs 18 explicit provider entry points. Grok Build is a read-tool-limited
+**Preview** backed by offline fixtures. The other 17 entries are **Held** and
+stop before provider construction, binary lookup, or command execution. No Ext
+provider is enabled in Core server mode.
 
 Vendor binaries, accounts, subscriptions, and their updates remain
 user-owned. Installing Ext alone does not install a vendor CLI, log in, call a
@@ -28,8 +26,106 @@ verify a vendor installation, authentication state, or service availability.
 
 Core keeps this discovery import-free. `unified-cli providers --include-ext`
 therefore reports a new entry as lifecycle `discovered` and support `unknown`.
-An explicit request loads only that provider's entry point; Core then reports
-support `held` and stops before any provider callback.
+An explicit request loads only that provider's entry point. Held providers stop
+before any provider callback. Grok continues only after its explicitly selected
+local binary passes bounded version and feature probes.
+
+## Grok Preview setup and boundary
+
+Grok Build Preview is the sole runnable Ext provider. Its primary official
+native installer is `https://x.ai/cli/install.sh`; the official npm package
+`@xai-official/grok` is a vendor alternative, but this 0.1 Preview setup uses
+the native install layout only. The known unrelated
+`@vibe-kit/grok-cli` CLI shape is rejected. The minimum supported version is
+`0.2.110`. Run the vendor installer in your normal user home, then copy its
+resolved platform binary into the private canonical path expected by Ext:
+
+```bash
+curl -fsSL https://x.ai/cli/install.sh | bash
+python - <<'PY'
+import os
+import shutil
+import stat
+from pathlib import Path
+
+source = (Path.home() / ".grok" / "bin" / "grok").resolve(strict=True)
+downloads = (Path.home() / ".grok" / "downloads").resolve(strict=True)
+metadata = source.stat()
+if (
+    source.parent != downloads
+    or not source.name.startswith("grok-")
+    or not stat.S_ISREG(metadata.st_mode)
+    or metadata.st_uid != os.getuid()
+    or metadata.st_mode & 0o022
+):
+    raise SystemExit("refusing an unexpected Grok installer target")
+
+root = Path.home() / ".unified-cli" / "providers" / "grok"
+binary_dir = root / "bin"
+provider_home = root / "home"
+for directory in (root, binary_dir, provider_home):
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory.chmod(0o700)
+target = binary_dir / "grok"
+temporary = binary_dir / ".grok.new"
+temporary.unlink(missing_ok=True)
+try:
+    with source.open("rb") as incoming, temporary.open("xb") as outgoing:
+        shutil.copyfileobj(incoming, outgoing)
+        outgoing.flush()
+        os.fsync(outgoing.fileno())
+    temporary.chmod(0o500)
+    os.replace(temporary, target)
+finally:
+    temporary.unlink(missing_ok=True)
+print(target)
+PY
+```
+
+Do not reuse a generic host login. Authenticate only that snapshot in its
+isolated home, then register the same canonical binary and home through Core's
+public extension-configuration API:
+
+```bash
+GROK_ROOT="$HOME/.unified-cli/providers/grok"
+GROK_MANAGED_MCPS_ENABLED=false \
+GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED=false \
+HOME="$GROK_ROOT/home" "$GROK_ROOT/bin/grok" login --device-auth
+python - <<'PY'
+from pathlib import Path
+from unified_cli import ExtensionLaunchOverridesV1, configure_extension_provider
+
+root = Path.home() / ".unified-cli" / "providers" / "grok"
+configure_extension_provider(
+    "grok",
+    ExtensionLaunchOverridesV1(
+        bin_path=str(root / "bin" / "grok"),
+        provider_home=str(root / "home"),
+    ),
+)
+PY
+unified-cli chat "explain this project" --provider grok --model grok-build
+```
+
+These are copy-only instructions; Ext never runs installation or login itself.
+Repeat the snapshot and registration after an intentional vendor CLI update.
+
+For each prompt, the adapter fixes `--no-auto-update`, strict sandboxing,
+`dontAsk`, and permits only `read_file`, `grep`, and `list_dir`. Plan,
+subagents, memory, web search, and managed MCP initialization are off; the two
+managed-MCP environment controls are fixed to `false` and caller values cannot
+override them. Immediately before every turn it fails closed if it finds
+`.grok`, `.envrc`, `.mcp.json`, `.cursor/mcp.json`,
+`.cursor/hooks.json`, or `.claude` from the cwd up to the Git root (or at the
+cwd only when it is outside a Git repository);
+provider-home runtime config, plugins, hook directories or hook-path files; or
+provider-home shell startup files, runtime config, plugins, hook directories or
+hook-path files; or managed `/etc/grok` configuration. An otherwise empty,
+auth-only isolated provider `HOME` is allowed.
+
+Offline fixtures verify the adapter, but the real authenticated CLI smoke is
+pending. Grok is therefore Preview, not Stable, and remains disabled in server
+mode.
 
 ## Local installation receipts
 
@@ -49,7 +145,7 @@ access can change a path between those operations.
 | Experimental | An enabled, limited-scope integration whose behavior may change. |
 | Held | Discoverable metadata only. It is blocked before provider construction, binary lookup, or command execution. |
 
-Only **Held** applies to every catalog entry below.
+Grok is **Preview**; every other catalog entry below is **Held**.
 
 ## Generated provider support
 
@@ -67,7 +163,7 @@ manual design record.
 | `cursor` | `held` | `none` | `disabled` |
 | `droid` | `held` | `none` | `disabled` |
 | `gitlab-duo` | `held` | `none` | `disabled` |
-| `grok` | `held` | `none` | `disabled` |
+| `grok` | `preview` | `chat, sessions, stream` | `disabled` |
 | `hermes` | `held` | `none` | `disabled` |
 | `kilo` | `held` | `none` | `disabled` |
 | `kimi` | `held` | `none` | `disabled` |
@@ -87,16 +183,15 @@ contract. “Auto-update containment” describes the intended boundary if an
 adapter is later enabled; no Held metadata executes it today.
 
 The Grok, Kimi, Copilot, and Cursor rows record current official-documentation
-research and frozen future-lab targets, not captured CLI output or verified
-support. Their prompts would be argv values and must not be logged. Each still
-needs isolated Stage 6 identity, framing, permission/MCP, auth/session/model,
-cancellation/cleanup, update/removal, and usage/error evidence. Their factories
-refuse before binary resolution, environment reads, or execution; ACP candidates
-are not enabled bridges.
+research and pinned compatibility targets. Prompts are argv values and must not
+be logged. Grok has an offline-fixture-verified one-shot bridge, but its real
+authenticated CLI smoke is pending. Kimi, Copilot, and Cursor remain Held and
+their factories refuse before binary resolution, environment reads, or
+execution. ACP candidates are not enabled bridges.
 
 | Provider ID | Official binary/package | Candidate transport | Provisional adapter target | Status | Auto-update containment | Official documentation |
 |---|---|---|---|---|---|---|
-| `grok` | xAI Grok Build (`grok`, `@xai-official/grok`); reject unrelated `@vibe-kit/grok-cli` | Streaming JSONL candidate | `-p` one-shot candidate; Core capability none | Held | Docs-only strict-sandbox/permission-filter candidate plus `GROK_DISABLE_AUTOUPDATER=1`; does not prove zero writes or disabled MCP startup | [Repository](https://github.com/xai-org/grok-build) · [Overview](https://docs.x.ai/build/overview) · [CLI reference](https://docs.x.ai/build/cli/reference) · [Headless scripting](https://docs.x.ai/build/cli/headless-scripting) |
+| `grok` | xAI Grok Build (`grok`): primary native installer `https://x.ai/cli/install.sh`; official npm `@xai-official/grok` is alternative; rejects unrelated `@vibe-kit/grok-cli` CLI shape | Streaming JSONL | Explicit `-p` one-shot with `chat`, `stream`, `sessions`; minimum `0.2.110` | Preview | Fixed no-auto-update, strict sandbox, `dontAsk`, web/plan/subagent/memory/managed-MCP off, and only `read_file`, `grep`, `list_dir`; fail-closed workspace/home/system configuration preflight; offline fixtures pass, authenticated CLI smoke pending | [Repository](https://github.com/xai-org/grok-build) · [Overview](https://docs.x.ai/build/overview) · [CLI reference](https://docs.x.ai/build/cli/reference) · [Headless scripting](https://docs.x.ai/build/cli/headless-scripting) |
 | `kimi` | Kimi Code CLI (`kimi`, `@moonshot-ai/kimi-code`), not legacy Python `kimi-cli` | Stream JSON candidate | `-p` one-shot auto-approves normal tools; Core capability none | Held | Candidate `KIMI_CODE_NO_AUTO_UPDATE=1` and `KIMI_DISABLE_TELEMETRY=1`; no per-run read-only/no-tools/web-off/MCP-off contract | [Getting started](https://moonshotai.github.io/kimi-code/en/guides/getting-started.html) · [Kimi command](https://moonshotai.github.io/kimi-code/en/reference/kimi-command.html) · [Kimi ACP](https://moonshotai.github.io/kimi-code/en/reference/kimi-acp.html) |
 | `copilot` | GitHub Copilot CLI (`copilot`, `@github/copilot`) | Plain-text one-shot candidate | Explicit read-only tool candidate; Core capability none | Held | Candidate `--no-auto-update` plus tool/MCP controls; JSONL schema and complete user/workspace MCP and dedicated-home isolation remain unverified | [Install](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli) · [CLI command reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference) · [ACP server](https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server) |
 | `cursor` | Cursor Agent CLI (`agent` primary; `cursor-agent` legacy alias since 2026-01-08) | Final/stream JSON schema candidates | Positional-prompt ABI is not safely representable; Core capability none | Held | No verified read-only, MCP, or update containment; `CURSOR_API_KEY` is env-only and never argv | [Install](https://cursor.com/docs/cli/installation) · [Parameters](https://cursor.com/docs/cli/reference/parameters) · [Output format](https://cursor.com/docs/cli/reference/output-format) · [ACP](https://cursor.com/docs/cli/acp) |
@@ -116,7 +211,7 @@ are not enabled bridges.
 | `gitlab-duo` | GitLab Duo CLI (`duo`, compiled generic package or official npm package `@gitlab/duo-cli`) | One-shot JSON candidate | `chat` candidate; Core capability none | Held | Headless runs auto-approve tools; JSON schema 1.0, authentication/entitlement, context/MCP/hooks, cleanup, and isolation require Stage 6 evidence | [Overview](https://docs.gitlab.com/user/gitlab_duo_cli/) · [Usage](https://docs.gitlab.com/user/gitlab_duo_cli/use/) · [Setup](https://docs.gitlab.com/user/gitlab_duo_cli/set_up/) |
 
 The optional `acp` and `mcp` extras install protocol SDK dependencies only.
-They do not activate a Held provider or make a provider call.
+They do not activate another provider or make a provider call.
 
 ## What promotion to an enabled integration requires
 

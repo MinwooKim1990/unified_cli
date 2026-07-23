@@ -48,7 +48,7 @@ pip install "unified-cli[server]"
 |---|---|---|
 | Included providers | Claude, Codex, Gemini (`agy`) | 18-item catalog metadata: Grok, Kimi, Copilot, Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, Cline, OpenCode, Kilo Code, Factory Droid, Pi, Oh My Pi, Hermes, Poolside, Amp, GitLab Duo |
 | Default behavior | Existing defaults are unchanged | Never changes Core defaults or its server allowlist |
-| Current state | Core providers retain their existing behavior | Exactly 18 inert entries are **Held**: discoverable metadata only, not runnable adapters; extension server support is disabled |
+| Current state | Core providers retain their existing behavior | Grok is a read-tool-limited **Preview** backed by offline fixtures; the other 17 entries are **Held**; extension server support is disabled |
 
 Ext is a separate PyPI distribution and Python module (`unified_cli_ext`). It
 does not bundle vendor CLIs, sign you in, call a service, or create charges.
@@ -65,15 +65,29 @@ python -c "import importlib.metadata as m; print([e.name for e in m.distribution
 The check lists installed provider entry-point metadata. In Stages 5B–5F it
 may list `grok`, `kimi`, `copilot`, `cursor`, `codebuddy`, `qoder`,
 `mistral-vibe`, `qwen`, `cline`, `opencode`, `kilo`, `droid`, `pi`,
-`oh-my-pi`, `hermes`, `poolside`, `amp`, and `gitlab-duo`; the Ext catalog
-classifies all 18 as **Held**. It does not run a provider, locate a vendor binary,
-authenticate, or make a network request. Do not treat a listed name as a chat
-command.
+`oh-my-pi`, `hermes`, `poolside`, `amp`, and `gitlab-duo`. Listing metadata does
+not run a provider, locate a vendor binary, authenticate, or make a network
+request. Grok is the only runnable Preview; the other 17 entries are Held.
 
 `unified-cli providers --include-ext` keeps discovery import-free, so a newly
 discovered extension first displays lifecycle `discovered` and support
-`unknown`. When that provider is explicitly requested, Core loads only its
-entry point, confirms support `held`, and leaves it unavailable for execution.
+`unknown`. When a provider is explicitly requested, Core loads only that entry
+point. Held entries remain unavailable. Grok runs only after the explicitly
+selected local binary passes its bounded version and feature probes; its real
+authenticated CLI smoke test is still pending and it remains disabled in server
+mode. The documented native snapshot and `configure_extension_provider(...)`
+registration are required before the first request.
+
+Grok's primary official native installer is `https://x.ai/cli/install.sh`
+(`@xai-official/grok` is an official npm alternative); see
+[Extensions](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.md)
+for its complete native snapshot, isolated-home login, registration, and
+fail-closed Preview boundary. Do not assume it reuses a generic host login.
+
+```bash
+# Run only after completing the linked setup.
+unified-cli chat "explain this project" --provider grok --model grok-build
+```
 
 </details>
 

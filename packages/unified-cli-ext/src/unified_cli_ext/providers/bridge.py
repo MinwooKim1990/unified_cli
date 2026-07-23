@@ -94,6 +94,7 @@ AdapterStateFactoryV1 = Callable[[], Any]
 AdapterRecordMapperV1 = Callable[[Mapping, Any], Iterable[Mapping]]
 AdapterResponseMapperV1 = Callable[[Any, Any], Iterable[Mapping]]
 AdapterFinalizerV1 = Callable[[Any], Iterable[Mapping]]
+AdapterTurnPreflightV1 = Callable[[str, Optional[str]], None]
 
 _SUPPORTED_PROCESS_TRANSPORTS = frozenset(
     (TransportKind.PLAIN, TransportKind.JSON, TransportKind.JSONL)
@@ -562,6 +563,7 @@ class AdapterProviderBridge(BaseProvider):
         map_record: Optional[AdapterRecordMapperV1],
         map_response: Optional[AdapterResponseMapperV1],
         finalize: Optional[AdapterFinalizerV1],
+        turn_preflight: Optional[AdapterTurnPreflightV1],
         first_output_timeout: Optional[float] = None,
         web_search: bool = False,
         max_stream_buffer_bytes: Optional[int] = None,
@@ -624,6 +626,7 @@ class AdapterProviderBridge(BaseProvider):
         self._map_record = map_record
         self._map_response = map_response
         self._finalize = finalize
+        self._turn_preflight = turn_preflight
 
     @classmethod
     def _discover_bin(cls) -> Optional[str]:
@@ -658,6 +661,19 @@ class AdapterProviderBridge(BaseProvider):
             raise
         except BaseException:
             raise ProtocolError("provider mapper state initialization failed") from None
+
+    def _run_turn_preflight(self) -> None:
+        callback = self._turn_preflight
+        if callback is None:
+            return
+        try:
+            callback(self.cwd, self._provider_home)
+        except ExtensionError:
+            raise
+        except (KeyboardInterrupt, GeneratorExit):
+            raise
+        except BaseException:
+            raise ConfigurationError("provider turn preflight failed") from None
 
     def _session_value(self, session_id: Optional[str]) -> Optional[str]:
         if session_id is None:
@@ -787,6 +803,7 @@ class AdapterProviderBridge(BaseProvider):
         turn: _TurnState,
         token: CancellationToken,
     ) -> Tuple[Message, ...]:
+        self._run_turn_preflight()
         transport = self._adapter.open_transport(
             self._inspection,
             prompt,
@@ -829,6 +846,7 @@ class AdapterProviderBridge(BaseProvider):
     ) -> Iterator[Message]:
         if self._map_record is None:
             raise ProtocolError("JSONL adapter has no record mapper")
+        self._run_turn_preflight()
         boundary = self._adapter.open_transport(
             self._inspection,
             prompt,
@@ -867,6 +885,7 @@ class AdapterProviderBridge(BaseProvider):
     ) -> Any:
         if self._map_record is None:
             raise ProtocolError("JSONL adapter has no record mapper")
+        self._run_turn_preflight()
         boundary = self._adapter.open_transport(
             self._inspection,
             prompt,
@@ -1199,6 +1218,7 @@ class _AdapterPluginRuntime:
         map_record: Optional[AdapterRecordMapperV1],
         map_response: Optional[AdapterResponseMapperV1],
         finalize: Optional[AdapterFinalizerV1],
+        turn_preflight: Optional[AdapterTurnPreflightV1],
     ) -> None:
         self.spec = spec
         self.default_model = default_model
@@ -1207,6 +1227,7 @@ class _AdapterPluginRuntime:
         self.map_record = map_record
         self.map_response = map_response
         self.finalize = finalize
+        self.turn_preflight = turn_preflight
 
     def _candidate(
         self,
@@ -1346,6 +1367,7 @@ class _AdapterPluginRuntime:
             map_record=self.map_record,
             map_response=self.map_response,
             finalize=self.finalize,
+            turn_preflight=self.turn_preflight,
             first_output_timeout=first_output_timeout,
             web_search=web_search,
             max_stream_buffer_bytes=(
@@ -1554,6 +1576,7 @@ def adapter_plugin(
     map_record: Optional[AdapterRecordMapperV1] = None,
     map_response: Optional[AdapterResponseMapperV1] = None,
     finalize: Optional[AdapterFinalizerV1] = None,
+    turn_preflight: Optional[AdapterTurnPreflightV1] = None,
 ) -> ProviderPluginV1:
     """Build lazy Core plugin metadata for one declarative adapter spec."""
 
@@ -1585,6 +1608,8 @@ def adapter_plugin(
         raise ConfigurationError("adapter map_response must be callable")
     if finalize is not None and not callable(finalize):
         raise ConfigurationError("adapter finalize must be callable")
+    if turn_preflight is not None and not callable(turn_preflight):
+        raise ConfigurationError("adapter turn_preflight must be callable")
     if spec.transport is TransportKind.JSONL and map_record is None:
         raise ConfigurationError("JSONL adapter requires map_record")
     if spec.transport is TransportKind.JSON and map_response is None:
@@ -1604,6 +1629,7 @@ def adapter_plugin(
         map_record,
         map_response,
         finalize,
+        turn_preflight,
     )
     return ProviderPluginV1(
         id=spec.id,
@@ -1631,6 +1657,7 @@ __all__ = [
     "AdapterRecordMapperV1",
     "AdapterResponseMapperV1",
     "AdapterStateFactoryV1",
+    "AdapterTurnPreflightV1",
     "INSTALLATION_RECEIPT_MEDIA_TYPE_V1",
     "adapter_plugin",
     "installation_receipt_envelope",

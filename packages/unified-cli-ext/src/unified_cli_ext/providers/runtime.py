@@ -1576,11 +1576,22 @@ class ProviderAdapterV1:
             for line in text.split("\n")
         )
         for marker in probe.required_markers:
-            if marker not in lines:
+            matches = (
+                sum(line.lstrip(" \t").startswith(marker) for line in lines)
+                if probe.marker_prefixes
+                else lines.count(marker)
+            )
+            if matches != 1:
                 raise ProtocolError("provider plain-text probe is missing a required marker")
         result = {}
         for name, field_spec in probe.fields.items():
-            if field_spec.presence_only:
+            if probe.marker_prefixes:
+                matches = [
+                    line.lstrip(" \t")
+                    for line in lines
+                    if line.lstrip(" \t").startswith(field_spec.marker)
+                ]
+            elif field_spec.presence_only:
                 matches = [line for line in lines if line == field_spec.marker]
             else:
                 matches = [line for line in lines if line.startswith(field_spec.marker)]
@@ -1604,6 +1615,8 @@ class ProviderAdapterV1:
                 if end < 0:
                     raise ProtocolError("provider plain-text probe field is unterminated")
             value = value[:end]
+            if field_spec.first_token:
+                value = value.partition(" ")[0]
             if len(value) > field_spec.max_chars:
                 raise ProtocolError("provider plain-text probe field exceeds its limit")
             result[name] = value
@@ -1619,7 +1632,11 @@ class ProviderAdapterV1:
             line[:-1] if line.endswith("\r") else line
             for line in text.split("\n")
         )
+        if probe.marker_prefixes:
+            lines = tuple(line.lstrip(" \t") for line in lines)
         marker = probe.identity_marker or expected_identity
+        if probe.identity_prefix:
+            return sum(line.startswith(marker) for line in lines) == 1
         identity_lines = lines.count(marker)
         if identity_lines == 1:
             return True
@@ -1833,10 +1850,12 @@ class ProviderAdapterV1:
                     version_spec.version_field: PlainTextFieldSpec(
                         version_spec.version_marker,
                         max_chars=128,
+                        first_token=version_spec.version_is_first_token,
                     )
                 },
                 expected={version_spec.version_field: None},
                 identity_marker=version_spec.identity_marker,
+                identity_prefix=version_spec.identity_prefix,
             )
         else:
             version_probe = JsonProbeSpec(
@@ -1889,6 +1908,8 @@ class ProviderAdapterV1:
                     for name, marker in feature_spec.feature_markers.items()
                 },
                 identity_marker=feature_spec.identity_marker,
+                marker_prefixes=feature_spec.marker_prefixes,
+                identity_prefix=feature_spec.identity_prefix,
             )
         else:
             feature_probe = JsonProbeSpec(
