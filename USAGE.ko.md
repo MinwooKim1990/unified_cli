@@ -410,7 +410,7 @@ from unified_cli import create, UnifiedConversation, UnifiedError
 
 ## 즉시 실행 가능한 예제
 
-`examples/` 에 8개 파일. 복사 붙여넣기 아니라 그대로 실행.
+`examples/` 에 9개 파일. 복사 붙여넣기 아니라 그대로 실행.
 
 ```bash
 source .venv/bin/activate
@@ -423,6 +423,7 @@ python examples/05_web_search.py        # 3 provider 웹서치
 python examples/06_error_handling.py    # UnifiedError 분류
 python examples/07_openai_sdk.py        # OpenAI SDK 로 서버 호출 (서버 기동 필요)
 python examples/08_async.py             # async / 병렬
+python examples/09_extensions.py grok "이 저장소 설명" --configure
 ```
 
 ## 터미널에서 빠르게 쓰기
@@ -540,13 +541,18 @@ c = OpenAI(base_url="https://trusted.example/v1",
 
 ### Claude
 - 기본 모델 `claude-haiku-4-5`. alias `haiku`/`sonnet`/`opus` 전부 허용
+- 현재 fallback 목록에는 `claude-fable-5`, `claude-opus-4-8`,
+  `claude-sonnet-5`가 포함되며, 인증된 Models API 새로고침 결과를 우선합니다.
 - 무인 도구 사용에는 권한 모드를 의도적으로 선택하세요. 래퍼는 웹서치나 이미지가
   켜졌다는 이유만으로 권한 모드를 바꾸지 않습니다.
   `permission_mode="bypassPermissions"`는 넓은 권한을 주므로 신뢰하는 로컬 입력에만 사용하세요.
 - 프로젝트 디렉토리 안에서 작업하려면 `cwd="..."` 전달
 
 ### Codex
-- 기본 모델 `gpt-5.4-mini`. ChatGPT 구독에서는 `gpt-5`, `gpt-5.5`, `gpt-5-codex` 거부됨
+- 호환성을 위해 기본 모델은 `gpt-5.4-mini`로 유지합니다. 실제 목록은
+  `~/.codex/models_cache.json`에서 읽으며 현재 `gpt-5.6-sol`,
+  `gpt-5.6-terra`, `gpt-5.6-luna` 등을 표시할 수 있습니다. 실제 사용 가능
+  여부는 설치된 Codex CLI와 계정에 따라 달라집니다.
 - 파일 편집이 필요하면 `create("codex", full_auto=True, cwd=...)` 로
 - 웹서치는 내부적으로 `-c tools.web_search=true` 로 활성화 (wrapper가 자동 처리)
 

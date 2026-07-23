@@ -86,7 +86,7 @@ metered.chat("new request")
 
 ## Runnable examples
 
-`examples/` contains 8 scripts you can run directly:
+`examples/` contains 9 scripts you can run directly:
 
 ```bash
 source .venv/bin/activate
@@ -99,6 +99,7 @@ python examples/05_web_search.py        # built-in web search per provider
 python examples/06_error_handling.py    # UnifiedError classification demo
 python examples/07_openai_sdk.py        # use OpenAI SDK against local server
 python examples/08_async.py             # achat / astream / asyncio.gather
+python examples/09_extensions.py grok "Explain this repo" --configure
 ```
 
 ## Quick terminal recipes
@@ -550,6 +551,8 @@ other value types raise `ValueError` instead of being passed ambiguously.
 
 ### Claude
 - Default model `claude-haiku-4-5`. Aliases `haiku` / `sonnet` / `opus` all work.
+- Current fallback catalog includes `claude-fable-5`, `claude-opus-4-8`, and
+  `claude-sonnet-5`; an authenticated Models API refresh remains authoritative.
 - Choose a permission mode deliberately for unattended tool use. The wrapper
   never changes it solely because web search or images are enabled.
   `permission_mode="bypassPermissions"` grants broad authority and is for
@@ -558,9 +561,10 @@ other value types raise `ValueError` instead of being passed ambiguously.
   `terse=True` (ClaudeProvider).
 
 ### Codex
-- Default model `gpt-5.4-mini`. ChatGPT subscription rejects `gpt-5`,
-  `gpt-5.5`, `gpt-5-codex` — use one of `gpt-5.4-mini` / `gpt-5.4` /
-  `gpt-5.2` / `gpt-5.3-codex-spark` instead.
+- Default model `gpt-5.4-mini` is retained for compatibility. The current
+  installed Codex catalog is read from `~/.codex/models_cache.json` and may
+  include `gpt-5.6-sol`, `gpt-5.6-terra`, and `gpt-5.6-luna`; availability
+  still depends on the installed CLI and account.
 - For file edits use `full_auto=True, cwd="..."` or set `sandbox="workspace-write"`.
 - Web search is enabled via `-c tools.web_search=true` internally (wrapper
   handles this — just pass `web_search=True`).

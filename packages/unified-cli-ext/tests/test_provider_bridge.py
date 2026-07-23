@@ -539,6 +539,19 @@ def test_malformed_mapper_and_lifecycle_errors_are_sanitized(
     assert caught.value.kind == "internal"
 
 
+def test_observed_no_api_key_process_failure_maps_to_safe_auth_error():
+    error = bridge_module._core_error(
+        "fixture-provider",
+        bridge_module.ProcessFailed(
+            1, "No API key found. Starting login flow with a private token."
+        ),
+    )
+
+    assert error.kind == "auth_expired"
+    assert "private token" not in str(error)
+    assert error.cause == ""
+
+
 def test_error_event_cleans_up_and_never_records_success(
     tmp_path, adapter_binary, monkeypatch
 ):
@@ -839,7 +852,7 @@ def test_fixed_model_issuance_rejects_public_mutation_before_spawn(
         record[0][:2] == ("fixture-provider", "fixture-model")
         for record in usage_records
     )
-    assert all(record[1].get("error_kind") == "internal" for record in usage_records)
+    assert all(record[1].get("error_kind") == "config" for record in usage_records)
 
 
 def test_declared_dynamic_model_mutation_is_routed_and_reported_truthfully(

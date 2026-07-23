@@ -629,15 +629,26 @@ class PlainTextFieldSpec:
     max_chars: int = 1024
     presence_only: bool = False
     first_token: bool = False
+    entire_line: bool = False
+    required_suffix: Optional[str] = None
 
     def __post_init__(self) -> None:
-        marker = _safe_text(
-            self.marker,
-            label="plain-text field marker",
-            maximum=1024,
-            empty=False,
-            newlines=False,
-        )
+        if type(self.entire_line) is not bool:
+            raise ConfigurationError("plain-text entire-line flag is invalid")
+        if self.entire_line:
+            if self.marker != "":
+                raise ConfigurationError(
+                    "plain-text entire-line fields require an empty marker"
+                )
+            marker = ""
+        else:
+            marker = _safe_text(
+                self.marker,
+                label="plain-text field marker",
+                maximum=1024,
+                empty=False,
+                newlines=False,
+            )
         if self.terminator is not None:
             terminator = _safe_text(
                 self.terminator,
@@ -653,10 +664,19 @@ class PlainTextFieldSpec:
             raise ConfigurationError("plain-text presence marker is invalid")
         if type(self.first_token) is not bool:
             raise ConfigurationError("plain-text first-token marker is invalid")
-        if self.presence_only and self.first_token:
+        if self.presence_only and (self.first_token or self.entire_line):
             raise ConfigurationError(
-                "plain-text presence markers cannot extract a first token"
+                "plain-text presence markers cannot extract a version value"
             )
+        if self.required_suffix is not None:
+            suffix = _safe_text(
+                self.required_suffix,
+                label="plain-text field suffix",
+                maximum=128,
+                empty=False,
+                newlines=False,
+            )
+            object.__setattr__(self, "required_suffix", suffix)
         object.__setattr__(self, "marker", marker)
 
 
@@ -720,6 +740,7 @@ class PlainTextProbeSpec:
     identity_marker: Optional[str] = None
     marker_prefixes: bool = False
     identity_prefix: bool = False
+    use_stderr: bool = False
     format: ProbeFormat = field(default=ProbeFormat.PLAIN_TEXT, init=False)
 
     def __post_init__(self) -> None:
@@ -746,6 +767,8 @@ class PlainTextProbeSpec:
             raise ConfigurationError("plain-text marker prefix mode is invalid")
         if type(self.identity_prefix) is not bool:
             raise ConfigurationError("plain-text identity prefix mode is invalid")
+        if type(self.use_stderr) is not bool:
+            raise ConfigurationError("plain-text output stream is invalid")
         if self.identity_prefix and self.identity_marker is None:
             raise ConfigurationError(
                 "plain-text identity prefix requires an explicit marker"
@@ -781,6 +804,9 @@ class VersionProbeSpec:
     version_marker: Optional[str] = None
     identity_marker: Optional[str] = None
     version_is_first_token: bool = False
+    version_is_entire_line: bool = False
+    version_required_suffix: Optional[str] = None
+    maximum_version_component: int = 1_000_000
     identity_prefix: bool = False
 
     def __post_init__(self) -> None:
@@ -811,14 +837,32 @@ class VersionProbeSpec:
         ):
             raise ConfigurationError("minimum version is invalid")
         if self.format is ProbeFormat.PLAIN_TEXT:
-            marker = _safe_text(
-                self.version_marker,
-                label="plain version marker",
-                maximum=1024,
-                empty=False,
-                newlines=False,
-            )
+            if type(self.version_is_entire_line) is not bool:
+                raise ConfigurationError("plain version entire-line flag is invalid")
+            if self.version_is_entire_line:
+                if self.version_marker is not None:
+                    raise ConfigurationError(
+                        "plain entire-line versions cannot use a marker"
+                    )
+                marker = None
+            else:
+                marker = _safe_text(
+                    self.version_marker,
+                    label="plain version marker",
+                    maximum=1024,
+                    empty=False,
+                    newlines=False,
+                )
             object.__setattr__(self, "version_marker", marker)
+            if self.version_required_suffix is not None:
+                suffix = _safe_text(
+                    self.version_required_suffix,
+                    label="plain version suffix",
+                    maximum=128,
+                    empty=False,
+                    newlines=False,
+                )
+                object.__setattr__(self, "version_required_suffix", suffix)
             if self.identity_marker is not None:
                 identity = _safe_text(
                     self.identity_marker,
@@ -830,6 +874,7 @@ class VersionProbeSpec:
                 object.__setattr__(self, "identity_marker", identity)
             for label, value in (
                 ("plain version first-token marker", self.version_is_first_token),
+                ("plain version entire-line flag", self.version_is_entire_line),
                 ("plain version identity-prefix flag", self.identity_prefix),
             ):
                 if type(value) is not bool:
@@ -842,9 +887,18 @@ class VersionProbeSpec:
             self.version_marker is not None
             or self.identity_marker is not None
             or self.version_is_first_token
+            or self.version_is_entire_line
+            or self.version_required_suffix is not None
             or self.identity_prefix
         ):
             raise ConfigurationError("plain version markers require plain-text format")
+        if (
+            type(self.maximum_version_component) is not int
+            or not 1_000_000
+            <= self.maximum_version_component
+            <= 2_147_483_647
+        ):
+            raise ConfigurationError("maximum version component is invalid")
         object.__setattr__(self, "minimum_version", minimum)
 
 
@@ -859,6 +913,7 @@ class FeatureProbeSpec:
     identity_marker: Optional[str] = None
     marker_prefixes: bool = False
     identity_prefix: bool = False
+    use_stderr: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.command, FixedCommandSpec):
@@ -924,6 +979,7 @@ class FeatureProbeSpec:
             for label, value in (
                 ("plain feature marker-prefix mode", self.marker_prefixes),
                 ("plain feature identity-prefix mode", self.identity_prefix),
+                ("plain feature stderr mode", self.use_stderr),
             ):
                 if type(value) is not bool:
                     raise ConfigurationError("{} is invalid".format(label))
@@ -936,6 +992,7 @@ class FeatureProbeSpec:
             or self.identity_marker is not None
             or self.marker_prefixes
             or self.identity_prefix
+            or self.use_stderr
         ):
             raise ConfigurationError("feature markers require plain-text format")
         object.__setattr__(self, "required_features", frozenset(features))

@@ -96,16 +96,18 @@ test("managed dashboard is accessible, localized, and console-clean", async ({ p
   await expect(page.locator("#main-content")).toBeVisible();
   await expect(page).toHaveURL(/\/dashboard$/);
   await expect(page.locator("#overview-mode")).toHaveText("Manage mode");
-  await expect(page.locator("#overview-provider-list .badge")).toHaveCount(4);
-  await expect(page.locator("#overview-provider-list .badge").filter({ hasText: "Not verified" })).toHaveCount(4);
+  await expect(page.locator("#overview-provider-list .badge")).toHaveCount(5);
+  await expect(page.locator("#overview-provider-list .badge").filter({ hasText: "Not verified" })).toHaveCount(5);
   await expect(page.locator("#overview-provider-list .badge").filter({ hasText: "Unavailable" })).toHaveCount(0);
   const extensionCard = page.locator(".provider-card").filter({ hasText: "preview-ext" });
-  await expect(extensionCard).toContainText("Metadata only · preview");
+  await expect(extensionCard).toContainText("Preview · explicit local checks only · preview");
   await expect(extensionCard).toContainText("preview </script><img src=x onerror=alert(1)>");
   await expect(extensionCard.locator("img")).toHaveCount(0);
   await expect(extensionCard.locator("button").filter({ hasText: "Verify" })).toBeDisabled();
   await expect(page.locator('#models-provider option[value="preview-ext"]')).toHaveAttribute("disabled", "");
   await expect(page.locator('#chat-provider option[value="preview-ext"]')).toHaveAttribute("disabled", "");
+  await expect(page.locator('#chat-provider option[value="grok"]')).toBeEnabled();
+  await expect(page.locator('#chat-provider option[value="grok"]')).toContainText("Ext Preview");
   await expect(page.locator('#setting-default-provider option[value="preview-ext"]')).toHaveCount(0);
   await page.reload();
   await expect(page.locator("#overview-mode")).toHaveText("Manage mode");
@@ -125,14 +127,19 @@ test("managed dashboard is accessible, localized, and console-clean", async ({ p
   const chatProviders = await page.locator("#chat-provider option").evaluateAll(
     (options) => options.filter((option) => option.value && !option.disabled).map((option) => option.value)
   );
-  expect(chatProviders.every((provider) => provider === "claude" || provider === "codex")).toBeTruthy();
+  expect(chatProviders).toEqual(["claude", "codex", "grok"]);
   await expect(page.locator("#chat-permission")).toHaveValue("read_only");
+  await expect(page.locator("#chat-preview-warning")).toBeHidden();
+  await expect(page.locator("#image-picker")).toBeEnabled();
   await page.locator("#image-picker").focus();
   await expect(page.locator("#image-picker")).toBeFocused();
   const fileFocusVisible = await page.locator(".file-button").evaluate(
     (label) => getComputedStyle(label).outlineStyle !== "none"
   );
   expect(fileFocusVisible).toBeTruthy();
+  await page.locator("#chat-provider").selectOption("grok");
+  await expect(page.locator("#chat-preview-warning")).toBeVisible();
+  await expect(page.locator("#image-picker")).toBeDisabled();
 
   await page.getByRole("button", { name: "Sessions", exact: true }).click();
   await page.getByRole("button", { name: "Refresh sessions" }).click();

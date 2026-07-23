@@ -34,6 +34,15 @@ def _provider_executable(tmp_path, name: str, version: str, help_text: str):
         "esac\n",
         encoding="utf-8",
     )
+    if name == "kilo":
+        path.write_text(
+            path.read_text(encoding="utf-8").replace(
+                quoted_help + " ;;\n",
+                quoted_help + " >&2 ;;\n",
+                1,
+            ),
+            encoding="utf-8",
+        )
     path.chmod(0o700)
     return path
 
@@ -61,7 +70,7 @@ def test_qoder_factory_runs_exact_closed_acp_argv_and_normalizes(monkeypatch, tm
     executable = _provider_executable(
         tmp_path,
         "qodercli",
-        "qodercli 1.1.1",
+        "1.1.1",
         "Usage: qodercli\n--acp\nAgent Client Protocol\n--permission-mode",
     )
     captured = {}
@@ -126,7 +135,7 @@ def test_qoder_bridge_rejects_resume_images_models_and_workspace_config(
     executable = _provider_executable(
         tmp_path,
         "qodercli",
-        "qodercli 1.1.1",
+        "1.1.1",
         "Usage: qodercli\n--acp\nAgent Client Protocol\n--permission-mode",
     )
     provider = qoder.PLUGIN.factory(
@@ -154,7 +163,7 @@ def test_qoder_rejects_project_mcp_config_before_probe_or_acp_spawn(
     executable = _provider_executable(
         tmp_path,
         "qodercli",
-        "qodercli 1.1.1",
+        "1.1.1",
         "Usage: qodercli\n--acp\nAgent Client Protocol\n--permission-mode",
     )
     (tmp_path / ".mcp.json").write_text("{}", encoding="utf-8")
@@ -189,7 +198,7 @@ def test_qoder_turn_guard_precedes_cold_inspection(monkeypatch, tmp_path):
     executable = _provider_executable(
         tmp_path,
         "qodercli",
-        "qodercli 1.1.1",
+        "1.1.1",
         "Usage: qodercli\n--acp\nAgent Client Protocol\n--permission-mode",
     )
     provider = qoder.PLUGIN.factory(
@@ -217,7 +226,7 @@ def test_factory_rejects_unsupported_model_before_probe(monkeypatch, tmp_path):
     executable = _provider_executable(
         tmp_path,
         "qodercli",
-        "qodercli 1.1.1",
+        "1.1.1",
         "Usage: qodercli\n--acp\nAgent Client Protocol\n--permission-mode",
     )
     calls = 0
@@ -243,7 +252,7 @@ def test_achat_rejects_unknown_options_before_turn(monkeypatch, tmp_path):
     executable = _provider_executable(
         tmp_path,
         "qodercli",
-        "qodercli 1.1.1",
+        "1.1.1",
         "Usage: qodercli\n--acp\nAgent Client Protocol\n--permission-mode",
     )
     provider = qoder.PLUGIN.factory(
@@ -271,7 +280,7 @@ def test_achat_rejects_unknown_options_before_turn(monkeypatch, tmp_path):
         (
             kilo,
             "kilo",
-            "kilo 7.4.11",
+            "7.4.11",
             "kilo acp\nstart ACP\n--hostname\n--port",
             ("acp", "--hostname", "127.0.0.1", "--port", "0"),
         ),
@@ -435,7 +444,7 @@ def test_qoder_environment_allowlist_drops_unrelated_values(tmp_path):
     executable = _provider_executable(
         tmp_path,
         "qodercli",
-        "qodercli 1.1.1",
+        "1.1.1",
         "Usage: qodercli\n--acp\nAgent Client Protocol\n--permission-mode",
     )
     provider = qoder.PLUGIN.factory(

@@ -62,10 +62,7 @@ ADAPTER_SPEC = ProviderAdapterSpecV1(
             _command("--version"),
             minimum_version=(1, 1, 1),
             format=ProbeFormat.PLAIN_TEXT,
-            version_marker="qodercli ",
-            identity_marker="qodercli 1.1.1",
-            version_is_first_token=True,
-            identity_prefix=True,
+            version_is_entire_line=True,
         ),
         feature_probe=FeatureProbeSpec(
             _command("--help"),

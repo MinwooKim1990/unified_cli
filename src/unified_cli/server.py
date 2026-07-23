@@ -1194,11 +1194,23 @@ def manage_verify_provider(provider_id: str, request: "Request"):
 
 
 @app.post("/api/ui/v1/providers/{provider_id}/models")
-def manage_provider_models(provider_id: str, request: "Request"):
+async def manage_provider_models(provider_id: str, request: "Request"):
     # Model discovery may invoke a provider-specific probe, so it is an
     # explicit mutation-style action even though it only returns metadata.
     runtime, _session = _manage_session(request, mutation=True)
-    return runtime.provider_models(provider_id)
+    payload = await _manage_json_body(request)
+    if not set(payload).issubset({"force_refresh"}):
+        raise ManageError(
+            400, "invalid_models_request", "Model refresh fields are invalid."
+        )
+    force_refresh = payload.get("force_refresh", False)
+    if type(force_refresh) is not bool:
+        raise ManageError(
+            400, "invalid_models_request", "Model refresh must be a boolean."
+        )
+    return runtime.provider_models(
+        provider_id, force_refresh=force_refresh
+    )
 
 
 @app.get("/api/ui/v1/sessions")

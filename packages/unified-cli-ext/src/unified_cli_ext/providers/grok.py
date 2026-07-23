@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import platform
+import shutil
 import stat
+import sys
 from collections.abc import Mapping
 from dataclasses import replace
 from types import MappingProxyType
 
 from ..errors import ConfigurationError, ProtocolError
+from ..transports.security import private_persistent_home
 from .bridge import adapter_plugin
 from .contract import (
     AdapterServerPolicy,
@@ -29,7 +34,8 @@ from .contract import (
     TransportKind,
     VersionProbeSpec,
 )
-from .path_resolver import path_launch_resolver
+from .installation import InstallationReceiptV1
+from .path_resolver import resolve_path_installation
 
 
 GROK_OFFICIAL_SOURCES = (
@@ -48,6 +54,8 @@ GROK_REAL_AUTHENTICATED_SMOKE_CAPTURED = True
 GROK_REAL_SMOKE_VERSION = "0.2.111"
 GROK_REAL_SMOKE_PLATFORM = "macos-aarch64"
 GROK_REAL_SMOKE_DATE = "2026-07-23"
+GROK_NATIVE_SHA256 = "e1fafdfffe14f339460befaf194360e8f90bfd02efe8a4f24cfa1c7aea657ffe"
+GROK_NATIVE_SNAPSHOT = "native-0.2.111-darwin-arm64-e1fafdfffe14"
 GROK_SAFE_CONFIG = """[cli]
 auto_update = false
 
@@ -294,6 +302,266 @@ def _same_identity(before: os.stat_result, after: os.stat_result) -> bool:
     return all(getattr(before, name) == getattr(after, name) for name in fields)
 
 
+def _managed_provider_home(provider_home: str) -> bool:
+    """Return whether Core owns the requested Grok home subtree."""
+
+    root = os.path.realpath(
+        os.path.join(
+            os.path.expanduser("~"),
+            ".unified-cli",
+            "providers",
+            ADAPTER_SPEC.id,
+        )
+    )
+    try:
+        return os.path.commonpath((root, provider_home)) == root
+    except (TypeError, ValueError):
+        return False
+
+
+def _prepare_managed_provider_configuration(provider_home: object) -> None:
+    """Provision only the deterministic safe config in Core's private home.
+
+    Authentication is deliberately left to the vendor's official login
+    command. Existing paths are never replaced or truncated; the normal
+    validation path remains authoritative after this helper returns.
+    """
+
+    if type(provider_home) is not str:
+        return
+    try:
+        home = private_persistent_home(provider_home)
+    except ConfigurationError:
+        raise ConfigurationError(
+            "Grok Preview requires an explicit private provider home"
+        ) from None
+    if not _managed_provider_home(home):
+        return
+
+    state_dir = os.path.join(home, ".grok")
+    try:
+        os.mkdir(state_dir, 0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        raise ConfigurationError(
+            "Grok Preview provider config could not be prepared"
+        ) from None
+    _validate_state_directory(
+        state_dir,
+        label=".grok state directory",
+        forbid_shared_write=True,
+    )
+
+    config_path = os.path.join(state_dir, "config.toml")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = None
+    try:
+        descriptor = os.open(config_path, flags, 0o600)
+    except FileExistsError:
+        pass
+    except OSError:
+        raise ConfigurationError(
+            "Grok Preview provider config could not be prepared"
+        ) from None
+    if descriptor is not None:
+        try:
+            os.fchmod(descriptor, 0o600)
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != getattr(os, "geteuid", lambda: metadata.st_uid)()
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+            ):
+                raise ConfigurationError(
+                    "Grok Preview provider config could not be prepared"
+                )
+            remaining = memoryview(GROK_SAFE_CONFIG.encode("utf-8"))
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("short write")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+        except ConfigurationError:
+            raise
+        except OSError:
+            raise ConfigurationError(
+                "Grok Preview provider config could not be prepared"
+            ) from None
+        finally:
+            os.close(descriptor)
+    _validate_safe_config(home)
+
+
+def _hash_descriptor(descriptor: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    while True:
+        block = os.read(descriptor, 1024 * 1024)
+        if not block:
+            break
+        digest.update(block)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return digest.hexdigest()
+
+
+def _private_snapshot_directory(parent: str, name: str) -> str:
+    path = os.path.join(parent, name)
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        raise ConfigurationError(
+            "Grok native runtime snapshot could not be prepared"
+        ) from None
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        raise ConfigurationError(
+            "Grok native runtime snapshot could not be inspected"
+        ) from None
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != getattr(os, "geteuid", lambda: metadata.st_uid)()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise ConfigurationError("Grok native runtime snapshot is unsafe")
+    return path
+
+
+def _verified_native_source() -> int:
+    if sys.platform != "darwin" or platform.machine().lower() != "arm64":
+        raise ConfigurationError(
+            "Grok native Preview is verified only on macOS arm64"
+        )
+    home = os.path.realpath(os.path.expanduser("~"))
+    source = os.path.join(home, ".grok", "downloads", "grok-macos-aarch64")
+    launcher = shutil.which(ADAPTER_SPEC.binary.executable)
+    if launcher is None or os.path.realpath(launcher) != source:
+        raise ConfigurationError("official Grok native installation was not found")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = None
+    try:
+        descriptor = os.open(source, flags)
+        metadata = os.fstat(descriptor)
+    except OSError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ConfigurationError(
+            "official Grok native installation could not be inspected"
+        ) from None
+    try:
+        verified = (
+            stat.S_ISREG(metadata.st_mode)
+            and metadata.st_uid
+            == getattr(os, "geteuid", lambda: metadata.st_uid)()
+            and metadata.st_nlink == 1
+            and not stat.S_IMODE(metadata.st_mode) & 0o022
+            and _hash_descriptor(descriptor) == GROK_NATIVE_SHA256
+        )
+    except OSError:
+        os.close(descriptor)
+        raise ConfigurationError(
+            "official Grok native installation could not be inspected"
+        ) from None
+    if not verified:
+        os.close(descriptor)
+        raise ConfigurationError("official Grok native installation is unverified")
+    return descriptor
+
+
+def _verified_snapshot_receipt() -> InstallationReceiptV1:
+    """Copy the reviewed native binary into a stable Core-owned launch path."""
+
+    source = _verified_native_source()
+    try:
+        from unified_cli.extension_config import default_provider_home
+
+        provider_home = default_provider_home(ADAPTER_SPEC.id)
+        provider_root = os.path.dirname(provider_home)
+        snapshot = _private_snapshot_directory(provider_root, GROK_NATIVE_SNAPSHOT)
+        bin_dir = _private_snapshot_directory(snapshot, "bin")
+        target = os.path.join(bin_dir, ADAPTER_SPEC.binary.executable)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        target_descriptor = None
+        try:
+            target_descriptor = os.open(target, flags, 0o500)
+        except FileExistsError:
+            pass
+        except OSError:
+            raise ConfigurationError(
+                "Grok native runtime snapshot could not be created"
+            ) from None
+        if target_descriptor is not None:
+            try:
+                os.fchmod(target_descriptor, 0o500)
+                os.lseek(source, 0, os.SEEK_SET)
+                while True:
+                    block = os.read(source, 1024 * 1024)
+                    if not block:
+                        break
+                    pending = memoryview(block)
+                    while pending:
+                        written = os.write(target_descriptor, pending)
+                        if written <= 0:
+                            raise OSError("short write")
+                        pending = pending[written:]
+                os.fsync(target_descriptor)
+            except OSError:
+                raise ConfigurationError(
+                    "Grok native runtime snapshot could not be created"
+                ) from None
+            finally:
+                os.close(target_descriptor)
+
+        verify_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+        verify_flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            verified = os.open(target, verify_flags)
+            metadata = os.fstat(verified)
+        except OSError:
+            raise ConfigurationError(
+                "Grok native runtime snapshot could not be verified"
+            ) from None
+        try:
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid
+                != getattr(os, "geteuid", lambda: metadata.st_uid)()
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o500
+                or _hash_descriptor(verified) != GROK_NATIVE_SHA256
+            ):
+                raise ConfigurationError("Grok native runtime snapshot is invalid")
+        finally:
+            os.close(verified)
+        return InstallationReceiptV1.capture_explicit_direct(
+            provider_id=ADAPTER_SPEC.id,
+            executable_path=target,
+            executable_basename=ADAPTER_SPEC.binary.executable,
+        )
+    finally:
+        os.close(source)
+
+
+def _resolve_grok_installation() -> InstallationReceiptV1:
+    try:
+        return resolve_path_installation(
+            provider_id=ADAPTER_SPEC.id,
+            executable=ADAPTER_SPEC.binary.executable,
+            package_names=(GROK_OFFICIAL_PACKAGE,),
+        )
+    except ConfigurationError:
+        return _verified_snapshot_receipt()
+
+
 def _validate_state_directory(
     path: str,
     *,
@@ -525,6 +793,20 @@ def _map_record(record: Mapping, state: dict):
         if kind == "thought":
             return ()
         return ({"type": "text_delta", "text": record["data"]},)
+    if kind == "error":
+        message = record.get("message")
+        if type(message) is not str or not message:
+            raise ProtocolError("Grok returned a malformed error record")
+        try:
+            message_size = len(message.encode("utf-8", "strict"))
+        except UnicodeError:
+            raise ProtocolError("Grok returned a malformed error record") from None
+        if message_size > 64 * 1024:
+            raise ProtocolError("Grok returned a malformed error record")
+        # Keep the vendor message inside the transport boundary. The process
+        # exits non-zero and the bridge classifies only controlled markers
+        # from its already bounded, redacted diagnostics.
+        return ()
     if kind == "end":
         required = {"type", "stopReason", "sessionId", "requestId"}
         if not required <= set(record):
@@ -568,11 +850,7 @@ def _finalize(state: dict):
 _BASE_PLUGIN = adapter_plugin(
     ADAPTER_SPEC,
     default_model=GROK_DEFAULT_MODEL,
-    launch_resolver=path_launch_resolver(
-        provider_id=ADAPTER_SPEC.id,
-        executable=ADAPTER_SPEC.binary.executable,
-        package_names=(GROK_OFFICIAL_PACKAGE,),
-    ),
+    launch_resolver=_resolve_grok_installation,
     state_factory=_state,
     map_record=_map_record,
     finalize=_finalize,
@@ -584,7 +862,8 @@ def _checked_factory(*args, **kwargs):
     if args:
         raise ConfigurationError(
             "provider factory received unsupported positional options"
-    )
+        )
+    _prepare_managed_provider_configuration(kwargs.get("provider_home"))
     _validate_runtime_boundary(kwargs.get("cwd"), kwargs.get("provider_home"))
     return _require_exact_version(_BASE_PLUGIN.factory(**kwargs))
 
@@ -617,6 +896,7 @@ def _require_exact_doctor_version(result):
 
 def _checked_binder(context):
     bound = _BASE_PLUGIN.launch_binder(context)
+    _prepare_managed_provider_configuration(bound.provider_home)
     _validate_provider_configuration(bound.provider_home)
 
     def create_checked(request):
@@ -631,8 +911,7 @@ def _checked_binder(context):
 
 
 def _checked_doctor():
-    _validate_provider_configuration(None)
-    return _BASE_PLUGIN.doctor()
+    return _require_exact_doctor_version(_BASE_PLUGIN.doctor())
 
 
 PLUGIN = replace(

@@ -740,6 +740,8 @@ def test_grok_mapper_functions_are_protocol_strict():
     state = _state()
     assert tuple(_map_record({"type": "thought", "data": "hidden"}, state)) == ()
     with pytest.raises(ProtocolError):
+        _map_record({"type": "error", "message": "\ud800"}, _state())
+    with pytest.raises(ProtocolError):
         _finalize(state)
 
 

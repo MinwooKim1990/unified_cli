@@ -97,7 +97,14 @@ def resolve_path_installation(
         )
     launcher = os.path.abspath(launcher)
     target = os.path.realpath(launcher)
-    if os.path.basename(target) == executable:
+    # npm global launchers are commonly symlinks whose package target keeps
+    # the public executable basename (for example ``bin/grok``).  Direct
+    # vendor installers also commonly publish a symlink to a same-named
+    # executable.  Treat only targets actually owned by a ``node_modules``
+    # tree as npm candidates; same-named targets elsewhere remain explicit
+    # direct installations.
+    target_parts = os.path.normpath(target).split(os.sep)
+    if os.path.basename(target) == executable and "node_modules" not in target_parts:
         return InstallationReceiptV1.capture_explicit_direct(
             provider_id=provider_id,
             executable_path=target,

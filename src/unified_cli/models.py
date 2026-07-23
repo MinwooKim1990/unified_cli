@@ -49,25 +49,26 @@ DEFAULT_MODELS: dict[ProviderName, str] = {
 # in errors.py; do not duplicate elsewhere.
 _HARDCODED: dict[ProviderName, list[str]] = {
     "claude": [
-        # 2026-04 GA tiers (verified live; aliases map to these snapshots)
-        "claude-opus-4-7",       # latest flagship (GA 2026-04-16)
-        "claude-sonnet-4-6",     # GA 2026-02-17
-        "claude-haiku-4-5",      # GA — fastest tier (this wrapper's default)
+        # Current official tiers as of 2026-07-23. Claude Code also accepts the
+        # tier aliases below; account entitlements can expose a subset.
+        "claude-fable-5",
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "claude-haiku-4-5",      # fastest tier (this wrapper's default)
         # Aliases — Claude CLI maps these to the latest snapshot of each tier.
         "haiku", "sonnet", "opus",
     ],
     "codex": [
-        # Verified live on ChatGPT subscription auth.
-        # `gpt-5.5` is the true flagship per ~/.codex/models_cache.json but
-        # requires an upgraded codex CLI; users on older CLIs see a clear
-        # "requires newer Codex" error and can `brew upgrade codex`.
-        "gpt-5.5",                 # frontier (needs codex >= ~0.130)
-        "gpt-5.4",                 # strong everyday
-        "gpt-5.4-mini",            # fastest mini (this wrapper's default)
-        "gpt-5.3-codex",           # coding-specialized
-        "gpt-5.3-codex-spark",     # lightweight, fastest
-        "gpt-5.2",                 # older flagship
-        "codex-auto-review",       # review specialist
+        # Current installed Codex catalog fallback as of 2026-07-23. At
+        # runtime ~/.codex/models_cache.json remains authoritative.
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "gpt-5.5",
+        "gpt-5.4",
+        "gpt-5.4-mini",            # this wrapper's compatibility default
+        "gpt-5.3-codex-spark",
+        "codex-auto-review",
     ],
     "gemini": [
         # Antigravity `agy` models. `agy --model` accepts these slug forms as

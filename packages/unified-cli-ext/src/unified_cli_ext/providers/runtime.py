@@ -1585,7 +1585,9 @@ class ProviderAdapterV1:
                 raise ProtocolError("provider plain-text probe is missing a required marker")
         result = {}
         for name, field_spec in probe.fields.items():
-            if probe.marker_prefixes:
+            if field_spec.entire_line:
+                matches = [line for line in lines if line != ""]
+            elif probe.marker_prefixes:
                 matches = [
                     line.lstrip(" \t")
                     for line in lines
@@ -1603,7 +1605,7 @@ class ProviderAdapterV1:
                 result[name] = True
                 continue
             line = matches[0]
-            value = line[len(field_spec.marker) :]
+            value = line if field_spec.entire_line else line[len(field_spec.marker) :]
             if field_spec.terminator in (None, "\n", "\r\n"):
                 end = len(value)
             else:
@@ -1617,6 +1619,12 @@ class ProviderAdapterV1:
             value = value[:end]
             if field_spec.first_token:
                 value = value.partition(" ")[0]
+            if field_spec.required_suffix is not None:
+                if not value.endswith(field_spec.required_suffix):
+                    raise ProtocolError(
+                        "provider plain-text probe field is missing its required suffix"
+                    )
+                value = value[: -len(field_spec.required_suffix)]
             if len(value) > field_spec.max_chars:
                 raise ProtocolError("provider plain-text probe field exceeds its limit")
             result[name] = value
@@ -1664,6 +1672,7 @@ class ProviderAdapterV1:
         provider_env: Optional[Mapping[str, str]] = None,
         provider_home: Optional[str] = None,
         cancellation: Optional[CancellationToken] = None,
+        require_plain_identity: bool = True,
     ) -> Mapping[str, Any]:
         self._ensure_usable()
         binary.verify(self.spec.binary.executable)
@@ -1733,7 +1742,8 @@ class ProviderAdapterV1:
                             raise ProtocolError("provider JSON probe is not bounded JSON") from None
                         result = MappingProxyType(dict(bounded))
                     else:
-                        result = self._plain_record(fixed.stdout, probe)
+                        plain_output = fixed.stderr if probe.use_stderr else fixed.stdout
+                        result = self._plain_record(plain_output, probe)
             binary.verify(self.spec.binary.executable)
             if isinstance(probe, JsonProbeSpec):
                 if (
@@ -1746,8 +1756,8 @@ class ProviderAdapterV1:
                     )
                 expected_items = probe.expected.items()
             elif isinstance(probe, PlainTextProbeSpec):
-                if not self._plain_identity_matches(
-                    fixed.stdout,
+                if require_plain_identity and not self._plain_identity_matches(
+                    fixed.stderr if probe.use_stderr else fixed.stdout,
                     probe,
                     self.spec.binary.expected_identity,
                 ):
@@ -1848,9 +1858,11 @@ class ProviderAdapterV1:
                 version_spec.command,
                 fields={
                     version_spec.version_field: PlainTextFieldSpec(
-                        version_spec.version_marker,
+                        version_spec.version_marker or "",
                         max_chars=128,
                         first_token=version_spec.version_is_first_token,
+                        entire_line=version_spec.version_is_entire_line,
+                        required_suffix=version_spec.version_required_suffix,
                     )
                 },
                 expected={version_spec.version_field: None},
@@ -1869,6 +1881,7 @@ class ProviderAdapterV1:
             provider_env=provider_env,
             provider_home=provider_home,
             cancellation=cancellation,
+            require_plain_identity=not version_spec.version_is_entire_line,
         )
         version = version_record.get(version_spec.version_field)
         if type(version) is not str or len(version) > 128:
@@ -1877,7 +1890,7 @@ class ProviderAdapterV1:
         if match is None:
             raise ProtocolError("provider version probe returned an invalid version")
         release = tuple(int(item) for item in match.group("release").split("."))
-        if any(item > 1_000_000 for item in release):
+        if any(item > version_spec.maximum_version_component for item in release):
             raise ProtocolError("provider version probe returned an invalid version")
         prerelease = match.group("prerelease")
         if prerelease is not None and any(
@@ -1910,6 +1923,7 @@ class ProviderAdapterV1:
                 identity_marker=feature_spec.identity_marker,
                 marker_prefixes=feature_spec.marker_prefixes,
                 identity_prefix=feature_spec.identity_prefix,
+                use_stderr=feature_spec.use_stderr,
             )
         else:
             feature_probe = JsonProbeSpec(

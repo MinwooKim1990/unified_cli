@@ -8,6 +8,7 @@ import unicodedata
 
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
+from prompt_toolkit.document import Document
 
 from unified_cli import repl
 from unified_cli import repl_completion as rc
@@ -65,6 +66,29 @@ def test_toolbar_korean_text_fits_ten_column_terminal(monkeypatch):
     assert rc._display_width(toolbar) <= 9
     assert "\x1b" not in toolbar
     assert not any(unicodedata.category(char).startswith("C") for char in toolbar)
+
+
+def test_menu_tracks_unique_command_prefix_subcommands_and_values():
+    completer = rc.UnifiedCompleter({
+        "provider": "claude",
+        "model": "haiku",
+        "_completion_core_models": {},
+    })
+    commands = list(completer.get_completions(Document("/the"), None))
+    providers = list(completer.get_completions(Document("/prov "), None))
+    auth_actions = list(completer.get_completions(Document("/au st"), None))
+    auth_providers = list(
+        completer.get_completions(Document("/au status co"), None)
+    )
+
+    assert [item.text for item in commands] == ["/theme"]
+    assert [item.text for item in providers] == [
+        "claude", "codex", "gemini", *rc.BUNDLED_EXTENSION_PROVIDERS,
+    ]
+    assert [item.text for item in auth_actions] == ["status"]
+    assert {item.text for item in auth_providers} >= {
+        "codex", "copilot", "codebuddy",
+    }
 
 
 def test_non_tty_path_never_builds_prompt_session(monkeypatch):

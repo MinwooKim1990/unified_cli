@@ -43,6 +43,30 @@ ENTRY_POINT_GROUP = "unified_cli.providers.v1"
 DISABLE_PLUGINS_ENV = "UNIFIED_CLI_DISABLE_PLUGINS"
 BUILTIN_PROVIDER_IDS: Tuple[ProviderName, ...] = ("claude", "codex", "gemini")
 RESERVED_PROVIDER_IDS = frozenset((*BUILTIN_PROVIDER_IDS, "agy"))
+# Passive copies of this distribution's entry-point metadata.  Manage-mode
+# bootstrap uses only these strings: it must be able to render the complete
+# bundled catalog without asking importlib to load provider modules.  A release
+# contract test keeps this tuple synchronized with pyproject.toml.
+BUNDLED_EXTENSION_ENTRY_POINTS_V1: Tuple[Tuple[str, str], ...] = (
+    ("grok", "unified_cli_ext.providers.grok:PLUGIN"),
+    ("kimi", "unified_cli_ext.providers.kimi:PLUGIN"),
+    ("copilot", "unified_cli_ext.providers.copilot:PLUGIN"),
+    ("cursor", "unified_cli_ext.providers.cursor:PLUGIN"),
+    ("codebuddy", "unified_cli_ext.providers.codebuddy:PLUGIN"),
+    ("qoder", "unified_cli_ext.providers.qoder:PLUGIN"),
+    ("mistral-vibe", "unified_cli_ext.providers.mistral_vibe:PLUGIN"),
+    ("qwen", "unified_cli_ext.providers.qwen:PLUGIN"),
+    ("cline", "unified_cli_ext.providers.cline:PLUGIN"),
+    ("opencode", "unified_cli_ext.providers.opencode:PLUGIN"),
+    ("kilo", "unified_cli_ext.providers.kilo:PLUGIN"),
+    ("droid", "unified_cli_ext.providers.droid:PLUGIN"),
+    ("pi", "unified_cli_ext.providers.pi:PLUGIN"),
+    ("oh-my-pi", "unified_cli_ext.providers.oh_my_pi:PLUGIN"),
+    ("hermes", "unified_cli_ext.providers.hermes:PLUGIN"),
+    ("poolside", "unified_cli_ext.providers.poolside:PLUGIN"),
+    ("amp", "unified_cli_ext.providers.amp:PLUGIN"),
+    ("gitlab-duo", "unified_cli_ext.providers.gitlab_duo:PLUGIN"),
+)
 
 
 @dataclass(frozen=True)
@@ -186,6 +210,55 @@ def _plugin_error(provider_id: ProviderId, code: str) -> UnifiedError:
     )
 
 
+def _sanitized_extension_error(
+    provider_id: ProviderId, error: UnifiedError,
+) -> UnifiedError:
+    """Preserve only a trusted error category across the plugin boundary.
+
+    Provider plugins may construct ``UnifiedError`` themselves, so their
+    message, hint, cause, provider id, and arbitrary attributes remain
+    untrusted.  Reconstructing the error lets bundled adapters report useful
+    categories such as ``auth_expired`` without exposing plugin-owned text.
+    """
+
+    kind = error.kind if type(error.kind) is str and error.kind in {
+        "auth_expired",
+        "rate_limit",
+        "model_not_allowed",
+        "not_found",
+        "network",
+        "resource_limit",
+        "config",
+        "internal",
+    } else "internal"
+    messages = {
+        "auth_expired": "Provider authentication is required.",
+        "rate_limit": "The provider temporarily refused the request due to a usage limit.",
+        "model_not_allowed": "The selected provider model is unavailable for this account.",
+        "not_found": "The requested provider resource was not found.",
+        "network": "The provider request failed because of a network problem.",
+        "resource_limit": "The provider could not complete the request within its resource limits.",
+        "config": "The provider configuration is unavailable or incompatible.",
+        "internal": f"Provider extension '{provider_id}' failed while running.",
+    }
+    hints = {
+        "auth_expired": (
+            "Run the provider's official login command in its unified-cli "
+            "provider home, then retry."
+        ),
+        "rate_limit": "Wait for the provider's stated cooldown before retrying.",
+        "model_not_allowed": "Refresh the provider model list or choose another model.",
+        "network": "Check the provider service and network connection, then retry.",
+        "config": "Run the provider doctor and configuration command, then retry.",
+    }
+    return UnifiedError(
+        kind=kind,
+        provider=provider_id,
+        message=messages[kind],
+        hint=hints.get(kind, ""),
+    )
+
+
 class _ExtensionProviderProxy(BaseProvider):
     """Core-owned error boundary around an explicitly loaded provider."""
 
@@ -223,6 +296,7 @@ class _ExtensionProviderProxy(BaseProvider):
 
     def chat(self, prompt: str, **kwargs: Any) -> Any:
         failed = False
+        runtime_error: Optional[UnifiedError] = None
         caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
         if caller_cancelled:
             raise _cancelled_error(self.name) from None
@@ -230,18 +304,26 @@ class _ExtensionProviderProxy(BaseProvider):
             response = self._inner.chat(prompt, **kwargs)
         except _CANCELLATION_EXCEPTIONS:
             raise
+        except UnifiedError as error:
+            caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
+            failed = not caller_cancelled
+            runtime_error = error if failed else None
+            response = None
         except BaseException:
             caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
             failed = not caller_cancelled
             response = None
         if caller_cancelled or _cancel_requested(kwargs.get("cancel_event")):
             raise _cancelled_error(self.name) from None
+        if runtime_error is not None:
+            raise _sanitized_extension_error(self.name, runtime_error) from None
         if failed:
             raise _plugin_error(self.name, "runtime") from None
         return response
 
     def stream(self, prompt: str, **kwargs: Any) -> Any:
         failed = False
+        runtime_error: Optional[UnifiedError] = None
         caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
         inner_iterator: Any = None
         if caller_cancelled:
@@ -255,6 +337,10 @@ class _ExtensionProviderProxy(BaseProvider):
                 yield message
         except _CANCELLATION_EXCEPTIONS:
             raise
+        except UnifiedError as error:
+            caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
+            failed = not caller_cancelled
+            runtime_error = error if failed else None
         except BaseException:
             caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
             failed = not caller_cancelled
@@ -266,16 +352,23 @@ class _ExtensionProviderProxy(BaseProvider):
                         close()
                 except _CANCELLATION_EXCEPTIONS:
                     raise
+                except UnifiedError as error:
+                    if not caller_cancelled:
+                        failed = True
+                        runtime_error = error
                 except BaseException:
                     if not caller_cancelled:
                         failed = True
         if caller_cancelled or _cancel_requested(kwargs.get("cancel_event")):
             raise _cancelled_error(self.name) from None
+        if runtime_error is not None:
+            raise _sanitized_extension_error(self.name, runtime_error) from None
         if failed:
             raise _plugin_error(self.name, "runtime") from None
 
     async def achat(self, prompt: str, **kwargs: Any) -> Any:
         failed = False
+        runtime_error: Optional[UnifiedError] = None
         caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
         if caller_cancelled:
             raise _cancelled_error(self.name) from None
@@ -283,18 +376,26 @@ class _ExtensionProviderProxy(BaseProvider):
             response = await self._inner.achat(prompt, **kwargs)
         except _CANCELLATION_EXCEPTIONS:
             raise
+        except UnifiedError as error:
+            caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
+            failed = not caller_cancelled
+            runtime_error = error if failed else None
+            response = None
         except BaseException:
             caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
             failed = not caller_cancelled
             response = None
         if caller_cancelled or _cancel_requested(kwargs.get("cancel_event")):
             raise _cancelled_error(self.name) from None
+        if runtime_error is not None:
+            raise _sanitized_extension_error(self.name, runtime_error) from None
         if failed:
             raise _plugin_error(self.name, "runtime") from None
         return response
 
     async def astream(self, prompt: str, **kwargs: Any) -> Any:
         failed = False
+        runtime_error: Optional[UnifiedError] = None
         cancelled = False
         caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
         inner_iterator: Any = None
@@ -311,6 +412,10 @@ class _ExtensionProviderProxy(BaseProvider):
         except _CANCELLATION_EXCEPTIONS:
             cancelled = True
             raise
+        except UnifiedError as error:
+            caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
+            failed = not caller_cancelled
+            runtime_error = error if failed else None
         except BaseException:
             caller_cancelled = _cancel_requested(kwargs.get("cancel_event"))
             failed = not caller_cancelled
@@ -322,11 +427,17 @@ class _ExtensionProviderProxy(BaseProvider):
                         await close()
                 except _CANCELLATION_EXCEPTIONS:
                     raise
+                except UnifiedError as error:
+                    if not cancelled and not caller_cancelled:
+                        failed = True
+                        runtime_error = error
                 except BaseException:
                     if not cancelled and not caller_cancelled:
                         failed = True
         if caller_cancelled or _cancel_requested(kwargs.get("cancel_event")):
             raise _cancelled_error(self.name) from None
+        if runtime_error is not None:
+            raise _sanitized_extension_error(self.name, runtime_error) from None
         if failed:
             raise _plugin_error(self.name, "runtime") from None
 
@@ -1069,6 +1180,44 @@ def _builtin_descriptors() -> list[ProviderDescriptorV1]:
     ]
 
 
+def passive_bundled_provider_descriptors() -> Tuple[ProviderDescriptorV1, ...]:
+    """Return callback-free Preview descriptors for bundled entry points.
+
+    The entry-point target is deliberately validated but not imported.  Model
+    defaults and capabilities belong to provider code, so this passive view
+    does not guess them; an explicit manage action may load exactly one target.
+    """
+
+    descriptors = []
+    seen = set()
+    prefix = "unified_cli_ext.providers."
+    for provider_id, target in BUNDLED_EXTENSION_ENTRY_POINTS_V1:
+        if (
+            provider_id in seen
+            or provider_id in RESERVED_PROVIDER_IDS
+            or not _valid_provider_id(provider_id)
+            or type(target) is not str
+            or not target.startswith(prefix)
+            or not target.endswith(":PLUGIN")
+        ):
+            raise RuntimeError("bundled provider entry-point metadata is invalid")
+        seen.add(provider_id)
+        descriptors.append(ProviderDescriptorV1(
+            id=provider_id,
+            source="extension",
+            status="discovered",
+            support_status="preview",
+            default_model=None,
+            capabilities=frozenset(),
+            route_prefixes=(provider_id,),
+            server_policy=ProviderServerPolicyV1(
+                enabled=False,
+                requires_external_isolation=True,
+            ),
+        ))
+    return tuple(descriptors)
+
+
 def _descriptor_from_loaded_plugin(
     plugin: ProviderPluginV1,
 ) -> ProviderDescriptorV1:
@@ -1125,6 +1274,10 @@ def list_providers(*, include_ext: bool = False) -> list[ProviderDescriptorV1]:
         return descriptors
 
     entry_points = _discover_entry_points()
+    bundled = {
+        descriptor.id: descriptor
+        for descriptor in passive_bundled_provider_descriptors()
+    }
     by_name: Dict[str, list[Any]] = {}
     invalid_names: list[str] = []
     for entry_point in entry_points:
@@ -1171,12 +1324,25 @@ def list_providers(*, include_ext: bool = False) -> list[ProviderDescriptorV1]:
         else:
             if failed is not None and status == "discovered":
                 status, error = "broken", "load_failed"
-            descriptors.append(ProviderDescriptorV1(
-                id=provider_id,
-                source="extension",
-                status=status,
-                error=error,
-            ))
+            passive = bundled.get(provider_id)
+            if (
+                passive is not None
+                and status == "discovered"
+                and error is None
+                and len(entries) == 1
+            ):
+                # The bundled manifest is generated from this distribution's
+                # entry-point metadata.  Reuse its callback-free Preview
+                # descriptor so CLI, REPL, and manage surfaces agree without
+                # importing provider code or probing a vendor executable.
+                descriptors.append(passive)
+            else:
+                descriptors.append(ProviderDescriptorV1(
+                    id=provider_id,
+                    source="extension",
+                    status=status,
+                    error=error,
+                ))
 
     for invalid_name in invalid_names:
         descriptors.append(ProviderDescriptorV1(

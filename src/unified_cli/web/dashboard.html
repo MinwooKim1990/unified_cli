@@ -124,10 +124,11 @@
             <form id="chat-form" class="panel chat-composer">
               <div class="field-grid">
                 <label for="chat-provider"><span data-i18n="provider">Provider</span><select id="chat-provider" name="provider" required><option value="" data-i18n="selectProvider">Select provider</option></select></label>
-                <label for="chat-model"><span data-i18n="model">Model</span><select id="chat-model" name="model"><option value="" data-i18n="defaultModel">Provider default</option></select></label>
+                <label for="chat-model"><span data-i18n="model">Model</span><input id="chat-model" name="model" list="chat-model-options" maxlength="256" autocomplete="off" data-i18n-placeholder="defaultModel" placeholder="Provider default"><datalist id="chat-model-options"></datalist><small class="field-help" data-i18n="manualModelHint">Model IDs can be entered manually in Chat when discovery is offline.</small></label>
                 <label for="chat-workspace"><span data-i18n="workspace">Workspace</span><select id="chat-workspace" name="workspace" required><option value="" data-i18n="selectWorkspace">Select workspace</option></select></label>
                 <label for="chat-permission"><span data-i18n="permission">Permission</span><input id="chat-permission" value="read_only" readonly aria-readonly="true"></label>
               </div>
+              <p id="chat-preview-warning" class="notice notice-warning" role="status" hidden data-i18n="chatPreviewWarning">Ext Preview runs only when you press Send. The selected local adapter remains read-only, and image input is unavailable.</p>
               <label for="chat-prompt"><span data-i18n="prompt">Prompt</span><textarea id="chat-prompt" name="prompt" rows="6" maxlength="20000" required data-i18n-placeholder="promptPlaceholder" placeholder="Ask about the selected workspace…"></textarea></label>
               <div class="attachment-row">
                 <label class="button secondary file-button" for="image-picker"><span data-i18n="addImages">Add images</span><input id="image-picker" type="file" accept="image/png,image/jpeg,image/webp" multiple></label>
@@ -175,6 +176,8 @@
               <label for="setting-theme"><span data-i18n="theme">Theme</span><select id="setting-theme" name="theme"><option value="auto" data-i18n="themeAuto">Auto</option><option value="light" data-i18n="themeLight">Light</option><option value="dark" data-i18n="themeDark">Dark</option></select></label>
               <label for="setting-default-provider"><span data-i18n="provider">Provider</span><select id="setting-default-provider" name="default_provider"><option value="" data-i18n="selectProvider">Select provider</option></select></label>
               <label for="setting-workspace"><span data-i18n="workspace">Workspace</span><select id="setting-workspace" name="workspace_id"><option value="" data-i18n="noDefaultWorkspace">No default workspace</option></select></label>
+              <label for="setting-reasoning-display"><span data-i18n="reasoningDisplay">Reasoning display</span><select id="setting-reasoning-display" name="reasoning_display"><option value="hidden" data-i18n="hidden">Hidden</option><option value="compact" data-i18n="compact">Compact</option></select></label>
+              <label for="setting-tool-display"><span data-i18n="toolDisplay">Tool display</span><select id="setting-tool-display" name="tool_display"><option value="hidden" data-i18n="hidden">Hidden</option><option value="compact" data-i18n="compact">Compact</option></select></label>
               <label for="setting-permission"><span data-i18n="browserPermission">Browser permission</span><input id="setting-permission" name="browser_permission" value="read_only" readonly aria-readonly="true"></label>
               <label class="checkbox-field" for="setting-web"><input id="setting-web" name="web" type="checkbox"><span data-i18n="allowWeb">Allow read-only web tools</span></label>
               <label class="checkbox-field" for="setting-prompt-preview"><input id="setting-prompt-preview" name="browser_prompt_preview" type="checkbox"><span data-i18n="allowPromptPreview">Allow short prompt previews in usage</span></label>

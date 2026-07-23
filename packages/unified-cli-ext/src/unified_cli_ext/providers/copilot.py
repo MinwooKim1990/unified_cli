@@ -68,7 +68,10 @@ ADAPTER_SPEC = ProviderAdapterSpecV1(
             _command("--version"),
             minimum_version=(0,),
             format=ProbeFormat.PLAIN_TEXT,
-            version_marker="copilot ",
+            version_marker="GitHub Copilot CLI ",
+            version_required_suffix=".",
+            identity_marker="GitHub Copilot CLI ",
+            identity_prefix=True,
         ),
         feature_probe=FeatureProbeSpec(
             _command("help"),

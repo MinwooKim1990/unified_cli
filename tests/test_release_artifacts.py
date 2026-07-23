@@ -254,9 +254,9 @@ def _entry_points_payload(entries=_UNIFIED_ENTRY_POINTS):
 
 
 def _unified_artifacts(tmp_path, *, dependencies=None, entry_points=None):
-    version = "0.5.2"
+    version = "0.5.3"
     root = "unified_cli-" + version
-    wheel_entry_points = "unified_cli-0.5.2.dist-info/entry_points.txt"
+    wheel_entry_points = "unified_cli-0.5.3.dist-info/entry_points.txt"
     sdist_entry_points = root + "/src/unified_cli.egg-info/entry_points.txt"
     payload = _entry_points_payload(
         _UNIFIED_ENTRY_POINTS if entry_points is None else entry_points
@@ -296,7 +296,7 @@ def _verify_unified(tmp_path, *, expected_optional_dependency=None):
     return verify_release_artifacts.verify_release_directory(
         tmp_path,
         expected_name="unified-cli",
-        expected_version="0.5.2",
+        expected_version="0.5.3",
         package_sources=(
             ("unified_cli", "src/unified_cli"),
             (

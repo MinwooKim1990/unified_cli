@@ -498,8 +498,12 @@ class ClaudeProvider(BaseProvider):
         model_usage = data.get("modelUsage") or {}
         if model in model_usage:
             resolved_model = model
+        elif model == "opus" and "claude-opus-4-8" in model_usage:
+            resolved_model = "claude-opus-4-8"
         elif model == "opus" and "claude-opus-4-7" in model_usage:
             resolved_model = "claude-opus-4-7"
+        elif model == "sonnet" and "claude-sonnet-5" in model_usage:
+            resolved_model = "claude-sonnet-5"
         elif model == "sonnet" and "claude-sonnet-4-6" in model_usage:
             resolved_model = "claude-sonnet-4-6"
         elif model == "haiku" and "claude-haiku-4-5-20251001" in model_usage:

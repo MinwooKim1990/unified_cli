@@ -1,18 +1,18 @@
 # Extensions
 
-Extensions are bundled with Core in the `unified-cli` 0.5.2
+Extensions are bundled with Core in the `unified-cli` 0.5.3
 distribution; `unified_cli` and `unified_cli_ext` are both public namespaces in
 that one wheel. Core continues to support Claude, Codex, and Gemini (`agy`) as
 its only defaults. Extensions are a feature boundary: using one does not change
 those defaults, add an extension to Core's local server allowlist, or install or
 configure vendor software.
 
-The bundled extensions provide 18 explicit provider entry points. Grok Build is a read-tool-limited
-**Preview** backed by offline fixtures and one representative authenticated
-native smoke. Every other provider uses a common transport with offline
-fixtures and is runnable as **Preview** when explicitly selected. Vendor CLI
-and account compatibility is not guaranteed. No Ext provider is enabled in Core
-server mode.
+The bundled extensions provide 18 explicit provider entry points and
+executable **Preview** adapters. Grok Build is backed by offline fixtures and
+one representative authenticated native smoke. Other providers use
+fixture-tested common transports and are attempted only when explicitly
+selected. Vendor CLI and account compatibility is not guaranteed. No Ext
+provider is enabled in the public Core `/v1/*` server routes.
 
 Vendor binaries, accounts, subscriptions, and their updates remain
 user-owned. Installing Ext alone does not install a vendor CLI, log in, call a
@@ -21,7 +21,7 @@ service, or incur charges. Ext is not affiliated with the vendors listed here.
 ## Install and inspect
 
 ```bash
-python -m pip install "unified-cli==0.5.2"
+python -m pip install "unified-cli==0.5.3"
 python -c "import unified_cli_ext; print(unified_cli_ext.__name__)"
 unified-cli providers --include-ext
 ```
@@ -35,18 +35,54 @@ before installing the planned unified release:
 
 ```bash
 python -m pip uninstall -y unified-cli-ext
-python -m pip install --force-reinstall "unified-cli==0.5.2"
+python -m pip install --force-reinstall "unified-cli==0.5.3"
 ```
 
 Core keeps this discovery import-free. `unified-cli providers --include-ext`
-therefore reports a new entry as lifecycle `discovered` and support `unknown`.
-An explicit request loads only that provider's entry point. All 18 entries are
-runnable Preview adapters; discovery itself remains import-free. Grok continues
-only after its explicitly selected local binary passes the exact `0.2.111`
-version and bounded feature probes. All Ext providers remain disabled in server
-mode.
+reports the bundled entries as lifecycle `discovered` and support `preview`
+without importing them. An explicit request loads only that provider's entry
+point. All 18 entries have executable Preview adapters. The 2026-07-23
+credential-free lab reached `create()` for 13 current official installations.
+Cursor, Hermes, Mistral Vibe, and Qoder returned bounded compatibility errors;
+Poolside was not installed because its installer required EULA acceptance.
+See the [accountless lab evidence](development/ext-accountless-live-lab-2026-07-23.md).
+Grok continues only after its explicitly selected local binary passes the
+exact `0.2.111` version and bounded feature probes. Ext providers remain
+disabled in public `/v1/*` routes.
 
 ## Grok Preview setup and boundary
+
+The normal setup is short. `configure` verifies the official executable,
+creates the reviewed isolated configuration, and stores a launch receipt. The
+vendor's official login then writes only to that isolated home:
+
+```bash
+curl -fsSL https://x.ai/cli/install.sh | bash
+unified-cli configure grok
+HOME="$HOME/.unified-cli/providers/grok/home" grok login --device-code
+python examples/09_extensions.py grok "Explain this repository"
+```
+
+The same flow is available from Python:
+
+```python
+from pathlib import Path
+from unified_cli import configure_extension_provider, create
+
+configure_extension_provider("grok")
+client = create("grok", cwd=str(Path.cwd().resolve()))
+print(client.chat("Explain this repository").text)
+```
+
+The normal user `~/.grok` authentication is never copied. If login is missing,
+Python and the CLI return a sanitized `auth_expired` error with the isolated
+login instruction.
+
+<details>
+<summary>Manual native snapshot verification reference</summary>
+
+The following longer recipe documents the checks performed automatically and
+is intended for maintainers auditing the reviewed macOS arm64 snapshot.
 
 Grok Build Preview is one runnable Ext provider. Its primary official
 native installer is `https://x.ai/cli/install.sh`; the official npm package
@@ -329,7 +365,10 @@ smoke of official native Grok `0.2.111` (commit marker `94172f2aa4e5`) passed on
 macOS arm64 on 2026-07-23; its sanitized results are recorded in
 [the smoke evidence](development/grok-0.2.111-smoke.md). This is one
 version/platform/auth sample, not a release-wide compatibility claim. Grok is
-therefore still Preview, not Stable, and remains disabled in server mode.
+therefore still Preview, not Stable, and remains disabled in public `/v1/*`
+server routes.
+
+</details>
 
 ## Local installation receipts
 
@@ -347,10 +386,15 @@ access can change a path between those operations.
 | Stable | A released, supported integration with the documented compatibility evidence. |
 | Preview | An enabled integration still being evaluated; its limits are documented. |
 
-All 18 catalog entries below are **Preview** and runnable when explicitly
-selected. Grok has representative authenticated live-test evidence; the other
-providers have fixture-tested common transports, not a guarantee of vendor or
-account compatibility. All Ext server policies are disabled.
+All 18 catalog entries below have executable **Preview** adapters and are
+attempted when explicitly selected. The current accountless lab reached
+`create()` for 13/18; its four compatibility blockers and one EULA-limited
+installation are documented above. Grok has representative authenticated
+live-test evidence; other providers have fixture-tested common transports,
+not a guarantee of vendor or account compatibility. All Ext public-server policies are disabled, so
+public-compatible `/v1/*` routes remain Core-only. The loopback-only
+`serve --manage` UI may still invoke an explicitly selected Ext provider in a
+registered workspace through the same Python `create()` path.
 
 ## Generated provider support
 
@@ -386,8 +430,8 @@ manual design record.
 “Candidate transport” records a provisional design direction, not a command
 contract. This is retained as a pre-0.5.2 design record; its historical Held
 and Experimental labels are superseded by the generated support table above.
-Every current adapter is runnable as Preview only after explicit selection;
-vendor and account compatibility can vary.
+Every current adapter is executable only after explicit selection; Preview
+compatibility can still stop before a turn with a bounded configuration error.
 
 The Grok, Kimi, Copilot, and Cursor rows record current official-documentation
 research and pinned compatibility targets. Prompts are argv values and must not
@@ -403,7 +447,7 @@ CLI and account combinations have not all been live-tested.
 | `copilot` | GitHub Copilot CLI (`copilot`, `@github/copilot`) | Plain-text one-shot candidate | Explicit read-only tool candidate; Core capability none | Held | Candidate `--no-auto-update` plus tool/MCP controls; JSONL schema and complete user/workspace MCP and dedicated-home isolation remain unverified | [Install](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli) · [CLI command reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference) · [ACP server](https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server) |
 | `cursor` | Cursor Agent CLI (`agent` primary; `cursor-agent` legacy alias since 2026-01-08) | Final/stream JSON schema candidates | Positional-prompt ABI is not safely representable; Core capability none | Held | No verified read-only, MCP, or update containment; `CURSOR_API_KEY` is env-only and never argv | [Install](https://cursor.com/docs/cli/installation) · [Parameters](https://cursor.com/docs/cli/reference/parameters) · [Output format](https://cursor.com/docs/cli/reference/output-format) · [ACP](https://cursor.com/docs/cli/acp) |
 | `codebuddy` | CodeBuddy Code (`codebuddy`, `@tencent-ai/codebuddy-code`) | JSONL protocol candidate | `chat` candidate; Core capability none | Held | Candidate `DISABLE_AUTOUPDATER=1`; exact frame and config isolation require verification | [CLI reference](https://www.codebuddy.ai/docs/cli/cli-reference) · [Headless mode](https://www.codebuddy.ai/docs/cli/headless) · [ACP](https://www.codebuddy.ai/docs/cli/acp) |
-| `qoder` | Qoder CLI (`qodercli`, `@qoder-ai/qodercli`) | ACP stdio | Explicit `chat`; Core server disabled | Experimental | Private setting `general.enableAutoUpdate=false`; runnable with bounded ACP lifecycle controls, subject to Experimental change | [Quick start](https://docs.qoder.com/en/cli/quick-start) · [ACP](https://docs.qoder.com/en/cli/acp) · [Permissions](https://docs.qoder.com/en/cli/permissions) |
+| `qoder` | Qoder CLI (`qodercli`, `@qoder-ai/qodercli`) | ACP stdio | Explicit `chat`; Core server disabled | Experimental | Private setting `general.enableAutoUpdate=false`; current `1.1.4` help no longer exposes the required ACP probe markers, so the lab returns a bounded config error | [Quick start](https://docs.qoder.com/en/cli/quick-start) · [ACP](https://docs.qoder.com/en/cli/acp) · [Permissions](https://docs.qoder.com/en/cli/permissions) |
 | `mistral-vibe` | Mistral Vibe (`vibe`, `mistral-vibe`) | JSONL message stream candidate | `chat` candidate; Core capability none | Held | Candidate private config with update checks off; direct and `vibe-acp` paths require separate verification | [Install](https://docs.mistral.ai/getting-started/quickstarts/vibe-code/install-cli) · [CLI workflow](https://docs.mistral.ai/vibe/code/cli/work-with-cli) · [ACP surfaces](https://docs.mistral.ai/vibe/code/choose-cli-vscode-web-sessions) |
 | `qwen` | Qwen Code (`qwen`, `@qwen-code/qwen-code`) | JSONL candidate | `chat` candidate; Core capability none | Held | Backend selection, credentials, update behavior, and event schema require verification | [Repository](https://github.com/QwenLM/qwen-code) · [Headless mode](https://qwenlm.github.io/qwen-code-docs/en/users/features/headless/) · [Authentication](https://qwenlm.github.io/qwen-code-docs/en/users/configuration/auth/) |
 | `cline` | Cline CLI (`cline`) | JSONL candidate; separate ACP candidate | `chat` candidate; Core capability none | Held | Candidate `CLINE_NO_AUTO_UPDATE=1`; stdin EOF, event schema, and local configuration isolation require verification | [CLI overview](https://docs.cline.bot/usage/cli-overview) · [CLI reference](https://docs.cline.bot/cli/cli-reference) · [Release source](https://github.com/cline/cline/tree/cli-v3.0.46/apps/cli) |
@@ -413,7 +457,7 @@ CLI and account combinations have not all been live-tested.
 | `pi` | Pi Coding Agent (`pi`, package `@earendil-works/pi-coding-agent`) | Custom NDJSON RPC candidate | `chat` candidate; Core capability none | Held | Candidate `--offline` and resource-disable flags require Stage 6 verification; this is not JSON-RPC | [Package](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/package.json) · [README](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md) · [RPC](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md) |
 | `oh-my-pi` | Oh My Pi (`omp`, package `@oh-my-pi/pi-coding-agent`) | Custom NDJSON RPC candidate | `chat` candidate; Core capability none | Held | No verified update containment claim yet; configuration, resources, permissions, and process lifecycle require Stage 6 verification | [Repository](https://github.com/can1357/oh-my-pi) · [RPC](https://github.com/can1357/oh-my-pi/blob/main/docs/rpc.md) · [Approval mode](https://github.com/can1357/oh-my-pi/blob/main/docs/approval-mode.md) |
 | `hermes` | Hermes Agent (`hermes`, PyPI `hermes-agent[acp]`) | ACP stdio candidate | `chat` candidate; Core capability none | Held | Hermes pins ACP 0.9.0 while Ext targets 0.11.x; compatibility, configuration, and lifecycle require Stage 6 verification | [PyPI](https://pypi.org/project/hermes-agent/) · [Repository](https://github.com/NousResearch/hermes-agent) · [ACP guide](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/acp.md) |
-| `poolside` | Poolside Agent CLI (`pool`, official native release) | ACP stdio | Explicit `chat`; Core server disabled | Experimental | Runnable with bounded ACP startup/configuration controls; proprietary binary behavior may change | [Install](https://docs.poolside.ai/cli/install) · [CLI reference](https://docs.poolside.ai/cli/cli-reference) · [Release](https://github.com/poolsideai/pool/releases/tag/v1.0.13) |
+| `poolside` | Poolside Agent CLI (`pool`, official native release) | ACP stdio | Explicit `chat`; Core server disabled | Experimental | Adapter and fixtures exist; the live lab did not accept the proprietary installer's EULA, so current binary creation was not tested | [Install](https://docs.poolside.ai/cli/install) · [CLI reference](https://docs.poolside.ai/cli/cli-reference) · [Release](https://github.com/poolsideai/pool/releases/tag/v1.0.13) |
 | `amp` | Amp CLI (`amp`, canonical package `@ampcode/cli`) | Claude-compatible streaming JSONL input/output candidate | `chat` candidate; Core capability none | Held | Tool approval is off by default; workspace settings, plugins, MCP, EOF/process lifecycle, and paid opt-in execution require isolated Stage 6 evidence | [Manual](https://ampcode.com/manual) · [Stream schema](https://ampcode.com/manual/appendix) · [Package](https://www.npmjs.com/package/@ampcode/cli) |
 | `gitlab-duo` | GitLab Duo CLI (`duo`, compiled generic package or official npm package `@gitlab/duo-cli`) | One-shot JSON candidate | `chat` candidate; Core capability none | Held | Headless runs auto-approve tools; JSON schema 1.0, authentication/entitlement, context/MCP/hooks, cleanup, and isolation require Stage 6 evidence | [Overview](https://docs.gitlab.com/user/gitlab_duo_cli/) · [Usage](https://docs.gitlab.com/user/gitlab_duo_cli/use/) · [Setup](https://docs.gitlab.com/user/gitlab_duo_cli/set_up/) |
 

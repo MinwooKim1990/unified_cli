@@ -35,8 +35,8 @@ from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Seque
 SCHEMA_VERSION = 1
 DEFAULT_BASELINE = Path(__file__).with_name("performance-baseline-v1.json")
 ROOT = Path(__file__).resolve().parents[1]
-CANDIDATE_CORE_VERSION = "0.5.2"
-CANDIDATE_EXT_VERSION = "0.5.2"
+CANDIDATE_CORE_VERSION = "0.5.3"
+CANDIDATE_EXT_VERSION = "0.5.3"
 REFERENCE_CORE_VERSION = "0.5.0"
 REFERENCE_EXT_VERSION = "0.1.0"
 _METRIC_NAMES = (

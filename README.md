@@ -9,21 +9,145 @@ Antigravity, Grok, and 17 more coding-agent CLIs.**
 
 🇰🇷 [한국어 README](README.ko.md) · 📖 [Detailed usage (EN)](USAGE.md) · 📖 [상세 가이드 (한국어)](USAGE.ko.md)
 
-## Install
+## Start here
+
+Choose **one** installation path. Both install the same Core + Preview provider
+code; there is no separate `unified-cli-ext` download.
+
+### A. Install from PyPI — use `unified-cli` from any directory
+
+`pipx` is recommended for a terminal application because it gives
+`unified-cli` its own environment while placing the command on your global
+`PATH`:
 
 ```bash
-pip install unified-cli
+python3 -m pip install --user pipx
+python3 -m pipx ensurepath
+# Open a new terminal once if ensurepath asks you to.
+pipx install "unified-cli[server,acp]"
+
+unified-cli --version
+unified-cli providers --include-ext
 ```
 
-This includes the full interactive REPL (live `/` slash-menu, model/provider
-pickers, snapshot-only `/status`) — `prompt_toolkit` ships as a core dependency, so no
-extra is needed for it.
-
-For the OpenAI-compatible HTTP server, install the optional `server` extra:
+Use `pipx upgrade unified-cli` for later releases. If you are already inside a
+Python virtual environment, ordinary pip is also fine:
 
 ```bash
-pip install "unified-cli[server]"
+python -m pip install "unified-cli[server,acp]"
 ```
+
+The base package is enough for the REPL. `server` adds the browser/local HTTP
+server; `acp` adds the optional ACP transport used by Qoder, Kilo, Hermes, and
+Poolside (Python 3.10–3.14).
+
+### B. Run a Git checkout — develop or test the current source
+
+```bash
+git clone https://github.com/MinwooKim1990/unified_cli.git
+cd unified_cli
+python3 -m venv .venv
+source .venv/bin/activate                  # Windows: .venv\Scripts\activate
+python -m pip install -e ".[server,acp,dev]"
+
+unified-cli --version                     # runs this checkout
+unified-cli repl
+```
+
+The command is available while that virtual environment is active. To keep an
+editable checkout but expose its command globally, run this once from the
+repository root instead:
+
+```bash
+pipx install --force --editable ".[server,acp]"
+```
+
+### Primary use: embed any provider in Python
+
+The terminal and browser are optional front ends. The primary API is the same
+small Python wrapper for all three Core providers and all 18 Preview providers:
+
+```python
+from pathlib import Path
+
+from unified_cli import PROVIDERS, UnifiedError, configure_extension_provider, create
+
+provider = "grok"  # or claude, codex, gemini, kimi, copilot, qwen, ...
+workspace = str(Path.cwd().resolve())  # Preview providers require an absolute path
+
+# Recommended once after installing/upgrading the vendor CLI. This verifies its
+# executable and stores a local launch receipt; it does not perform vendor login.
+if provider not in PROVIDERS:
+    configure_extension_provider(provider)
+
+client = create(provider, cwd=workspace)
+try:
+    response = client.chat("Explain this project")
+    print(response.text)
+except UnifiedError as error:
+    print(error.kind, error)  # e.g. auth_expired, rate_limit, config
+```
+
+Streaming and async use the same object:
+
+```python
+for event in client.stream("Review the current diff"):
+    if event.kind == "text":
+        print(event.text, end="", flush=True)
+
+# In an async function:
+# response = await client.achat("Explain this project")
+# async for event in client.astream("Review the diff"): ...
+```
+
+`unified_cli_ext` is bundled in the same wheel and loaded lazily. Application
+code should normally import the stable public API from `unified_cli`; no second
+PyPI package or subprocess-sidecar is needed. See
+[`examples/09_extensions.py`](examples/09_extensions.py) for a runnable example.
+Non-Python language bindings are future work; the supported embedded contract
+in 0.5.3 is the Python API above.
+
+### What to run after either installation
+
+```bash
+# 1. Passive catalog: shows Core + all bundled Preview providers; runs no vendor CLI.
+unified-cli providers --include-ext
+
+# 2. Check installed binaries/login state when you explicitly ask.
+unified-cli doctor
+
+# 3. Verify and save an installed Preview CLI once (example: Grok).
+unified-cli configure grok
+
+# 4. Full-screen terminal UI: choose provider/model and type / for commands.
+unified-cli repl
+
+# 5. One command without entering the REPL.
+unified-cli chat "explain this repository" --provider claude --cwd "$PWD"
+unified-cli chat "explain this repository" --provider grok --cwd "$PWD"
+
+# 6. Local browser management UI. Only the listed workspace can be used.
+unified-cli serve --manage --workspace "$PWD" --open
+```
+
+The terminal prints the one-time local browser URL if `--open` cannot launch
+it. Plain `unified-cli serve --open` shows the read-only dashboard;
+`--manage --workspace ...` enables local provider/model/settings/chat controls.
+Keep it on `127.0.0.1`; the public-compatible `/v1/*` API retains its stricter
+Core-only trust boundary.
+
+All 18 bundled Preview adapters are exposed through the same Python and
+terminal APIs and are attempted only when explicitly selected. In the
+credential-free 2026-07-23 lab, current official installations reached
+`create()` for 13 providers. Cursor, Hermes, Mistral Vibe, and Qoder returned
+bounded compatibility errors, while Poolside was not installed because its
+installer required EULA acceptance. See the
+[accountless lab evidence](docs/development/ext-accountless-live-lab-2026-07-23.md).
+Browser chat additionally requires a fixed read-only boundary; this release
+allows explicit attempts for
+`grok`, `copilot`, `qoder`, `mistral-vibe`, `qwen`, `kilo`, `pi`,
+`oh-my-pi`, `hermes`, and `poolside`. The other Preview entries still appear
+with a clear reason and remain selectable through `create()`/REPL/CLI.
 
 > **Prerequisites — this package installs and authenticates _nothing_.**
 > `unified-cli` is a thin wrapper that shells out to the official agentic CLIs
@@ -51,13 +175,14 @@ no second `unified-cli-ext` package to install.
 | Status | Supported coding CLIs (Provider ID) | What it means |
 |---|---|---|
 | **Stable Core** | Claude Code (`claude`), OpenAI Codex (`codex`), Google Antigravity (`gemini` / `agy`) | Existing behavior and defaults remain unchanged |
-| **Preview — runnable when explicitly selected** | Grok Build (`grok`), Kimi Code (`kimi`), GitHub Copilot CLI (`copilot`), Cursor Agent (`cursor`), CodeBuddy (`codebuddy`), Qoder (`qoder`), Mistral Vibe (`mistral-vibe`), Qwen Code (`qwen`), Cline (`cline`), OpenCode (`opencode`), Kilo Code (`kilo`), Factory Droid (`droid`), Pi (`pi`), Oh My Pi (`oh-my-pi`), Hermes Agent (`hermes`), Poolside Agent CLI (`poolside`), Amp (`amp`), GitLab Duo CLI (`gitlab-duo`) | Shared transports and fixtures are tested, but most vendor CLI/account combinations have not been live-tested |
+| **Preview — executable adapter, attempted when selected** | Grok Build (`grok`), Kimi Code (`kimi`), GitHub Copilot CLI (`copilot`), Cursor Agent (`cursor`), CodeBuddy (`codebuddy`), Qoder (`qoder`), Mistral Vibe (`mistral-vibe`), Qwen Code (`qwen`), Cline (`cline`), OpenCode (`opencode`), Kilo Code (`kilo`), Factory Droid (`droid`), Pi (`pi`), Oh My Pi (`oh-my-pi`), Hermes Agent (`hermes`), Poolside Agent CLI (`poolside`), Amp (`amp`), GitLab Duo CLI (`gitlab-duo`) | All adapters have shared transport fixtures; the current accountless lab reached `create()` for 13/18, with five limitations documented above |
 
 Preview does **not** mean “catalog only.” Every listed Preview provider has an
 executable adapter and is attempted when you explicitly select it:
 
 ```bash
 unified-cli providers --include-ext
+unified-cli configure grok
 unified-cli chat "explain this project" --provider grok --cwd "$PWD"
 unified-cli chat "review this change" --provider kimi --cwd "$PWD"
 unified-cli chat "find the bug" --provider copilot --cwd "$PWD"
@@ -72,9 +197,11 @@ pip install "unified-cli[acp]"
 
 Install and sign in to the corresponding official vendor CLI first. Extensions
 are lazy: they are never auto-selected, never change the Core default provider,
-and remain disabled in HTTP server mode. Preview processes use a private
-provider home; if a vendor stores login only in its normal home, repeat that
-vendor's official login in the private home described in the
+and remain disabled on the public-compatible `/v1/*` routes. The loopback-only
+`serve --manage` UI can run an Ext provider only after you explicitly select it
+and register an absolute workspace. Preview processes use a private provider
+home; if a vendor stores login only in its normal home, repeat that vendor's
+official login in the private home described in the
 [extension guide](https://github.com/MinwooKim1990/unified_cli/blob/main/docs/extensions.md).
 Grok uses the guide's verified isolated login setup.
 
@@ -86,13 +213,15 @@ Grok uses the guide's verified isolated login setup.
 > [GitHub issue](https://github.com/MinwooKim1990/unified_cli/issues/new).
 > Reports intentionally omit prompts, environment values, auth data, and tokens.
 
-Python uses the same installed package and registry:
+Python uses the same installed package and registry. `create()` is the public
+embedded API; importing `unified_cli_ext` directly is optional:
 
 ```python
-from unified_cli import create
-import unified_cli_ext  # already included by `pip install unified-cli`
+from pathlib import Path
+from unified_cli import configure_extension_provider, create
 
-client = create("grok", cwd="/absolute/path/to/project")
+configure_extension_provider("grok")
+client = create("grok", cwd=str(Path.cwd().resolve()))
 print(client.chat("Explain this project").text)
 ```
 
@@ -225,13 +354,15 @@ can import**.
 
 | Provider | Default | Latest flagship (override with `-m`) |
 |---|---|---|
-| Claude | `claude-haiku-4-5` | `claude-opus-4-7` (or alias `opus`) |
-| Codex | `gpt-5.4-mini` | `gpt-5.4` (or `gpt-5.5` if your `codex` CLI is up to date) |
+| Claude | `claude-haiku-4-5` | `claude-fable-5`, `claude-opus-4-8`, `claude-sonnet-5` |
+| Codex | `gpt-5.4-mini` | `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna` |
 | Gemini (`agy`) | `gemini-3.5-flash` | `gemini-3.1-pro` |
 
 Override via `-m <name>`. The wrapper passes any model ID straight through to
-the underlying CLI; `unified-cli models` shows the available list as a starting
-point. For the absolute fastest interactive feel use `-m gpt-5.3-codex-spark`.
+the underlying CLI; `/model` in the REPL and the browser Refresh action query
+the selected provider explicitly, while `unified-cli models --refresh` does the
+same from a command. For the ultra-fast coding specialist currently advertised
+by the installed catalog, use `-m gpt-5.3-codex-spark`.
 
 Model discovery is explicit and uses a one-hour, monotonic in-process cache;
 imports, server startup, management bootstrap, and REPL startup do not populate
@@ -269,22 +400,19 @@ copies, so caller mutation never changes later results.
 
 ## Install from source (development)
 
-```bash
-git clone https://github.com/MinwooKim1990/unified_cli.git
-cd unified_cli
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e '.[server,dev]'
+Follow **Start here → B** above. After activating `.venv`, these are useful:
 
-unified-cli setup     # first-time onboarding wizard (see note below)
+```bash
+unified-cli setup     # optional Core onboarding
+unified-cli doctor
+python -m pytest
 ```
 
-Requires Python 3.9+ and at least one of `claude`, `codex`, `agy` already
-installed and logged in — see **Prerequisites** above. The optional `setup`
-wizard only *suggests* the official install commands for any missing CLI (e.g.
-npm/brew for Claude/Codex; `agy` ships with the Antigravity suite —
-https://antigravity.google) and opens each provider's own browser login; it
-never stores credentials and you can decline any step.
+Requires Python 3.9+ (Python 3.10–3.14 for the optional ACP extra) and at least
+one vendor CLI to make a real call. The setup wizard only suggests official
+Core install/login commands; Preview CLI installation remains explicit and is
+documented in the [extension guide](docs/extensions.md). It never stores
+credentials and every step can be declined.
 
 ## Usage at a glance
 

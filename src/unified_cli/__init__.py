@@ -1,4 +1,4 @@
-"""unified_cli — one Python + CLI API for Claude Code / Codex / Gemini.
+"""unified_cli — one Python API for supported coding-agent CLIs.
 
 Quick start (Python):
 
@@ -7,6 +7,13 @@ Quick start (Python):
     # Single call
     resp = create("claude").chat("안녕")
     print(resp.text, resp.session_id)
+
+    # Bundled Preview providers use the same public API (example: Grok).
+    # Configure/login once with the provider's official CLI before calling it.
+    grok = create("grok", cwd="/absolute/project/path")
+    for message in grok.stream("이 프로젝트를 요약해줘"):
+        if message.kind == "text":
+            print(message.text, end="", flush=True)
 
     # Manual history (external code manages session_id)
     cli = create("codex")
@@ -36,7 +43,7 @@ Error handling:
         e.hint  # 사용자용 복구 힌트
 """
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"
 
 from .base import BaseProvider
 from .conversation import UnifiedConversation

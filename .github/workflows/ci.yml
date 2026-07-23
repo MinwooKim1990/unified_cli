@@ -126,8 +126,8 @@ jobs:
 
       - name: Verify namespace versions share the release
         run: |
-          python -c "import unified_cli; assert unified_cli.__version__ == '0.5.2'"
-          python -c "import unified_cli_ext; assert unified_cli_ext.__version__ == '0.5.2'"
+          python -c "import unified_cli; assert unified_cli.__version__ == '0.5.3'"
+          python -c "import unified_cli_ext; assert unified_cli_ext.__version__ == '0.5.3'"
 
   ext-optional-extras:
     name: Optional ${{ matrix.extra }} · Python ${{ matrix.python-version }}
@@ -220,29 +220,29 @@ jobs:
         run: |
           python -m twine check dist/unified/*
           python scripts/verify_unified_release_artifacts.py \
-            dist/unified --version 0.5.2
+            dist/unified --version 0.5.3
 
       - name: Rebuild the wheel from the verified sdist
         run: |
           python -m pip wheel --no-deps --wheel-dir dist/rebuilt \
-            dist/unified/unified_cli-0.5.2.tar.gz
+            dist/unified/unified_cli-0.5.3.tar.gz
           mkdir dist/rebuilt-pair
-          cp dist/rebuilt/unified_cli-0.5.2-py3-none-any.whl \
+          cp dist/rebuilt/unified_cli-0.5.3-py3-none-any.whl \
             dist/rebuilt-pair/
-          cp dist/unified/unified_cli-0.5.2.tar.gz dist/rebuilt-pair/
+          cp dist/unified/unified_cli-0.5.3.tar.gz dist/rebuilt-pair/
           python scripts/verify_unified_release_artifacts.py \
-            dist/rebuilt-pair --version 0.5.2
+            dist/rebuilt-pair --version 0.5.3
 
       - name: Smoke test the clean unified wheel and uninstall
         run: |
           python -m venv /tmp/unified-wheel-smoke
           /tmp/unified-wheel-smoke/bin/python -m pip install --upgrade pip
           /tmp/unified-wheel-smoke/bin/python -m pip install \
-            dist/unified/unified_cli-0.5.2-py3-none-any.whl
-          test "$(/tmp/unified-wheel-smoke/bin/unified-cli --version)" = "0.5.2"
+            dist/unified/unified_cli-0.5.3-py3-none-any.whl
+          test "$(/tmp/unified-wheel-smoke/bin/unified-cli --version)" = "0.5.3"
           /tmp/unified-wheel-smoke/bin/unified-cli --help >/dev/null
           /tmp/unified-wheel-smoke/bin/python \
-            scripts/verify_single_distribution.py --version 0.5.2
+            scripts/verify_single_distribution.py --version 0.5.3
           /tmp/unified-wheel-smoke/bin/python -m pip check
           /tmp/unified-wheel-smoke/bin/python -m pip uninstall -y unified-cli
           /tmp/unified-wheel-smoke/bin/python -c \
@@ -260,9 +260,9 @@ jobs:
             unified-cli-ext
           /tmp/unified-migration-smoke/bin/python -m pip install \
             --force-reinstall \
-            dist/unified/unified_cli-0.5.2-py3-none-any.whl
+            dist/unified/unified_cli-0.5.3-py3-none-any.whl
           /tmp/unified-migration-smoke/bin/python \
-            scripts/verify_single_distribution.py --version 0.5.2
+            scripts/verify_single_distribution.py --version 0.5.3
           /tmp/unified-migration-smoke/bin/python -m pip check
 
   browser-e2e:

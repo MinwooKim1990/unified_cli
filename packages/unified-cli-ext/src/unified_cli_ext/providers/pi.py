@@ -41,6 +41,10 @@ from .runtime import ProtocolLaunchBoundaryV1
 PI_OFFICIAL_PACKAGE = "@earendil-works/pi-coding-agent"
 PI_DEFAULT_MODEL = "provider-default"
 PI_PROMPT_ID = "unified-cli-ext-turn"
+PI_NO_AUTH_ERROR = (
+    "No API key found for the selected model. Use /login to log into a "
+    "provider via OAuth or API key."
+)
 PI_RPC_FIXED_ARGV = (
     "--mode",
     "rpc",
@@ -221,10 +225,15 @@ class _PiRpcBridge(AdapterProviderBridge):
             if not success:
                 state["error"] = True
                 state["terminal"] = True
+                error_code = (
+                    "auth_required"
+                    if record.get("error") == PI_NO_AUTH_ERROR
+                    else "prompt_rejected"
+                )
                 canonical.append(
                     {
                         "type": "error",
-                        "code": "prompt_rejected",
+                        "code": error_code,
                         "message": "The provider rejected the prompt.",
                         "retryable": False,
                     }
@@ -494,20 +503,17 @@ ADAPTER_SPEC = ProviderAdapterSpecV1(
             _command("--version"),
             minimum_version=(0,),
             format=ProbeFormat.PLAIN_TEXT,
-            version_marker="pi ",
-            identity_marker="pi ",
-            version_is_first_token=True,
-            identity_prefix=True,
+            version_is_entire_line=True,
         ),
         feature_probe=FeatureProbeSpec(
             _command("--help"),
             required_features=frozenset(("chat", "stream")),
             format=ProbeFormat.PLAIN_TEXT,
             feature_markers={
-                "chat": "--mode",
+                "chat": "--mode <mode>",
                 "stream": "--no-session",
             },
-            identity_marker="Usage: pi",
+            identity_marker="pi - AI coding assistant",
             marker_prefixes=True,
             identity_prefix=True,
         ),
@@ -542,6 +548,7 @@ PLUGIN = _protocol_plugin(
 __all__ = [
     "ADAPTER_SPEC",
     "PI_DEFAULT_MODEL",
+    "PI_NO_AUTH_ERROR",
     "PI_FIXED_ENVIRONMENT",
     "PI_OFFICIAL_PACKAGE",
     "PI_PROMPT_ID",

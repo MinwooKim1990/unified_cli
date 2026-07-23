@@ -150,6 +150,40 @@ def test_core_create_route_help_version_and_listing_do_not_discover(monkeypatch,
     assert exc.value.code == 0
 
 
+def test_core_and_bundled_ext_create_dispatch_keeps_public_python_contract(
+    monkeypatch,
+):
+    expected_ext = tuple(
+        provider_id
+        for provider_id, _target
+        in registry.BUNDLED_EXTENSION_ENTRY_POINTS_V1
+    )
+    assert len(expected_ext) == 18
+    assert len(set(expected_ext)) == 18
+    descriptors = registry.passive_bundled_provider_descriptors()
+    assert tuple(item.id for item in descriptors) == expected_ext
+    assert all(item.status == "discovered" for item in descriptors)
+    assert all(item.support_status == "preview" for item in descriptors)
+
+    calls = []
+
+    def instantiate(provider_id, *, model=None, extension_launch=None, **opts):
+        calls.append((provider_id, model, extension_launch, opts))
+        provider = DummyProvider(model=model, **opts)
+        provider.name = provider_id
+        return provider
+
+    monkeypatch.setattr(registry, "instantiate_extension_provider", instantiate)
+    for provider_id in expected_ext:
+        provider = create(provider_id, model="selected", cwd="/tmp")
+        assert provider.name == provider_id
+        assert provider.model == "selected"
+
+    assert [item[0] for item in calls] == list(expected_ext)
+    assert all(item[1:] == ("selected", None, {"cwd": "/tmp"}) for item in calls)
+    assert tuple(PROVIDERS) == ("claude", "codex", "gemini")
+
+
 def test_extension_listing_is_metadata_only_and_does_not_load_slow_plugin(monkeypatch):
     class NeverLoad(FakeEntryPoint):
         def load(self):
@@ -950,6 +984,92 @@ def test_extension_runtime_boundary_sanitizes_plugin_unified_errors(monkeypatch)
         assert exc.value.__context__ is None
 
 
+def test_extension_runtime_boundary_preserves_safe_error_kind_only(monkeypatch):
+    secret = "plugin-owned-auth-secret"
+
+    class AuthProvider(DummyProvider):
+        @staticmethod
+        def _error():
+            return UnifiedError(
+                kind="auth_expired",
+                provider="forged-provider",
+                message=secret,
+                hint=secret,
+                cause=secret,
+            )
+
+        def chat(self, prompt, **kwargs):
+            raise self._error()
+
+        def stream(self, prompt, **kwargs):
+            raise self._error()
+            yield  # pragma: no cover
+
+        async def achat(self, prompt, **kwargs):
+            raise self._error()
+
+        async def astream(self, prompt, **kwargs):
+            raise self._error()
+            yield  # pragma: no cover
+
+    def factory(**kwargs):
+        provider = AuthProvider(**kwargs)
+        provider.name = "runtime-auth"
+        return provider
+
+    _set_entry_points(monkeypatch, [FakeEntryPoint(
+        "runtime-auth",
+        _plugin("runtime-auth", factory=factory),
+    )])
+    provider = create("runtime-auth")
+
+    async def consume_async_stream():
+        return [message async for message in provider.astream("hello")]
+
+    calls = [
+        lambda: provider.chat("hello"),
+        lambda: list(provider.stream("hello")),
+        lambda: asyncio.run(provider.achat("hello")),
+        lambda: asyncio.run(consume_async_stream()),
+    ]
+    for call in calls:
+        with pytest.raises(UnifiedError) as caught:
+            call()
+        assert caught.value.kind == "auth_expired"
+        assert caught.value.provider == "runtime-auth"
+        assert secret not in str(caught.value)
+
+
+def test_extension_runtime_boundary_rejects_non_string_error_kind(monkeypatch):
+    secret = "plugin-owned-kind-secret"
+
+    class InvalidKindProvider(DummyProvider):
+        def chat(self, prompt, **kwargs):
+            error = UnifiedError(
+                kind="internal",
+                provider="forged-provider",
+                message=secret,
+            )
+            error.kind = [secret]
+            raise error
+
+    def factory(**kwargs):
+        provider = InvalidKindProvider(**kwargs)
+        provider.name = "runtime-invalid-kind"
+        return provider
+
+    _set_entry_points(monkeypatch, [FakeEntryPoint(
+        "runtime-invalid-kind",
+        _plugin("runtime-invalid-kind", factory=factory),
+    )])
+
+    with pytest.raises(UnifiedError) as caught:
+        create("runtime-invalid-kind").chat("hello")
+    assert caught.value.kind == "internal"
+    assert caught.value.provider == "runtime-invalid-kind"
+    assert secret not in str(caught.value)
+
+
 def test_extension_proxy_reconstructs_only_caller_owned_cancellation(monkeypatch):
     secret = "plugin-cancellation-marker-secret"
 
@@ -1134,6 +1254,55 @@ def test_providers_cli_plain_and_json_remain_metadata_only(monkeypatch, capsys):
     assert "discovered" in output
     assert "unknown" in output
     assert ep.load_calls == 0
+
+
+def test_bundled_providers_cli_uses_passive_preview_metadata(monkeypatch, capsys):
+    entries = [
+        FakeEntryPoint(provider_id, _plugin(provider_id))
+        for provider_id, _target in registry.BUNDLED_EXTENSION_ENTRY_POINTS_V1
+    ]
+    _set_entry_points(monkeypatch, entries)
+    from unified_cli.cli import main
+
+    assert main(["providers", "--include-ext", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    extensions = [item for item in payload if item["source"] == "extension"]
+
+    assert len(extensions) == 18
+    assert all(item["status"] == "discovered" for item in extensions)
+    assert all(item["support_status"] == "preview" for item in extensions)
+    assert all(item["route_prefixes"] == [item["id"]] for item in extensions)
+    assert all(item["server_policy"]["enabled"] is False for item in extensions)
+    assert all(
+        item["server_policy"]["requires_external_isolation"] is True
+        for item in extensions
+    )
+    assert all(entry.load_calls == 0 for entry in entries)
+
+
+def test_configure_cli_exposes_persisted_preview_home(monkeypatch, capsys):
+    observed = []
+
+    def configure(provider, *, verify=True):
+        observed.append((provider, verify))
+        return SimpleNamespace(
+            provider_id=provider,
+            provider_home="/tmp/unified-preview-home",
+            receipt_sha256="a" * 64,
+        )
+
+    monkeypatch.setattr(registry, "configure_extension_provider", configure)
+    from unified_cli.cli import main
+
+    assert main(["configure", "grok", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "provider": "grok",
+        "provider_home": "/tmp/unified-preview-home",
+        "receipt_sha256": "a" * 64,
+        "verified": True,
+    }
+    assert observed == [("grok", True)]
 
 
 def test_models_cli_can_explicitly_list_one_extension(monkeypatch, capsys):

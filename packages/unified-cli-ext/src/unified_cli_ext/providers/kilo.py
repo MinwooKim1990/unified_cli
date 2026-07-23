@@ -59,10 +59,7 @@ ADAPTER_SPEC = ProviderAdapterSpecV1(
             _command("--version"),
             minimum_version=(7, 4, 11),
             format=ProbeFormat.PLAIN_TEXT,
-            version_marker="kilo ",
-            identity_marker="kilo 7.4.11",
-            version_is_first_token=True,
-            identity_prefix=True,
+            version_is_entire_line=True,
         ),
         feature_probe=FeatureProbeSpec(
             _command("acp", "--help"),
@@ -77,6 +74,7 @@ ADAPTER_SPEC = ProviderAdapterSpecV1(
             identity_marker="kilo acp",
             marker_prefixes=True,
             identity_prefix=True,
+            use_stderr=True,
         ),
     ),
     prompt=PromptCommandSpec(

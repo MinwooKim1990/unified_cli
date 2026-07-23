@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-07-23
+
+### Added
+
+- Made the public Python wrapper the documented primary interface for Core and
+  all 18 Preview providers, with a runnable embedding example and a
+  `unified-cli configure PROVIDER` command for verified local launch receipts.
+- Added all bundled Preview providers to the REPL and management UI catalogs,
+  including provider/model selectors, explicit model refresh, and clear
+  Stable/Preview status.
+- Added slash-command prefix completion and interactive TTY controls for
+  provider, model, settings, permissions, sessions, theme, and language.
+- Recorded the credential-free live lab honestly: all 18 adapters were
+  discovered and dispatched, 13 current official installations reached
+  `create()`, four returned bounded compatibility errors, and Poolside was not
+  installed because EULA acceptance was not authorized.
+
+### Fixed
+
+- Preserved safe extension error categories such as `auth_expired` and
+  `rate_limit` across the plugin boundary while continuing to discard
+  plugin-owned messages, hints, causes, and secret-bearing output.
+- Recognized Grok's official unauthenticated JSON response and prepared its
+  isolated safe configuration automatically.
+- Updated live provider version probes to accept the exact documented output
+  shapes observed from current official CLIs without weakening executable or
+  semantic-version verification.
+- Refreshed Claude and Codex fallback catalogs from current official metadata
+  while keeping explicit live/cache refreshes authoritative.
+
+### Changed
+
+- The browser dashboard now exposes the complete provider catalog and performs
+  model or doctor probes only after an explicit user action. Loopback manage
+  chat can invoke the audited read-only Ext subset through the same Python
+  `create()` path; public-compatible `/v1/*` remains Core-only.
+- Expanded PyPI, source-checkout, pipx, REPL, browser, and embedded-Python
+  instructions in both English and Korean.
+
 ## [0.5.2] - 2026-07-23
 
 ### Added
@@ -340,7 +379,8 @@ Initial public release.
   `gemini-3.5-flash` continue to route to it. Note: `agy` headless output is
   plain text and does **not** report token usage.
 
-[Unreleased]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/MinwooKim1990/unified_cli/compare/v0.4.0...v0.5.0

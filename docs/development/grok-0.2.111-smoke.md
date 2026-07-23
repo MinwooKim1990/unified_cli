@@ -34,5 +34,7 @@ recorded here.
 ## Scope
 
 This is evidence for one native version, platform, and authentication sample.
-It does not make Grok Stable, enable Ext providers in the server, establish
-every provider's behavior, or guarantee zero risk.
+It does not make Grok Stable, enable Ext providers on public-compatible
+`/v1/*` routes, establish every provider's behavior, or guarantee zero risk.
+The loopback-only management UI may invoke Grok only when the user explicitly
+selects it in a registered workspace.

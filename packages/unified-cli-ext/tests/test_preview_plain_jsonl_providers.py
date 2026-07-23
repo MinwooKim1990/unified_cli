@@ -64,6 +64,17 @@ CASES = (
     ),
 )
 
+REAL_VERSION_OUTPUTS = {
+    "amp": "0.0.1784809706-g96cc8a (released 2026-07-23T12:28:26.000Z, 1h ago)",
+    "cline": "3.0.46",
+    "codebuddy": "2.126.0",
+    "copilot": "GitHub Copilot CLI 1.0.73.",
+    "gitlab-duo": "9.6.0",
+    "kimi": "0.29.0",
+    "opencode": "1.18.4",
+    "qwen": "0.20.1",
+}
+
 
 def _fake_cli(
     tmp_path: Path,
@@ -71,8 +82,31 @@ def _fake_cli(
     interpreter: Path,
 ) -> Path:
     spec = case.module.ADAPTER_SPEC
-    version_marker = spec.binary.version_probe.version_marker
-    feature_marker = spec.binary.feature_probe.feature_markers["chat"]
+    version_spec = spec.binary.version_probe
+    version_text = REAL_VERSION_OUTPUTS.get(
+        spec.id,
+        (
+            "1.2.3"
+            if version_spec.version_is_entire_line
+            else (
+                version_spec.version_marker
+                + "1.2.3"
+                + (version_spec.version_required_suffix or "")
+            )
+        ),
+    )
+    feature_spec = spec.binary.feature_probe
+    feature_lines = tuple(
+        dict.fromkeys(
+            (
+                feature_spec.identity_marker,
+                *(
+                    feature_spec.feature_markers[name]
+                    for name in sorted(feature_spec.required_features)
+                ),
+            )
+        )
+    )
     prompt_option = spec.prompt.prompt_option
     target = tmp_path / spec.binary.executable
     log_path = target.with_suffix(".invocation.json")
@@ -81,18 +115,21 @@ import json
 import pathlib
 import sys
 
-VERSION_MARKER = {version_marker!r}
-FEATURE_MARKER = {feature_marker!r}
+VERSION_TEXT = {version_text!r}
+FEATURE_LINES = {feature_lines!r}
+FEATURE_USE_STDERR = {feature_use_stderr!r}
 PROMPT_OPTION = {prompt_option!r}
 LOG_PATH = pathlib.Path({log_path!r})
 
 args = sys.argv[1:]
 stdin_text = sys.stdin.read()
 if args == ["--version"]:
-    sys.stdout.write(VERSION_MARKER + "1.2.3\\n")
+    sys.stdout.write(VERSION_TEXT + "\\n")
     raise SystemExit(0)
 if "--help" in args or args == ["help"]:
-    sys.stdout.write(FEATURE_MARKER + "\\n")
+    (sys.stderr if FEATURE_USE_STDERR else sys.stdout).write(
+        "\\n".join(FEATURE_LINES) + "\\n"
+    )
     raise SystemExit(0)
 
 if PROMPT_OPTION is not None:
@@ -108,8 +145,9 @@ LOG_PATH.write_text(
 )
 sys.stdout.write(prompt)
 """.format(
-        version_marker=version_marker,
-        feature_marker=feature_marker,
+        version_text=version_text,
+        feature_lines=feature_lines,
+        feature_use_stderr=feature_spec.use_stderr,
         prompt_option=prompt_option,
         log_path=str(log_path),
     )

@@ -58,6 +58,93 @@ def test_registry_dispatch_retains_multiword_argument():
     assert seen == [("/model", "/model", "Gemini 3.5 Flash (Medium)")]
 
 
+def test_registry_unique_prefix_dispatches_and_ambiguity_never_guesses():
+    seen = []
+    result = DEFAULT_REGISTRY.dispatch(
+        "/prov codex",
+        lambda spec, invoked, arg: seen.append((spec.name, invoked, arg)) or False,
+    )
+    assert result.handled and not result.ambiguous_candidates
+    assert seen == [("/provider", "/prov", "codex")]
+
+    ambiguous = DEFAULT_REGISTRY.dispatch(
+        "/c",
+        lambda *_args: pytest.fail("ambiguous prefixes must never dispatch"),
+    )
+    assert ambiguous.handled
+    assert set(ambiguous.ambiguous_candidates) >= {
+        "/context", "/cwd", "/clear", "/copy",
+    }
+
+
+def test_repl_ambiguity_lists_candidates_without_mutation(monkeypatch):
+    output, target = _recording_console()
+    monkeypatch.setattr(repl, "console", output)
+    current = {"provider": "claude", "model": "haiku"}
+    state = ReplState(provider="claude", model="haiku")
+    conv = SimpleNamespace(context_window=8)
+
+    repl._handle_slash(
+        "/c", conv, current, {}, [], False, repl_state=state,
+    )
+
+    rendered = target.getvalue()
+    assert "/context" in rendered and "/cwd" in rendered
+    assert current["provider"] == "claude"
+    assert current["model"] == "haiku"
+    assert state.context_window == 8
+
+
+def test_tty_no_arg_setting_picker_mutates_and_persists(monkeypatch):
+    saved = []
+    selections = {"effort": "high"}
+    conv = SimpleNamespace(
+        context_window=8, provider_opts_by_provider={},
+        _clients={"stale": object()},
+    )
+    current = {"provider": "codex", "model": "gpt"}
+    state = ReplState(provider="codex", model="gpt")
+    monkeypatch.setattr(
+        repl, "pick_value",
+        lambda name, choices, **kwargs: selections[name],
+    )
+    monkeypatch.setattr(
+        repl.settings, "set", lambda key, value: saved.append((key, value))
+    )
+
+    repl._handle_slash(
+        "/eff", conv, current, {}, [], True, repl_state=state,
+    )
+
+    assert state.effort == "high"
+    assert saved == [("effort", "high")]
+    assert conv._clients == {}
+    assert conv.provider_opts_by_provider["codex"]["config_overrides"][
+        "model_reasoning_effort"
+    ] == "high"
+
+
+def test_tty_no_arg_input_flow_mutates_context(monkeypatch):
+    saved = []
+    conv = SimpleNamespace(
+        context_window=8, provider_opts_by_provider={}, _clients={},
+    )
+    current = {"provider": "claude", "model": "haiku"}
+    state = ReplState(provider="claude", model="haiku")
+    monkeypatch.setattr(repl, "prompt_value", lambda *args, **kwargs: "12")
+    monkeypatch.setattr(
+        repl.settings, "set", lambda key, value: saved.append((key, value))
+    )
+
+    repl._handle_slash(
+        "/cont", conv, current, {}, [], True, repl_state=state,
+    )
+
+    assert state.context_window == 12
+    assert conv.context_window == 12
+    assert saved == [("context_window", 12)]
+
+
 def test_repl_state_round_trips_legacy_dicts():
     current = {"provider": "claude", "model": "haiku"}
     options = {"cwd": "/tmp", "web_search": False}

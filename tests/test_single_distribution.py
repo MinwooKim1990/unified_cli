@@ -7,6 +7,8 @@ import re
 import sys
 from pathlib import Path
 
+from unified_cli.registry import BUNDLED_EXTENSION_ENTRY_POINTS_V1
+
 
 ROOT = Path(__file__).parents[1]
 SCRIPT = ROOT / "scripts" / "verify_single_distribution.py"
@@ -40,6 +42,9 @@ def test_root_metadata_and_independent_smoke_inventory_match():
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
     assert _provider_entry_points(pyproject) == (
+        verifier.EXPECTED_PROVIDER_ENTRY_POINTS
+    )
+    assert dict(BUNDLED_EXTENSION_ENTRY_POINTS_V1) == (
         verifier.EXPECTED_PROVIDER_ENTRY_POINTS
     )
     assert len(verifier.EXPECTED_PROVIDER_ENTRY_POINTS) == 18
