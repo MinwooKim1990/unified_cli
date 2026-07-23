@@ -182,11 +182,15 @@ API_STATE_PATH = "/api/ui/v1/" + "state"
 
 
 def test_frontend_routes_and_payloads_match_management_contract() -> None:
+    html = HTML.read_text(encoding="utf-8")
     js = JS.read_text(encoding="utf-8")
+    assert 'id="chat-preview-warning"' in html
+    assert 'data-i18n="chatPreviewWarning"' in html
     assert '`${API_ROOT}/providers/${encodeURIComponent(provider)}/models`' in js
-    assert '{ method: "POST", body: "{}" }' in js
+    assert 'body: JSON.stringify({ force_refresh: force })' in js
     assert 'workspace_id: workspace' in js
     assert 'session_id: state.resumeSessionId || null' in js
+    assert 'picker.disabled = extension' in js
     assert 'const path = `${API_ROOT}/chat/${encodeURIComponent(id)}/cancel`' in js
     assert 'if (!id) return;' in js
     assert 'body = { archived: true }' in js
@@ -219,12 +223,40 @@ def test_provider_actions_and_extension_metadata_are_strictly_opt_in() -> None:
     assert 'value.models_supported === true' in js
     assert 'value.default_supported === true' in js
     assert 'provider.source === "extension"' in js
-    assert 'provider.status !== "loaded"' in js
+    assert '["discovered", "loaded"].includes(provider.status)' in js
     assert 'provider.server_policy.enabled !== false' in js
     assert 'Object.hasOwn(provider, "commands")' in js
     assert 'source === "builtin" && CORE_PROVIDER_IDS.has' in js
     assert 'UNSAFE_PROVIDER_TEXT_PATTERN' in js
     assert '!CORE_PROVIDER_IDS.has(sessionProvider)' in js
+
+
+def test_models_are_linked_cached_and_keep_manual_offline_entry() -> None:
+    html = HTML.read_text(encoding="utf-8")
+    js = JS.read_text(encoding="utf-8")
+    assert 'id="chat-model" name="model" list="chat-model-options"' in html
+    assert 'id="chat-model-options"' in html
+    assert 'data-i18n="manualModelHint"' in html
+    assert 'if (supported) loadModels(provider);' in js
+    assert '&& !isExtensionProvider(provider)' in js
+    assert 'cache.age_seconds' in js
+    assert 'data.fallback === true' in js
+    assert 'byId("chat-model").value || null' in js
+
+
+def test_settings_editor_posts_all_visible_secure_controls() -> None:
+    html = HTML.read_text(encoding="utf-8")
+    js = JS.read_text(encoding="utf-8")
+    for control in (
+        "setting-theme", "setting-default-provider", "setting-workspace",
+        "setting-reasoning-display", "setting-tool-display", "setting-web",
+        "setting-prompt-preview",
+    ):
+        assert f'id="{control}"' in html
+        assert f'byId("{control}")' in js
+    assert 'reasoning_display: byId("setting-reasoning-display").value' in js
+    assert 'tool_display: byId("setting-tool-display").value' in js
+    assert 'status.textContent = errorMessage(error, t("settingsFailed"))' in js
 
 
 def test_provider_state_connection_and_usage_export_fail_closed() -> None:

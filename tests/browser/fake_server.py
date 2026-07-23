@@ -63,11 +63,30 @@ def main() -> None:
             enabled=True, requires_external_isolation=False,
         ),
     )
-    token = server.prepare_manage(
-        (str(WORKSPACE),), provider_snapshots=(extension,),
+    grok = ProviderDescriptorV1(
+        id="grok",
+        source="extension",
+        status="discovered",
+        support_status="preview",
+        default_model=None,
+        capabilities=frozenset(),
+        route_prefixes=("grok",),
+        server_policy=ProviderServerPolicyV1(
+            enabled=False, requires_external_isolation=True,
+        ),
     )
+    manage.passive_bundled_provider_descriptors = lambda: (grok,)
+    token = server.prepare_manage((str(WORKSPACE),))
     runtime = manage.get_manage_runtime()
     assert runtime is not None
+    # Keep one constructor-injected-style Ext row to prove that arbitrary
+    # metadata remains non-actionable beside the audited bundled Preview row.
+    runtime._extension_provider_snapshots += (
+        manage._copy_extension_provider_snapshot(extension),
+    )
+    runtime._extension_provider_ids = frozenset(
+        (*runtime._extension_provider_ids, extension.id)
+    )
     runtime.session_manager.upsert(
         provider="preview-ext",
         session_id="native-preview-session",

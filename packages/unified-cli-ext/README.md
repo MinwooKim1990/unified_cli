@@ -2,10 +2,10 @@
 
 This directory organizes the extension source included in
 [`unified-cli`](https://github.com/MinwooKim1990/unified_cli). For the planned
-0.5.2 release it is not independently buildable or installable: one
+0.5.3 release it is not independently buildable or installable: one
 `unified-cli` wheel provides both `unified_cli` and `unified_cli_ext`. The
-extension feature set ships transport and runtime contracts, one bounded Grok
-Build Preview adapter and 17 additional runnable Preview adapters.
+extension feature set ships transport and runtime contracts plus 18 executable
+Preview adapters that are attempted only when explicitly selected.
 
 ## What this release does—and does not do
 
@@ -19,9 +19,9 @@ The installed catalog has entry-point metadata for Grok, Kimi, Copilot,
 Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, Cline, OpenCode, Kilo Code,
 Factory Droid, Pi, Oh My Pi, Hermes Agent, Poolside Agent CLI, Amp, and GitLab
 Duo CLI. Grok is a read-tool-limited **Preview** with `chat`, `stream`, and
-`sessions` capabilities. Every other catalog entry is also a runnable
-**Preview** adapter when explicitly selected. Common transports are
-fixture-tested, but vendor CLI and account compatibility is not guaranteed.
+`sessions` capabilities. Every catalog entry has an executable **Preview**
+adapter. Common transports are fixture-tested, but vendor CLI and account
+compatibility is not guaranteed.
 All extension server policies are disabled.
 
 For Grok Build, Kimi Code CLI, GitHub Copilot CLI, and Cursor Agent CLI, the
@@ -60,12 +60,12 @@ Install the planned unified release; Core and extensions are a feature boundary,
 not two distributions:
 
 ```bash
-python -m pip install "unified-cli==0.5.2"
+python -m pip install "unified-cli==0.5.3"
 ```
 
 If a developer or tester installed a legacy local or failed split wheel, first
 run `python -m pip uninstall -y unified-cli-ext`, then run
-`python -m pip install --force-reinstall "unified-cli==0.5.2"`. No separate
+`python -m pip install --force-reinstall "unified-cli==0.5.3"`. No separate
 project was published to public PyPI.
 
 The import package is `unified_cli_ext`. Before selecting Grok, complete the
@@ -104,7 +104,7 @@ for the full catalog and official vendor documentation.
 ## Optional protocol dependencies
 
 Protocol SDKs remain optional; they are not required for Core or Grok in
-`unified-cli` 0.5.2. The `acp` extra is required for ACP-based Preview
+`unified-cli` 0.5.3. The `acp` extra is required for ACP-based Preview
 providers, but installing it does not select or run a provider by itself. The available extras are `acp`, `mcp`,
 `all` (both protocol SDKs), and `dev` (test dependencies).
 
@@ -156,9 +156,14 @@ records, and none of this imports a plugin or probes a provider at startup.
 
 ## Status
 
-This release has 18 runnable Preview integrations. Grok has a representative
-authenticated native smoke; the other common transports are fixture-tested,
-but vendor and account compatibility is not guaranteed. No Ext provider is
-exposed through Core's local server. Failed Preview runs write prompt-free
-reports under `~/.unified-cli/preview-diagnostics/`; attach one to a GitHub
-issue to help improve compatibility.
+This release bundles 18 executable Preview integrations. The credential-free
+2026-07-23 lab reached `create()` for 13 current official installations.
+Cursor, Hermes, Mistral Vibe, and Qoder returned bounded compatibility errors;
+Poolside was not installed because accepting its EULA was outside the test
+authorization. Grok also has a representative authenticated native smoke.
+See the root
+[lab evidence](../../docs/development/ext-accountless-live-lab-2026-07-23.md).
+No Ext provider is exposed through Core's public-compatible server routes.
+Failed Preview runs write prompt-free reports under
+`~/.unified-cli/preview-diagnostics/`; attach one to a GitHub issue to help
+improve compatibility.

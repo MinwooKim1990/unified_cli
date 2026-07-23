@@ -16,9 +16,15 @@ from . import models
 from .i18n import t
 from .models import DEFAULT_MODELS
 from .providers.gemini import gemini_enabled
+from .registry import passive_bundled_provider_descriptors
 from .repl_commands import CommandSpec, DEFAULT_REGISTRY
 
 _PROVIDERS = ("claude", "codex", "gemini")
+# This Core-owned metadata API validates the packaged entry-point names and
+# targets without enumerating installed distributions or importing providers.
+BUNDLED_EXTENSION_PROVIDERS = tuple(
+    descriptor.id for descriptor in passive_bundled_provider_descriptors()
+)
 
 
 # ---------- slash command registry (single source of truth) ----------
@@ -98,6 +104,8 @@ def slash_candidates(token: str) -> list:
 def _provider_meta(provider: str) -> str:
     if provider == "gemini" and not gemini_enabled():
         return t("repl.picker.locked_suffix").strip()
+    if provider not in _PROVIDERS:
+        return t("repl.picker.ext_preview_suffix").strip()
     return ""
 
 
@@ -131,7 +139,7 @@ def _arg_candidates_from_snapshots(
     - /lang     → en|ko
     """
     tok = (token or "").lower()
-    providers = list(_PROVIDERS)
+    providers = list(_PROVIDERS) + list(BUNDLED_EXTENSION_PROVIDERS)
     if provider_snapshots is not None:
         for candidate in provider_snapshots:
             if (
@@ -256,14 +264,23 @@ class UnifiedCompleter(Completer):  # type: ignore[misc]
         stripped = text.lstrip()
         if not stripped.startswith("/"):
             return
-        if " " not in stripped:
+        if not any(char.isspace() for char in stripped):
             for name, meta in slash_candidates(stripped):
                 yield Completion(name, start_position=-len(stripped), display_meta=meta)
             return
-        cmd, _, arg = stripped.partition(" ")
-        if cmd not in _BY_NAME:
+        boundary = next(
+            (index for index, char in enumerate(stripped) if char.isspace()),
+            None,
+        )
+        if boundary is None:
             return
-        last = "" if (arg == "" or arg.endswith(" ")) else arg.split()[-1]
+        invoked = stripped[:boundary]
+        spec, ambiguous = DEFAULT_REGISTRY.resolve_prefix(invoked)
+        if spec is None or ambiguous:
+            return
+        cmd = spec.name
+        arg = stripped[boundary + 1:]
+        last = "" if (arg == "" or arg[-1:].isspace()) else arg.split()[-1]
         provider = self.current.get("provider", "claude")
         descriptors = self.current.get("loaded_extension_descriptors")
         if type(descriptors) is not dict:
@@ -499,7 +516,7 @@ def _pick_provider_from_snapshots(choices: Sequence[str]) -> Optional[str]:
     from .i18n import t
 
     values = []
-    providers = list(_PROVIDERS)
+    providers = list(_PROVIDERS) + list(BUNDLED_EXTENSION_PROVIDERS)
     for candidate in choices:
         if candidate not in providers and _safe_provider_id(candidate):
             providers.append(candidate)
@@ -511,4 +528,56 @@ def _pick_provider_from_snapshots(choices: Sequence[str]) -> Optional[str]:
         text=t("repl.picker.provider_text"),
         values=values,
         default="claude",
+    ).run()
+
+
+def pick_value(
+    name: str,
+    choices: Sequence[object],
+    *,
+    default: Optional[str] = None,
+) -> Optional[str]:
+    """Open a small safe value picker used by no-argument slash commands."""
+    from prompt_toolkit.shortcuts import radiolist_dialog
+
+    values = []
+    seen: set[str] = set()
+    for choice in choices:
+        if isinstance(choice, tuple) and len(choice) == 2:
+            value, label = choice
+        else:
+            value = label = choice
+        if (
+            type(value) is not str
+            or not value
+            or value in seen
+            or type(label) is not str
+        ):
+            continue
+        seen.add(value)
+        values.append((value, _safe_display_meta(label)))
+    if not values:
+        return None
+    selected = default if default in seen else values[0][0]
+    return radiolist_dialog(
+        title=t("repl.picker.setting_title", name=name),
+        text=t("repl.picker.setting_text"),
+        values=values,
+        default=selected,
+    ).run()
+
+
+def prompt_value(
+    name: str,
+    *,
+    default: str = "",
+) -> Optional[str]:
+    """Open a bounded prompt-toolkit input dialog for a setting value."""
+    from prompt_toolkit.shortcuts import input_dialog
+
+    safe_default = default if type(default) is str and len(default) <= 16_384 else ""
+    return input_dialog(
+        title=t("repl.picker.input_title", name=name),
+        text=t("repl.picker.input_text"),
+        default=safe_default,
     ).run()

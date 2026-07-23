@@ -16,6 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from unified_cli import conversation as conversation_module  # noqa: E402
 from unified_cli import manage, session_manager, settings  # noqa: E402
 from unified_cli.base import BaseProvider  # noqa: E402
 from unified_cli.core import Attachment, Message, Response, Usage  # noqa: E402
@@ -58,6 +59,25 @@ def _events(lines):
     return [json.loads(line) for line in lines]
 
 
+def _extension_descriptor(
+    provider="grok",
+    capabilities=frozenset(("chat", "stream", "sessions")),
+):
+    return manage.ProviderDescriptorV1(
+        id=provider,
+        source="extension",
+        status="loaded",
+        support_status="preview",
+        default_model="preview-default",
+        capabilities=capabilities,
+        route_prefixes=(provider,),
+        server_policy=manage.ProviderServerPolicyV1(
+            enabled=False,
+            requires_external_isolation=True,
+        ),
+    )
+
+
 def test_browser_chat_provider_workspace_permission_and_image_fail_closed(tmp_path):
     runtime, owner = _runtime(tmp_path)
     base = {
@@ -80,6 +100,154 @@ def test_browser_chat_provider_workspace_permission_and_image_fail_closed(tmp_pa
             "provider": "claude", **base,
             "images": [{"path": "/etc/passwd", "media_type": "image/png", "data": "x"}],
         }, owner.key)
+
+
+def test_ext_preview_chat_is_lazy_audited_cwd_only_and_rejects_images(
+    tmp_path, monkeypatch,
+):
+    runtime, owner = _runtime(tmp_path)
+    loaded = []
+
+    def snapshot(provider):
+        loaded.append(provider)
+        return _extension_descriptor(provider)
+
+    monkeypatch.setattr(manage, "snapshot_provider_descriptor", snapshot)
+    chat = _chat(runtime, owner, provider="grok")
+    assert loaded == ["grok"]
+    assert chat.model == "preview-default"
+    assert chat.provider_capabilities == frozenset(
+        ("chat", "stream", "sessions")
+    )
+    conversation = runtime._conversation_for_chat(chat)
+    assert conversation.provider_opts_by_provider == {
+        "grok": {"cwd": str(tmp_path.resolve())}
+    }
+    runtime.finish_chat(chat.id)
+
+    monkeypatch.setattr(
+        manage,
+        "_decode_data_image",
+        lambda _value: pytest.fail("Ext images must be rejected before decoding"),
+    )
+    with pytest.raises(manage.ManageError) as image_error:
+        _chat(runtime, owner, provider="grok", images=["data:image/png;base64,eA=="])
+    assert image_error.value.code == "images_unsupported"
+    assert loaded == ["grok"]
+
+
+def test_ext_preview_stream_reuses_python_factory_path(tmp_path, monkeypatch):
+    runtime, owner = _runtime(tmp_path)
+    monkeypatch.setattr(
+        manage,
+        "snapshot_provider_descriptor",
+        lambda provider: _extension_descriptor(provider),
+    )
+    created = []
+
+    class Provider:
+        def stream(self, prompt, **kwargs):
+            assert prompt == "hello"
+            assert kwargs["session_id"] is None
+            assert kwargs["images"] is None
+            assert isinstance(kwargs["cancel_event"], threading.Event)
+            yield Message(kind="text", provider="grok", text="factory reply")
+
+    def create(provider, *, model=None, **options):
+        created.append((provider, model, options))
+        return Provider()
+
+    monkeypatch.setattr(conversation_module, "create", create)
+    chat = _chat(runtime, owner, provider="grok")
+    events = _events(runtime.stream_chat(chat))
+    assert created == [(
+        "grok",
+        "preview-default",
+        {"cwd": str(tmp_path.resolve())},
+    )]
+    assert {"type": "text_delta", "text": "factory reply"} in events
+    assert events[-1] == {"type": "done", "status": "completed"}
+
+
+def test_ext_preview_unsafe_or_mutated_contracts_fail_before_factory(
+    tmp_path, monkeypatch,
+):
+    runtime, owner = _runtime(tmp_path)
+    calls = []
+    monkeypatch.setattr(
+        manage,
+        "snapshot_provider_descriptor",
+        lambda provider: calls.append(provider) or _extension_descriptor(
+            provider, frozenset(("chat", "permissions"))
+        ),
+    )
+
+    with pytest.raises(manage.ManageError) as unsafe:
+        _chat(runtime, owner, provider="kimi")
+    assert unsafe.value.code == "provider_unsupported"
+    assert calls == []
+
+    with pytest.raises(manage.ManageError) as permission:
+        _chat(runtime, owner, provider="grok", permission="workspace_write")
+    assert permission.value.code == "permission_forbidden"
+    assert calls == []
+
+    with pytest.raises(manage.ManageError) as mutated:
+        _chat(runtime, owner, provider="grok")
+    assert mutated.value.code == "permission_forbidden"
+    assert calls == ["grok"]
+
+
+def test_ext_preview_stream_error_and_cancellation_are_normalized(
+    tmp_path, monkeypatch,
+):
+    runtime, owner = _runtime(tmp_path)
+    monkeypatch.setattr(
+        manage,
+        "snapshot_provider_descriptor",
+        lambda provider: _extension_descriptor(provider),
+    )
+
+    class FailingConversation:
+        def stream(self, *_args, **_kwargs):
+            yield Message(kind="text", provider="grok", text="partial")
+            raise UnifiedError(
+                kind="network", provider="grok", message="private detail"
+            )
+
+    monkeypatch.setattr(
+        runtime, "_conversation_for_chat", lambda _chat: FailingConversation()
+    )
+    failed_chat = _chat(runtime, owner, provider="grok")
+    failed = _events(runtime.stream_chat(failed_chat))
+    assert failed[-2:] == [
+        {
+            "type": "error",
+            "code": "network",
+            "message": "The provider request failed.",
+        },
+        {"type": "done", "status": "error"},
+    ]
+    assert failed_chat.id not in runtime._active_chats
+
+    class CancelledConversation:
+        def stream(self, *_args, **kwargs):
+            assert kwargs["cancel_event"].is_set()
+            error = UnifiedError(
+                kind="internal", provider="grok", message="cancelled"
+            )
+            error._cancelled = True
+            raise error
+            yield  # pragma: no cover
+
+    monkeypatch.setattr(
+        runtime, "_conversation_for_chat", lambda _chat: CancelledConversation()
+    )
+    cancelled_chat = _chat(runtime, owner, provider="grok")
+    runtime.cancel_chat(cancelled_chat.id, owner.key)
+    cancelled = _events(runtime.stream_chat(cancelled_chat))
+    assert cancelled[-1] == {"type": "done", "status": "cancelled"}
+    assert cancelled_chat.id not in runtime._active_chats
 
 
 def test_browser_provider_options_are_verified_read_only_mappings(tmp_path, monkeypatch):

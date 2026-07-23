@@ -37,7 +37,9 @@ def test_slash_candidates_have_descriptions():
 
 def test_arg_candidates_provider():
     vals = [v for v, _ in rc.arg_candidates("/provider", "claude", "")]
-    assert vals == ["claude", "codex", "gemini"]
+    assert vals == [
+        "claude", "codex", "gemini", *rc.BUNDLED_EXTENSION_PROVIDERS,
+    ]
 
 
 def test_arg_candidates_provider_gemini_locked():
@@ -85,7 +87,7 @@ def test_arg_candidates_auth_is_explicit_provider_second():
     providers = [
         v for v, _ in rc.arg_candidates("/auth", "claude", "co", "status co")
     ]
-    assert providers == ["codex"]
+    assert providers == ["codex", "copilot", "codebuddy"]
 
 
 def test_model_refresh_completion_is_explicit_only():

@@ -47,10 +47,15 @@ class ProcessFailed(TransportError):
 class ProviderReportedError(TransportError):
     """A provider emitted a canonical error event before clean completion."""
 
-    def __init__(self, *, retryable: bool = False) -> None:
+    def __init__(
+        self, *, retryable: bool = False, category: str = ""
+    ) -> None:
         if type(retryable) is not bool:
             retryable = False
+        if category not in ("", "auth_expired", "rate_limit"):
+            category = ""
         self.retryable = retryable
+        self.category = category
         super().__init__("provider reported a turn failure")
 
 

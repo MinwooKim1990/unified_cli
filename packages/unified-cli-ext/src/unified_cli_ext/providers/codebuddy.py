@@ -57,7 +57,7 @@ ADAPTER_SPEC = ProviderAdapterSpecV1(
             _command("--version"),
             minimum_version=(0,),
             format=ProbeFormat.PLAIN_TEXT,
-            version_marker="codebuddy ",
+            version_is_entire_line=True,
         ),
         feature_probe=FeatureProbeSpec(
             _command("--help"),

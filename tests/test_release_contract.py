@@ -1,4 +1,4 @@
-"""Fail-closed source contracts for the unified 0.5.2 release path."""
+"""Fail-closed source contracts for the unified 0.5.3 release path."""
 
 from __future__ import annotations
 
@@ -30,8 +30,8 @@ verify_github_release_assets = importlib.util.module_from_spec(
 sys.modules[_RELEASE_ASSET_SPEC.name] = verify_github_release_assets
 _RELEASE_ASSET_SPEC.loader.exec_module(verify_github_release_assets)
 
-WHEEL = "unified_cli-0.5.2-py3-none-any.whl"
-SDIST = "unified_cli-0.5.2.tar.gz"
+WHEEL = "unified_cli-0.5.3-py3-none-any.whl"
+SDIST = "unified_cli-0.5.3.tar.gz"
 PERFORMANCE_REFERENCE_SHA = "be1478884735c862e894959944ba53e149ea4210"
 LEGACY_SPLIT_SHA = "7abb7ebc36a4668b3cc9634fd65af5c75b30c758"
 PERFORMANCE_INSTALL_COMMAND = (
@@ -120,7 +120,7 @@ def _release_asset_fixture(tmp_path: Path):
         "assets": records,
         "isDraft": False,
         "isPrerelease": False,
-        "tagName": "v0.5.2",
+        "tagName": "v0.5.3",
     }
     release_json = tmp_path / "release.json"
     release_json.write_text(json.dumps(release), encoding="utf-8")
@@ -135,8 +135,8 @@ def test_one_project_owns_both_namespace_versions_and_release_record():
     )
     pyproject = _text(ROOT / "pyproject.toml")
 
-    assert '__version__ = "0.5.2"' in core_init
-    assert '__version__ = "0.5.2"' in ext_init
+    assert '__version__ = "0.5.3"' in core_init
+    assert '__version__ = "0.5.3"' in ext_init
     assert 'name = "unified-cli"' in pyproject
     assert 'where = ["src", "packages/unified-cli-ext/src"]' in pyproject
     assert pyproject.count(
@@ -150,7 +150,7 @@ def test_one_project_owns_both_namespace_versions_and_release_record():
         )
     ) == 18
     assert '"unified-cli-ext' not in pyproject
-    assert "## [0.5.2] - 2026-07-23" in _text(ROOT / "CHANGELOG.md")
+    assert "## [0.5.3] - 2026-07-23" in _text(ROOT / "CHANGELOG.md")
     assert "## [0.5.1] - 2026-07-23" in _text(ROOT / "CHANGELOG.md")
     assert "## [0.5.0]" in _text(ROOT / "CHANGELOG.md")
 
@@ -184,7 +184,7 @@ def test_publish_requires_exact_clean_main_and_exact_version_tag():
     assert "merge-base --is-ancestor" not in workflow
     assert "skip-existing" not in workflow
     assert "workflow_dispatch" not in workflow
-    assert 'RELEASE_VERSION: "0.5.2"' in workflow
+    assert 'RELEASE_VERSION: "0.5.3"' in workflow
     assert 'os.environ["RELEASE_TAG"] != "v" + expected' in workflow
     assert workflow.count("namespace version source is ambiguous or wrong") == 1
     assert "legacy Ext project still exists" in workflow
@@ -333,7 +333,7 @@ def test_final_release_asset_manifest_and_downloaded_bytes_pass(tmp_path):
     wheel, sdist = verify_github_release_assets.verify_release_assets(
         release_json,
         assets,
-        expected_tag="v0.5.2",
+        expected_tag="v0.5.3",
         wheel_name=WHEEL,
         sdist_name=SDIST,
     )
@@ -401,7 +401,7 @@ def test_final_release_asset_corruption_fails_closed(tmp_path, corruption):
         verify_github_release_assets.verify_release_assets(
             release_json,
             assets,
-            expected_tag="v0.5.2",
+            expected_tag="v0.5.3",
             wheel_name=WHEEL,
             sdist_name=SDIST,
         )
@@ -410,7 +410,7 @@ def test_final_release_asset_corruption_fails_closed(tmp_path, corruption):
 def test_runbook_describes_one_immutable_release_and_aborted_ext_marker():
     runbook = _text(ROOT / "RELEASING.md")
     assert "one distribution, one PyPI project, one immutable" in runbook
-    assert "tag: `v0.5.2`" in runbook
+    assert "tag: `v0.5.3`" in runbook
     assert "environment, workflow, or GitHub Release for extensions" in runbook
     assert "`ext-v0.1.0` tag was an aborted publishing attempt" in runbook
     assert "Never rerun its historical" in runbook

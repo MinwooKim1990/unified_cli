@@ -51,7 +51,9 @@ ADAPTER_SPEC = ProviderAdapterSpecV1(
             _command("--version"),
             minimum_version=(0,),
             format=ProbeFormat.PLAIN_TEXT,
-            version_marker="amp ",
+            version_is_entire_line=True,
+            version_is_first_token=True,
+            maximum_version_component=2_147_483_647,
         ),
         feature_probe=FeatureProbeSpec(
             _command("--help"),

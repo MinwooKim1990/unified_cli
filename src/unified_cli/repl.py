@@ -44,6 +44,7 @@ from .repl_commands import CORE_AUTH_SPECS, DEFAULT_REGISTRY, CommandSpec
 from .repl_completion import (
     _completion_model_snapshot, arg_candidates, build_session,
     has_prompt_toolkit, pick_model, pick_provider, pick_provider_from_snapshots,
+    pick_value, prompt_value,
 )
 from .repl_state import ReplState
 from .state import resolve_cwd, save_last_session
@@ -588,6 +589,15 @@ def _handle_slash(
     )
     result = DEFAULT_REGISTRY.dispatch(line, context.execute)
     state.sync_legacy(current, provider_opts)
+    if result.ambiguous_candidates:
+        _safe_print(
+            t(
+                "repl.command.ambiguous",
+                candidates=", ".join(result.ambiguous_candidates),
+            ),
+            style="yellow",
+        )
+        return False
     if not result.handled:
         command = line.strip().split(None, 1)[0]
         _safe_print(t("repl.unknown.detail", cmd=command), style="red")
@@ -708,7 +718,7 @@ class _SlashContext:
         elif cmd == "/multiline":
             self._toggle("multiline", argument)
         elif cmd == "/usage":
-            _print_usage()
+            self._usage()
         elif cmd == "/lang":
             self._lang(argument)
         return False
@@ -736,6 +746,29 @@ class _SlashContext:
 
     def _model(self, argument: str) -> None:
         provider = self.state.provider
+        if not argument and self.use_ptk:
+            # Opening the picker is an explicit request, so refresh here
+            # instead of showing only the startup-safe fallback catalog.
+            # REPL startup itself remains probe-free.
+            try:
+                if provider in PROVIDERS:
+                    from .models import list_models
+
+                    choices = list_models(provider, force_refresh=True)
+                    _replace_core_model_choices(
+                        self.current, provider, choices,
+                    )
+                else:
+                    from .registry import list_extension_models
+
+                    choices = list_extension_models(provider)
+                    self.state.replace_extension_models(provider, choices)
+            except UnifiedError as exc:
+                _print_unified_error(exc)
+                _safe_print(t("repl.model.using_fallback"), style="yellow")
+            except Exception:  # noqa: BLE001 - provider/list boundary
+                _safe_print(t("repl.model.refresh_failed"), style="red")
+                _safe_print(t("repl.model.using_fallback"), style="yellow")
         if argument == "--refresh":
             try:
                 if provider in PROVIDERS:
@@ -822,6 +855,18 @@ class _SlashContext:
             )
 
     def _auth(self, argument: str) -> None:
+        if not argument and self.use_ptk:
+            action = pick_value(
+                "auth action", ("status", "login", "logout"), default="status"
+            )
+            if not action:
+                return
+            provider = pick_provider_from_snapshots(
+                list(self.state.loaded_extension_descriptors)
+            )
+            if not provider:
+                return
+            argument = action + " " + provider
         parts = argument.split()
         if len(parts) != 2:
             _safe_print(t("repl.auth.usage"), style="red")
@@ -894,6 +939,22 @@ class _SlashContext:
             console.print(Text("  " + icon + " " + state.name + ": " + label, style=color))
 
     def _settings(self) -> None:
+        if self.use_ptk:
+            command = pick_value(
+                "settings",
+                (
+                    "/provider", "/model", "/auth", "/style", "/effort",
+                    "/reasoning", "/context", "/system", "/timeout",
+                    "/permissions", "/tools", "/mcp", "/web", "/cwd",
+                    "/add-dir", "/theme", "/multiline",
+                ),
+            )
+            if not command:
+                return
+            spec = DEFAULT_REGISTRY.resolve(command)
+            if spec is not None:
+                self.execute(spec, command, "")
+            return
         table = Table(show_header=False, box=None, padding=(0, 2))
         table.add_column(style="cyan")
         table.add_column()
@@ -905,6 +966,12 @@ class _SlashContext:
         console.print(table)
 
     def _style(self, argument: str) -> None:
+        if not argument and self.use_ptk:
+            argument = pick_value(
+                "style", _STYLE_VALUES, default=self.state.style
+            ) or ""
+            if not argument:
+                return
         if not argument:
             _safe_print(t("repl.status.value", name="style", value=self.state.style), style="dim")
             return
@@ -929,6 +996,12 @@ class _SlashContext:
         _safe_print(t("repl.status.value", name="style", value=value), style="dim")
 
     def _effort(self, argument: str) -> None:
+        if not argument and self.use_ptk:
+            argument = pick_value(
+                "effort", _EFFORT_VALUES, default=self.state.effort
+            ) or ""
+            if not argument:
+                return
         if not argument:
             _safe_print(t("repl.status.value", name="effort", value=self.state.effort), style="dim")
             return
@@ -953,6 +1026,11 @@ class _SlashContext:
         _safe_print(t("repl.status.value", name="effort", value=value), style="dim")
 
     def _system(self, argument: str) -> None:
+        if not argument and self.use_ptk:
+            chosen = prompt_value("system")
+            if chosen is None or not chosen.strip():
+                return
+            argument = chosen
         if not argument:
             _print_system_status(self.state.system_prompt)
             return
@@ -985,6 +1063,19 @@ class _SlashContext:
             "reasoning": "reasoning_summaries",
             "multiline": "multiline",
         }[name]
+        if not argument and self.use_ptk:
+            choices = (
+                ("hidden", "summary")
+                if name == "reasoning" else ("on", "off")
+            )
+            current = (
+                ("summary" if bool(getattr(self.state, attr)) else "hidden")
+                if name == "reasoning"
+                else ("on" if bool(getattr(self.state, attr)) else "off")
+            )
+            argument = pick_value(name, choices, default=current) or ""
+            if not argument:
+                return
         if not argument:
             value = bool(getattr(self.state, attr))
             _safe_print(t("repl.status.value", name=name, value="on" if value else "off"), style="dim")
@@ -1006,6 +1097,16 @@ class _SlashContext:
         _safe_print(t("repl.status.value", name=name, value=display), style="dim")
 
     def _web(self, argument: str) -> None:
+        if not argument and self.use_ptk:
+            current = (
+                ("on" if self.state.web_search else "off")
+                if self.state.web_explicit else "default"
+            )
+            argument = pick_value(
+                "web", ("default", "on", "off"), default=current
+            ) or ""
+            if not argument:
+                return
         if not argument:
             value = (
                 ("on" if self.state.web_search else "off")
@@ -1039,6 +1140,12 @@ class _SlashContext:
         _safe_print(t("repl.status.value", name="web", value=value), style="dim")
 
     def _context(self, argument: str) -> None:
+        if not argument and self.use_ptk:
+            argument = prompt_value(
+                "context", default=str(self.state.context_window)
+            ) or ""
+            if not argument:
+                return
         if not argument:
             _safe_print(t("repl.context.status", value=self.state.context_window), style="dim")
             return
@@ -1055,6 +1162,16 @@ class _SlashContext:
         _safe_print(t("repl.context.changed", value=value), style="dim")
 
     def _timeout(self, argument: str) -> None:
+        if not argument and self.use_ptk:
+            argument = prompt_value(
+                "timeout",
+                default=(
+                    "default" if self.state.timeout is None
+                    else str(self.state.timeout)
+                ),
+            ) or ""
+            if not argument:
+                return
         if not argument:
             value = "default" if self.state.timeout is None else str(self.state.timeout)
             _safe_print(t("repl.status.value", name="timeout", value=value), style="dim")
@@ -1077,6 +1194,14 @@ class _SlashContext:
         _safe_print(t("repl.timeout.changed"), style="dim")
 
     def _permissions(self, argument: str) -> None:
+        if not argument and self.use_ptk:
+            argument = pick_value(
+                "permissions",
+                _PERMISSION_VALUES,
+                default=self.state.permission_mode,
+            ) or ""
+            if not argument:
+                return
         if not argument:
             _safe_print(
                 t("repl.permissions.current", value=self.state.permission_mode,
@@ -1110,6 +1235,10 @@ class _SlashContext:
         _safe_print(t("repl.status.value", name="permissions", value=value), style="dim")
 
     def _cwd(self, argument: str) -> None:
+        if not argument and self.use_ptk:
+            argument = prompt_value("cwd", default=self.state.cwd) or ""
+            if not argument:
+                return
         if not argument:
             _safe_print(t("repl.status.value", name="cwd", value=self.state.cwd), style="dim")
             return
@@ -1124,6 +1253,10 @@ class _SlashContext:
         _safe_print(t("repl.cwd.changed", cwd=resolved), style="dim")
 
     def _add_dir(self, argument: str) -> None:
+        if not argument and self.use_ptk:
+            argument = prompt_value("add-dir") or ""
+            if not argument:
+                return
         if not argument:
             if not self.state.added_dirs:
                 _safe_print(t("repl.add_dir.none"), style="dim")
@@ -1174,6 +1307,26 @@ class _SlashContext:
         if not records:
             _safe_print(t("repl.sessions.none"), style="dim")
             return
+        if self.use_ptk:
+            values = []
+            for index, record in enumerate(records[:100]):
+                provider = safe_terminal_text(
+                    getattr(record, "provider", ""), max_chars=32
+                )
+                name = safe_terminal_text(
+                    getattr(record, "name", "") or "—", max_chars=48
+                )
+                model = safe_terminal_text(
+                    getattr(record, "model", "") or "—", max_chars=48
+                )
+                values.append((str(index), provider + " · " + name + " · " + model))
+            selected = pick_value("sessions", values)
+            if selected is None:
+                return
+            try:
+                records = [records[int(selected)]]
+            except (IndexError, TypeError, ValueError):
+                return
         table = Table(header_style="bold cyan")
         for key in ("provider", "name", "model", "session"):
             table.add_column(t("repl.sessions.col_" + key))
@@ -1258,6 +1411,12 @@ class _SlashContext:
             _safe_print(t("repl.diff.truncated"), style="yellow")
 
     def _theme(self, argument: str) -> None:
+        if not argument and self.use_ptk:
+            argument = pick_value(
+                "theme", ("auto", "dark", "light"), default=self.state.theme
+            ) or ""
+            if not argument:
+                return
         if not argument:
             _safe_print(t("repl.status.value", name="theme", value=self.state.theme), style="dim")
             return
@@ -1285,6 +1444,26 @@ class _SlashContext:
             pass
         _safe_print(t("repl.lang.changed", lang=code), style="dim")
         _banner(self.current, self.use_ptk)
+
+    def _usage(self) -> None:
+        if not self.use_ptk:
+            _print_usage()
+            return
+        aggregates = tracker.aggregates()
+        if not aggregates:
+            _print_usage()
+            return
+        selected = pick_value(
+            "usage",
+            (("all", t("repl.picker.usage_all")),)
+            + tuple(
+                (aggregate.provider, aggregate.provider)
+                for aggregate in aggregates
+            ),
+            default="all",
+        )
+        if selected:
+            _print_usage(None if selected == "all" else selected)
 
     def _save(self) -> None:
         sid = self.conv.sessions.get(self.state.provider)
@@ -1668,8 +1847,11 @@ def _reset_conversation(conv: UnifiedConversation) -> None:
     conv._locked_provider = None  # type: ignore[attr-defined]
 
 
-def _print_usage() -> None:
-    aggregates = tracker.aggregates()
+def _print_usage(provider: Optional[str] = None) -> None:
+    aggregates = [
+        aggregate for aggregate in tracker.aggregates()
+        if provider is None or aggregate.provider == provider
+    ]
     if not aggregates:
         _safe_print(t("repl.tokens.none"), style="dim")
         return

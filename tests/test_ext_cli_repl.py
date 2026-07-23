@@ -571,6 +571,39 @@ def test_repl_provider_and_literal_model_load_metadata_only(monkeypatch):
     assert calls == {"factory": 0, "models": 0, "doctor": 0}
 
 
+def test_bundled_provider_menu_is_passive_and_selection_loads_only_one(monkeypatch):
+    grok = _EntryPoint("grok", _plugin("grok"))
+    kimi = _EntryPoint("kimi", _plugin("kimi"))
+    discovery = _install(monkeypatch, kimi, grok)
+
+    candidates = repl_completion.arg_candidates(
+        "/provider", "claude", "",
+    )
+    assert [value for value, _meta in candidates] == [
+        "claude", "codex", "gemini",
+        *repl_completion.BUNDLED_EXTENSION_PROVIDERS,
+    ]
+    assert all(
+        meta == "(Ext Preview)"
+        for value, meta in candidates
+        if value in repl_completion.BUNDLED_EXTENSION_PROVIDERS
+    )
+    assert discovery["calls"] == 0
+    assert grok.load_calls == kimi.load_calls == 0
+
+    current = {"provider": "claude", "model": "haiku"}
+    state = ReplState(provider="claude", model="haiku")
+    repl._handle_slash(
+        "/provider grok", _slash_conversation(), current, {}, [], False,
+        repl_state=state,
+    )
+
+    assert current["provider"] == "grok"
+    assert discovery["calls"] == 1
+    assert grok.load_calls == 1
+    assert kimi.load_calls == 0
+
+
 def test_repl_extension_model_refresh_replaces_only_last_good_snapshot(monkeypatch):
     calls = {"models": 0}
     failing = {"value": False}
@@ -829,7 +862,9 @@ def test_completion_uses_only_in_memory_extension_snapshots(monkeypatch):
     providers = list(completer.get_completions(Document("/provider "), None))
     assert [item.text for item in models] == ["vendor/one"]
     assert [item.text for item in providers] == [
-        "claude", "codex", "gemini", "synthetic",
+        "claude", "codex", "gemini",
+        *repl_completion.BUNDLED_EXTENSION_PROVIDERS,
+        "synthetic",
     ]
 
 
@@ -1017,7 +1052,9 @@ def test_loaded_extension_provider_picker_uses_snapshot_without_signature_break(
     assert list(inspect.signature(repl_completion.pick_provider).parameters) == []
     assert repl_completion.pick_provider_from_snapshots(["synthetic"]) == "synthetic"
     assert [value for value, _label in captured["values"]] == [
-        "claude", "codex", "gemini", "synthetic",
+        "claude", "codex", "gemini",
+        *repl_completion.BUNDLED_EXTENSION_PROVIDERS,
+        "synthetic",
     ]
 
 

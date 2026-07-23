@@ -44,7 +44,13 @@ from .models import (
     list_models,
 )
 from .plugin import ProviderServerPolicyV1
-from .registry import ProviderDescriptorV1, list_providers
+from .registry import (
+    ProviderDescriptorV1,
+    doctor_provider,
+    list_providers,
+    passive_bundled_provider_descriptors,
+    snapshot_provider_descriptor,
+)
 from .session_manager import SessionManager, SessionRecord
 from .settings import load_settings, save_settings
 from .usage import tracker
@@ -79,6 +85,23 @@ _EXT_CAPABILITY_RE = re.compile(
 )
 _CORE_PROVIDER_IDS = frozenset(("claude", "codex", "gemini"))
 _RESERVED_MANAGE_PROVIDER_IDS = frozenset((*_CORE_PROVIDER_IDS, "agy"))
+_BROWSER_SAFE_EXTENSION_PROVIDER_IDS = frozenset((
+    "grok",
+    "copilot",
+    "qoder",
+    "mistral-vibe",
+    "qwen",
+    "kilo",
+    "pi",
+    "oh-my-pi",
+    "hermes",
+    "poolside",
+))
+_BROWSER_EXTENSION_CAPABILITIES = frozenset((
+    "chat",
+    "stream",
+    "sessions",
+))
 _EXT_SUPPORT_STATUSES = frozenset(
     ("stable", "preview", "experimental", "held")
 )
@@ -143,6 +166,7 @@ class ActiveChat:
     images: List[Attachment]
     native_session_id: Optional[str]
     browser_session_id: Optional[str]
+    provider_capabilities: frozenset[str] = field(default_factory=frozenset)
     cancel_event: threading.Event = field(default_factory=threading.Event)
 
 
@@ -405,7 +429,7 @@ def _copy_extension_provider_snapshot(
         or type(lifecycle_status) is not str
         or type(support_status) is not str
         or source != "extension"
-        or lifecycle_status != "loaded"
+        or lifecycle_status not in {"discovered", "loaded"}
         or support_status not in _EXT_SUPPORT_STATUSES
     ):
         raise ValueError("extension provider snapshot is invalid")
@@ -439,7 +463,15 @@ def _copy_extension_provider_snapshot(
     ):
         raise ValueError("extension provider snapshot is invalid")
 
-    if support_status == "held":
+    if lifecycle_status == "discovered":
+        if (
+            support_status != "preview"
+            or default_model is not None
+            or copied_capabilities
+        ):
+            raise ValueError("extension provider snapshot is invalid")
+        copied_default_model = None
+    elif support_status == "held":
         # Held metadata may be shown, but never as executable or configured.
         copied_default_model = None
         copied_capabilities = []
@@ -451,7 +483,7 @@ def _copy_extension_provider_snapshot(
     return ProviderDescriptorV1(
         id=provider_id,
         source="extension",
-        status="loaded",
+        status=lifecycle_status,
         support_status=support_status,
         default_model=copied_default_model,
         capabilities=frozenset(tuple(copied_capabilities)),
@@ -666,16 +698,29 @@ class ManageRuntime:
         self._version_cache: "OrderedDict[object, Tuple[float, Tuple[bool, str, str]]]" = OrderedDict()
         self._auth_cache: "OrderedDict[object, Tuple[float, Tuple[bool, str]]]" = OrderedDict()
         self._models_cache: "OrderedDict[object, Tuple[float, Tuple[Tuple[object, ...], ...]]]" = OrderedDict()
+        self._model_cached_at: Dict[object, float] = {}
         self._failed_bootstraps: Dict[str, Deque[float]] = {}
         self.session_manager = SessionManager()
         self.workspaces = self._prepare_workspaces(workspaces)
         self._workspace_by_id = {workspace.id: workspace for workspace in self.workspaces}
+        bundled_snapshots = provider_snapshots is None
+        snapshots = (
+            passive_bundled_provider_descriptors()
+            if bundled_snapshots
+            else provider_snapshots
+        )
         self._extension_provider_snapshots = _copy_extension_provider_snapshots(
-            provider_snapshots
+            snapshots
         )
         self._extension_provider_ids = frozenset(
             descriptor.id for descriptor in self._extension_provider_snapshots
         )
+        # Constructor-injected descriptors remain metadata-only.  Only Core's
+        # callback-free bundled entry-point manifest authorizes an explicit
+        # exact-id load through the ordinary Python registry contracts.
+        self._manageable_extension_provider_ids = frozenset(
+            descriptor.id for descriptor in self._extension_provider_snapshots
+        ) if bundled_snapshots else frozenset()
 
     def _prepare_workspaces(self, values: Sequence[str]) -> Tuple[Workspace, ...]:
         if isinstance(values, (str, bytes)) or len(values) > 32:
@@ -725,6 +770,7 @@ class ManageRuntime:
             self._version_cache.clear()
             self._auth_cache.clear()
             self._models_cache.clear()
+            self._model_cached_at.clear()
             # Lock order is always ManageRuntime -> Core model cache.  Model
             # owners never retain the Core lock while reacquiring this lock.
             invalidate_core_model_cache()
@@ -809,13 +855,17 @@ class ManageRuntime:
 
     def _invalidate_model_cache_locked(self, provider_id: str) -> None:
         self._clear_provider_entries_locked(provider_id, (self._models_cache,))
+        for key in tuple(self._model_cached_at):
+            if isinstance(key, tuple) and key and key[0] == provider_id:
+                self._model_cached_at.pop(key, None)
         self._model_generations[provider_id] = (
             self._model_generations.get(provider_id, 0) + 1
         )
         # Keep this call under the Manage lock so invalidation has one visible
         # linearization point.  Core never calls back into Manage while holding
         # its cache lock, so the lock order cannot form a cycle.
-        invalidate_core_model_cache(provider_id)  # type: ignore[arg-type]
+        if provider_id in _CORE_PROVIDER_IDS:
+            invalidate_core_model_cache(provider_id)  # type: ignore[arg-type]
 
     def _invalidate_provider_cache_locked(self, provider_id: str) -> None:
         self._clear_provider_entries_locked(
@@ -839,6 +889,7 @@ class ManageRuntime:
                 self._version_cache.clear()
                 self._auth_cache.clear()
                 self._models_cache.clear()
+                self._model_cached_at.clear()
                 self._provider_identities.clear()
                 invalidate_core_model_cache()
                 for name in _VERIFY_SPECS:
@@ -1150,10 +1201,15 @@ class ManageRuntime:
             rows.append(row)
         for descriptor in self._extension_provider_snapshots:
             policy = descriptor.server_policy
+            browser_chat_supported = (
+                descriptor.id in self._manageable_extension_provider_ids
+                and descriptor.id in _BROWSER_SAFE_EXTENSION_PROVIDER_IDS
+                and descriptor.support_status != "held"
+            )
             rows.append({
                 "id": descriptor.id,
                 "source": "extension",
-                "status": "loaded",
+                "status": descriptor.status,
                 "support_status": descriptor.support_status,
                 "default_model": descriptor.default_model,
                 "capabilities": sorted(descriptor.capabilities),
@@ -1164,9 +1220,13 @@ class ManageRuntime:
                         or policy.requires_external_isolation is True
                     ),
                 },
-                "chat_supported": False,
-                "verify_supported": False,
-                "models_supported": False,
+                "chat_supported": browser_chat_supported,
+                "verify_supported": (
+                    descriptor.id in self._manageable_extension_provider_ids
+                ),
+                "models_supported": (
+                    descriptor.id in self._manageable_extension_provider_ids
+                ),
                 "default_supported": False,
                 "metadata_only": True,
             })
@@ -1190,7 +1250,14 @@ class ManageRuntime:
     def provider_models(
         self, provider_id: str, *, force_refresh: bool = False
     ) -> Dict[str, Any]:
-        if type(provider_id) is not str or provider_id not in _CORE_PROVIDER_IDS:
+        core_provider = (
+            type(provider_id) is str and provider_id in _CORE_PROVIDER_IDS
+        )
+        extension_provider = (
+            type(provider_id) is str
+            and provider_id in self._manageable_extension_provider_ids
+        )
+        if not core_provider and not extension_provider:
             raise ManageError(403, "provider_unsupported", "Provider models are unavailable.")
 
         with self._lock:
@@ -1199,7 +1266,11 @@ class ManageRuntime:
                     503, "manage_disabled", "The management runtime is disabled."
                 )
 
-        identity = _effective_model_binary_identity(provider_id)
+        identity = (
+            _effective_model_binary_identity(provider_id)
+            if core_provider
+            else None
+        )
         self._observe_binary("models", provider_id, identity)
         context = _environment_identity(provider_id)
         key = (provider_id, identity, context)
@@ -1212,7 +1283,13 @@ class ManageRuntime:
             if not force_refresh and identity_is_current:
                 record = self._cache_get(self._models_cache, key)
                 if record is not None:
-                    return self._models_response(provider_id, record)
+                    cached_at = self._model_cached_at.get(key, time.monotonic())
+                    return self._models_response(
+                        provider_id,
+                        record,
+                        True,
+                        max(0, int(time.monotonic() - cached_at)),
+                    )
 
             generation = self._model_generations.get(provider_id, 0)
             flight_key = (provider_id, generation, key)
@@ -1259,7 +1336,11 @@ class ManageRuntime:
                 # ManageRuntime owns the shorter UI TTL, so a miss must not be
                 # silently extended by Core's longer process cache.
                 try:
-                    models = list_models(provider_id, force_refresh=True)
+                    models = (
+                        list_models(provider_id, force_refresh=True)
+                        if core_provider
+                        else list_models(provider_id)
+                    )
                 except TypeError as error:
                     # Preserve compatibility with downstream/test listers that
                     # implement the historical one-argument callable shape.
@@ -1281,13 +1362,19 @@ class ManageRuntime:
                 raise ManageError(
                     502,
                     "models_unavailable",
-                    "Provider models are unavailable.",
+                    (
+                        "Provider models are unavailable. Enter a model ID "
+                        "manually in Chat, or configure the local provider and retry."
+                    ),
                 ) from None
             except Exception:
                 raise ManageError(
                     502,
                     "models_unavailable",
-                    "Provider models are unavailable.",
+                    (
+                        "Provider models are unavailable. Enter a model ID "
+                        "manually in Chat, or configure the local provider and retry."
+                    ),
                 ) from None
             if fallback_fence_error is not None:
                 raise fallback_fence_error
@@ -1305,7 +1392,11 @@ class ManageRuntime:
                 and type(item.id) is str
                 and len(item.id) <= 512
             )
-            current_identity = _effective_model_binary_identity(provider_id)
+            current_identity = (
+                _effective_model_binary_identity(provider_id)
+                if core_provider
+                else None
+            )
             commit_error = None
             with self._lock:
                 if flight.error is not None:
@@ -1330,6 +1421,10 @@ class ManageRuntime:
                             PROVIDER_MODELS_TTL_SECONDS,
                             rows,
                         )
+                        self._model_cached_at[key] = time.monotonic()
+                        for cached_key in tuple(self._model_cached_at):
+                            if cached_key not in self._models_cache:
+                                self._model_cached_at.pop(cached_key, None)
                     flight.result = rows
                     flight.committed = True
             if commit_error is not None:
@@ -1353,10 +1448,21 @@ class ManageRuntime:
 
     @staticmethod
     def _models_response(
-        provider_id: str, rows: Tuple[Tuple[object, ...], ...]
+        provider_id: str,
+        rows: Tuple[Tuple[object, ...], ...],
+        cached: bool = False,
+        age_seconds: int = 0,
     ) -> Dict[str, Any]:
         return {
             "provider": provider_id,
+            "cache": {
+                "cached": cached,
+                "age_seconds": age_seconds,
+                "ttl_seconds": int(PROVIDER_MODELS_TTL_SECONDS),
+            },
+            "fallback": bool(rows) and all(
+                row[4] == "hardcoded" for row in rows
+            ),
             "models": [
                 {
                     "id": row[0],
@@ -1369,11 +1475,72 @@ class ManageRuntime:
             ],
         }
 
+    def _verify_extension_provider(self, provider_id: str) -> Dict[str, Any]:
+        """Run the ordinary Python doctor contract for one explicit Ext id.
+
+        Only a small Core-normalized diagnostic crosses the browser boundary;
+        arbitrary plugin doctor fields and exception text are never exposed.
+        """
+
+        with self._lock:
+            self._require_enabled_locked()
+        try:
+            result = doctor_provider(provider_id)
+        except (KeyboardInterrupt, GeneratorExit, asyncio.CancelledError):
+            raise
+        except UnifiedError:
+            raise ManageError(
+                502,
+                "verify_failed",
+                (
+                    "Provider verification failed. Configure its local "
+                    "installation with the Python/REPL workflow and retry."
+                ),
+            ) from None
+        except Exception:
+            raise ManageError(
+                502,
+                "verify_failed",
+                "Provider verification failed.",
+            ) from None
+        if type(result) is not dict or type(result.get("available")) is not bool:
+            raise ManageError(
+                502,
+                "verify_failed",
+                "Provider verification returned an invalid diagnostic.",
+            )
+        available = result["available"] is True
+        version = _safe_text(result.get("version", ""), maximum=120)
+        auth_value = result.get("auth")
+        auth = (
+            auth_value
+            if type(auth_value) is str
+            and auth_value in {"authenticated", "not_authenticated", "unknown"}
+            else "unknown"
+        )
+        return {
+            "provider": provider_id,
+            "installed": available,
+            "ready": available,
+            "status": "ready" if available else "unavailable",
+            "auth": auth,
+            "version": version,
+            "support_status": "preview",
+            "checks": [{
+                "check": "provider_doctor",
+                "ok": available,
+                "code": "ok" if available else "not_ready",
+                "output": "",
+            }],
+        }
+
     def verify_provider(
         self, provider_id: str, *, force_refresh: bool = False
     ) -> Dict[str, Any]:
         if self._is_extension_provider_id(provider_id):
-            raise self._provider_unsupported()
+            if provider_id not in self._manageable_extension_provider_ids:
+                raise self._provider_unsupported()
+            return self._verify_extension_provider(provider_id)
         specs = (
             _VERIFY_SPECS.get(provider_id)
             if type(provider_id) is str and len(provider_id) <= 64
@@ -1763,6 +1930,53 @@ class ManageRuntime:
             raise ManageError(403, "session_forbidden", "Session does not match the workspace.")
         return record.session_id, handle  # native id remains inside the runtime
 
+    def _extension_chat_descriptor(
+        self, provider_id: str,
+    ) -> ProviderDescriptorV1:
+        """Load one audited bundled Preview descriptor for an explicit chat."""
+
+        if (
+            provider_id not in self._manageable_extension_provider_ids
+            or provider_id not in _BROWSER_SAFE_EXTENSION_PROVIDER_IDS
+        ):
+            raise self._provider_unsupported()
+        try:
+            descriptor = _copy_extension_provider_snapshot(
+                snapshot_provider_descriptor(provider_id)
+            )
+        except (KeyboardInterrupt, GeneratorExit, asyncio.CancelledError):
+            raise
+        except UnifiedError:
+            raise ManageError(
+                502,
+                "provider_unavailable",
+                "The selected Ext Preview provider could not be loaded.",
+            ) from None
+        except Exception:
+            raise ManageError(
+                502,
+                "provider_unavailable",
+                "The selected Ext Preview provider could not be loaded.",
+            ) from None
+        if (
+            descriptor.id != provider_id
+            or descriptor.status != "loaded"
+            or descriptor.support_status == "held"
+            or "chat" not in descriptor.capabilities
+            or not descriptor.capabilities.issubset(
+                _BROWSER_EXTENSION_CAPABILITIES
+            )
+        ):
+            raise ManageError(
+                403,
+                "permission_forbidden",
+                (
+                    "This Ext Preview provider does not satisfy the browser "
+                    "read-only chat boundary."
+                ),
+            )
+        return descriptor
+
     def start_chat(self, payload: object, owner_key: str) -> ActiveChat:
         if type(payload) is not dict:
             raise ManageError(400, "invalid_chat", "Chat request must be an object.")
@@ -1773,9 +1987,16 @@ class ManageRuntime:
         if not set(payload).issubset(allowed):
             raise ManageError(400, "invalid_chat", "Chat request contains unsupported fields.")
         provider = payload.get("provider")
-        if self._is_extension_provider_id(provider):
+        extension_provider = self._is_extension_provider_id(provider)
+        if extension_provider and (
+            provider not in self._manageable_extension_provider_ids
+            or provider not in _BROWSER_SAFE_EXTENSION_PROVIDER_IDS
+        ):
             raise self._provider_unsupported()
-        if type(provider) is not str or provider not in {"claude", "codex"}:
+        if (
+            type(provider) is not str
+            or (not extension_provider and provider not in {"claude", "codex"})
+        ):
             raise ManageError(403, "provider_forbidden", "Provider is unavailable for browser chat.")
         if payload.get("permission", "read_only") != "read_only":
             raise ManageError(403, "permission_forbidden", "Browser chat is read-only.")
@@ -1787,12 +2008,15 @@ class ManageRuntime:
         if "workspace" in payload and "workspace_id" in payload:
             raise ManageError(400, "invalid_workspace", "Specify one workspace identifier.")
         workspace = self._workspace(payload.get("workspace_id", payload.get("workspace")))
-        model = self._model(payload.get("model"), provider)
-        native_session, browser_session = self._resume_session(
-            payload.get("session_id"), provider, workspace)
         raw_images = payload.get("images", [])
         if type(raw_images) is not list or len(raw_images) > MAX_IMAGES:
             raise ManageError(413, "too_many_images", "Too many images were supplied.")
+        if extension_provider and raw_images:
+            raise ManageError(
+                400,
+                "images_unsupported",
+                "Ext Preview browser chat does not support image input.",
+            )
         images = []
         total_image_bytes = 0
         for value in raw_images:
@@ -1816,6 +2040,29 @@ class ManageRuntime:
                 )
             images.append(image)
 
+        provider_capabilities: frozenset[str] = frozenset()
+        if extension_provider:
+            descriptor = self._extension_chat_descriptor(provider)
+            provider_capabilities = descriptor.capabilities
+            model_value = payload.get("model")
+            model = self._model(
+                descriptor.default_model if model_value is None else model_value,
+                provider,
+            )
+            if (
+                payload.get("session_id") is not None
+                and "sessions" not in provider_capabilities
+            ):
+                raise ManageError(
+                    403,
+                    "session_forbidden",
+                    "This Ext Preview provider does not support session resume.",
+                )
+        else:
+            model = self._model(payload.get("model"), provider)
+        native_session, browser_session = self._resume_session(
+            payload.get("session_id"), provider, workspace)
+
         with self._lock:
             self._require_enabled_locked()
             if len(self._active_chats) >= MAX_ACTIVE_CHATS:
@@ -1828,6 +2075,7 @@ class ManageRuntime:
                 workspace=workspace, model=model, prompt=prompt, images=images,
                 native_session_id=native_session,
                 browser_session_id=browser_session,
+                provider_capabilities=provider_capabilities,
             )
             self._active_chats[chat_id] = chat
             self._provider_active[provider] = chat_id
@@ -1876,6 +2124,14 @@ class ManageRuntime:
                 # an older workspace-write session read-only in the browser.
                 "config_overrides": {"sandbox_mode": "read-only"},
             }
+        elif (
+            chat.provider in _BROWSER_SAFE_EXTENSION_PROVIDER_IDS
+            and chat.provider in self._manageable_extension_provider_ids
+            and "chat" in chat.provider_capabilities
+        ):
+            # Bundled Ext adapters own their fixed read-only/no-prompt argv.
+            # Core supplies only the registered absolute workspace.
+            provider_options = {"cwd": chat.workspace.path}
         else:  # defensive: start_chat has already fail-closed
             raise ManageError(403, "provider_forbidden", "Provider is unavailable for browser chat.")
         conversation = UnifiedConversation(

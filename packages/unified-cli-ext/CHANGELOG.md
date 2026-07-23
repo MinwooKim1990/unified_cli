@@ -5,6 +5,22 @@ It is not the changelog of an independently published package.
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-07-23
+
+- Documents and regression-tests `from unified_cli import create` as the
+  primary embedded API for every bundled Preview provider.
+- Preserves sanitized authentication and usage-limit error kinds through the
+  Core plugin boundary, including Grok's official unauthenticated JSON form
+  and Pi's fixed no-auth RPC response.
+- Refreshes version-probe contracts from current accountless official CLI
+  evidence while retaining exact executable provenance and semver checks.
+- Makes the complete Preview catalog visible in REPL and local manage surfaces
+  without adding a second distribution or changing Core defaults.
+- Records the accountless live result without broadening it: 13 current
+  official installations reached `create()`, Cursor/Hermes/Mistral
+  Vibe/Qoder had bounded compatibility blockers, and Poolside was not
+  installed because EULA acceptance was not authorized.
+
 ## [0.5.2] - 2026-07-23
 
 - Makes every one of the 18 bundled provider entry points an explicitly
@@ -74,7 +90,8 @@ Initial extension-foundation release for `unified-cli` 0.5.x.
   extension package to public PyPI and did not create a GitHub Release. The
   planned 0.5.2 unified distribution supersedes that split-release plan.
 
-[Unreleased]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.0...v0.5.1
 [0.1.0]: https://github.com/MinwooKim1990/unified_cli/tree/ext-v0.1.0

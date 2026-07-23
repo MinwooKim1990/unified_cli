@@ -74,6 +74,9 @@ const messages = {
     verifyFailed: "Verification failed", noProviders: "No provider metadata is available.",
     noWorkspaces: "No approved workspaces are available.", loading: "Loading…", loadFailed: "Could not load data",
     modelsLoaded: "Models loaded", noModels: "No models returned for this provider.",
+    modelsCached: "cached", modelsFresh: "fresh", secondsOld: "s old",
+    manualModelHint: "Model IDs can be entered manually in Chat when discovery is offline.",
+    previewWarning: "Preview · explicit local checks only", authStatus: "Auth",
     contextUnknown: "Unknown", resume: "Resume", rename: "Rename", archive: "Archive",
     delete: "Delete", save: "Save", core: "Core", ext: "Ext", sessionActionFailed: "Session action failed",
     sessionActionComplete: "Session updated", renameSession: "Rename session", deleteSessionQuestion: "Delete this session from the index?",
@@ -81,6 +84,7 @@ const messages = {
     noUsage: "No usage rows match these filters.", calls: "calls", errors: "errors", success: "Success",
     error: "Error", chatStarting: "Starting secure stream…", chatStreaming: "Streaming…",
     chatDone: "Response complete", chatCancelled: "Chat cancelled", chatFailed: "Chat failed",
+    chatPreviewWarning: "Ext Preview runs only when you press Send. The selected local adapter remains read-only, and image input is unavailable.",
     promptRequired: "Enter a prompt.", selectionRequired: "Select a provider and workspace.",
     imageRejected: "Some images were rejected by the file limits.", removeImage: "Remove image",
     session: "Session", reasoningSummary: "Reasoning summary", toolStarted: "Started",
@@ -93,7 +97,9 @@ const messages = {
     languageLocalNote: "Language changes apply immediately and are stored when you choose Save settings.",
     saveSettings: "Save settings", settingsSaved: "Settings saved", settingsFailed: "Settings could not be saved",
     primaryLandmark: "Primary", managementViews: "Management views", summary: "Summary",
-    metadataOnly: "Metadata only", supportStatus: "Support status"
+    metadataOnly: "Metadata only", supportStatus: "Support status",
+    reasoningDisplay: "Reasoning display", toolDisplay: "Tool display",
+    hidden: "Hidden", compact: "Compact"
   },
   ko: {
     actions: "작업", activeSessions: "활성 세션", addImages: "이미지 추가",
@@ -149,6 +155,9 @@ const messages = {
     verifyFailed: "확인 실패", noProviders: "제공자 메타데이터가 없습니다.",
     noWorkspaces: "승인된 작업공간이 없습니다.", loading: "불러오는 중…", loadFailed: "데이터를 불러오지 못했습니다",
     modelsLoaded: "모델을 불러왔습니다", noModels: "이 제공자가 반환한 모델이 없습니다.",
+    modelsCached: "캐시", modelsFresh: "새로 불러옴", secondsOld: "초 전",
+    manualModelHint: "검색이 오프라인이면 Chat에서 모델 ID를 직접 입력할 수 있습니다.",
+    previewWarning: "Preview · 명시적 로컬 확인만", authStatus: "인증",
     contextUnknown: "알 수 없음", resume: "재개", rename: "이름 변경", archive: "보관",
     delete: "삭제", save: "저장", core: "Core", ext: "Ext", sessionActionFailed: "세션 작업 실패",
     sessionActionComplete: "세션 업데이트됨", renameSession: "세션 이름 변경", deleteSessionQuestion: "색인에서 이 세션을 삭제할까요?",
@@ -156,6 +165,7 @@ const messages = {
     noUsage: "필터에 맞는 사용량 행이 없습니다.", calls: "호출", errors: "오류", success: "성공",
     error: "오류", chatStarting: "보안 스트림 시작 중…", chatStreaming: "스트리밍 중…",
     chatDone: "응답 완료", chatCancelled: "채팅 취소됨", chatFailed: "채팅 실패",
+    chatPreviewWarning: "Ext Preview는 보내기를 누를 때만 실행됩니다. 선택한 로컬 어댑터는 읽기 전용이며 이미지 입력은 사용할 수 없습니다.",
     promptRequired: "프롬프트를 입력하세요.", selectionRequired: "제공자와 작업공간을 선택하세요.",
     imageRejected: "파일 제한으로 일부 이미지가 거부되었습니다.", removeImage: "이미지 제거",
     session: "세션", reasoningSummary: "추론 요약", toolStarted: "시작됨",
@@ -168,7 +178,9 @@ const messages = {
     languageLocalNote: "언어 변경은 즉시 적용되며 설정 저장을 선택하면 서버에 저장됩니다.",
     saveSettings: "설정 저장", settingsSaved: "설정 저장됨", settingsFailed: "설정을 저장하지 못했습니다",
     primaryLandmark: "주요 영역", managementViews: "관리 화면", summary: "요약",
-    metadataOnly: "메타데이터 전용", supportStatus: "지원 상태"
+    metadataOnly: "메타데이터 전용", supportStatus: "지원 상태",
+    reasoningDisplay: "추론 표시", toolDisplay: "도구 표시",
+    hidden: "숨김", compact: "간단히"
   }
 };
 
@@ -360,7 +372,8 @@ function normalizeProvider(value, fallbackId = "") {
   const supportStatus = typeof value.support_status === "string" && value.support_status.length <= 32
     ? value.support_status : "unknown";
   if ((isCore && (status !== "builtin" || supportStatus !== "stable"))
-      || (isExtension && (status !== "loaded" || !EXT_SUPPORT_STATUSES.has(supportStatus)))) return null;
+      || (isExtension && (!["discovered", "loaded"].includes(status)
+        || !EXT_SUPPORT_STATUSES.has(supportStatus)))) return null;
   const capabilities = Array.isArray(value.capabilities)
     ? value.capabilities.slice(0, 64).filter((item) => (
       typeof item === "string" && item.length <= 64 && CAPABILITY_ID_PATTERN.test(item)
@@ -379,9 +392,9 @@ function normalizeProvider(value, fallbackId = "") {
       enabled: isCore && policy.enabled === true,
       requires_external_isolation: isExtension || policy.requires_external_isolation === true
     },
-    chat_supported: isCore && value.chat_supported === true,
-    verify_supported: isCore && value.verify_supported === true,
-    models_supported: isCore && value.models_supported === true,
+    chat_supported: value.chat_supported === true,
+    verify_supported: value.verify_supported === true,
+    models_supported: value.models_supported === true,
     default_supported: isCore && value.default_supported === true,
     metadata_only: isExtension
   };
@@ -423,6 +436,11 @@ function normalizeProviders(value) {
 function providerSupports(id, field) {
   const provider = state.providers.find((item) => providerId(item) === id);
   return Boolean(provider) && provider[field] === true;
+}
+
+function isExtensionProvider(id) {
+  const provider = state.providers.find((item) => providerId(item) === id);
+  return Boolean(provider) && provider.source === "extension";
 }
 
 function normalizeWorkspaces(value) {
@@ -546,7 +564,7 @@ function renderProviders() {
     const header = makeElement("header");
     const title = makeElement("div");
     const subtitle = provider.source === "extension"
-      ? `${t("metadataOnly")} · ${textValue(provider.support_status, t("unknown"), 32)}`
+      ? `${t("previewWarning")} · ${textValue(provider.support_status, t("unknown"), 32)}`
       : "CLI provider";
     title.append(makeElement("h3", "", name), makeElement("p", "muted", subtitle));
     header.append(title, providerBadge(provider));
@@ -555,6 +573,7 @@ function renderProviders() {
     appendSummaryRow(details, t("source"), provider.source === "extension" ? t("ext") : t("core"));
     appendSummaryRow(details, t("version"), textValue(provider.version || provider.cli_version, t("notAvailable"), 100));
     appendSummaryRow(details, t("status"), textValue(provider.status || provider.health || provider.state, availability === "ready" ? t("ready") : t("unknown"), 120));
+    appendSummaryRow(details, t("authStatus"), textValue(provider.auth, t("notChecked"), 40));
     appendSummaryRow(details, t("supportStatus"), textValue(provider.support_status, t("unknown"), 32));
     appendSummaryRow(details, t("defaultModel"), textValue(provider.default_model, t("notAvailable"), 512));
     appendSummaryRow(details, t("capabilities"), capabilityText(provider.capabilities));
@@ -571,6 +590,17 @@ function renderProviders() {
     verify.disabled = state.mode !== "manage" || provider.verify_supported !== true || !id;
     verify.addEventListener("click", () => verifyProvider(id, verify, card));
     card.append(verify);
+    if (provider.models_supported === true) {
+      const models = makeElement("button", "button secondary", t("refreshModels"));
+      models.type = "button";
+      models.disabled = state.mode !== "manage";
+      models.addEventListener("click", () => {
+        showView("models");
+        byId("models-provider").value = id;
+        loadModels(id, true);
+      });
+      card.append(models);
+    }
     target.append(card);
   });
   populateProviderOptions();
@@ -615,7 +645,9 @@ function populateProviderOptions() {
     state.providers.forEach((provider) => {
       const id = providerId(provider);
       if (!id) return;
-      const name = providerName(provider);
+      const name = provider.source === "extension"
+        ? `${providerName(provider)} (Ext Preview)`
+        : providerName(provider);
       const option = makeElement("option", "", name);
       option.value = id;
       if (select.id === "chat-provider") option.disabled = provider.chat_supported !== true;
@@ -624,6 +656,7 @@ function populateProviderOptions() {
     });
     if (Array.from(select.options).some((option) => option.value === current)) select.value = current;
   });
+  updateChatProviderControls(byId("chat-provider").value);
   populateSettingsOptions();
 }
 
@@ -679,10 +712,13 @@ function validBootstrap(data) {
     const extension = provider.source === "extension" && !CORE_PROVIDER_IDS.has(provider.id) && provider.id !== "agy";
     if (!core && !extension) return false;
     if (core && (provider.status !== "builtin" || provider.support_status !== "stable")) return false;
-    if (extension && (provider.status !== "loaded" || !EXT_SUPPORT_STATUSES.has(provider.support_status))) return false;
+    if (extension && (!["discovered", "loaded"].includes(provider.status)
+        || !EXT_SUPPORT_STATUSES.has(provider.support_status))) return false;
     if (["chat_supported", "verify_supported", "models_supported", "default_supported", "metadata_only"].some((key) => typeof provider[key] !== "boolean")) return false;
-    if (extension && (provider.chat_supported !== false || provider.verify_supported !== false
-        || provider.models_supported !== false || provider.default_supported !== false
+    if (extension && (typeof provider.chat_supported !== "boolean"
+        || typeof provider.verify_supported !== "boolean"
+        || typeof provider.models_supported !== "boolean"
+        || provider.default_supported !== false
         || provider.metadata_only !== true)) return false;
     if (core && provider.metadata_only !== false) return false;
     if (!Array.isArray(provider.capabilities) || provider.capabilities.length > 64
@@ -692,7 +728,10 @@ function validBootstrap(data) {
         || typeof provider.server_policy.requires_external_isolation !== "boolean") return false;
     if (extension && (provider.server_policy.enabled !== false
         || provider.server_policy.requires_external_isolation !== true)) return false;
-    if (provider.support_status === "held") {
+    if (provider.status === "discovered") {
+      if (provider.support_status !== "preview" || provider.default_model !== null
+          || provider.capabilities.length !== 0) return false;
+    } else if (provider.support_status === "held") {
       if (provider.default_model !== null || provider.capabilities.length !== 0) return false;
     } else if (typeof provider.default_model !== "string" || !provider.default_model
         || provider.default_model.length > 512 || provider.default_model !== provider.default_model.trim()
@@ -710,6 +749,8 @@ function validBootstrap(data) {
   }
   const settings = data.settings;
   if (!["en", "ko"].includes(settings.lang) || !["auto", "light", "dark"].includes(settings.theme)) return false;
+  if (!["hidden", "compact"].includes(settings.reasoning_display)
+      || !["hidden", "compact"].includes(settings.tool_display)) return false;
   if (settings.browser_permission !== "read_only" || typeof settings.browser_prompt_preview !== "boolean" || typeof settings.web !== "boolean") return false;
   if (!["claude", "codex", "gemini"].includes(settings.default_provider)) return false;
   if (settings.workspace_id !== null && (typeof settings.workspace_id !== "string" || !workspaceIds.has(settings.workspace_id))) return false;
@@ -799,6 +840,10 @@ function applySettings(settings) {
   setTheme(theme);
   byId("setting-web").checked = settings.web === true;
   byId("setting-prompt-preview").checked = settings.browser_prompt_preview === true;
+  byId("setting-reasoning-display").value = ["hidden", "compact"].includes(settings.reasoning_display)
+    ? settings.reasoning_display : "hidden";
+  byId("setting-tool-display").value = ["hidden", "compact"].includes(settings.tool_display)
+    ? settings.tool_display : "compact";
   byId("setting-permission").value = "read_only";
   populateSettingsOptions();
 }
@@ -826,6 +871,8 @@ async function saveSettings(event) {
       theme: byId("setting-theme").value,
       browser_permission: "read_only",
       browser_prompt_preview: byId("setting-prompt-preview").checked,
+      reasoning_display: byId("setting-reasoning-display").value,
+      tool_display: byId("setting-tool-display").value,
       default_provider: defaultProvider,
       workspace_id: byId("setting-workspace").value || null,
       web: byId("setting-web").checked
@@ -1103,12 +1150,19 @@ async function loadModels(provider, force = false) {
   try {
     const data = await mutationFetch(
       `${API_ROOT}/providers/${encodeURIComponent(provider)}/models`,
-      { method: "POST", body: "{}" }
+      { method: "POST", body: JSON.stringify({ force_refresh: force }) }
     );
     const rows = Array.isArray(data) ? data : listValue(data.models || data.data);
     state.modelsByProvider.set(provider, rows.filter(isRecord).slice(0, MAX_MODEL_ROWS));
     renderModels(state.modelsByProvider.get(provider));
-    byId("models-status").textContent = t("modelsLoaded");
+    const cache = isRecord(data.cache) ? data.cache : {};
+    const age = Number.isSafeInteger(cache.age_seconds) && cache.age_seconds >= 0
+      ? cache.age_seconds : 0;
+    const cacheLabel = cache.cached === true
+      ? `${t("modelsCached")} · ${age}${t("secondsOld")}`
+      : t("modelsFresh");
+    const fallbackLabel = data.fallback === true ? ` · ${t("manualModelHint")}` : "";
+    byId("models-status").textContent = `${t("modelsLoaded")} · ${cacheLabel}${fallbackLabel}`;
     populateChatModels(provider);
   } catch (error) {
     byId("models-status").textContent = errorMessage(error, t("loadFailed"));
@@ -1142,17 +1196,34 @@ function renderModels(rows) {
 }
 
 function populateChatModels(provider) {
-  const select = byId("chat-model");
-  const current = resetOptions(select, "defaultModel");
+  const input = byId("chat-model");
+  const options = byId("chat-model-options");
+  const current = input.value;
+  clearNode(options);
   const rows = state.modelsByProvider.get(provider) || [];
   rows.forEach((model) => {
     const id = textValue(model.id || model.name || model.model, "", 300);
     if (!id) return;
     const option = makeElement("option", "", id);
     option.value = id;
-    select.append(option);
+    options.append(option);
   });
-  if (Array.from(select.options).some((option) => option.value === current)) select.value = current;
+  input.value = current;
+}
+
+function updateChatProviderControls(providerIdValue) {
+  const provider = state.providers.find(
+    (item) => providerId(item) === providerIdValue
+  );
+  const extension = Boolean(provider && provider.source === "extension");
+  const warning = byId("chat-preview-warning");
+  warning.hidden = !extension;
+  const picker = byId("image-picker");
+  picker.disabled = extension;
+  byId("image-limit").textContent = extension
+    ? t("chatPreviewWarning")
+    : t("imageLimit");
+  if (extension) releaseImages();
 }
 
 function sessionItems(value) {
@@ -1279,6 +1350,7 @@ function resumeSession(item) {
   const id = sessionId(item);
   if (!provider || !workspace || !id) return;
   byId("chat-provider").value = provider;
+  updateChatProviderControls(provider);
   byId("chat-workspace").value = workspace;
   state.resumeSessionId = id;
   if (state.modelsByProvider.has(provider)) populateChatModels(provider);
@@ -1721,8 +1793,14 @@ function wireEvents() {
     const provider = event.target.value;
     state.resumeSessionId = "";
     byId("chat-session-label").textContent = "";
+    byId("chat-model").value = "";
     if (state.modelsByProvider.has(provider)) populateChatModels(provider);
-    else resetOptions(byId("chat-model"), "defaultModel");
+    else clearNode(byId("chat-model-options"));
+    updateChatProviderControls(provider);
+    if (
+      providerSupports(provider, "models_supported")
+      && !isExtensionProvider(provider)
+    ) loadModels(provider);
   });
   byId("chat-workspace").addEventListener("change", () => {
     state.resumeSessionId = "";

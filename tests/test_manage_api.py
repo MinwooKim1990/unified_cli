@@ -21,7 +21,7 @@ pytest.importorskip("fastapi")
 httpx = pytest.importorskip("httpx")
 
 from unified_cli import manage, server, session_manager, settings  # noqa: E402
-from unified_cli.core import Response, Usage  # noqa: E402
+from unified_cli.core import ModelInfo, Response, Usage  # noqa: E402
 from unified_cli.errors import UnifiedError  # noqa: E402
 from unified_cli.plugin import ProviderServerPolicyV1  # noqa: E402
 from unified_cli.registry import ProviderDescriptorV1  # noqa: E402
@@ -127,8 +127,8 @@ def test_bootstrap_one_time_replay_cookie_scope_and_safe_metadata(tmp_path, monk
             assert body["authenticated"] is True
             assert body["csrf_token"]
             assert body["versions"] == {
-                "unified_cli": "0.5.2",
-                "unified_cli_ext": "0.5.2",
+                "unified_cli": "0.5.3",
+                "unified_cli_ext": "0.5.3",
             }
             assert body["limits"]["image_total_bytes"] == 12 * 1024 * 1024
             assert body["providers"]
@@ -294,7 +294,7 @@ def test_security_headers_csp_no_cors_and_manage_body_limit(tmp_path, monkeypatc
     run(scenario())
 
 
-def test_bootstrap_and_provider_listing_do_not_probe_models_or_import_plugins(
+def test_bootstrap_lists_bundled_entry_point_metadata_without_provider_probes(
     tmp_path, monkeypatch,
 ):
     calls = {"entry_points": 0, "models": 0, "popen": 0, "load": 0}
@@ -322,11 +322,129 @@ def test_bootstrap_and_provider_listing_do_not_probe_models_or_import_plugins(
         async with client() as api:
             response = await bootstrap(api, token)
             assert response.status_code == 200
-            assert {row["id"] for row in response.json()["providers"]} == {
+            rows = response.json()["providers"]
+            assert {row["id"] for row in rows} == {
                 "claude", "codex", "gemini",
+                "grok", "kimi", "copilot", "cursor", "codebuddy", "qoder",
+                "mistral-vibe", "qwen", "cline", "opencode", "kilo",
+                "droid", "pi", "oh-my-pi", "hermes", "poolside", "amp",
+                "gitlab-duo",
             }
+            extensions = [row for row in rows if row["source"] == "extension"]
+            assert len(extensions) == 18
+            assert all(row["status"] == "discovered" for row in extensions)
+            assert all(row["support_status"] == "preview" for row in extensions)
+            assert all(row["models_supported"] is True for row in extensions)
+            assert {
+                row["id"] for row in extensions if row["chat_supported"]
+            } == manage._BROWSER_SAFE_EXTENSION_PROVIDER_IDS
     run(scenario())
     assert calls == {"entry_points": 0, "models": 0, "popen": 0, "load": 0}
+
+
+def test_bundled_ext_explicit_models_and_doctor_reuse_python_contracts(
+    tmp_path, monkeypatch,
+):
+    calls = []
+
+    def models(provider, **kwargs):
+        calls.append(("models", provider, kwargs))
+        return [
+            ModelInfo(
+                id="official-preview-model",
+                provider=provider,
+                default=True,
+                source="plugin",
+            )
+        ]
+
+    def doctor(provider):
+        calls.append(("doctor", provider))
+        return {
+            "id": provider,
+            "available": True,
+            "status": "Preview",
+            "version": "1.2.3",
+        }
+
+    def snapshot(provider):
+        calls.append(("snapshot", provider))
+        return extension_snapshot(
+            provider_id=provider,
+            default_model="official-preview-model",
+            capabilities=frozenset(("chat", "stream", "sessions")),
+        )
+
+    monkeypatch.setattr(manage, "list_models", models)
+    monkeypatch.setattr(manage, "doctor_provider", doctor)
+    monkeypatch.setattr(manage, "snapshot_provider_descriptor", snapshot)
+    token = server.prepare_manage([str(tmp_path)])
+
+    async def scenario():
+        async with client() as api:
+            exchanged = await bootstrap(api, token)
+            csrf = exchanged.json()["csrf_token"]
+            headers = mutation_headers(csrf)
+            first = await api.post(
+                "/api/ui/v1/providers/grok/models",
+                json={"force_refresh": False},
+                headers=headers,
+            )
+            second = await api.post(
+                "/api/ui/v1/providers/grok/models",
+                json={"force_refresh": False},
+                headers=headers,
+            )
+            verified = await api.post(
+                "/api/ui/v1/providers/grok/verify",
+                json={},
+                headers=headers,
+            )
+            assert first.status_code == second.status_code == verified.status_code == 200
+            return first.json(), second.json(), verified.json()
+
+    first, second, verified = run(scenario())
+    assert first["models"] == [{
+        "id": "official-preview-model",
+        "display_name": "",
+        "default": True,
+        "deprecated": False,
+        "source": "plugin",
+    }]
+    assert first["cache"]["cached"] is False
+    assert second["cache"]["cached"] is True
+    assert second["cache"]["age_seconds"] >= 0
+    assert verified == {
+        "provider": "grok",
+        "installed": True,
+        "ready": True,
+        "status": "ready",
+        "auth": "unknown",
+        "version": "1.2.3",
+        "support_status": "preview",
+        "checks": [{
+            "check": "provider_doctor",
+            "ok": True,
+            "code": "ok",
+            "output": "",
+        }],
+    }
+    runtime = manage.get_manage_runtime()
+    assert runtime is not None
+    chat = runtime.start_chat({
+        "provider": "grok",
+        "workspace_id": runtime.workspaces[0].id,
+        "permission": "read_only",
+        "prompt": "hello",
+    }, "owner")
+    assert chat.provider == "grok"
+    assert chat.model == "official-preview-model"
+    runtime.finish_chat(chat.id)
+    assert calls == [
+        ("models", "grok", {}),
+        ("doctor", "grok"),
+        ("snapshot", "grok"),
+    ]
 
 
 def test_injected_extension_snapshot_is_copied_bounded_metadata_only(
@@ -706,7 +824,16 @@ def test_model_discovery_is_an_explicit_same_origin_mutation(tmp_path, monkeypat
                 headers=mutation_headers(csrf),
             )
             assert allowed.status_code == 200
-            assert allowed.json() == {"provider": "claude", "models": []}
+            assert allowed.json() == {
+                "provider": "claude",
+                "cache": {
+                    "cached": False,
+                    "age_seconds": 0,
+                    "ttl_seconds": 60,
+                },
+                "fallback": False,
+                "models": [],
+            }
             assert calls == ["claude"]
 
     run(scenario())

@@ -18,7 +18,7 @@ PROVIDERS = (
     (
         qoder,
         "qodercli",
-        "qodercli 1.1.1",
+        "1.1.4",
         "Usage: qodercli\n--acp\nAgent Client Protocol\n--permission-mode",
         ("--acp", "--permission-mode", "dont_ask"),
         {},
@@ -26,7 +26,7 @@ PROVIDERS = (
     (
         kilo,
         "kilo",
-        "kilo 7.4.11",
+        "7.4.15",
         "kilo acp\nstart ACP\n--hostname\n--port",
         ("acp", "--hostname", "127.0.0.1", "--port", "0"),
         {
@@ -65,7 +65,14 @@ PROVIDERS = (
 )
 
 
-def _official_cli_fixture(tmp_path, name: str, version: str, help_text: str):
+def _official_cli_fixture(
+    tmp_path,
+    name: str,
+    version: str,
+    help_text: str,
+    *,
+    help_to_stderr: bool = False,
+):
     executable = tmp_path / name
     quoted_help = " ".join(
         "'{}'".format(line.replace("'", "'\\''"))
@@ -77,6 +84,7 @@ def _official_cli_fixture(tmp_path, name: str, version: str, help_text: str):
         + 'case "$*" in\n'
         + '  *"--help"*) printf "%s\\n" '
         + quoted_help
+        + (" >&2" if help_to_stderr else "")
         + " ;;\n"
         + '  *) printf "%s\\n" '
         + quoted_version
@@ -124,7 +132,13 @@ def test_path_selection_reaches_the_official_sdk_process_boundary(
     argv,
     provider_env,
 ):
-    executable = _official_cli_fixture(tmp_path, name, version, help_text)
+    executable = _official_cli_fixture(
+        tmp_path,
+        name,
+        version,
+        help_text,
+        help_to_stderr=module.ADAPTER_SPEC.binary.feature_probe.use_stderr,
+    )
     monkeypatch.setenv("PATH", str(tmp_path))
     captured = {}
 

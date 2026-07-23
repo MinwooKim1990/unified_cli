@@ -111,6 +111,27 @@ _MAX_MODEL_ID_CHARS = 512
 INSTALLATION_RECEIPT_MEDIA_TYPE_V1 = (
     "application/vnd.unified-cli-ext.installation-receipt.v1+json"
 )
+_AUTH_FAILURE_MARKERS = (
+    "not signed in",
+    "not authenticated",
+    "no auth credentials",
+    "no api key found",
+    "authentication required",
+    "authentication failed",
+    "unauthorized",
+    "login required",
+    "sign in required",
+)
+_RATE_LIMIT_MARKERS = (
+    "rate limit",
+    "too many requests",
+    "quota exceeded",
+    "usage limit",
+)
+_SAFE_PROVIDER_ERROR_CODES = {
+    "auth_required": "auth_expired",
+    "rate_limit": "rate_limit",
+}
 
 
 @dataclass(frozen=True)
@@ -150,6 +171,26 @@ def _core_error(provider: str, error: ExtensionError) -> UnifiedError:
             "Preview integration."
         )
     elif isinstance(error, ProviderReportedError):
+        if error.category == "auth_expired":
+            return UnifiedError(
+                kind="auth_expired",
+                provider=provider,
+                message="Provider authentication is required.",
+                hint=(
+                    "Run the provider's official login command in its "
+                    "unified-cli provider home, then retry."
+                ),
+            )
+        if error.category == "rate_limit":
+            return UnifiedError(
+                kind="rate_limit",
+                provider=provider,
+                message=(
+                    "The provider temporarily refused the request due to a "
+                    "usage limit."
+                ),
+                hint="Wait for the provider's stated cooldown before retrying.",
+            )
         kind = "internal"
         message = "Provider reported an error."
     elif isinstance(error, TransportTimeout):
@@ -162,6 +203,28 @@ def _core_error(provider: str, error: ExtensionError) -> UnifiedError:
         kind = "internal"
         message = "Provider returned an invalid response for this Preview integration."
     elif isinstance(error, ProcessFailed):
+        diagnostics = error.diagnostics.casefold()
+        if any(marker in diagnostics for marker in _AUTH_FAILURE_MARKERS):
+            return UnifiedError(
+                kind="auth_expired",
+                provider=provider,
+                message="Provider authentication is required.",
+                hint=(
+                    "Run the provider's official login command in its "
+                    "unified-cli provider home, then retry."
+                ),
+            )
+        if (
+            any(marker in diagnostics for marker in _RATE_LIMIT_MARKERS)
+            or " 429" in diagnostics
+            or diagnostics.startswith("429")
+        ):
+            return UnifiedError(
+                kind="rate_limit",
+                provider=provider,
+                message="The provider temporarily refused the request due to a usage limit.",
+                hint="Wait for the provider's stated cooldown before retrying.",
+            )
         kind = "internal"
         message = "Provider process failed."
     else:
@@ -375,6 +438,7 @@ class _TurnState:
         self.done = False
         self.saw_error = False
         self.error_retryable = False
+        self.error_category = ""
 
     def remaining_events(self) -> int:
         return self.max_events - self.canonical_count
@@ -512,6 +576,7 @@ class _TurnState:
                 raise ProtocolError("provider emitted multiple error events")
             self.saw_error = True
             self.error_retryable = event.retryable
+            self.error_category = _SAFE_PROVIDER_ERROR_CODES.get(event.code, "")
             return Message(
                 kind="error",
                 provider=self.provider,
@@ -535,7 +600,10 @@ class _TurnState:
         if self.active_tools:
             raise ProtocolError("provider response left active tool calls")
         if self.saw_error:
-            raise ProviderReportedError(retryable=self.error_retryable)
+            raise ProviderReportedError(
+                retryable=self.error_retryable,
+                category=self.error_category,
+            )
         if self.expected_session is not None and not self.session_id:
             raise ProtocolError("provider response omitted the requested session")
 
@@ -963,12 +1031,14 @@ class AdapterProviderBridge(BaseProvider):
         )
 
     @staticmethod
-    def _record_error(provider: str, model: str, started: float) -> None:
+    def _record_error(
+        provider: str, model: str, started: float, kind: str,
+    ) -> None:
         _usage_tracker.record(
             provider,
             model,
             latency_ms=int((time.monotonic() - started) * 1000),
-            error_kind="internal",
+            error_kind=kind,
         )
 
     def chat(
@@ -1003,8 +1073,11 @@ class AdapterProviderBridge(BaseProvider):
             self._record_success(provider_id, selected_model, turn, started)
             return response
         except ExtensionError as error:
-            self._record_error(provider_id, selected_model, started)
-            raise _core_error(provider_id, error) from None
+            translated = _core_error(provider_id, error)
+            self._record_error(
+                provider_id, selected_model, started, translated.kind,
+            )
+            raise translated from None
         finally:
             if relay is not None:
                 relay.close()
@@ -1043,8 +1116,11 @@ class AdapterProviderBridge(BaseProvider):
             succeeded = True
             self._record_success(provider_id, selected_model, turn, started)
         except ExtensionError as error:
-            self._record_error(provider_id, selected_model, started)
-            raise _core_error(provider_id, error) from None
+            translated = _core_error(provider_id, error)
+            self._record_error(
+                provider_id, selected_model, started, translated.kind,
+            )
+            raise translated from None
         finally:
             if not succeeded:
                 token.cancel()
@@ -1100,8 +1176,11 @@ class AdapterProviderBridge(BaseProvider):
         except asyncio.CancelledError:
             raise
         except ExtensionError as error:
-            self._record_error(provider_id, selected_model, started)
-            raise _core_error(provider_id, error) from None
+            translated = _core_error(provider_id, error)
+            self._record_error(
+                provider_id, selected_model, started, translated.kind,
+            )
+            raise translated from None
         finally:
             if relay is not None:
                 relay.close()
@@ -1167,8 +1246,11 @@ class AdapterProviderBridge(BaseProvider):
             token.cancel()
             raise
         except ExtensionError as error:
-            self._record_error(provider_id, selected_model, started)
-            raise _core_error(provider_id, error) from None
+            translated = _core_error(provider_id, error)
+            self._record_error(
+                provider_id, selected_model, started, translated.kind,
+            )
+            raise translated from None
         finally:
             if not succeeded:
                 token.cancel()

@@ -75,7 +75,12 @@ CWD = {cwd!r}
 
 args = sys.argv[1:]
 if args == ["--version"]:
-    sys.stdout.write(PROVIDER + " 1.2.3\\n")
+    version = {{
+        "droid": "0.178.0",
+        "omp": "omp/17.0.9",
+        "pi": "0.81.1",
+    }}[PROVIDER]
+    sys.stdout.write(version + "\\n")
     raise SystemExit(0)
 if PROVIDER == "droid" and args == ["exec", "--help"]:
     sys.stdout.write(
@@ -85,8 +90,12 @@ if PROVIDER == "droid" and args == ["exec", "--help"]:
     raise SystemExit(0)
 if PROVIDER in ("pi", "omp") and args == ["--help"]:
     sys.stdout.write(
-        "Usage: " + PROVIDER + " [options]\\n"
-        "--mode <mode>\\n"
+        (
+            "pi - AI coding assistant with read, bash, edit, write tools\\n"
+            if PROVIDER == "pi"
+            else "omp v17.0.9\\n"
+        )
+        + ("--mode <mode>\\n" if PROVIDER == "pi" else "--mode=<value>\\n")
         + ("--no-session\\n" if PROVIDER == "pi" else "--no-tools\\n")
     )
     raise SystemExit(0)
@@ -119,6 +128,15 @@ if PROVIDER == "pi":
     if prompt == "broken":
         sys.stdout.write("not-json\\n")
         sys.stdout.flush()
+        raise SystemExit(0)
+    if prompt == "no-auth":
+        send({{
+            "id": "unified-cli-ext-turn",
+            "type": "response",
+            "command": "prompt",
+            "success": False,
+            "error": {pi_no_auth_error!r},
+        }})
         raise SystemExit(0)
     send({{
         "id": "unified-cli-ext-turn",
@@ -275,6 +293,7 @@ if sys.stdin.read() != "":
         expected_argv=case.expected_argv,
         log_path=str(log_path),
         cwd=str(tmp_path),
+        pi_no_auth_error=pi.PI_NO_AUTH_ERROR,
     )
     target.write_text("#!{}\n{}".format(interpreter, body), encoding="utf-8")
     target.chmod(0o700)
@@ -344,3 +363,21 @@ def test_preview_rpc_provider_malformed_protocol_is_diagnostic(
     assert "provider={}".format(case.module.ADAPTER_SPEC.id) in reports[0].read_text(
         encoding="utf-8"
     )
+
+
+def test_pi_fixed_no_auth_response_maps_to_safe_core_error(
+    tmp_path: Path,
+    fixture_interpreter: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = CASES[0]
+    _fake_cli(tmp_path, case, fixture_interpreter)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    provider = pi.PLUGIN.factory(cwd=str(tmp_path))
+
+    with pytest.raises(UnifiedError) as captured:
+        provider.chat("no-auth")
+
+    assert captured.value.kind == "auth_expired"
+    assert captured.value.provider == "pi"
+    assert pi.PI_NO_AUTH_ERROR not in str(captured.value)

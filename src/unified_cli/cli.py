@@ -1,4 +1,4 @@
-"""Terminal CLI: `unified-cli {doctor,setup,status,chat,models}`."""
+"""Terminal CLI: `unified-cli {doctor,setup,status,chat,models,configure}`."""
 
 from __future__ import annotations
 
@@ -255,6 +255,49 @@ def _cmd_providers(args: argparse.Namespace) -> int:
             escape(item.default_model or "-"),
         )
     console.print(tbl)
+    return 0
+
+
+# ----- configure Preview provider -----
+
+def _cmd_configure_provider(args: argparse.Namespace) -> int:
+    """Verify and persist one explicitly selected extension launch."""
+
+    from .registry import configure_extension_provider
+
+    try:
+        configured = configure_extension_provider(
+            args.provider,
+            verify=not args.no_verify,
+        )
+    except UnifiedError as exc:
+        err_console.print(f"[red]{escape(str(exc))}[/red]")
+        return 2
+    payload = {
+        "provider": configured.provider_id,
+        "provider_home": configured.provider_home,
+        "receipt_sha256": configured.receipt_sha256,
+        "verified": not args.no_verify,
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    console.print(
+        "[green]{}[/green]".format(escape(t(
+            "cli.configure.ok", provider=configured.provider_id,
+        )))
+    )
+    if configured.provider_home:
+        console.print(t(
+            "cli.configure.home", path=escape(configured.provider_home),
+        ))
+    if configured.provider_id == "grok" and configured.provider_home:
+        console.print(t(
+            "cli.configure.grok_login",
+            path=escape(configured.provider_home),
+        ))
+    else:
+        console.print(t("cli.configure.login_hint"))
     return 0
 
 
@@ -809,6 +852,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--json", action="store_true", help=t("cli.help.providers.json"),
     )
     p_providers.set_defaults(func=_cmd_providers)
+
+    p_configure = _add("configure", help=t("cli.help.configure"))
+    p_configure.add_argument("provider", help=t("cli.help.configure.provider"))
+    p_configure.add_argument(
+        "--no-verify", action="store_true",
+        help=t("cli.help.configure.no_verify"),
+    )
+    p_configure.add_argument(
+        "--json", action="store_true", help=t("cli.help.configure.json"),
+    )
+    p_configure.set_defaults(func=_cmd_configure_provider)
 
     p_config = _add("config", help=t("cli.help.config"))
     config_sub = p_config.add_subparsers(dest="config_cmd", required=True)

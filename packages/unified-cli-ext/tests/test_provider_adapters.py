@@ -252,6 +252,53 @@ def test_model_probe_rejects_plain_text_without_a_bounded_list_grammar():
         ModelProbeSpec(plain_probe)
 
 
+def test_entire_line_version_extraction_is_unique_bounded_and_exact():
+    probe = PlainTextProbeSpec(
+        command("--version"),
+        fields={
+            "version": PlainTextFieldSpec(
+                "",
+                max_chars=128,
+                first_token=True,
+                entire_line=True,
+            )
+        },
+        expected={"version": None},
+    )
+
+    assert dict(
+        ProviderAdapterV1._plain_record(
+            "0.0.1784809706-g96cc8a (released at a bounded timestamp)\n",
+            probe,
+        )
+    ) == {"version": "0.0.1784809706-g96cc8a"}
+    with pytest.raises(ProtocolError, match="ambiguous"):
+        ProviderAdapterV1._plain_record("1.2.3\nunexpected\n", probe)
+
+    suffixed = PlainTextProbeSpec(
+        command("--version"),
+        fields={
+            "version": PlainTextFieldSpec(
+                "GitHub Copilot CLI ",
+                max_chars=128,
+                required_suffix=".",
+            )
+        },
+        expected={"version": None},
+    )
+    assert dict(
+        ProviderAdapterV1._plain_record(
+            "GitHub Copilot CLI 1.0.73.\n",
+            suffixed,
+        )
+    ) == {"version": "1.0.73"}
+    with pytest.raises(ProtocolError, match="required suffix"):
+        ProviderAdapterV1._plain_record(
+            "GitHub Copilot CLI 1.0.73\n",
+            suffixed,
+        )
+
+
 def test_adapter_metadata_has_aggregate_utf8_bound_and_stable_snapshot():
     oversized_prompt = PromptCommandSpec(
         tuple("x" * (16 * 1024) for _ in range(20)),

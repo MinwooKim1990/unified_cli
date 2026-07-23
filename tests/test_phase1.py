@@ -1,6 +1,6 @@
 """Regression tests for Phase 1 fixes (flagship verification + safety).
 
-F1: hardcoded list refresh (Claude 4.7 / Codex with gpt-5.5 / Gemini correct IDs)
+F1: hardcoded list refresh (current Claude/Codex / Gemini CLI fallback IDs)
 F2: empty API key env guard
 F3: Claude is_error JSON raise
 F4: subprocess timeout defaults
@@ -29,10 +29,11 @@ from unified_cli import UnifiedError
 
 # ---- F1: hardcoded list contents ----
 
-def test_f1_claude_hardcoded_includes_flagship_4_7():
+def test_f1_claude_hardcoded_includes_current_official_tiers():
     ids = _HARDCODED["claude"]
-    assert "claude-opus-4-7" in ids, f"missing Opus 4.7 in {ids}"
-    assert "claude-sonnet-4-6" in ids
+    assert "claude-fable-5" in ids
+    assert "claude-opus-4-8" in ids
+    assert "claude-sonnet-5" in ids
     assert "claude-haiku-4-5" in ids
     # aliases
     assert "opus" in ids and "sonnet" in ids and "haiku" in ids
@@ -40,12 +41,10 @@ def test_f1_claude_hardcoded_includes_flagship_4_7():
 
 def test_f1_codex_hardcoded_includes_flagship_and_codex_specialists():
     ids = _HARDCODED["codex"]
-    # gpt-5.5 (flagship, may need newer codex CLI)
+    assert {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} <= set(ids)
     assert "gpt-5.5" in ids
     assert "gpt-5.4" in ids
     assert "gpt-5.4-mini" in ids
-    # Coding-specialized (verified live)
-    assert "gpt-5.3-codex" in ids
     assert "gpt-5.3-codex-spark" in ids
 
 
@@ -119,12 +118,12 @@ def test_f6_resolved_model_from_modelusage():
         "result": "ok",
         "session_id": "s1",
         "usage": {"input_tokens": 5, "output_tokens": 2},
-        "modelUsage": {"claude-opus-4-7": {"input": 5, "output": 2}},
+        "modelUsage": {"claude-opus-4-8": {"input": 5, "output": 2}},
     })
     cli = ClaudeProvider.__new__(ClaudeProvider)
     resp = cli._parse_json_response(fake, "opus")
     # User passed alias "opus", but Response.model exposes the actual snapshot
-    assert resp.model == "claude-opus-4-7", \
+    assert resp.model == "claude-opus-4-8", \
         f"expected resolved model, got {resp.model}"
 
 

@@ -25,6 +25,7 @@ class CommandSpec:
 class DispatchResult:
     handled: bool
     exit_requested: bool = False
+    ambiguous_candidates: Tuple[str, ...] = ()
 
 
 CommandHandler = Callable[[CommandSpec, str, str], bool]
@@ -62,6 +63,34 @@ class CommandRegistry:
     def resolve(self, name: str) -> Optional[CommandSpec]:
         return self._by_name.get(name)
 
+    def resolve_prefix(
+        self, name: str
+    ) -> Tuple[Optional[CommandSpec], Tuple[str, ...]]:
+        """Resolve an exact name or one unambiguous command-name prefix.
+
+        Exact names always win (``/clear`` must not be made ambiguous by
+        ``/clear-images``).  Aliases participate in matching, while multiple
+        matching names for the same command still resolve to that one command.
+        """
+        exact = self.resolve(name)
+        if exact is not None:
+            return exact, ()
+        matches = [
+            (candidate, command)
+            for command in self._commands
+            for candidate in command.all_names
+            if candidate.startswith(name)
+        ]
+        distinct: list[CommandSpec] = []
+        for _candidate, command in matches:
+            if command not in distinct:
+                distinct.append(command)
+        if len(distinct) == 1:
+            return distinct[0], ()
+        if len(distinct) > 1:
+            return None, tuple(candidate for candidate, _command in matches)
+        return None, ()
+
     def names(self, *, include_aliases: bool = True) -> list[str]:
         if include_aliases:
             return [name for command in self._commands for name in command.all_names]
@@ -78,7 +107,9 @@ class CommandRegistry:
             pieces = stripped.split(None, 1)
             invoked = pieces[0]
             argument = pieces[1] if len(pieces) == 2 else ""
-        spec = self.resolve(invoked)
+        spec, ambiguous = self.resolve_prefix(invoked)
+        if ambiguous:
+            return DispatchResult(True, ambiguous_candidates=ambiguous)
         if spec is None:
             return DispatchResult(False)
         return DispatchResult(True, bool(handler(spec, invoked, argument.strip())))
