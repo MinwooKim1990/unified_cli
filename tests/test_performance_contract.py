@@ -58,6 +58,15 @@ def _reference_copy(
     return root
 
 
+def _reference_manifest(tmp_path: Path, *, name: str):
+    reference = _reference_copy(tmp_path, name=name)
+    return check_performance._validate_reference_manifest(
+        reference,
+        expected_sha=check_performance.REFERENCE_SHA,
+        expected_digest=check_performance.source_tree_digest(reference),
+    )
+
+
 def _append_ext_candidate(candidate: Path, payload: str) -> None:
     target = (
         candidate
@@ -95,9 +104,14 @@ def test_baseline_pins_reference_digest_anchors_and_exact_policies():
         "metric": "core_import",
     }
     assert metrics["core_version"]["normalization"]["anchor_milliseconds"] == 94.635
+    assert metrics["ext_import"]["normalization"] == {
+        "anchor_milliseconds": 52.066,
+        "kind": "paired_same_metric_ratio",
+        "metric": "ext_import",
+    }
     assert metrics["ext_passive_registry"]["normalization"] == {
         "anchor_milliseconds": 195.661,
-        "kind": "paired_same_metric_reference",
+        "kind": "paired_same_metric_ratio",
         "metric": "ext_passive_registry",
     }
     assert metrics["repl_first_prompt"]["normalization"] == {
@@ -106,6 +120,11 @@ def test_baseline_pins_reference_digest_anchors_and_exact_policies():
         "metric": "repl_first_prompt",
     }
     assert metrics["ext_passive_registry"]["samples"] == 61
+    assert (
+        metrics["ext_import"]["samples"],
+        metrics["ext_import"]["statistic"],
+        metrics["ext_import"]["warmups"],
+    ) == (15, "p95", 3)
     assert metrics["repl_first_prompt"]["samples"] == 31
     assert (
         metrics["repl_first_prompt"]["samples"],
@@ -114,6 +133,7 @@ def test_baseline_pins_reference_digest_anchors_and_exact_policies():
     ) == (31, "p95", 3)
     assert check_performance._threshold(metrics["core_import"]) == 98.606
     assert check_performance._threshold(metrics["core_version"]) == 144.635
+    assert check_performance._threshold(metrics["ext_import"]) == 250.0
     assert check_performance._threshold(metrics["ext_passive_registry"]) == 250.0
     assert check_performance._threshold(metrics["repl_first_prompt"]) == 300.0
 
@@ -189,6 +209,44 @@ def test_synthetic_partial_cross_metric_factor_and_ratio_shapes_are_rejected(
         check_performance.load_config(_write_config(tmp_path, config))
 
 
+@pytest.mark.parametrize(
+    ("name", "kind"),
+    (
+        ("core_import", "paired_same_metric_ratio"),
+        ("core_version", "paired_same_metric_ratio"),
+        ("repl_first_prompt", "paired_same_metric_ratio"),
+        ("ext_import", "paired_same_metric_reference"),
+        ("ext_passive_registry", "paired_same_metric_reference"),
+    ),
+)
+def test_normalization_kind_is_scoped_to_authorized_metrics(tmp_path, name, kind):
+    config = check_performance.load_config(check_performance.DEFAULT_BASELINE)
+    config["metrics"][name]["normalization"]["kind"] = kind
+    with pytest.raises(
+        check_performance.PerformanceConfigError,
+        match=name + " normalization kind",
+    ):
+        check_performance.load_config(
+            _write_config(tmp_path, config, name + "-normalization.json")
+        )
+
+
+@pytest.mark.parametrize(
+    ("name", "anchor"),
+    (("ext_import", 52.066), ("ext_passive_registry", 195.661)),
+)
+def test_ratio_anchor_drift_is_rejected(tmp_path, name, anchor):
+    config = check_performance.load_config(check_performance.DEFAULT_BASELINE)
+    config["metrics"][name]["normalization"]["anchor_milliseconds"] = anchor + 0.001
+    with pytest.raises(
+        check_performance.PerformanceConfigError,
+        match=name + " reference anchor",
+    ):
+        check_performance.load_config(
+            _write_config(tmp_path, config, name + "-anchor.json")
+        )
+
+
 def test_old_synthetic_and_partial_profiles_are_rejected(tmp_path):
     config = check_performance.load_config(check_performance.DEFAULT_BASELINE)
     config["metrics"]["calibration_import_workload"] = {
@@ -262,6 +320,98 @@ def test_registry_exact_250_boundary():
         [250.001] * 3, metric,
         reference_before=reference, reference_after=reference,
     )["passed"] is False
+
+
+def test_ratio_normalization_is_proportionally_invariant():
+    metric = _short(check_performance.load_config(
+        check_performance.DEFAULT_BASELINE
+    )["metrics"]["ext_import"])
+    candidate = [100.0, 150.0, 200.0]
+    reference = [50.0, 75.0, 100.0]
+    baseline = check_performance.summarize(
+        candidate, metric,
+        reference_before=reference, reference_after=reference,
+    )
+    slowed = check_performance.summarize(
+        [value * 3.0 for value in candidate], metric,
+        reference_before=[value * 3.0 for value in reference],
+        reference_after=[value * 3.0 for value in reference],
+    )
+    baseline_proof = baseline["details"]["reference_normalization"]
+    slowed_proof = slowed["details"]["reference_normalization"]
+    assert baseline_proof["normalized_samples_ms"] == (
+        slowed_proof["normalized_samples_ms"]
+    )
+    assert baseline_proof["normalized_observed_ms"] == (
+        slowed_proof["normalized_observed_ms"]
+    )
+
+
+def test_ratio_candidate_only_regression_and_one_slow_side_remain_visible():
+    metric = _short(check_performance.load_config(
+        check_performance.DEFAULT_BASELINE
+    )["metrics"]["ext_passive_registry"])
+    anchor = metric["normalization"]["anchor_milliseconds"]
+    candidate = [250.001] * 3
+    regressed = check_performance.summarize(
+        candidate, metric,
+        reference_before=[anchor] * 3,
+        reference_after=[anchor] * 3,
+    )
+    one_slow_side = check_performance.summarize(
+        candidate, metric,
+        reference_before=[anchor] * 3,
+        reference_after=[anchor * 3.0] * 3,
+    )
+    assert regressed["passed"] is False
+    assert one_slow_side["passed"] is False
+    assert one_slow_side["details"]["reference_normalization"][
+        "paired_reference_ms"
+    ] == [anchor] * 3
+
+
+def test_ratio_unrounded_value_controls_exact_policy_boundary():
+    metric = _short(check_performance.load_config(
+        check_performance.DEFAULT_BASELINE
+    )["metrics"]["ext_import"])
+    anchor = metric["normalization"]["anchor_milliseconds"]
+    result = check_performance.summarize(
+        [250.0004] * 3, metric,
+        reference_before=[anchor] * 3,
+        reference_after=[anchor] * 3,
+    )
+    assert result["details"]["reference_normalization"][
+        "normalized_observed_ms"
+    ] == 250.0
+    assert result["passed"] is False
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    (
+        ([0.0, 1.0, 1.0], [1.0, 1.0, 1.0]),
+        ([float("nan"), 1.0, 1.0], [1.0, 1.0, 1.0]),
+        ([float("inf"), 1.0, 1.0], [1.0, 1.0, 1.0]),
+        ([1.0, 1.0], [1.0, 1.0, 1.0]),
+    ),
+)
+def test_ratio_invalid_reference_sets_fail_closed(before, after):
+    metric = _short(check_performance.load_config(
+        check_performance.DEFAULT_BASELINE
+    )["metrics"]["ext_import"])
+    with pytest.raises(check_performance.MeasurementError):
+        check_performance.summarize(
+            [1.0, 1.0, 1.0], metric,
+            reference_before=before, reference_after=after,
+        )
+
+
+def test_ratio_missing_reference_set_fails_closed():
+    metric = _short(check_performance.load_config(
+        check_performance.DEFAULT_BASELINE
+    )["metrics"]["ext_import"])
+    with pytest.raises(check_performance.MeasurementError):
+        check_performance.summarize([1.0, 1.0, 1.0], metric)
 
 
 def test_repl_exact_300_normalized_boundary_and_shared_host_delay():
@@ -1118,7 +1268,13 @@ def test_ext_import_cannot_replace_shared_guard_even_after_env_tampering(
         guard = Path(env["UNIFIED_PERF_GUARD_ROOT"]) / "sitecustomize.py"
         original = guard.read_bytes()
         with pytest.raises(check_performance.MeasurementError, match="forbidden action"):
-            check_performance._measure_ext_import(metric, child, marker)
+            check_performance._measure_ext_import(
+                metric, child,
+                _reference_manifest(
+                    tmp_path, name="reference-" + operation,
+                ),
+                env, marker,
+            )
         assert marker.read_text(encoding="utf-8").startswith("mutation:")
         assert guard.read_bytes() == original
         assert not Path(str(guard) + ".disabled").exists()
@@ -1142,7 +1298,11 @@ def test_ext_import_cannot_fork_even_after_env_tampering(tmp_path):
     with check_performance.isolated_environment(ROOT) as (env, marker, _fixture):
         child = check_performance._source_environment(env, candidate)
         with pytest.raises(check_performance.MeasurementError, match="forbidden action"):
-            check_performance._measure_ext_import(metric, child, marker)
+            check_performance._measure_ext_import(
+                metric, child,
+                _reference_manifest(tmp_path, name="reference-fork"),
+                env, marker,
+            )
         assert marker.read_text(encoding="utf-8").startswith("fork:os.fork")
 
 
@@ -1168,7 +1328,11 @@ def test_ext_import_cannot_leave_an_af_unix_endpoint(tmp_path):
         child = check_performance._source_environment(env, candidate)
         endpoint = Path(env["TMPDIR"]) / "candidate.sock"
         with pytest.raises(check_performance.MeasurementError, match="forbidden action"):
-            check_performance._measure_ext_import(metric, child, marker)
+            check_performance._measure_ext_import(
+                metric, child,
+                _reference_manifest(tmp_path, name="reference-unix-socket"),
+                env, marker,
+            )
         assert marker.read_text(encoding="utf-8").startswith("socket:candidate.sock")
         assert not endpoint.exists()
 
@@ -1203,16 +1367,81 @@ def test_guard_integrity_preflight_blocks_the_next_reference_child(tmp_path):
         assert not sentinel.exists()
 
 
-def test_ext_import_normal_measurement_shape_is_preserved():
+def test_ext_import_normal_measurement_shape_is_preserved(tmp_path):
     metric = _short(check_performance.load_config(
         check_performance.DEFAULT_BASELINE
     )["metrics"]["ext_import"], samples=2)
     with check_performance.isolated_environment(ROOT) as (env, marker, _fixture):
         candidate = check_performance._source_environment(env, ROOT)
-        samples = check_performance._measure_ext_import(metric, candidate, marker)
+        samples, raw_median, details, before, after = (
+            check_performance._measure_ext_import(
+                metric, candidate,
+                _reference_manifest(tmp_path, name="reference-ext-import"),
+                env, marker,
+            )
+        )
         assert len(samples) == 2
         assert all(value >= 0 for value in samples)
+        assert len(before) == len(after) == 2
+        assert raw_median is None
+        assert details == {"reference_metric": "ext_import"}
         assert not marker.exists()
+
+
+def test_ext_import_uses_fresh_reference_candidate_reference_order_and_fails_closed(
+    monkeypatch,
+):
+    metric = _short(check_performance.load_config(
+        check_performance.DEFAULT_BASELINE
+    )["metrics"]["ext_import"], samples=2)
+    events = []
+    reference_number = 0
+
+    def fake_run(_argv, env):
+        events.append(env["kind"])
+        return 0.0, b"1.0"
+
+    def fake_fresh(_manifest, env, callback, *, registry=False):
+        nonlocal reference_number
+        assert registry is False
+        reference_number += 1
+        return callback({**env, "kind": "reference-" + str(reference_number)})
+
+    monkeypatch.setattr(check_performance, "_run", fake_run)
+    monkeypatch.setattr(check_performance, "_fresh_reference_once", fake_fresh)
+    monkeypatch.setattr(check_performance, "_assert_guard_marker_clear", lambda _: None)
+    samples, raw_median, details, before, after = (
+        check_performance._measure_ext_import(
+            metric,
+            {"kind": "candidate"},
+            object(),
+            {"kind": "base"},
+            Path("unused-marker"),
+        )
+    )
+    assert samples == before == after == [1.0, 1.0]
+    assert raw_median is None
+    assert details == {"reference_metric": "ext_import"}
+    assert events == [
+        "reference-1", "candidate", "reference-2",
+        "reference-3", "candidate", "reference-4",
+    ]
+
+    events.clear()
+
+    def failed_reference(*_args, **_kwargs):
+        raise check_performance.MeasurementError("reference proof failed")
+
+    monkeypatch.setattr(check_performance, "_fresh_reference_once", failed_reference)
+    with pytest.raises(check_performance.MeasurementError, match="proof failed"):
+        check_performance._measure_ext_import(
+            metric,
+            {"kind": "candidate"},
+            object(),
+            {"kind": "base"},
+            Path("unused-marker"),
+        )
+    assert events == []
 
 
 def test_candidate_can_write_only_to_disposable_state_roots_and_devnull():
@@ -1752,6 +1981,32 @@ def test_json_report_shape_is_stable_and_contains_no_source_paths():
     assert set(proof) == {
         "anchor_ms", "kind", "normalized_observed_ms",
         "normalized_samples_ms", "paired_adjustments_ms",
+        "policy_threshold_ms", "reference_after_ms", "reference_before_ms",
+    }
+
+
+def test_ratio_json_report_contains_raw_and_chosen_references_without_adjustments():
+    metric = _short(check_performance.load_config(
+        check_performance.DEFAULT_BASELINE
+    )["metrics"]["ext_import"])
+    anchor = metric["normalization"]["anchor_milliseconds"]
+    result = check_performance.summarize(
+        [anchor, anchor * 2.0, anchor * 3.0],
+        metric,
+        reference_before=[anchor, anchor * 2.0, anchor * 4.0],
+        reference_after=[anchor * 2.0, anchor * 3.0, anchor * 3.0],
+    )
+    proof = result["details"]["reference_normalization"]
+    assert proof["kind"] == "paired_same_metric_ratio"
+    assert proof["paired_reference_ms"] == [
+        anchor, anchor * 2.0, anchor * 3.0,
+    ]
+    assert proof["normalized_samples_ms"] == [anchor, anchor, anchor]
+    assert "paired_adjustments_ms" not in proof
+    assert result["samples_ms"] == [anchor, anchor * 2.0, anchor * 3.0]
+    assert set(proof) == {
+        "anchor_ms", "kind", "normalized_observed_ms",
+        "normalized_samples_ms", "paired_reference_ms",
         "policy_threshold_ms", "reference_after_ms", "reference_before_ms",
     }
 

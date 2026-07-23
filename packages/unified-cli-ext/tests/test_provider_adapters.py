@@ -3110,6 +3110,7 @@ def test_provider_import_is_true_cold_and_side_effect_free():
 import builtins
 import subprocess
 import sys
+import typing
 seen = []
 original = builtins.__import__
 def capture(name, *args, **kwargs):
@@ -3122,6 +3123,25 @@ subprocess.Popen = lambda *a, **k: (_ for _ in ()).throw(AssertionError("probe s
 import unified_cli_ext.providers
 assert "unified_cli.plugin" not in seen
 assert "unified_cli.plugin" not in sys.modules
+assert unified_cli_ext.providers.ProviderAdapterRegistryV1().descriptors() == ()
+assert "unified_cli_ext.providers.runtime" not in sys.modules
+assert "unified_cli_ext.providers.installation" not in sys.modules
+assert "unified_cli_ext.providers.bridge" not in sys.modules
+register_hints = typing.get_type_hints(
+    unified_cli_ext.providers.ProviderAdapterRegistryV1.register
+)
+get_hints = typing.get_type_hints(
+    unified_cli_ext.providers.ProviderAdapterRegistryV1.get
+)
+adapters_hints = typing.get_type_hints(
+    unified_cli_ext.providers.ProviderAdapterRegistryV1.adapters.fget
+)
+runtime_type = sys.modules[
+    "unified_cli_ext.providers.runtime"
+].ProviderAdapterV1
+assert register_hints["return"] is runtime_type
+assert runtime_type in typing.get_args(get_hints["return"])
+assert typing.get_args(adapters_hints["return"])[1] is runtime_type
 '''
     environment = dict(os.environ)
     environment["PYTHONPATH"] = source_path

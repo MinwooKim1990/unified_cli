@@ -105,21 +105,35 @@ source trees are identical.
 Every retained sample, and every warmup, runs three fresh processes in this
 fixed order: `reference_before`, `candidate`, `reference_after`. For reference
 values `b_i` and `a_i`, candidate value `c_i`, and the metric's versioned anchor
-`A`, the calculation is:
+`A`, both normalization methods first choose:
 
 `r_i = min(b_i, a_i)`
+
+Core import, Core version, and REPL first prompt retain additive same-metric
+normalization:
 
 `h_i = max(0, r_i - A)`
 
 `normalized_i = max(0, c_i - h_i)`
 
+Ext import and the passive Ext registry use proportional same-metric
+normalization:
+
+`normalized_i = A * c_i / r_i`
+
+The Ext form removes the proportional process/import slowdown observed on
+shared CI runners while preserving the candidate/reference regression ratio.
+It requires every `r_i` to be finite and strictly positive. The additive form
+remains in place for Core and REPL because their policies were established with
+additive host qualification.
+
 The target statistic is applied only after this per-sample normalization and is
 compared unrounded. One slow reference side cannot increase credit because the
-minimum is used. There is no ratio, multiplier, host cap, aggregate adjustment,
-or cross-metric credit: Core import references only Core import, Core version
-references only Core version, and the passive registry references only the
-passive registry. Any reference failure, origin mismatch, or proof failure
-fails the measurement closed.
+minimum is used. There is no cross-metric credit, host cap, aggregate
+adjustment, retry selection, or unrelated multiplier: every candidate is
+qualified only by the same metric from the immutable reference. Any nonfinite,
+missing, failed, or origin-mismatched reference fails the measurement closed;
+the ratio-normalized Ext metrics additionally reject zero references.
 
 The anchors and policies are:
 
@@ -127,8 +141,12 @@ The anchors and policies are:
 | --- | --- | ---: | ---: |
 | Core import | median / 15 | 48.606 ms | 98.606 ms |
 | Core version | median / 15 | 94.635 ms | 144.635 ms |
+| Ext import | p95 / 15 | 52.066 ms | 250.000 ms |
 | Passive Ext registry | p95 / 61 | 195.661 ms | 250.000 ms |
 
+The Ext import anchor is the 52.066 ms value already recorded in the pinned
+reference commit's versioned baseline; this change restores it as a
+same-metric anchor rather than inventing a new threshold from failing CI runs.
 The registry anchor was established on 2026-07-22 in Asia/Seoul on an Apple M4
 Mac mini (Darwin 25.5.0, arm64) with CPython 3.14.3. The final sanitized harness
 ran three independent runs, each with three warmups and 61 retained candidate

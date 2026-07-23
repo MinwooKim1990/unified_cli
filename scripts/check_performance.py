@@ -49,8 +49,10 @@ _METRIC_NAMES = (
     "stream_relay",
 )
 _NORMALIZED_METRICS = frozenset({
-    "core_import", "core_version", "ext_passive_registry", "repl_first_prompt",
+    "core_import", "core_version", "ext_import", "ext_passive_registry",
+    "repl_first_prompt",
 })
+_RATIO_NORMALIZED_METRICS = frozenset({"ext_import", "ext_passive_registry"})
 REFERENCE_SHA = "be1478884735c862e894959944ba53e149ea4210"
 REFERENCE_SOURCE_TREE_DIGEST = (
     "7f21edae7ab640afb342261ef4092586101edc9549661e391032ce6906fc04f4"
@@ -61,6 +63,7 @@ SOURCE_TREES = (
     "packages/unified-cli-ext/src/unified_cli_ext",
 )
 _CORE_ANCHORS = {"core_import": 48.606, "core_version": 94.635}
+_EXT_IMPORT_ANCHOR = 52.066
 _REGISTRY_ANCHOR = 195.661
 _REPL_ANCHOR = 164.551
 _CREDENTIAL_MARKERS = (
@@ -205,7 +208,12 @@ def load_config(path: Path) -> Dict[str, Any]:
                 "metric",
             }:
                 raise PerformanceConfigError(name + " normalization is invalid")
-            if normalization["kind"] != "paired_same_metric_reference":
+            expected_kind = (
+                "paired_same_metric_ratio"
+                if name in _RATIO_NORMALIZED_METRICS
+                else "paired_same_metric_reference"
+            )
+            if normalization["kind"] != expected_kind:
                 raise PerformanceConfigError(name + " normalization kind is unsupported")
             if normalization["metric"] != name:
                 raise PerformanceConfigError(name + " reference metric is invalid")
@@ -213,6 +221,8 @@ def load_config(path: Path) -> Dict[str, Any]:
                 normalization["anchor_milliseconds"], name + " reference anchor",
             )
             if name in _CORE_ANCHORS and anchor != _CORE_ANCHORS[name]:
+                raise PerformanceConfigError(name + " reference anchor is invalid")
+            if name == "ext_import" and anchor != _EXT_IMPORT_ANCHOR:
                 raise PerformanceConfigError(name + " reference anchor is invalid")
             if name == "ext_passive_registry" and anchor != _REGISTRY_ANCHOR:
                 raise PerformanceConfigError(name + " reference anchor is invalid")
@@ -226,10 +236,11 @@ def load_config(path: Path) -> Dict[str, Any]:
             "relative_slack": 0.1,
         }:
             raise PerformanceConfigError(name + " policy is invalid")
-    if metrics["ext_passive_registry"]["threshold"] != {
-        "kind": "fixed", "milliseconds": 250.0,
-    }:
-        raise PerformanceConfigError("ext_passive_registry policy is invalid")
+    for name in ("ext_import", "ext_passive_registry"):
+        if metrics[name]["threshold"] != {
+            "kind": "fixed", "milliseconds": 250.0,
+        }:
+            raise PerformanceConfigError(name + " policy is invalid")
     if metrics["repl_first_prompt"]["threshold"] != {
         "kind": "fixed", "milliseconds": 300.0,
     }:
@@ -237,6 +248,7 @@ def load_config(path: Path) -> Dict[str, Any]:
     expected_shapes = {
         "core_import": (15, "median", 3),
         "core_version": (15, "median", 3),
+        "ext_import": (15, "p95", 3),
         "ext_passive_registry": (61, "p95", 3),
         "repl_first_prompt": (31, "p95", 3),
     }
@@ -326,29 +338,54 @@ def summarize(
         ):
             raise MeasurementError("paired reference normalization is invalid")
         anchor = float(normalization["anchor_milliseconds"])
-        adjustments = [
-            max(0.0, min(before, after) - anchor)
+        paired_references = [
+            min(before, after)
             for before, after in zip(reference_before, reference_after)
         ]
-        normalized_samples = [
-            max(0.0, sample - delta)
-            for sample, delta in zip(samples, adjustments)
-        ]
+        kind = normalization["kind"]
+        if kind == "paired_same_metric_reference":
+            adjustments = [
+                max(0.0, reference - anchor)
+                for reference in paired_references
+            ]
+            normalized_samples = [
+                max(0.0, sample - delta)
+                for sample, delta in zip(samples, adjustments)
+            ]
+        elif kind == "paired_same_metric_ratio":
+            if any(reference <= 0.0 for reference in paired_references):
+                raise MeasurementError("paired ratio reference is invalid")
+            normalized_samples = [
+                anchor * sample / reference
+                for sample, reference in zip(samples, paired_references)
+            ]
+            if any(
+                not math.isfinite(value) or value < 0
+                for value in normalized_samples
+            ):
+                raise MeasurementError("paired ratio normalization is invalid")
+        else:
+            raise MeasurementError("paired reference normalization is unsupported")
         normalized_observed = _observed(normalized_samples, metric)
         normalization_details = {
             "anchor_ms": _rounded(anchor),
-            "kind": normalization["kind"],
+            "kind": kind,
             "normalized_observed_ms": _rounded(normalized_observed),
             "normalized_samples_ms": [
                 _rounded(value) for value in normalized_samples
-            ],
-            "paired_adjustments_ms": [
-                _rounded(value) for value in adjustments
             ],
             "policy_threshold_ms": _rounded(policy_limit),
             "reference_after_ms": [_rounded(value) for value in reference_after],
             "reference_before_ms": [_rounded(value) for value in reference_before],
         }
+        if kind == "paired_same_metric_reference":
+            normalization_details["paired_adjustments_ms"] = [
+                _rounded(value) for value in adjustments
+            ]
+        else:
+            normalization_details["paired_reference_ms"] = [
+                _rounded(value) for value in paired_references
+            ]
         comparison_observed = normalized_observed
     elif reference_before is not None or reference_after is not None:
         raise MeasurementError("unexpected reference samples")
@@ -1966,23 +2003,44 @@ print(output.getvalue().strip())
 
 
 def _measure_ext_import(
-    metric: Mapping[str, Any], env: Mapping[str, str], marker: Path,
-) -> List[float]:
-    child_env = dict(env)
-    child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
-    child_env["UNIFIED_PERF_FORBID_CTYPES"] = "1"
-    child_env["UNIFIED_PERF_FORBID_MUTATIONS"] = "1"
-    child_env["UNIFIED_PERF_FORBID_SUBPROCESSES"] = "1"
-    code = (
-        "import time; start=time.perf_counter_ns(); import unified_cli_ext; "
-        "elapsed=(time.perf_counter_ns()-start)/1e6; "
-        "assert unified_cli_ext.__version__=='" + EXT_VERSION + "'; print(elapsed)"
-    )
-    samples = _repeat_process(
-        _python_argv(code), child_env, metric, inner_float=True,
+    metric: Mapping[str, Any], candidate_env: Mapping[str, str],
+    reference_manifest: SourceManifest, base_env: Mapping[str, str], marker: Path,
+) -> Tuple[
+    List[float], Optional[float], Dict[str, Any], List[float], List[float],
+]:
+    def once(env: Mapping[str, str]) -> float:
+        child_env = dict(env)
+        child_env["UNIFIED_PERF_FORBID_ENTRYPOINT_IMPORTS"] = "1"
+        child_env["UNIFIED_PERF_FORBID_CTYPES"] = "1"
+        child_env["UNIFIED_PERF_FORBID_MUTATIONS"] = "1"
+        child_env["UNIFIED_PERF_FORBID_SUBPROCESSES"] = "1"
+        code = r'''
+import os
+import sys
+import time
+start = time.perf_counter_ns()
+import unified_cli_ext
+elapsed = (time.perf_counter_ns() - start) / 1e6
+assert unified_cli_ext.__version__ == "''' + EXT_VERSION + r'''"
+''' + _ORIGIN_PROOF + r'''
+_perf_prove_origins(
+    "unified_cli_ext",
+    os.path.realpath(os.environ["UNIFIED_PERF_DESIGNATED_EXT_ROOT"]),
+)
+print(elapsed)
+'''
+        _, payload = _run(_python_argv(code), child_env)
+        value = _float_output(payload)
+        _assert_guard_marker_clear(marker)
+        return value
+
+    samples, before, after, details = _repeat_same_metric_reference(
+        metric,
+        lambda: once(candidate_env),
+        lambda: _fresh_reference_once(reference_manifest, base_env, once),
     )
     _assert_guard_marker_clear(marker)
-    return samples
+    return samples, None, details, before, after
 
 
 def _measure_ext_registry(
@@ -2417,9 +2475,8 @@ def run_checks(
             ("core_version", lambda: _measure_core_version(
                 metrics["core_version"], candidate_env, reference_manifest, env, marker,
             )),
-            ("ext_import", lambda: (
-                _measure_ext_import(metrics["ext_import"], candidate_env, marker),
-                None, None, None, None,
+            ("ext_import", lambda: _measure_ext_import(
+                metrics["ext_import"], candidate_env, reference_manifest, env, marker,
             )),
             ("ext_passive_registry", lambda: _measure_ext_registry(
                 metrics["ext_passive_registry"], candidate_registry_env,
