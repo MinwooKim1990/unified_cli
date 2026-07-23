@@ -1,46 +1,100 @@
-"""Held metadata for a future Cline CLI integration."""
+"""Opt-in Preview adapter for the official Cline CLI."""
 
 from __future__ import annotations
 
-from .contract import PromptMode, TransportKind
-from .held import held_adapter_spec, held_plugin
+from .bridge import adapter_plugin
+from .contract import (
+    AdapterServerPolicy,
+    AdapterStatus,
+    BinarySpec,
+    DoctorProbeSpec,
+    EnvironmentPolicy,
+    ExitStatusProbeSpec,
+    FeatureProbeSpec,
+    FixedCommandSpec,
+    OperationLimits,
+    ProbeFormat,
+    PromptCommandSpec,
+    PromptMode,
+    PromptSentinelPolicy,
+    ProviderAdapterSpecV1,
+    ProviderCapability,
+    TransportKind,
+    VersionProbeSpec,
+)
+from .path_resolver import path_launch_resolver
 
 
-# The candidate direct form is ``cline --json -- <prompt>``, but the held helper
-# cannot declare its required sentinel policy and the released process currently
-# waits for stdin EOF.  A Cline-specific runner must build that sentinel argv,
-# close stdin, and prove a clean exit before this adapter can be enabled.
-CLINE_ONE_SHOT_LIFECYCLE_REQUIRES_STAGE_6_EVIDENCE = True
+CLINE_OFFICIAL_SOURCES = (
+    "https://docs.cline.bot/cli/cli-reference",
+    "https://docs.cline.bot/usage/cli-overview",
+)
+CLINE_DEFAULT_MODEL = "default"
+CLINE_OFFICIAL_PACKAGES = ("@cline/cli", "cline")
+CLINE_HEADLESS_FIXED_ARGV = ("--auto-approve", "false")
 
-# Released JSON events do not yet match the documented schema closely enough to
-# establish a stable parser contract.  Captured fixtures are required first.
-CLINE_OUTPUT_SCHEMA_REQUIRES_STAGE_6_EVIDENCE = True
+_PROBE_LIMITS = OperationLimits(10.0, 64 * 1024, 16 * 1024, 8)
+_PROMPT_LIMITS = OperationLimits(120.0, 16 * 1024 * 1024, 1024 * 1024, 50_000)
 
-# Stage 6 must prove isolated settings, tools, and MCP behavior.  In particular,
-# no ambient credential is allowlisted by this held record.
-CLINE_CONFIG_ISOLATION_REQUIRES_STAGE_6_EVIDENCE = True
 
-# ACP is a separate integration surface and is not claimed by this direct JSONL
-# candidate.  It requires its own captured transport and lifecycle evidence.
-CLINE_ACP_REQUIRES_SEPARATE_STAGE_6_EVIDENCE = True
+def _command(*argv: str) -> FixedCommandSpec:
+    return FixedCommandSpec(argv, limits=_PROBE_LIMITS)
 
-ADAPTER_SPEC = held_adapter_spec(
-    provider_id="cline",
+
+ADAPTER_SPEC = ProviderAdapterSpecV1(
+    id="cline",
     display_name="Cline CLI",
-    executable="cline",
-    prompt_argv=("--json",),
-    # This protocol placeholder is inert.  It prevents the generic runner from
-    # claiming a positional one-shot lifecycle that the helper cannot express.
-    prompt_mode=PromptMode.PROTOCOL,
-    prompt_option=None,
-    transport=TransportKind.JSONL,
-    # This control is safe to opt in; CLINE_API_KEY and other ambient
-    # credentials remain excluded.
-    environment_keys=frozenset(("CLINE_NO_AUTO_UPDATE",)),
-    # Exact identity output still requires an isolated fixture.  These markers
-    # are provisional inert metadata and are never probed while held.
-    version_marker="cline ",
-    help_chat_marker="--json",
+    status=AdapterStatus.PREVIEW,
+    binary=BinarySpec(
+        executable="cline",
+        expected_identity="cline",
+        version_probe=VersionProbeSpec(
+            _command("--version"),
+            minimum_version=(0,),
+            format=ProbeFormat.PLAIN_TEXT,
+            version_marker="cline ",
+        ),
+        feature_probe=FeatureProbeSpec(
+            _command("--help"),
+            required_features=frozenset(("chat",)),
+            format=ProbeFormat.PLAIN_TEXT,
+            feature_markers={"chat": "prompt"},
+            identity_marker="prompt",
+            marker_prefixes=True,
+            identity_prefix=True,
+        ),
+    ),
+    prompt=PromptCommandSpec(
+        fixed_argv=CLINE_HEADLESS_FIXED_ARGV,
+        mode=PromptMode.POSITIONAL_AFTER_SENTINEL,
+        sentinel_policy=PromptSentinelPolicy.REQUIRED,
+        limits=_PROMPT_LIMITS,
+    ),
+    transport=TransportKind.PLAIN,
+    environment=EnvironmentPolicy(
+        allowed_keys=frozenset(("CLINE_NO_AUTO_UPDATE",))
+    ),
+    doctor=DoctorProbeSpec(ExitStatusProbeSpec(_command("--version"))),
+    capabilities=frozenset((ProviderCapability.CHAT.value,)),
+    server_policy=AdapterServerPolicy(enabled=False),
 )
 
-PLUGIN = held_plugin(ADAPTER_SPEC)
+PLUGIN = adapter_plugin(
+    ADAPTER_SPEC,
+    default_model=CLINE_DEFAULT_MODEL,
+    launch_resolver=path_launch_resolver(
+        provider_id="cline",
+        executable="cline",
+        package_names=CLINE_OFFICIAL_PACKAGES,
+    ),
+)
+
+
+__all__ = [
+    "ADAPTER_SPEC",
+    "CLINE_DEFAULT_MODEL",
+    "CLINE_HEADLESS_FIXED_ARGV",
+    "CLINE_OFFICIAL_PACKAGES",
+    "CLINE_OFFICIAL_SOURCES",
+    "PLUGIN",
+]

@@ -129,15 +129,10 @@ def verify_installed(expected_version: str) -> None:
         socket.create_connection = original_create_connection
 
     support = {plugin.id: plugin.support_status for plugin in plugins}
-    if support.get("grok") != "preview":
-        _fail("Grok is not Preview")
-    experimental = {"qoder", "kilo", "poolside"}
-    if {key for key, value in support.items() if value == "experimental"} != experimental:
-        _fail("experimental provider inventory does not match")
-    if {key for key, value in support.items() if value == "held"} != (
-        set(EXPECTED_PROVIDER_ENTRY_POINTS) - {"grok", *experimental}
-    ):
-        _fail("held provider inventory does not match")
+    if support != {
+        provider_id: "preview" for provider_id in EXPECTED_PROVIDER_ENTRY_POINTS
+    }:
+        _fail("Preview provider inventory does not match")
     if any(plugin.server_policy.enabled for plugin in plugins):
         _fail("an extension provider is enabled for server use")
     if "acp" in sys.modules or "mcp" in sys.modules:

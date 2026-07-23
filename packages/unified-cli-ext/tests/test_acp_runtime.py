@@ -21,6 +21,7 @@ from unified_cli_ext import (
     TransportTimeout,
     UsageEvent,
 )
+from unified_cli_ext.errors import ConfigurationError
 from unified_cli_ext.transports import ExecutableIdentity
 
 
@@ -190,6 +191,40 @@ def install_fake(monkeypatch, state):
     return module, sdk
 
 
+def test_acp_launch_rechecks_every_verified_prefix_entry(
+    tmp_path, process_identity, monkeypatch
+):
+    executable, identity = process_identity
+    target = tmp_path / "provider-target"
+    target.write_text("first")
+    target.chmod(0o700)
+    target_path = str(target)
+    target_identity = ExecutableIdentity.capture(target_path)
+    transport = AcpProcessTransportV1(
+        [executable, target_path],
+        executable_identity=identity,
+        launch_identities=(identity, target_identity),
+        cwd=str(tmp_path),
+        provider_namespace="fake",
+    )
+    target.write_text("replacement")
+    target.chmod(0o700)
+    state = FakeSdkState()
+    module, _ = install_fake(monkeypatch, state)
+    spawned = []
+
+    def forbidden_popen(*args, **kwargs):
+        spawned.append(args)
+        raise AssertionError("changed ACP target spawned")
+
+    monkeypatch.setattr(module.subprocess, "Popen", forbidden_popen)
+    with pytest.raises(
+        ConfigurationError, match="provider binary identity changed"
+    ):
+        asyncio.run(transport.text_turn("hello"))
+    assert spawned == []
+
+
 def require_official_acp_011():
     acp = pytest.importorskip("acp")
     version = importlib.metadata.version("agent-client-protocol")
@@ -306,7 +341,7 @@ def test_text_turn_uses_typed_sdk_and_isolated_owned_process(
     spawned = {}
 
     def capture_popen(*args, **kwargs):
-        spawned["argv"] = tuple(args[0])
+        spawned["argv"] = tuple(os.fspath(item) for item in args[0])
         spawned["cwd"] = os.fspath(kwargs["cwd"])
         spawned["env"] = dict(kwargs["env"])
         spawned["flags"] = {

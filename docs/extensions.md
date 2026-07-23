@@ -1,6 +1,6 @@
 # Extensions
 
-Extensions are bundled with Core in the planned `unified-cli` 0.5.1
+Extensions are bundled with Core in the `unified-cli` 0.5.2
 distribution; `unified_cli` and `unified_cli_ext` are both public namespaces in
 that one wheel. Core continues to support Claude, Codex, and Gemini (`agy`) as
 its only defaults. Extensions are a feature boundary: using one does not change
@@ -9,10 +9,10 @@ configure vendor software.
 
 The bundled extensions provide 18 explicit provider entry points. Grok Build is a read-tool-limited
 **Preview** backed by offline fixtures and one representative authenticated
-native smoke. Qoder, Kilo, and Poolside are runnable **Experimental**
-integrations. The remaining 14 entries are **Held** and stop before provider
-construction, binary lookup, or command execution. No Ext provider is enabled
-in Core server mode.
+native smoke. Every other provider uses a common transport with offline
+fixtures and is runnable as **Preview** when explicitly selected. Vendor CLI
+and account compatibility is not guaranteed. No Ext provider is enabled in Core
+server mode.
 
 Vendor binaries, accounts, subscriptions, and their updates remain
 user-owned. Installing Ext alone does not install a vendor CLI, log in, call a
@@ -21,7 +21,7 @@ service, or incur charges. Ext is not affiliated with the vendors listed here.
 ## Install and inspect
 
 ```bash
-python -m pip install "unified-cli==0.5.1"
+python -m pip install "unified-cli==0.5.2"
 python -c "import unified_cli_ext; print(unified_cli_ext.__name__)"
 unified-cli providers --include-ext
 ```
@@ -35,16 +35,16 @@ before installing the planned unified release:
 
 ```bash
 python -m pip uninstall -y unified-cli-ext
-python -m pip install --force-reinstall "unified-cli==0.5.1"
+python -m pip install --force-reinstall "unified-cli==0.5.2"
 ```
 
 Core keeps this discovery import-free. `unified-cli providers --include-ext`
 therefore reports a new entry as lifecycle `discovered` and support `unknown`.
-An explicit request loads only that provider's entry point. Held providers stop
-before any provider callback. Grok continues only after its explicitly selected
-local binary passes the exact `0.2.111` version and bounded feature probes.
-Qoder, Kilo, and Poolside are experimental explicit-request integrations; they
-remain disabled in server mode.
+An explicit request loads only that provider's entry point. All 18 entries are
+runnable Preview adapters; discovery itself remains import-free. Grok continues
+only after its explicitly selected local binary passes the exact `0.2.111`
+version and bounded feature probes. All Ext providers remain disabled in server
+mode.
 
 ## Grok Preview setup and boundary
 
@@ -346,11 +346,11 @@ access can change a path between those operations.
 |---|---|
 | Stable | A released, supported integration with the documented compatibility evidence. |
 | Preview | An enabled integration still being evaluated; its limits are documented. |
-| Experimental | An enabled, limited-scope integration whose behavior may change. |
-| Held | Discoverable metadata only. It is blocked before provider construction, binary lookup, or command execution. |
 
-Grok is **Preview**; Qoder, Kilo, and Poolside are **Experimental**; every
-other catalog entry below is **Held**. All Ext server policies are disabled.
+All 18 catalog entries below are **Preview** and runnable when explicitly
+selected. Grok has representative authenticated live-test evidence; the other
+providers have fixture-tested common transports, not a guarantee of vendor or
+account compatibility. All Ext server policies are disabled.
 
 ## Generated provider support
 
@@ -361,41 +361,42 @@ manual design record.
 <!-- BEGIN GENERATED EXT PROVIDER SUPPORT -->
 | Provider ID | Support status | Core capabilities | Server |
 |---|---|---|---|
-| `amp` | `held` | `none` | `disabled` |
-| `cline` | `held` | `none` | `disabled` |
-| `codebuddy` | `held` | `none` | `disabled` |
-| `copilot` | `held` | `none` | `disabled` |
-| `cursor` | `held` | `none` | `disabled` |
-| `droid` | `held` | `none` | `disabled` |
-| `gitlab-duo` | `held` | `none` | `disabled` |
+| `amp` | `preview` | `chat` | `disabled` |
+| `cline` | `preview` | `chat` | `disabled` |
+| `codebuddy` | `preview` | `chat` | `disabled` |
+| `copilot` | `preview` | `chat` | `disabled` |
+| `cursor` | `preview` | `chat` | `disabled` |
+| `droid` | `preview` | `chat, stream` | `disabled` |
+| `gitlab-duo` | `preview` | `chat` | `disabled` |
 | `grok` | `preview` | `chat, sessions, stream` | `disabled` |
-| `hermes` | `held` | `none` | `disabled` |
-| `kilo` | `experimental` | `chat` | `disabled` |
-| `kimi` | `held` | `none` | `disabled` |
-| `mistral-vibe` | `held` | `none` | `disabled` |
-| `oh-my-pi` | `held` | `none` | `disabled` |
-| `opencode` | `held` | `none` | `disabled` |
-| `pi` | `held` | `none` | `disabled` |
-| `poolside` | `experimental` | `chat` | `disabled` |
-| `qoder` | `experimental` | `chat` | `disabled` |
-| `qwen` | `held` | `none` | `disabled` |
+| `hermes` | `preview` | `chat` | `disabled` |
+| `kilo` | `preview` | `chat` | `disabled` |
+| `kimi` | `preview` | `chat` | `disabled` |
+| `mistral-vibe` | `preview` | `chat` | `disabled` |
+| `oh-my-pi` | `preview` | `chat, stream` | `disabled` |
+| `opencode` | `preview` | `chat` | `disabled` |
+| `pi` | `preview` | `chat, stream` | `disabled` |
+| `poolside` | `preview` | `chat` | `disabled` |
+| `qoder` | `preview` | `chat` | `disabled` |
+| `qwen` | `preview` | `chat` | `disabled` |
 <!-- END GENERATED EXT PROVIDER SUPPORT -->
 
-## Stage 5B–5F catalog
+## Historical Stage 5B–5F design catalog
 
 “Candidate transport” records a provisional design direction, not a command
-contract. “Auto-update containment” describes the intended boundary. Held
-metadata does not execute; the three Experimental adapters below are explicitly
-runnable, while their behavior may change.
+contract. This is retained as a pre-0.5.2 design record; its historical Held
+and Experimental labels are superseded by the generated support table above.
+Every current adapter is runnable as Preview only after explicit selection;
+vendor and account compatibility can vary.
 
 The Grok, Kimi, Copilot, and Cursor rows record current official-documentation
 research and pinned compatibility targets. Prompts are argv values and must not
 be logged. Grok has an offline-fixture-verified one-shot bridge and one
-representative authenticated native smoke. Kimi, Copilot, and Cursor remain Held and
-their factories refuse before binary resolution, environment reads, or
-execution. ACP candidates are not enabled bridges.
+representative authenticated native smoke. The other providers are Preview
+adapters with common transports validated by fixtures; their vendor-specific
+CLI and account combinations have not all been live-tested.
 
-| Provider ID | Official binary/package | Candidate transport | Provisional adapter target | Status | Auto-update containment | Official documentation |
+| Provider ID | Official binary/package | Candidate transport | Provisional adapter target | Historical pre-0.5.2 status | Auto-update containment | Official documentation |
 |---|---|---|---|---|---|---|
 | `grok` | xAI Grok Build (`grok`): primary native installer `https://x.ai/cli/install.sh`; official npm `@xai-official/grok` is alternative; rejects unrelated `@vibe-kit/grok-cli` CLI shape | Streaming JSONL | Explicit `-p` one-shot with `chat`, `stream`, `sessions`; exact `0.2.111`; default `grok-4.5` | Preview | Fixed no-auto-update, strict sandbox, `dontAsk`, write/tool-search/LSP/memory/subagents/web, compatibility scanners, managed MCP, marketplace auto-registration off; marketplace SHA and gitignore-aware traversal required; exact private safe config and fail-closed workspace/home/system preflight; defense in depth, not a complete secret boundary; offline fixtures plus one representative authenticated native `0.2.111` macOS arm64 smoke | [Repository](https://github.com/xai-org/grok-build) · [Overview](https://docs.x.ai/build/overview) · [CLI reference](https://docs.x.ai/build/cli/reference) · [Headless scripting](https://docs.x.ai/build/cli/headless-scripting) |
 | `kimi` | Kimi Code CLI (`kimi`, `@moonshot-ai/kimi-code`), not legacy Python `kimi-cli` | Stream JSON candidate | `-p` one-shot auto-approves normal tools; Core capability none | Held | Candidate `KIMI_CODE_NO_AUTO_UPDATE=1` and `KIMI_DISABLE_TELEMETRY=1`; no per-run read-only/no-tools/web-off/MCP-off contract | [Getting started](https://moonshotai.github.io/kimi-code/en/guides/getting-started.html) · [Kimi command](https://moonshotai.github.io/kimi-code/en/reference/kimi-command.html) · [Kimi ACP](https://moonshotai.github.io/kimi-code/en/reference/kimi-acp.html) |
@@ -435,8 +436,8 @@ repeatable evidence for:
 - session semantics, including how a session starts, continues, and ends.
 
 This evidence is a compatibility gate, not a promise that a provider will be
-promoted. Until it is complete and reviewed, the entry remains Held and cannot
-run.
+promoted to Stable. Until it is complete and reviewed, the current runnable
+entry remains Preview.
 
 ## Trust and ownership boundary
 

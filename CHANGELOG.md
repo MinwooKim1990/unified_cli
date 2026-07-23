@@ -7,22 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Planned for 0.5.1
+## [0.5.2] - 2026-07-23
 
-- Consolidate Core and extensions into one `unified-cli` distribution. The
-  wheel will provide public namespaces `unified_cli` and `unified_cli_ext`; this
-  is a feature boundary, not a second package. Core defaults remain Claude,
-  Codex, and Gemini only and stay inert/lazy for extensions. Grok remains
-  Preview; Qoder, Kilo, and Poolside are runnable Experimental integrations;
-  the other 14 extension providers remain Held. All Ext server policies remain
-  disabled.
-- Optional protocol SDK installs will use `unified-cli[acp]` and
-  `unified-cli[mcp]`. A legacy local or failed split wheel can be removed with
-  `python -m pip uninstall -y unified-cli-ext` before force-reinstalling
-  `unified-cli==0.5.1`.
+### Added
+
+- All 18 bundled extension providers now have executable Preview adapters and
+  run when explicitly selected. Grok has representative authenticated live
+  evidence; the remaining provider families have offline transport fixtures
+  and remain Preview until vendor/account-specific reports confirm them.
+- Safe lazy PATH resolution supports direct official executables and allowlisted
+  npm launchers without changing Core provider defaults.
+- Prompt-free, permission-restricted Preview diagnostics are written under
+  `~/.unified-cli/preview-diagnostics/` with a GitHub issue link.
+
+### Changed
+
+- The English and Korean READMEs now show the full supported CLI catalog,
+  Preview status, installation extras, usage examples, isolated-login boundary,
+  and compatibility-reporting instructions near the top.
+- Every extension remains explicit-only and disabled in HTTP server mode. Core
+  Claude, Codex, and Gemini/Antigravity behavior is unchanged.
+
+### Security
+
+- ACP launches now verify every interpreter/target prefix entry through spawn,
+  and Preview diagnostics never persist vendor stdout/stderr.
+
+## [0.5.1] - 2026-07-23
+
+### Changed
+
+- Consolidated Core and extensions into one `unified-cli` distribution that
+  provides both `unified_cli` and `unified_cli_ext`; no second PyPI package is
+  required.
+- Kept Grok as Preview, enabled Qoder, Kilo, and Poolside as Experimental, and
+  retained the remaining extension catalog as Held metadata.
+- Moved optional protocol SDK installs to `unified-cli[acp]` and
+  `unified-cli[mcp]`.
 - The historical `ext-v0.1.0` tag was an aborted publishing attempt: no
   extension PyPI project and no extension GitHub Release were published. This
-  supersedes the split-release plan without changing the 0.5.0 record below.
+  superseded the split-release plan without changing the 0.5.0 record below.
 
 ## [0.5.0] - 2026-07-23
 
@@ -316,7 +340,9 @@ Initial public release.
   `gemini-3.5-flash` continue to route to it. Note: `agy` headless output is
   plain text and does **not** report token usage.
 
-[Unreleased]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.1...v0.5.2
+[0.5.1]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/MinwooKim1990/unified_cli/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/MinwooKim1990/unified_cli/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/MinwooKim1990/unified_cli/compare/v0.2.0...v0.3.0

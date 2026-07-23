@@ -1,59 +1,103 @@
-"""Inert Held metadata for a future OpenCode CLI integration."""
+"""Opt-in Preview adapter for the official OpenCode CLI."""
 
 from __future__ import annotations
 
-from .contract import PromptMode, PromptSentinelPolicy, TransportKind
-from .held import held_adapter_spec, held_plugin
+from .bridge import adapter_plugin
+from .contract import (
+    AdapterServerPolicy,
+    AdapterStatus,
+    BinarySpec,
+    DoctorProbeSpec,
+    EnvironmentPolicy,
+    ExitStatusProbeSpec,
+    FeatureProbeSpec,
+    FixedCommandSpec,
+    OperationLimits,
+    ProbeFormat,
+    PromptCommandSpec,
+    PromptMode,
+    PromptSentinelPolicy,
+    ProviderAdapterSpecV1,
+    ProviderCapability,
+    TransportKind,
+    VersionProbeSpec,
+)
+from .path_resolver import path_launch_resolver
 
 
-# The direct one-shot candidate must prove that stdin is closed at the required
-# point and that the process exits cleanly.  Until then, this is only inert
-# metadata; no runner applies its declared controls.
-OPENCODE_ONE_SHOT_STDIN_EOF_REQUIRES_STAGE_6_EVIDENCE = True
+OPENCODE_OFFICIAL_SOURCES = ("https://opencode.ai/docs/cli/",)
+OPENCODE_DEFAULT_MODEL = "default"
+OPENCODE_OFFICIAL_PACKAGE = "opencode-ai"
+OPENCODE_HEADLESS_FIXED_ARGV = ("run",)
+OPENCODE_FIXED_ENVIRONMENT = {
+    "OPENCODE_DISABLE_AUTOUPDATE": "true",
+    "OPENCODE_DISABLE_DEFAULT_PLUGINS": "true",
+    "OPENCODE_DISABLE_LSP_DOWNLOAD": "true",
+    "OPENCODE_DISABLE_MODELS_FETCH": "true",
+    "OPENCODE_DISABLE_CLAUDE_CODE": "true",
+}
 
-# Exact version/help output requires isolated captured fixtures.  The markers
-# below are provisional and are not probed while this adapter remains Held.
-OPENCODE_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE = True
+_PROBE_LIMITS = OperationLimits(10.0, 64 * 1024, 16 * 1024, 8)
+_PROMPT_LIMITS = OperationLimits(120.0, 16 * 1024 * 1024, 1024 * 1024, 50_000)
 
-# Stage 6 must establish the JSONL event schema before a parser can rely on it.
-OPENCODE_OUTPUT_SCHEMA_REQUIRES_STAGE_6_EVIDENCE = True
 
-# Permission, configuration, and MCP isolation remain unverified.  The
-# allowlisted controls below are inert and will not be applied until verification.
-OPENCODE_PERMISSION_CONFIG_MCP_ISOLATION_REQUIRES_STAGE_6_EVIDENCE = True
+def _command(*argv: str) -> FixedCommandSpec:
+    return FixedCommandSpec(argv, limits=_PROBE_LIMITS)
 
-# Process/session cleanup requires isolated lifecycle evidence before enabling
-# any execution path.
-OPENCODE_PROCESS_SESSION_CLEANUP_REQUIRES_STAGE_6_EVIDENCE = True
 
-# HTTP/SSE is a separate transport surface from this direct JSONL candidate.
-OPENCODE_HTTP_SSE_SEPARATE_REQUIRES_STAGE_6_EVIDENCE = True
-
-# ACP likewise requires independent transport and lifecycle verification.
-OPENCODE_ACP_SEPARATE_REQUIRES_STAGE_6_EVIDENCE = True
-
-ADAPTER_SPEC = held_adapter_spec(
-    provider_id="opencode",
+ADAPTER_SPEC = ProviderAdapterSpecV1(
+    id="opencode",
     display_name="OpenCode",
-    executable="opencode",
-    prompt_argv=("--pure", "run", "--format", "json"),
-    prompt_mode=PromptMode.POSITIONAL_AFTER_SENTINEL,
-    prompt_option=None,
-    sentinel_policy=PromptSentinelPolicy.REQUIRED,
-    transport=TransportKind.JSONL,
-    # These declared controls are static Held metadata only.  They are not read
-    # or applied until Stage 6 verification makes an executable adapter safe.
-    environment_keys=frozenset(
-        (
-            "OPENCODE_DISABLE_AUTOUPDATE",
-            "OPENCODE_DISABLE_DEFAULT_PLUGINS",
-            "OPENCODE_DISABLE_LSP_DOWNLOAD",
-            "OPENCODE_DISABLE_MODELS_FETCH",
-            "OPENCODE_DISABLE_CLAUDE_CODE",
-        )
+    status=AdapterStatus.PREVIEW,
+    binary=BinarySpec(
+        executable="opencode",
+        expected_identity="opencode",
+        version_probe=VersionProbeSpec(
+            _command("--version"),
+            minimum_version=(0,),
+            format=ProbeFormat.PLAIN_TEXT,
+            version_marker="opencode ",
+        ),
+        feature_probe=FeatureProbeSpec(
+            _command("--help"),
+            required_features=frozenset(("chat",)),
+            format=ProbeFormat.PLAIN_TEXT,
+            feature_markers={"chat": "run [message..]"},
+            identity_marker="run [message..]",
+            marker_prefixes=True,
+            identity_prefix=True,
+        ),
     ),
-    version_marker="opencode ",
-    help_chat_marker="run [message..]",
+    prompt=PromptCommandSpec(
+        fixed_argv=OPENCODE_HEADLESS_FIXED_ARGV,
+        mode=PromptMode.POSITIONAL_AFTER_SENTINEL,
+        sentinel_policy=PromptSentinelPolicy.REQUIRED,
+        limits=_PROMPT_LIMITS,
+    ),
+    transport=TransportKind.PLAIN,
+    environment=EnvironmentPolicy(fixed_values=OPENCODE_FIXED_ENVIRONMENT),
+    doctor=DoctorProbeSpec(ExitStatusProbeSpec(_command("--version"))),
+    capabilities=frozenset((ProviderCapability.CHAT.value,)),
+    server_policy=AdapterServerPolicy(enabled=False),
 )
 
-PLUGIN = held_plugin(ADAPTER_SPEC)
+PLUGIN = adapter_plugin(
+    ADAPTER_SPEC,
+    default_model=OPENCODE_DEFAULT_MODEL,
+    launch_resolver=path_launch_resolver(
+        provider_id="opencode",
+        executable="opencode",
+        package_names=(OPENCODE_OFFICIAL_PACKAGE,),
+    ),
+)
+
+
+__all__ = [
+    "ADAPTER_SPEC",
+    "OPENCODE_DEFAULT_MODEL",
+    "OPENCODE_FIXED_ENVIRONMENT",
+    "OPENCODE_HEADLESS_FIXED_ARGV",
+    "OPENCODE_OFFICIAL_PACKAGE",
+    "OPENCODE_OFFICIAL_SOURCES",
+    "PLUGIN",
+]

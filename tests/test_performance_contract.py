@@ -158,7 +158,7 @@ def test_baseline_pins_reference_digest_anchors_and_exact_policies():
     assert (
         check_performance.CANDIDATE_CORE_VERSION,
         check_performance.CANDIDATE_EXT_VERSION,
-    ) == ("0.5.1", "0.5.1")
+    ) == ("0.5.2", "0.5.2")
     assert (
         check_performance.REFERENCE_CORE_VERSION,
         check_performance.REFERENCE_EXT_VERSION,
@@ -726,11 +726,11 @@ def test_candidate_core_and_ext_version_mismatches_fail_independently(
 @pytest.mark.parametrize(
     ("package", "relative", "wrong_version"),
     (
-        ("core", "src/unified_cli/__init__.py", "0.5.1"),
+        ("core", "src/unified_cli/__init__.py", "0.5.2"),
         (
             "ext",
             "packages/unified-cli-ext/src/unified_cli_ext/__init__.py",
-            "0.5.1",
+            "0.5.2",
         ),
     ),
 )
@@ -751,10 +751,10 @@ def test_reference_core_and_ext_version_mismatches_fail_independently(
 @pytest.mark.parametrize(
     ("expected_core_version", "expected_ext_version"),
     (
-        ("from-environment", "0.5.1"),
-        ("0.5.1", "from-environment"),
-        ("0.5.1", "0.1.0"),
-        (["0.5.1"], "0.5.1"),
+        ("from-environment", "0.5.2"),
+        ("0.5.2", "from-environment"),
+        ("0.5.2", "0.1.0"),
+        (["0.5.2"], "0.5.2"),
     ),
 )
 def test_manifest_version_expectations_reject_untrusted_or_mixed_pairs(
@@ -1041,7 +1041,7 @@ def test_measured_children_embed_trusted_candidate_and_reference_versions(
             check_performance._measure_core_import,
             "core_import",
             (
-                "assert unified_cli.__version__ == '0.5.1'",
+                "assert unified_cli.__version__ == '0.5.2'",
             ),
             (
                 "assert unified_cli.__version__ == '0.5.0'",
@@ -1051,7 +1051,7 @@ def test_measured_children_embed_trusted_candidate_and_reference_versions(
             check_performance._measure_core_version,
             "core_version",
             (
-                "output.getvalue().strip() == '0.5.1'",
+                "output.getvalue().strip() == '0.5.2'",
             ),
             (
                 "output.getvalue().strip() == '0.5.0'",
@@ -1061,7 +1061,7 @@ def test_measured_children_embed_trusted_candidate_and_reference_versions(
             check_performance._measure_ext_import,
             "ext_import",
             (
-                "assert unified_cli_ext.__version__ == '0.5.1'",
+                "assert unified_cli_ext.__version__ == '0.5.2'",
             ),
             (
                 "assert unified_cli_ext.__version__ == '0.1.0'",
@@ -1071,8 +1071,8 @@ def test_measured_children_embed_trusted_candidate_and_reference_versions(
             check_performance._measure_ext_registry,
             "ext_passive_registry",
             (
-                "assert unified_cli.__version__ == '0.5.1'",
-                "assert unified_cli_ext.__version__ == '0.5.1'",
+                "assert unified_cli.__version__ == '0.5.2'",
+                "assert unified_cli_ext.__version__ == '0.5.2'",
             ),
             (
                 "assert unified_cli.__version__ == '0.5.0'",

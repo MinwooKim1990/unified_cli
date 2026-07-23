@@ -29,6 +29,7 @@ from .contract import (
     TransportKind,
     VersionProbeSpec,
 )
+from .path_resolver import path_launch_resolver
 
 
 GROK_OFFICIAL_SOURCES = (
@@ -567,6 +568,11 @@ def _finalize(state: dict):
 _BASE_PLUGIN = adapter_plugin(
     ADAPTER_SPEC,
     default_model=GROK_DEFAULT_MODEL,
+    launch_resolver=path_launch_resolver(
+        provider_id=ADAPTER_SPEC.id,
+        executable=ADAPTER_SPEC.binary.executable,
+        package_names=(GROK_OFFICIAL_PACKAGE,),
+    ),
     state_factory=_state,
     map_record=_map_record,
     finalize=_finalize,

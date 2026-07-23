@@ -1,43 +1,37 @@
-"""Inert Held metadata for the official GitHub Copilot CLI.
-
-The documented one-shot argv limits the model to read-only workspace tools, but
-Copilot also consumes executable hook/plugin/MCP configuration from provider
-state and repository settings.  Those inputs cannot be made immutable with
-portable pathname checks around a subprocess launch, so this entry remains Held.
-"""
+"""Opt-in Preview adapter for the official GitHub Copilot CLI."""
 
 from __future__ import annotations
 
-from .contract import PromptMode, TransportKind
-from .held import held_adapter_spec, held_plugin
+from .bridge import adapter_plugin
+from .contract import (
+    AdapterServerPolicy,
+    AdapterStatus,
+    BinarySpec,
+    DoctorProbeSpec,
+    EnvironmentPolicy,
+    ExitStatusProbeSpec,
+    FeatureProbeSpec,
+    FixedCommandSpec,
+    OperationLimits,
+    ProbeFormat,
+    PromptCommandSpec,
+    PromptMode,
+    ProviderAdapterSpecV1,
+    ProviderCapability,
+    TransportKind,
+    VersionProbeSpec,
+)
+from .path_resolver import path_launch_resolver
 
 
 COPILOT_OFFICIAL_SOURCES = (
     "https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference",
     "https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference",
-    "https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference",
     "https://github.com/github/copilot-cli",
-    "https://www.npmjs.com/package/@github/copilot",
 )
 COPILOT_OFFICIAL_PACKAGE = "@github/copilot"
 COPILOT_DEFAULT_MODEL = "auto"
 COPILOT_READ_ONLY_TOOLS = ("view", "glob", "grep")
-COPILOT_STAGE_6_TARGET_VERSION = "1.0.73"
-COPILOT_STAGE_6_EVIDENCE_CAPTURED = False
-
-COPILOT_VERSION_HELP_IDENTITY_PROVENANCE_REQUIRES_STAGE_6_EVIDENCE = True
-COPILOT_PROMPT_OUTPUT_FRAMING_REQUIRES_STAGE_6_EVIDENCE = True
-COPILOT_PERMISSION_TOOL_MCP_ISOLATION_REQUIRES_STAGE_6_EVIDENCE = True
-COPILOT_AUTH_SESSION_MODEL_REQUIRES_STAGE_6_EVIDENCE = True
-COPILOT_CANCELLATION_PROCESS_CLEANUP_REQUIRES_STAGE_6_EVIDENCE = True
-COPILOT_UPDATE_REMOVAL_REQUIRES_STAGE_6_EVIDENCE = True
-COPILOT_QUOTA_USAGE_ERROR_REQUIRES_STAGE_6_EVIDENCE = True
-COPILOT_ACP_REQUIRES_SEPARATE_STAGE_6_EVIDENCE = True
-COPILOT_DEDICATED_HOME_ISOLATION_REQUIRES_STAGE_6_EVIDENCE = True
-
-
-# Candidate metadata only.  ``view``, ``glob``, and ``grep`` are read-only
-# Copilot tools; this is deliberately not described as a no-tools invocation.
 COPILOT_DOCUMENTED_HEADLESS_FIXED_ARGV = (
     "--silent",
     "--no-ask-user",
@@ -55,24 +49,59 @@ COPILOT_DOCUMENTED_HEADLESS_FIXED_ARGV = (
     "--output-format=text",
 )
 
+_PROBE_LIMITS = OperationLimits(10.0, 64 * 1024, 16 * 1024, 8)
+_PROMPT_LIMITS = OperationLimits(120.0, 16 * 1024 * 1024, 1024 * 1024, 50_000)
 
-ADAPTER_SPEC = held_adapter_spec(
-    provider_id="copilot",
+
+def _command(*argv: str) -> FixedCommandSpec:
+    return FixedCommandSpec(argv, limits=_PROBE_LIMITS)
+
+
+ADAPTER_SPEC = ProviderAdapterSpecV1(
+    id="copilot",
     display_name="GitHub Copilot CLI",
-    executable="copilot",
-    prompt_argv=COPILOT_DOCUMENTED_HEADLESS_FIXED_ARGV,
-    prompt_mode=PromptMode.OPTION_VALUE,
-    prompt_option="-p",
+    status=AdapterStatus.PREVIEW,
+    binary=BinarySpec(
+        executable="copilot",
+        expected_identity="copilot",
+        version_probe=VersionProbeSpec(
+            _command("--version"),
+            minimum_version=(0,),
+            format=ProbeFormat.PLAIN_TEXT,
+            version_marker="copilot ",
+        ),
+        feature_probe=FeatureProbeSpec(
+            _command("help"),
+            required_features=frozenset(("chat",)),
+            format=ProbeFormat.PLAIN_TEXT,
+            feature_markers={"chat": "-p, --prompt"},
+            identity_marker="-p, --prompt",
+            marker_prefixes=True,
+            identity_prefix=True,
+        ),
+    ),
+    prompt=PromptCommandSpec(
+        fixed_argv=COPILOT_DOCUMENTED_HEADLESS_FIXED_ARGV,
+        mode=PromptMode.OPTION_VALUE,
+        prompt_option="-p",
+        limits=_PROMPT_LIMITS,
+    ),
     transport=TransportKind.PLAIN,
-    # Static candidate metadata only.  No environment value is read or applied
-    # while Held.
-    environment_keys=frozenset(("COPILOT_HOME",)),
-    version_marker="copilot ",
-    help_chat_marker="-p, --prompt",
-    help_argv=("help",),
+    environment=EnvironmentPolicy(allowed_keys=frozenset(("COPILOT_HOME",))),
+    doctor=DoctorProbeSpec(ExitStatusProbeSpec(_command("--version"))),
+    capabilities=frozenset((ProviderCapability.CHAT.value,)),
+    server_policy=AdapterServerPolicy(enabled=False),
 )
 
-PLUGIN = held_plugin(ADAPTER_SPEC)
+PLUGIN = adapter_plugin(
+    ADAPTER_SPEC,
+    default_model=COPILOT_DEFAULT_MODEL,
+    launch_resolver=path_launch_resolver(
+        provider_id="copilot",
+        executable="copilot",
+        package_names=(COPILOT_OFFICIAL_PACKAGE,),
+    ),
+)
 
 
 __all__ = [

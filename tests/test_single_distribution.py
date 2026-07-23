@@ -51,8 +51,11 @@ def test_single_distribution_verifier_tracks_ext_support_statuses():
         verifier.EXPECTED_PROVIDER_ENTRY_POINTS
     )
     source = SCRIPT.read_text(encoding="utf-8")
-    assert 'experimental = {"qoder", "kilo", "poolside"}' in source
-    assert "experimental provider inventory does not match" in source
+    assert (
+        'provider_id: "preview" for provider_id in EXPECTED_PROVIDER_ENTRY_POINTS'
+        in source
+    )
+    assert "Preview provider inventory does not match" in source
 
 
 def test_only_root_project_is_buildable_and_publishable():

@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-import subprocess
-
-import pytest
-
 from unified_cli_ext.providers import AdapterStatus
 from unified_cli_ext.providers.copilot import (
     ADAPTER_SPEC,
@@ -11,14 +7,10 @@ from unified_cli_ext.providers.copilot import (
     COPILOT_READ_ONLY_TOOLS,
     PLUGIN,
 )
-from unified_cli_ext.providers.held import (
-    HELD_UNAVAILABLE_MESSAGE,
-    HeldProviderUnavailableError,
-)
 
 
-def test_copilot_is_inert_held_read_only_candidate_metadata():
-    assert ADAPTER_SPEC.status is AdapterStatus.HELD
+def test_copilot_is_runnable_preview_with_read_only_candidate_metadata():
+    assert ADAPTER_SPEC.status is AdapterStatus.PREVIEW
     assert ADAPTER_SPEC.prompt.fixed_argv == COPILOT_DOCUMENTED_HEADLESS_FIXED_ARGV
     assert ADAPTER_SPEC.transport.value == "plain"
     assert ADAPTER_SPEC.environment.allowed_keys == frozenset(("COPILOT_HOME",))
@@ -32,17 +24,11 @@ def test_copilot_is_inert_held_read_only_candidate_metadata():
     for denied in ("write", "shell", "url", "memory"):
         assert "--deny-tool={}".format(denied) in COPILOT_DOCUMENTED_HEADLESS_FIXED_ARGV
 
-    assert PLUGIN.support_status == "held"
-    assert PLUGIN.default_model == "unavailable"
-    assert PLUGIN.capabilities == frozenset()
+    assert PLUGIN.support_status == "preview"
+    assert PLUGIN.default_model == "auto"
+    assert PLUGIN.capabilities == frozenset(("chat",))
     assert PLUGIN.server_policy.enabled is False
-    assert PLUGIN.model_lister() == ()
-    assert dict(PLUGIN.doctor()) == {
-        "id": "copilot",
-        "status": "Held",
-        "available": False,
-        "message": HELD_UNAVAILABLE_MESSAGE,
-    }
+    assert PLUGIN.model_lister()[0].provider == "copilot"
 
 
 def test_copilot_candidate_prompt_placement_is_static_metadata_only():
@@ -55,17 +41,3 @@ def test_copilot_candidate_prompt_placement_is_static_metadata_only():
         prompt,
     )
     assert built.stdin_text is None
-
-
-def test_copilot_held_factory_fails_before_external_execution(monkeypatch):
-    def forbidden(*args, **kwargs):
-        raise AssertionError("Held Copilot attempted external execution")
-
-    monkeypatch.setattr(subprocess, "Popen", forbidden)
-    with pytest.raises(HeldProviderUnavailableError) as caught:
-        PLUGIN.factory(
-            cwd="/private/tmp",
-            bin_path="/private/tmp/copilot",
-            provider_home="/private/tmp/copilot-home",
-        )
-    assert str(caught.value) == HELD_UNAVAILABLE_MESSAGE

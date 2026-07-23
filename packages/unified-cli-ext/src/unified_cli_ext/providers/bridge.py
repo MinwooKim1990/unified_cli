@@ -74,6 +74,7 @@ from .contract import (
     ProviderCapability,
     TransportKind,
 )
+from .diagnostics import REPORT_URL, write_preview_diagnostic
 from .held import held_plugin
 from .installation import (
     InstallationReceiptV1,
@@ -138,27 +139,42 @@ def _cancelled_error(provider: str) -> UnifiedError:
 
 
 def _core_error(provider: str, error: ExtensionError) -> UnifiedError:
-    """Translate Ext failures without copying provider diagnostics."""
+    """Translate Ext failures and point Preview users to a prompt-free report."""
 
     if isinstance(error, TransportCancelled):
         return _cancelled_error(provider)
     if isinstance(error, ConfigurationError):
-        return _configuration_error(
-            provider, "Provider adapter configuration is unavailable."
+        kind = "config"
+        message = (
+            "Provider configuration is unavailable or incompatible for this "
+            "Preview integration."
         )
-    if isinstance(error, ProviderReportedError):
+    elif isinstance(error, ProviderReportedError):
+        kind = "internal"
         message = "Provider reported an error."
     elif isinstance(error, TransportTimeout):
+        kind = "internal"
         message = "Provider request timed out."
     elif isinstance(error, LimitExceeded):
+        kind = "internal"
         message = "Provider output exceeded its configured limit."
     elif isinstance(error, ProtocolError):
-        message = "Provider returned an invalid response."
+        kind = "internal"
+        message = "Provider returned an invalid response for this Preview integration."
     elif isinstance(error, ProcessFailed):
+        kind = "internal"
         message = "Provider process failed."
     else:
+        kind = "internal"
         message = "Provider runtime failed."
-    return UnifiedError(kind="internal", provider=provider, message=message)
+    path = write_preview_diagnostic(provider, error)
+    if path is not None:
+        message = "{} Diagnostic: {}. Report it at {}.".format(
+            message, path, REPORT_URL
+        )
+    else:
+        message = "{} Report it at {}.".format(message, REPORT_URL)
+    return UnifiedError(kind=kind, provider=provider, message=message)
 
 
 def installation_receipt_envelope(

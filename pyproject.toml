@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "unified-cli"
-description = "Drive Claude Code, OpenAI Codex, and Google Antigravity CLIs through one unified Python API and an OpenAI-compatible server — using your existing CLI subscriptions, no API keys required."
+description = "Drive Claude Code, OpenAI Codex, Google Antigravity, Grok, and more coding-agent CLIs through one unified Python API and an OpenAI-compatible server, using vendor CLIs and credentials already configured on your machine."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
@@ -16,6 +16,8 @@ keywords = [
     "claude",
     "claude-code",
     "codex",
+    "grok",
+    "coding-agent",
     "antigravity",
     "cli",
     "wrapper",
