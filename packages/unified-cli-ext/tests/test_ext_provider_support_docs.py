@@ -56,6 +56,12 @@ def test_generated_ext_provider_support_check_is_clean(tmp_path):
     assert result.returncode == 0, result.stderr
 
 
+def test_support_table_reads_entry_points_from_root_pyproject():
+    module = _load_script_module()
+    assert module.PYPROJECT_PATH == ROOT / "pyproject.toml"
+    assert len(module.read_entry_points()) == 18
+
+
 @pytest.mark.parametrize("filename", ("extensions.md", "extensions.ko.md"))
 def test_grok_preview_docs_include_the_runnable_canonical_setup(filename):
     content = (ROOT / "docs" / filename).read_text(encoding="utf-8")

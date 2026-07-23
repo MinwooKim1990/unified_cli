@@ -1,98 +1,70 @@
-# Releasing Core and Ext
+# Releasing unified-cli
 
-This runbook is the only production release path for:
+The planned 0.5.1 release has one distribution, one PyPI project, one immutable
+tag, and one GitHub Release:
 
-- Core: `unified-cli` 0.5.0, immutable tag `v0.5.0`, workflow `publish.yml`;
-- Ext: `unified-cli-ext` 0.1.0, immutable tag `ext-v0.1.0`, workflow
-  `publish-ext.yml`.
+- distribution and PyPI project: `unified-cli`;
+- tag: `v0.5.1`;
+- GitHub Release: `v0.5.1`, with the verified wheel and sdist attached.
 
-Both tags must identify the same exact clean commit at the tip of `main`. Core
-is published and smoke-tested first. Ext is tagged only after the Core workflow
-has installed Core 0.5.0 from public PyPI and created the mandatory Core GitHub
-Release. The Ext workflow then tests against that released Core, publishes Ext,
-smoke-tests both public packages, and creates the mandatory Ext GitHub Release.
-Each GitHub Release carries the exact wheel and sdist already verified by its
-build job; a release record without those two matching assets is incomplete.
+The single wheel contains both public Python namespaces, `unified_cli` and
+`unified_cli_ext`. Core and extensions are a feature boundary, not separate
+release units. Do not create a second package, tag, trusted publisher,
+environment, workflow, or GitHub Release for extensions.
 
-Never move, delete, or reuse a release tag. Never upload the same version twice,
-use `skip-existing`, or use a local production `twine upload`. A duplicate upload
-is a release failure, not a condition to hide.
+The historical `ext-v0.1.0` tag was an aborted publishing attempt. No extension
+PyPI project or GitHub Release was published. Never rerun its historical
+workflow.
 
-## Sources of version truth
+Never move, delete, or reuse a release tag. Never upload the same version
+twice, use `skip-existing`, or use a local production `twine upload`. A
+duplicate upload is a release failure, not a condition to hide.
 
-Core is single-sourced in `src/unified_cli/__init__.py`:
+## Version and release notes
 
-```python
-__version__ = "0.5.0"
-```
+Set the one project version to `0.5.1` in the authoritative Core version source
+used by `pyproject.toml`. Update the root changelog with the 0.5.1 release note
+before tagging. The extension-source changelog may describe the bundled feature
+changes, but it is not an independently released version.
 
-`pyproject.toml` reads that attribute dynamically. Ext is single-sourced in
-`packages/unified-cli-ext/pyproject.toml`:
-
-```toml
-version = "0.1.0"
-dependencies = ["unified-cli>=0.5,<0.6"]
-```
-
-`packages/unified-cli-ext/src/unified_cli_ext/__init__.py` must expose the same
-Ext version. Both changelogs must contain the versions being released.
+The release notes must state that the wheel provides both namespaces; Core
+defaults remain Claude, Codex, and Gemini only; extensions are explicit and
+lazy; Grok remains Preview; Qoder, Kilo, and Poolside are runnable
+Experimental integrations; the other 14 extension providers remain Held; and
+all Ext server policies remain disabled.
+Do not claim authentication or login E2E coverage beyond recorded evidence.
 
 ## One-time trusted-publisher and GitHub setup
 
-Create separate PyPI projects and GitHub Actions trusted publishers. The values
-are exact and current:
+Configure exactly one PyPI trusted publisher and one GitHub environment for the
+repository's release workflow:
 
-| Package | Owner | Repository | Workflow | GitHub environment |
+| Package | Owner | Repository | Tag | GitHub environment |
 | --- | --- | --- | --- | --- |
-| `unified-cli` | `MinwooKim1990` | `unified_cli` | `publish.yml` | `pypi` |
-| `unified-cli-ext` | `MinwooKim1990` | `unified_cli` | `publish-ext.yml` | `pypi-ext` |
+| `unified-cli` | `MinwooKim1990` | `unified_cli` | `v0.5.1` | `pypi` |
 
-In each PyPI project, use **Manage → Publishing → Add a new publisher**. Before
-a project exists, create a pending publisher from the account Publishing page;
-the first trusted publish creates the project without a long-lived token.
+In PyPI, use **Manage → Publishing → Add a new publisher** for `unified-cli`.
+Before the project exists, create a pending publisher from the account
+Publishing page; the first trusted publish creates the project without a
+long-lived token.
 
-Configure these GitHub controls before creating either tag:
-
-- a tag ruleset restricts creation, update, and deletion of `v*` and `ext-v*`
-  tags to the release maintainer; updates and force movement remain forbidden;
-- environment `pypi` accepts only `v*` tags;
-- environment `pypi-ext` accepts only `ext-v*` tags;
-- required reviewers, prevention of self-review, and disabled administrator
-  bypass are enabled whenever an independent trusted reviewer is available.
-
-The workflows grant `id-token: write` only to their PyPI publish jobs and
-`contents: write` only to their final GitHub Release jobs. No PyPI token is
-stored in GitHub.
+Protect `v*` tags so only the release maintainer can create them and tag updates
+or deletion remain forbidden. Limit the `pypi` environment to `v*` tags. Grant
+`id-token: write` only to the PyPI publish job and `contents: write` only to the
+final GitHub Release job. Do not store a PyPI token in GitHub.
 
 ## Prepare one exact release commit
 
-1. Update the Core and Ext version sources and both changelogs.
-2. From a clean `main`, run the complete offline Core and Ext suites,
-   distribution builds, metadata checks, clean installs, and the following
-   pinned-reference performance gate. The lock is a hash-verified, CPython
-   3.14/Ubuntu 24.04 wheel set for the harness's Core server imports; use the
-   exact command rather than resolving dependencies from the local environment.
-
-   ```bash
-   REFERENCE_SHA="be1478884735c862e894959944ba53e149ea4210"
-   REFERENCE_ROOT="../unified-cli-performance-reference"
-   git fetch --no-tags origin main "$REFERENCE_SHA"
-   git merge-base --is-ancestor "$REFERENCE_SHA" origin/main
-   git worktree add --detach "$REFERENCE_ROOT" "$REFERENCE_SHA"
-   python -m venv /tmp/unified-cli-performance-venv
-   /tmp/unified-cli-performance-venv/bin/python -m pip install --upgrade pip
-   PIP_CONFIG_FILE=/dev/null /tmp/unified-cli-performance-venv/bin/python -m pip install --isolated --no-cache-dir --require-hashes --only-binary=:all: --index-url https://pypi.org/simple -r scripts/performance-requirements.txt
-   /tmp/unified-cli-performance-venv/bin/python scripts/check_performance.py --reference-root "$REFERENCE_ROOT"
-   git worktree remove "$REFERENCE_ROOT"
-   ```
-
-   Keep the detached reference worktree read-only. If the candidate reached
-   `main` through a merge commit, the `git merge-base --is-ancestor` check is
-   required: the pinned reference SHA must remain in `main` ancestry, not only
-   in a local branch or a rewritten history.
-3. Push the release commit to `main` and wait for every required CI check on
-   that exact commit to pass.
-4. Record the immutable candidate:
+1. Update the authoritative version to `0.5.1` and update the root changelog.
+2. From a clean `main`, run the complete required offline test suite,
+   distribution build, metadata checks, clean-install checks, and all required
+   readiness gates for the unified wheel.
+3. Verify that the built wheel includes both `unified_cli` and
+   `unified_cli_ext`, declares the `acp` and `mcp` extras on `unified-cli`, and
+   has no separate-distribution dependency or artifact.
+4. Push the candidate to `main` and wait for all required CI checks on that
+   exact commit to pass.
+5. Record the immutable candidate:
 
    ```bash
    git switch main
@@ -102,122 +74,50 @@ stored in GitHub.
    test "$MAIN_SHA" = "$(git rev-parse origin/main)"
    ```
 
-Do not merge or push another `main` commit between the two tag pushes. Both
-release workflows reject an older ancestor of `main`; equality with the current
-`origin/main` commit is required.
+Do not merge or push another `main` commit between recording `MAIN_SHA` and
+tagging it.
 
-`Required CI gate` is the single stable, fail-closed aggregation of the test
-matrix, pinned-reference performance gate, Ext checks, and distribution-pair
-check (the opt-in browser check is intentionally excluded). Configure this job
-as the required `main` ruleset status check before a production release.
+## Publish 0.5.1
 
-## Release 1 of 2: Core 0.5.0
-
-Create Core's tag at the recorded commit and push only that tag:
+Create and push the one release tag:
 
 ```bash
-git tag v0.5.0 "$MAIN_SHA"
-git push origin refs/tags/v0.5.0
+git tag v0.5.1 "$MAIN_SHA"
+git push origin refs/tags/v0.5.1
 ```
 
-`publish.yml` must complete in this order:
+The release workflow must:
 
-1. prove `v0.5.0`, the event SHA, the checkout, and current `origin/main` are
-   the same commit; prove the checkout is clean and the source version is 0.5.0;
-2. in separate required jobs, run the complete offline Core suite and the
-   pinned-reference performance/readiness gate; both must pass before build;
-3. build exactly one Core wheel and one Core sdist, verify both metadata
-   identities, filenames, archive roots, wheel RECORD SHA-256 hashes/sizes,
-   member file/directory hierarchy, the exact `rich>=13` and
-   `prompt-toolkit>=3.0.43` default-runtime dependency set, optional-extra
-   markers, and package boundaries, reject every Core dependency on Ext, and
-   clean-install the wheel;
-4. publish only the verified Core artifact through environment `pypi`;
-5. install `unified-cli==0.5.0` from the explicit public
+1. prove that `v0.5.1`, the event SHA, checkout, and current `origin/main` are
+   the same clean commit, and that the source version is `0.5.1`;
+2. run the required offline tests and readiness gates before building;
+3. build exactly one `unified-cli` wheel and one sdist, verify their metadata,
+   archive roots, RECORD integrity, hashes, package hierarchy, default runtime
+   dependencies, and optional-extra markers, then clean-install the wheel;
+4. publish only those verified artifacts through the `pypi` environment;
+5. install `unified-cli==0.5.1` from the explicit public
    `https://pypi.org/simple` index with cache, extra indexes, local links, and
-   `no-index` configuration disabled, then verify its import, entry point,
-   version, and dependency health;
-6. only after that PyPI smoke passes, download the verified build artifact and
-   create the mandatory GitHub Release for `v0.5.0` with that exact wheel and
-   sdist attached. A safe rerun verifies an existing final release, asset names,
-   sizes, digests when available, and downloaded bytes instead of uploading a
-   replacement.
+   `no-index` configuration disabled, then verify both public namespaces, the
+   entry point, version, and dependency health; and
+6. only after that public-PyPI smoke passes, create the final GitHub Release for
+   `v0.5.1` with the exact verified wheel and sdist attached. A safe rerun
+   verifies an existing final release and downloaded asset bytes rather than
+   replacing them.
 
-Confirm both outcomes before proceeding:
+Confirm the two outcomes:
 
-- <https://pypi.org/project/unified-cli/0.5.0/>
-- <https://github.com/MinwooKim1990/unified_cli/releases/tag/v0.5.0>
-
-If Core did not complete all six steps, do not create the Ext tag.
-
-## Release 2 of 2: Ext 0.1.0
-
-First prove that `main` has not moved and both tags will share the Core release
-commit:
-
-```bash
-git fetch --no-tags origin main
-test "$MAIN_SHA" = "$(git rev-parse origin/main)"
-test "$MAIN_SHA" = "$(git rev-parse 'v0.5.0^{commit}')"
-git tag ext-v0.1.0 "$MAIN_SHA"
-git push origin refs/tags/ext-v0.1.0
-```
-
-`publish-ext.yml` must complete in this order:
-
-1. prove `ext-v0.1.0`, `v0.5.0`, the event SHA, the checkout, and current
-   `origin/main` are the same clean commit; prove the Ext name, version, and
-   exact Core dependency line; require the `v0.5.0` GitHub Release to exist as
-   a final, non-draft, non-prerelease release with exactly both non-empty Core
-   artifacts, require their recorded sizes and SHA-256 digests, download them
-   into a new empty directory, compare the downloaded bytes to that metadata,
-   and rerun the complete Core wheel/sdist verifier;
-2. run the separate pinned-reference performance/readiness job; it and the
-   provenance job must pass before testing or building;
-3. install Core 0.5.0 from public PyPI and run the complete offline Ext suite;
-4. build exactly one Ext wheel and one Ext sdist, verify both metadata
-   identities, filenames, archive roots, wheel RECORD SHA-256 hashes/sizes,
-   member file/directory hierarchy, exactly one default-runtime dependency
-   (`unified-cli>=0.5,<0.6`), optional-extra markers, reject Core package paths,
-   and check the Ext wheel against the released Core wheel;
-5. clean-install the built Ext wheel alongside released Core and assert both
-   versions;
-6. publish only the verified Ext artifact through environment `pypi-ext`;
-7. install `unified-cli==0.5.0` and `unified-cli-ext==0.1.0` together from the
-   explicit public PyPI index with cache, extra indexes, local links, and
-   `no-index` configuration disabled, then verify both versions and dependency
-   health;
-8. only after that PyPI smoke passes, download the verified Ext build artifact
-   and create the mandatory GitHub Release for `ext-v0.1.0` with the exact Ext
-   wheel and sdist attached. Reruns verify an existing final release and both
-   downloaded asset bytes rather than replacing them.
-
-Confirm both outcomes:
-
-- <https://pypi.org/project/unified-cli-ext/0.1.0/>
-- <https://github.com/MinwooKim1990/unified_cli/releases/tag/ext-v0.1.0>
+- <https://pypi.org/project/unified-cli/0.5.1/>
+- <https://github.com/MinwooKim1990/unified_cli/releases/tag/v0.5.1>
 
 ## Failure and rollback rules
 
-PyPI releases are immutable. A repair always uses a new version and new tag;
-never move the failed tag or attempt another upload of the same version.
+PyPI releases are immutable. A repair always uses a new `unified-cli` version
+and a new `v*` tag; never move the failed tag or attempt another upload of the
+same version. If public-PyPI smoke fails, stop, fix on `main`, and release a new
+version. A yank limits new resolution but is not deletion.
 
-- If Core is defective or its PyPI smoke fails before Ext is tagged, stop. Yank
-  only `unified-cli` 0.5.0, annotate its GitHub Release if one exists, fix on
-  `main`, and release a new Core version. Do not publish Ext against the yanked
-  Core.
-- If Ext is defective after Core is healthy, yank only `unified-cli-ext` 0.1.0
-  and annotate only the Ext GitHub Release. Leave Core 0.5.0 and its GitHub
-  Release intact; repair Ext under a new Ext version/tag.
-- If the PyPI upload and public-PyPI smoke passed but the final GitHub Release
-  API call failed, do not rerun or bypass the upload. Verify the public package
-  and immutable tag again, then create the missing GitHub Release manually for
-  that existing tag with the exact verified wheel and sdist. If a release
-  already exists, its final/draft state and attached assets must match; do not
-  overwrite or silently add to a mismatched release. Record the failed workflow
-  and recovery in the release notes.
-- A yank limits new resolution but is not deletion. Publish a corrected version
-  promptly and explain the affected package/version without changing the other
-  package's history.
-
-The two GitHub Releases are mandatory release records, not optional notes.
+If publishing succeeded but GitHub Release creation failed, do not rerun or
+bypass the upload. Re-verify the public package and immutable tag, then create
+the missing GitHub Release manually with the exact verified wheel and sdist. If
+a release already exists, its state and attached assets must match; do not
+overwrite or silently add mismatched files.

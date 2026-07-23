@@ -31,6 +31,7 @@ PI_OFFLINE_UPDATE_PACKAGE_TELEMETRY_CONTAINMENT_REQUIRES_STAGE_6_EVIDENCE = True
 # Cancellation, stdin EOF, process cleanup, session/resume, and image behavior
 # each require lifecycle and protocol fixtures before enablement.
 PI_RPC_CANCEL_STDIN_EOF_PROCESS_CLEANUP_REQUIRES_STAGE_6_EVIDENCE = True
+PI_PLATFORM_PROCESS_CONTAINMENT_REQUIRES_STAGE_6_EVIDENCE = True
 PI_SESSION_RESUME_IMAGE_REQUIRES_STAGE_6_EVIDENCE = True
 
 ADAPTER_SPEC = held_adapter_spec(

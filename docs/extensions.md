@@ -1,15 +1,18 @@
 # Extensions
 
-`unified-cli-ext` is separate from Core (`unified-cli`). Core continues to
-support Claude, Codex, and Gemini (`agy`) with its existing defaults. Installing
-Ext does not change those defaults, does not add an extension to Core's local
-server allowlist, and does not install or configure any vendor software.
+Extensions are bundled with Core in the planned `unified-cli` 0.5.1
+distribution; `unified_cli` and `unified_cli_ext` are both public namespaces in
+that one wheel. Core continues to support Claude, Codex, and Gemini (`agy`) as
+its only defaults. Extensions are a feature boundary: using one does not change
+those defaults, add an extension to Core's local server allowlist, or install or
+configure vendor software.
 
-Ext installs 18 explicit provider entry points. Grok Build is a read-tool-limited
+The bundled extensions provide 18 explicit provider entry points. Grok Build is a read-tool-limited
 **Preview** backed by offline fixtures and one representative authenticated
-native smoke. The other 17 entries are **Held** and
-stop before provider construction, binary lookup, or command execution. No Ext
-provider is enabled in Core server mode.
+native smoke. Qoder, Kilo, and Poolside are runnable **Experimental**
+integrations. The remaining 14 entries are **Held** and stop before provider
+construction, binary lookup, or command execution. No Ext provider is enabled
+in Core server mode.
 
 Vendor binaries, accounts, subscriptions, and their updates remain
 user-owned. Installing Ext alone does not install a vendor CLI, log in, call a
@@ -18,22 +21,34 @@ service, or incur charges. Ext is not affiliated with the vendors listed here.
 ## Install and inspect
 
 ```bash
-python -m pip install unified-cli-ext
-python -c "import importlib.metadata as m; print([e.name for e in m.distribution('unified-cli-ext').entry_points if e.group == 'unified_cli.providers.v1'])"
+python -m pip install "unified-cli==0.5.1"
+python -c "import unified_cli_ext; print(unified_cli_ext.__name__)"
+unified-cli providers --include-ext
 ```
 
-The second command only displays installed entry-point names. It does not
-verify a vendor installation, authentication state, or service availability.
+The Python command only confirms that the bundled extension namespace imports.
+The `providers` command displays installed entry-point metadata. Neither
+verifies a vendor installation, authentication state, or service availability.
+
+For a developer or tester with a legacy local or failed split wheel, recover
+before installing the planned unified release:
+
+```bash
+python -m pip uninstall -y unified-cli-ext
+python -m pip install --force-reinstall "unified-cli==0.5.1"
+```
 
 Core keeps this discovery import-free. `unified-cli providers --include-ext`
 therefore reports a new entry as lifecycle `discovered` and support `unknown`.
 An explicit request loads only that provider's entry point. Held providers stop
 before any provider callback. Grok continues only after its explicitly selected
 local binary passes the exact `0.2.111` version and bounded feature probes.
+Qoder, Kilo, and Poolside are experimental explicit-request integrations; they
+remain disabled in server mode.
 
 ## Grok Preview setup and boundary
 
-Grok Build Preview is the sole runnable Ext provider. Its primary official
+Grok Build Preview is one runnable Ext provider. Its primary official
 native installer is `https://x.ai/cli/install.sh`; the official npm package
 `@xai-official/grok` is a vendor alternative, but this 0.1 Preview setup uses
 the native install layout only. The known unrelated
@@ -334,7 +349,8 @@ access can change a path between those operations.
 | Experimental | An enabled, limited-scope integration whose behavior may change. |
 | Held | Discoverable metadata only. It is blocked before provider construction, binary lookup, or command execution. |
 
-Grok is **Preview**; every other catalog entry below is **Held**.
+Grok is **Preview**; Qoder, Kilo, and Poolside are **Experimental**; every
+other catalog entry below is **Held**. All Ext server policies are disabled.
 
 ## Generated provider support
 
@@ -354,22 +370,23 @@ manual design record.
 | `gitlab-duo` | `held` | `none` | `disabled` |
 | `grok` | `preview` | `chat, sessions, stream` | `disabled` |
 | `hermes` | `held` | `none` | `disabled` |
-| `kilo` | `held` | `none` | `disabled` |
+| `kilo` | `experimental` | `chat` | `disabled` |
 | `kimi` | `held` | `none` | `disabled` |
 | `mistral-vibe` | `held` | `none` | `disabled` |
 | `oh-my-pi` | `held` | `none` | `disabled` |
 | `opencode` | `held` | `none` | `disabled` |
 | `pi` | `held` | `none` | `disabled` |
-| `poolside` | `held` | `none` | `disabled` |
-| `qoder` | `held` | `none` | `disabled` |
+| `poolside` | `experimental` | `chat` | `disabled` |
+| `qoder` | `experimental` | `chat` | `disabled` |
 | `qwen` | `held` | `none` | `disabled` |
 <!-- END GENERATED EXT PROVIDER SUPPORT -->
 
 ## Stage 5B–5F catalog
 
 “Candidate transport” records a provisional design direction, not a command
-contract. “Auto-update containment” describes the intended boundary if an
-adapter is later enabled; no Held metadata executes it today.
+contract. “Auto-update containment” describes the intended boundary. Held
+metadata does not execute; the three Experimental adapters below are explicitly
+runnable, while their behavior may change.
 
 The Grok, Kimi, Copilot, and Cursor rows record current official-documentation
 research and pinned compatibility targets. Prompts are argv values and must not
@@ -385,22 +402,23 @@ execution. ACP candidates are not enabled bridges.
 | `copilot` | GitHub Copilot CLI (`copilot`, `@github/copilot`) | Plain-text one-shot candidate | Explicit read-only tool candidate; Core capability none | Held | Candidate `--no-auto-update` plus tool/MCP controls; JSONL schema and complete user/workspace MCP and dedicated-home isolation remain unverified | [Install](https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli) · [CLI command reference](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference) · [ACP server](https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server) |
 | `cursor` | Cursor Agent CLI (`agent` primary; `cursor-agent` legacy alias since 2026-01-08) | Final/stream JSON schema candidates | Positional-prompt ABI is not safely representable; Core capability none | Held | No verified read-only, MCP, or update containment; `CURSOR_API_KEY` is env-only and never argv | [Install](https://cursor.com/docs/cli/installation) · [Parameters](https://cursor.com/docs/cli/reference/parameters) · [Output format](https://cursor.com/docs/cli/reference/output-format) · [ACP](https://cursor.com/docs/cli/acp) |
 | `codebuddy` | CodeBuddy Code (`codebuddy`, `@tencent-ai/codebuddy-code`) | JSONL protocol candidate | `chat` candidate; Core capability none | Held | Candidate `DISABLE_AUTOUPDATER=1`; exact frame and config isolation require verification | [CLI reference](https://www.codebuddy.ai/docs/cli/cli-reference) · [Headless mode](https://www.codebuddy.ai/docs/cli/headless) · [ACP](https://www.codebuddy.ai/docs/cli/acp) |
-| `qoder` | Qoder CLI (`qodercli`, `@qoder-ai/qodercli`) | ACP stdio candidate | `chat` candidate; Core capability none | Held | Candidate private setting `general.enableAutoUpdate=false`; ACP lifecycle requires verification | [Quick start](https://docs.qoder.com/en/cli/quick-start) · [ACP](https://docs.qoder.com/en/cli/acp) · [Permissions](https://docs.qoder.com/en/cli/permissions) |
+| `qoder` | Qoder CLI (`qodercli`, `@qoder-ai/qodercli`) | ACP stdio | Explicit `chat`; Core server disabled | Experimental | Private setting `general.enableAutoUpdate=false`; runnable with bounded ACP lifecycle controls, subject to Experimental change | [Quick start](https://docs.qoder.com/en/cli/quick-start) · [ACP](https://docs.qoder.com/en/cli/acp) · [Permissions](https://docs.qoder.com/en/cli/permissions) |
 | `mistral-vibe` | Mistral Vibe (`vibe`, `mistral-vibe`) | JSONL message stream candidate | `chat` candidate; Core capability none | Held | Candidate private config with update checks off; direct and `vibe-acp` paths require separate verification | [Install](https://docs.mistral.ai/getting-started/quickstarts/vibe-code/install-cli) · [CLI workflow](https://docs.mistral.ai/vibe/code/cli/work-with-cli) · [ACP surfaces](https://docs.mistral.ai/vibe/code/choose-cli-vscode-web-sessions) |
 | `qwen` | Qwen Code (`qwen`, `@qwen-code/qwen-code`) | JSONL candidate | `chat` candidate; Core capability none | Held | Backend selection, credentials, update behavior, and event schema require verification | [Repository](https://github.com/QwenLM/qwen-code) · [Headless mode](https://qwenlm.github.io/qwen-code-docs/en/users/features/headless/) · [Authentication](https://qwenlm.github.io/qwen-code-docs/en/users/configuration/auth/) |
 | `cline` | Cline CLI (`cline`) | JSONL candidate; separate ACP candidate | `chat` candidate; Core capability none | Held | Candidate `CLINE_NO_AUTO_UPDATE=1`; stdin EOF, event schema, and local configuration isolation require verification | [CLI overview](https://docs.cline.bot/usage/cli-overview) · [CLI reference](https://docs.cline.bot/cli/cli-reference) · [Release source](https://github.com/cline/cline/tree/cli-v3.0.46/apps/cli) |
 | `opencode` | OpenCode (`opencode`, package `opencode-ai`) | `JSONL one-shot` candidate | `chat` candidate; Core capability none | Held | Candidate disable controls require verification; stdin EOF, config/MCP isolation, and process/session lifecycle remain Stage 6 gates | [Documentation](https://opencode.ai/docs/) · [CLI](https://opencode.ai/docs/cli/) · [Server](https://opencode.ai/docs/server/) |
-| `kilo` | Kilo Code (`kilo`, package `@kilocode/cli`) | `ACP stdio with an internal loopback server` candidate | `chat` candidate; Core capability none | Held | No verified auto-update containment claim yet; ACP loopback/process/config/permission lifecycles require Stage 6 verification | [CLI](https://kilo.ai/docs/code-with-ai/platforms/cli) · [CLI reference](https://kilo.ai/docs/code-with-ai/platforms/cli-reference) · [Release](https://github.com/Kilo-Org/kilocode/releases/tag/v7.4.11) |
+| `kilo` | Kilo Code (`kilo`, package `@kilocode/cli`) | `ACP stdio with an internal loopback server` | Explicit `chat`; Core server disabled | Experimental | Runnable with bounded ACP loopback/process/config/permission controls; behavior may change | [CLI](https://kilo.ai/docs/code-with-ai/platforms/cli) · [CLI reference](https://kilo.ai/docs/code-with-ai/platforms/cli-reference) · [Release](https://github.com/Kilo-Org/kilocode/releases/tag/v7.4.11) |
 | `droid` | Factory Droid (`droid`, npm package `droid`) | Vendor stream JSON-RPC candidate | `chat` candidate; Core capability none | Held | Candidate update control, protocol envelope, permission flow, and process lifecycle require Stage 6 verification | [CLI reference](https://docs.factory.ai/reference/cli-reference) · [Droid Exec](https://docs.factory.ai/cli/droid-exec/overview) · [Package metadata](https://registry.npmjs.org/droid/latest) |
 | `pi` | Pi Coding Agent (`pi`, package `@earendil-works/pi-coding-agent`) | Custom NDJSON RPC candidate | `chat` candidate; Core capability none | Held | Candidate `--offline` and resource-disable flags require Stage 6 verification; this is not JSON-RPC | [Package](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/package.json) · [README](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/README.md) · [RPC](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/rpc.md) |
 | `oh-my-pi` | Oh My Pi (`omp`, package `@oh-my-pi/pi-coding-agent`) | Custom NDJSON RPC candidate | `chat` candidate; Core capability none | Held | No verified update containment claim yet; configuration, resources, permissions, and process lifecycle require Stage 6 verification | [Repository](https://github.com/can1357/oh-my-pi) · [RPC](https://github.com/can1357/oh-my-pi/blob/main/docs/rpc.md) · [Approval mode](https://github.com/can1357/oh-my-pi/blob/main/docs/approval-mode.md) |
 | `hermes` | Hermes Agent (`hermes`, PyPI `hermes-agent[acp]`) | ACP stdio candidate | `chat` candidate; Core capability none | Held | Hermes pins ACP 0.9.0 while Ext targets 0.11.x; compatibility, configuration, and lifecycle require Stage 6 verification | [PyPI](https://pypi.org/project/hermes-agent/) · [Repository](https://github.com/NousResearch/hermes-agent) · [ACP guide](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/acp.md) |
-| `poolside` | Poolside Agent CLI (`pool`, official native release) | ACP stdio candidate | `chat` candidate; Core capability none | Held | No verified startup/update containment claim yet; proprietary binary identity, ACP schema, configuration, and removal require Stage 6 verification | [Install](https://docs.poolside.ai/cli/install) · [CLI reference](https://docs.poolside.ai/cli/cli-reference) · [Release](https://github.com/poolsideai/pool/releases/tag/v1.0.13) |
+| `poolside` | Poolside Agent CLI (`pool`, official native release) | ACP stdio | Explicit `chat`; Core server disabled | Experimental | Runnable with bounded ACP startup/configuration controls; proprietary binary behavior may change | [Install](https://docs.poolside.ai/cli/install) · [CLI reference](https://docs.poolside.ai/cli/cli-reference) · [Release](https://github.com/poolsideai/pool/releases/tag/v1.0.13) |
 | `amp` | Amp CLI (`amp`, canonical package `@ampcode/cli`) | Claude-compatible streaming JSONL input/output candidate | `chat` candidate; Core capability none | Held | Tool approval is off by default; workspace settings, plugins, MCP, EOF/process lifecycle, and paid opt-in execution require isolated Stage 6 evidence | [Manual](https://ampcode.com/manual) · [Stream schema](https://ampcode.com/manual/appendix) · [Package](https://www.npmjs.com/package/@ampcode/cli) |
 | `gitlab-duo` | GitLab Duo CLI (`duo`, compiled generic package or official npm package `@gitlab/duo-cli`) | One-shot JSON candidate | `chat` candidate; Core capability none | Held | Headless runs auto-approve tools; JSON schema 1.0, authentication/entitlement, context/MCP/hooks, cleanup, and isolation require Stage 6 evidence | [Overview](https://docs.gitlab.com/user/gitlab_duo_cli/) · [Usage](https://docs.gitlab.com/user/gitlab_duo_cli/use/) · [Setup](https://docs.gitlab.com/user/gitlab_duo_cli/set_up/) |
 
-The optional `acp` and `mcp` extras install protocol SDK dependencies only.
-They do not activate another provider or make a provider call.
+The optional `acp` and `mcp` extras install protocol SDK dependencies only:
+`unified-cli[acp]` and `unified-cli[mcp]`. They do not activate another
+provider or make a provider call.
 
 ## What promotion to an enabled integration requires
 

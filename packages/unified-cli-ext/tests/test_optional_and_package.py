@@ -8,6 +8,10 @@ import traceback
 
 import pytest
 
+EXT_SOURCE = pathlib.Path(__file__).resolve().parents[1] / "src"
+if str(EXT_SOURCE) not in sys.path:
+    sys.path.insert(0, str(EXT_SOURCE))
+
 import unified_cli_ext
 from unified_cli_ext import (
     AcpSdkAdapter,
@@ -22,7 +26,7 @@ from unified_cli_ext import (
 
 
 def test_public_package_api_and_version():
-    assert unified_cli_ext.__version__ == "0.1.0"
+    assert unified_cli_ext.__version__ == "0.5.1"
     assert "JsonlProcess" in unified_cli_ext.__all__
     assert "EventNormalizer" in unified_cli_ext.__all__
     assert "AcpSdkAdapter" in unified_cli_ext.__all__
@@ -50,7 +54,7 @@ print(unified_cli_ext.__version__)
         text=True,
         timeout=5,
     )
-    assert result.stdout.strip() == "0.1.0"
+    assert result.stdout.strip() == "0.5.1"
 
 
 def test_optional_dependency_absent_errors_are_clear(monkeypatch):
@@ -64,9 +68,13 @@ def test_optional_dependency_absent_errors_are_clear(monkeypatch):
         return original(name, *args, **kwargs)
 
     monkeypatch.setattr(importlib, "import_module", missing)
-    with pytest.raises(OptionalDependencyError, match=r"\[acp\]"):
+    with pytest.raises(
+        OptionalDependencyError, match=r"unified-cli\[acp\]"
+    ):
         acp_module.require_acp_sdk()
-    with pytest.raises(OptionalDependencyError, match=r"\[mcp\]"):
+    with pytest.raises(
+        OptionalDependencyError, match=r"unified-cli\[mcp\]"
+    ):
         mcp_module.require_mcp_sdk()
 
 
@@ -238,12 +246,33 @@ def test_all_source_files_parse_with_python_39_grammar():
         ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 9))
 
 
-def test_pyproject_dependency_and_wheel_namespace_contract():
-    package_root = pathlib.Path(unified_cli_ext.__file__).parents[2]
-    text = (package_root / "pyproject.toml").read_text(encoding="utf-8")
-    assert '"unified-cli>=0.5,<0.6"' in text
+def test_root_pyproject_owns_both_namespaces_and_ext_provider_entry_points():
+    repository_root = pathlib.Path(__file__).resolve().parents[3]
+    pyproject_path = repository_root / "pyproject.toml"
+    text = pyproject_path.read_text(encoding="utf-8")
+
+    assert 'name = "unified-cli"' in text
+    assert 'where = ["src", "packages/unified-cli-ext/src"]' in text
+    assert '"unified_cli",' in text
+    assert '"unified_cli_ext",' in text
     assert '"agent-client-protocol>=0.11,<0.12; python_version >= \'3.10\'' in text
     assert '"mcp>=1.27,<2; python_version >= \'3.10\'"' in text
-    assert 'include = ["unified_cli_ext*"]' in text
-    assert 'unified_cli = [' not in text
+    assert '[project.optional-dependencies]' in text
+    assert 'acp = [' in text
+    assert 'mcp = [' in text
+
+    entry_point_section = text.split(
+        '[project.entry-points."unified_cli.providers.v1"]', 1
+    )[1].split('[tool.setuptools.dynamic]', 1)[0]
+    entry_points = [
+        line for line in entry_point_section.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert len(entry_points) == 18
+    assert all(' = "unified_cli_ext.providers.' in line for line in entry_points)
+
+    project_dependencies = text.split("dependencies = [", 1)[1].split("]\n", 1)[0]
+    assert "unified-cli-ext" not in project_dependencies
+    assert '"unified-cli"' not in project_dependencies
+    assert not (repository_root / "packages" / "unified-cli-ext" / "pyproject.toml").exists()
     assert (pathlib.Path(unified_cli_ext.__file__).parent / "py.typed").exists()

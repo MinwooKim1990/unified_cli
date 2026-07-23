@@ -42,37 +42,52 @@ pip install "unified-cli[server]"
 > **Any subset works** — you do not need all three. The wrapper simply uses
 > whichever of `claude` / `codex` / `agy` it finds on your `$PATH`.
 
-## Core and Ext
+## Core and Extensions
 
-| | Core: `unified-cli` | Ext: [`unified-cli-ext`](https://pypi.org/project/unified-cli-ext/) |
+| | Core defaults | Bundled extensions |
 |---|---|---|
 | Included providers | Claude, Codex, Gemini (`agy`) | 18-item catalog metadata: Grok, Kimi, Copilot, Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, Cline, OpenCode, Kilo Code, Factory Droid, Pi, Oh My Pi, Hermes, Poolside, Amp, GitLab Duo |
 | Default behavior | Existing defaults are unchanged | Never changes Core defaults or its server allowlist |
-| Current state | Core providers retain their existing behavior | Grok is a read-tool-limited **Preview** with offline fixtures and one representative authenticated native smoke; the other 17 entries are **Held**; extension server support is disabled |
+| Current state | Core providers retain their existing behavior | Grok is a read-tool-limited **Preview**; Qoder, Kilo, and Poolside are runnable **Experimental** integrations; the other 14 entries are **Held**; extension server support is disabled |
 
-Ext is a separate PyPI distribution and Python module (`unified_cli_ext`). It
-does not bundle vendor CLIs, sign you in, call a service, or create charges.
-Provider binaries and accounts remain yours to install and manage.
+Core and Extensions are a feature boundary, not a package boundary: the planned
+0.5.1 `unified-cli` wheel contains both public namespaces, `unified_cli` and
+`unified_cli_ext`. Extensions still do not bundle vendor CLIs, sign you in,
+call a service, or create charges. Provider binaries and accounts remain yours
+to install and manage.
 
 <details>
-<summary>Install Ext and check its catalog metadata</summary>
+<summary>Inspect bundled extension catalog metadata</summary>
 
 ```bash
-python -m pip install unified-cli-ext
-python -c "import importlib.metadata as m; print([e.name for e in m.distribution('unified-cli-ext').entry_points if e.group == 'unified_cli.providers.v1'])"
+python -m pip install "unified-cli==0.5.1"
+python -c "import unified_cli_ext; print(unified_cli_ext.__name__)"
+unified-cli providers --include-ext
 ```
 
-The check lists installed provider entry-point metadata. In Stages 5B–5F it
-may list `grok`, `kimi`, `copilot`, `cursor`, `codebuddy`, `qoder`,
+The Python command confirms that the bundled extension namespace imports. The
+`providers` command lists installed entry-point metadata. It may list `grok`,
+`kimi`, `copilot`, `cursor`, `codebuddy`, `qoder`,
 `mistral-vibe`, `qwen`, `cline`, `opencode`, `kilo`, `droid`, `pi`,
 `oh-my-pi`, `hermes`, `poolside`, `amp`, and `gitlab-duo`. Listing metadata does
 not run a provider, locate a vendor binary, authenticate, or make a network
-request. Grok is the only runnable Preview; the other 17 entries are Held.
+request. Grok is a runnable Preview; Qoder, Kilo, and Poolside are runnable
+Experimental integrations; the other 14 entries are Held. All extension server
+policies remain disabled.
+
+If a developer or tester installed a legacy local or failed split wheel, clean
+it up before installing the planned unified release:
+
+```bash
+python -m pip uninstall -y unified-cli-ext
+python -m pip install --force-reinstall "unified-cli==0.5.1"
+```
 
 `unified-cli providers --include-ext` keeps discovery import-free, so a newly
 discovered extension first displays lifecycle `discovered` and support
 `unknown`. When a provider is explicitly requested, Core loads only that entry
-point. Held entries remain unavailable. Grok runs only after the explicitly
+point. Held entries remain unavailable. Qoder, Kilo, and Poolside are
+Experimental explicit-request integrations. Grok runs only after the explicitly
 selected local binary passes its exact `0.2.111` version and feature probes;
 unreviewed updates fail closed. A
 representative isolated device-code smoke passed with official native Grok

@@ -50,9 +50,23 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 server = ["fastapi>=0.100", "uvicorn>=0.23", "pydantic>=2"]
+acp = [
+    "agent-client-protocol>=0.11,<0.12; python_version >= '3.10' and python_version < '3.15'",
+]
+mcp = [
+    "mcp>=1.27,<2; python_version >= '3.10'",
+]
 # httpx powers starlette's TestClient (server endpoint tests).
 dev = ["pytest>=7", "fastapi>=0.100", "pydantic>=2", "httpx>=0.24"]
-all = ["fastapi>=0.100", "uvicorn>=0.23", "pydantic>=2", "pytest>=7", "httpx>=0.24"]
+all = [
+    "fastapi>=0.100",
+    "uvicorn>=0.23",
+    "pydantic>=2",
+    "pytest>=7",
+    "httpx>=0.24",
+    "agent-client-protocol>=0.11,<0.12; python_version >= '3.10' and python_version < '3.15'",
+    "mcp>=1.27,<2; python_version >= '3.10'",
+]
 
 [project.urls]
 Homepage = "https://github.com/MinwooKim1990/unified_cli"
@@ -63,15 +77,42 @@ Documentation = "https://github.com/MinwooKim1990/unified_cli#readme"
 [project.scripts]
 unified-cli = "unified_cli.cli:main"
 
+[project.entry-points."unified_cli.providers.v1"]
+grok = "unified_cli_ext.providers.grok:PLUGIN"
+kimi = "unified_cli_ext.providers.kimi:PLUGIN"
+copilot = "unified_cli_ext.providers.copilot:PLUGIN"
+cursor = "unified_cli_ext.providers.cursor:PLUGIN"
+codebuddy = "unified_cli_ext.providers.codebuddy:PLUGIN"
+qoder = "unified_cli_ext.providers.qoder:PLUGIN"
+mistral-vibe = "unified_cli_ext.providers.mistral_vibe:PLUGIN"
+qwen = "unified_cli_ext.providers.qwen:PLUGIN"
+cline = "unified_cli_ext.providers.cline:PLUGIN"
+opencode = "unified_cli_ext.providers.opencode:PLUGIN"
+kilo = "unified_cli_ext.providers.kilo:PLUGIN"
+droid = "unified_cli_ext.providers.droid:PLUGIN"
+pi = "unified_cli_ext.providers.pi:PLUGIN"
+oh-my-pi = "unified_cli_ext.providers.oh_my_pi:PLUGIN"
+hermes = "unified_cli_ext.providers.hermes:PLUGIN"
+poolside = "unified_cli_ext.providers.poolside:PLUGIN"
+amp = "unified_cli_ext.providers.amp:PLUGIN"
+gitlab-duo = "unified_cli_ext.providers.gitlab_duo:PLUGIN"
+
 [tool.setuptools.dynamic]
 version = { attr = "unified_cli.__version__" }
 
 [tool.setuptools.packages.find]
-where = ["src"]
-include = ["unified_cli*"]
+where = ["src", "packages/unified-cli-ext/src"]
+include = [
+    "unified_cli",
+    "unified_cli.*",
+    "unified_cli_ext",
+    "unified_cli_ext.*",
+]
+namespaces = false
 
 [tool.setuptools.package-data]
 unified_cli = ["py.typed", "web/dashboard.html", "web/app.css", "web/app.js"]
+unified_cli_ext = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

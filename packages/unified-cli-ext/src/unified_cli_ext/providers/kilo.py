@@ -1,41 +1,107 @@
-"""Inert Held metadata for a future Kilo Code CLI integration."""
+"""Experimental ACP 0.11 adapter for the official Kilo Code CLI."""
 
 from __future__ import annotations
 
-from .contract import PromptMode, TransportKind
-from .held import held_adapter_spec, held_plugin
+from functools import partial
+from types import MappingProxyType
 
-
-# Exact version/help output needs isolated fixtures before the provisional
-# markers below can be trusted.  Held metadata never probes them.
-KILO_VERSION_HELP_OUTPUT_REQUIRES_STAGE_6_EVIDENCE = True
-
-# ACP startup, negotiation, and shutdown need captured lifecycle evidence.
-KILO_ACP_LIFECYCLE_REQUIRES_STAGE_6_EVIDENCE = True
-
-# The loopback listener and its child process require cleanup verification.
-KILO_LOOPBACK_PROCESS_CLEANUP_REQUIRES_STAGE_6_EVIDENCE = True
-
-# Permission, configuration, and MCP isolation must be proven before enabling
-# this provider; the declared control remains inert while Held.
-KILO_PERMISSION_CONFIG_MCP_ISOLATION_REQUIRES_STAGE_6_EVIDENCE = True
-
-# Authentication, session/model behavior, and ACP event schemas are unverified.
-KILO_AUTH_SESSION_MODEL_EVENT_SCHEMA_REQUIRES_STAGE_6_EVIDENCE = True
-
-ADAPTER_SPEC = held_adapter_spec(
-    provider_id="kilo",
-    display_name="Kilo Code",
-    executable="kilo",
-    prompt_argv=("--pure", "acp", "--hostname", "127.0.0.1", "--port", "0", "--no-mdns"),
-    prompt_mode=PromptMode.PROTOCOL,
-    prompt_option=None,
-    transport=TransportKind.ACP,
-    # This is inert static metadata and is not read or applied until Stage 6
-    # confirms an isolated, safe execution contract.
-    environment_keys=frozenset(("KILO_DISABLE_AUTOUPDATE",)),
-    version_marker="kilo ",
-    help_chat_marker="kilo acp",
+from .acp_bridge import acp_plugin, reject_workspace_config
+from .contract import (
+    AdapterServerPolicy,
+    AdapterStatus,
+    BinarySpec,
+    DoctorProbeSpec,
+    EnvironmentPolicy,
+    ExitStatusProbeSpec,
+    FeatureProbeSpec,
+    FixedCommandSpec,
+    OperationLimits,
+    ProbeFormat,
+    PromptCommandSpec,
+    PromptMode,
+    ProviderAdapterSpecV1,
+    ProviderCapability,
+    TransportKind,
+    VersionProbeSpec,
 )
 
-PLUGIN = held_plugin(ADAPTER_SPEC)
+
+KILO_OFFICIAL_PACKAGE = "@kilocode/cli"
+KILO_STAGE_6_VERSION = "7.4.11"
+KILO_ACP_FIXED_ARGV = ("acp", "--hostname", "127.0.0.1", "--port", "0")
+_PROBE_LIMITS = OperationLimits(10.0, 64 * 1024, 16 * 1024, 8)
+_PROMPT_LIMITS = OperationLimits(120.0, 16 * 1024 * 1024, 1024 * 1024, 50_000)
+_FIXED_ENV = MappingProxyType(
+    {
+        "KILO_PURE": "1",
+        "KILO_NO_DAEMON": "1",
+        "KILO_CONFIG_CONTENT": (
+            '{"mcp":{},"plugin":[],"snapshot":false,'
+            '"permission":{"*":"deny"}}'
+        ),
+    }
+)
+
+
+def _command(*argv: str) -> FixedCommandSpec:
+    return FixedCommandSpec(argv, limits=_PROBE_LIMITS)
+
+
+ADAPTER_SPEC = ProviderAdapterSpecV1(
+    id="kilo",
+    display_name="Kilo Code",
+    status=AdapterStatus.EXPERIMENTAL,
+    binary=BinarySpec(
+        executable="kilo",
+        expected_identity="kilo",
+        version_probe=VersionProbeSpec(
+            _command("--version"),
+            minimum_version=(7, 4, 11),
+            format=ProbeFormat.PLAIN_TEXT,
+            version_marker="kilo ",
+            identity_marker="kilo 7.4.11",
+            version_is_first_token=True,
+            identity_prefix=True,
+        ),
+        feature_probe=FeatureProbeSpec(
+            _command("acp", "--help"),
+            required_features=frozenset(("acp", "chat", "loopback", "ephemeral-port")),
+            format=ProbeFormat.PLAIN_TEXT,
+            feature_markers={
+                "acp": "start ACP",
+                "chat": "kilo acp",
+                "loopback": "--hostname",
+                "ephemeral-port": "--port",
+            },
+            identity_marker="kilo acp",
+            marker_prefixes=True,
+            identity_prefix=True,
+        ),
+    ),
+    prompt=PromptCommandSpec(
+        fixed_argv=KILO_ACP_FIXED_ARGV,
+        mode=PromptMode.PROTOCOL,
+        prompt_option=None,
+        limits=_PROMPT_LIMITS,
+    ),
+    transport=TransportKind.ACP,
+    environment=EnvironmentPolicy(fixed_values=_FIXED_ENV),
+    doctor=DoctorProbeSpec(ExitStatusProbeSpec(_command("acp", "--version"))),
+    capabilities=frozenset((ProviderCapability.CHAT.value,)),
+    server_policy=AdapterServerPolicy(enabled=False),
+)
+
+PLUGIN = acp_plugin(
+    ADAPTER_SPEC,
+    workspace_guard=partial(
+        reject_workspace_config,
+        names=(
+            "kilo.json",
+            "kilo.jsonc",
+            ".kilo",
+            ".kilocode",
+            "opencode.json",
+            "opencode.jsonc",
+        ),
+    ),
+)

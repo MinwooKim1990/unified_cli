@@ -26,14 +26,14 @@ from ..transports.security import CancellationToken, validate_positive_timeout
 def require_mcp_sdk() -> ModuleType:
     if sys.version_info < (3, 10):
         raise OptionalDependencyError(
-            "MCP support requires Python >=3.10 and unified-cli-ext[mcp]"
+            "MCP support requires Python >=3.10 and unified-cli[mcp]"
         )
     try:
         return importlib.import_module("mcp")
     except ModuleNotFoundError as exc:
         if exc.name == "mcp":
             raise OptionalDependencyError(
-                "MCP support requires the optional 'unified-cli-ext[mcp]' extra"
+                "MCP support requires the optional 'unified-cli[mcp]' extra"
             ) from exc
         raise TransportError("MCP SDK import failed") from None
     except Exception:

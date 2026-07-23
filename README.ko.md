@@ -44,36 +44,49 @@ pip install "unified-cli[server]"
 > 셋 다 필요하지 않습니다 — **일부만 있어도 동작**합니다. 래퍼는 `$PATH` 에서
 > 발견되는 `claude` / `codex` / `agy` 만 사용합니다.
 
-## Core와 Ext
+## Core와 확장
 
-| | Core: `unified-cli` | Ext: [`unified-cli-ext`](https://pypi.org/project/unified-cli-ext/) |
+| | Core 기본값 | 함께 제공되는 확장 |
 |---|---|---|
 | 포함 provider | Claude, Codex, Gemini (`agy`) | 18개 카탈로그 메타데이터: Grok, Kimi, Copilot, Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, Cline, OpenCode, Kilo Code, Factory Droid, Pi, Oh My Pi, Hermes, Poolside, Amp, GitLab Duo |
 | 기본 동작 | 기존 기본값은 바뀌지 않음 | Core 기본값과 서버 허용 목록을 절대 변경하지 않음 |
-| 현재 상태 | Core provider는 기존 동작을 유지 | Grok은 오프라인 fixture와 대표 인증 native smoke를 거친 읽기 도구 제한 **Preview**, 나머지 17개는 **Held**, 확장 서버 지원은 비활성화 |
+| 현재 상태 | Core provider는 기존 동작을 유지 | Grok은 읽기 도구 제한 **Preview**, Qoder·Kilo·Poolside는 실행 가능한 **Experimental**, 나머지 14개는 **Held**, 확장 서버 지원은 비활성화 |
 
-Ext는 별도 PyPI 배포판이자 Python 모듈(`unified_cli_ext`)입니다. vendor CLI를
-포함하지 않고, 로그인·서비스 호출·과금 발생을 하지 않습니다. provider 바이너리와
-계정은 사용자가 직접 설치하고 관리합니다.
+Core와 확장은 패키지 경계가 아니라 기능 경계입니다. 계획된 0.5.1 `unified-cli` wheel에는
+공개 namespace `unified_cli`와 `unified_cli_ext`가 모두 포함됩니다. 확장은 vendor CLI를
+포함하지 않고, 로그인·서비스 호출·과금 발생을 하지 않습니다. provider 바이너리와 계정은
+사용자가 직접 설치하고 관리합니다.
 
 <details>
-<summary>Ext 설치 및 카탈로그 메타데이터 확인</summary>
+<summary>함께 제공되는 확장 카탈로그 메타데이터 확인</summary>
 
 ```bash
-python -m pip install unified-cli-ext
-python -c "import importlib.metadata as m; print([e.name for e in m.distribution('unified-cli-ext').entry_points if e.group == 'unified_cli.providers.v1'])"
+python -m pip install "unified-cli==0.5.1"
+python -c "import unified_cli_ext; print(unified_cli_ext.__name__)"
+unified-cli providers --include-ext
 ```
 
-이 확인은 설치된 provider 엔트리포인트 메타데이터만 나열합니다. Stage 5B–5F에서는
+Python 명령은 함께 설치된 확장 namespace의 import만 확인하고, `providers` 명령이 설치된
+provider 엔트리포인트 메타데이터를 나열합니다. 여기에는
 `grok`, `kimi`, `copilot`, `cursor`, `codebuddy`, `qoder`, `mistral-vibe`, `qwen`,
 `cline`, `opencode`, `kilo`, `droid`, `pi`, `oh-my-pi`, `hermes`, `poolside`, `amp`,
 `gitlab-duo`가 표시될 수 있습니다. 이 메타데이터 목록 조회는 provider 실행, vendor
-바이너리 탐색, 인증, 네트워크 요청을 하지 않습니다. 실행 가능한 Preview는 Grok 하나이며
-나머지 17개 항목은 Held입니다.
+바이너리 탐색, 인증, 네트워크 요청을 하지 않습니다. Grok은 실행 가능한 Preview이고
+Qoder, Kilo, Poolside는 실행 가능한 Experimental이며 나머지 14개 항목은 Held입니다.
+모든 확장 서버 정책은 비활성입니다.
+
+개발자나 테스터가 레거시 로컬 wheel 또는 실패한 분리 wheel을 설치했다면, 계획된 통합
+릴리스를 설치하기 전에 다음과 같이 정리하세요.
+
+```bash
+python -m pip uninstall -y unified-cli-ext
+python -m pip install --force-reinstall "unified-cli==0.5.1"
+```
 
 `unified-cli providers --include-ext`는 import 없이 탐색하므로 처음에는 수명 주기
 `discovered`, 지원 상태 `unknown`으로 표시합니다. 해당 provider를 명시적으로 요청할
-때만 그 엔트리포인트 하나를 로드합니다. Held 항목은 실행되지 않습니다. Grok은 명시적으로
+때만 그 엔트리포인트 하나를 로드합니다. Held 항목은 실행되지 않습니다. Qoder, Kilo,
+Poolside는 Experimental 명시 요청 통합입니다. Grok은 명시적으로
 선택한 로컬 바이너리가 정확한 `0.2.111` 버전·기능 probe를 통과해야만 실행되며 검토하지
 않은 업데이트는 fail closed합니다. 공식 native Grok
 `0.2.111`의 macOS arm64 대표 격리 device-code smoke는 2026-07-23에 통과했지만, Grok은

@@ -18,7 +18,7 @@ from email.message import Message
 from email.parser import BytesParser
 from email.policy import compat32
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 
 _MAX_ARCHIVE_BYTES = 256 * 1024 * 1024
@@ -44,6 +44,9 @@ _MARKER_VARIABLES = frozenset({
 
 RequirementContract = Tuple[str, frozenset]
 ExpectedDependencies = Optional[Union[str, Sequence[str]]]
+PackageSource = Tuple[str, str]
+RequiredPackageFile = Tuple[str, str]
+ExpectedEntryPoints = Optional[Mapping[str, Mapping[str, str]]]
 
 
 class ArtifactVerificationError(ValueError):
@@ -273,6 +276,30 @@ def _expected_requirement_contracts(
     return contracts
 
 
+def _expected_optional_requirement_contracts(
+    expected_dependencies: ExpectedDependencies,
+) -> Tuple[str, ...]:
+    if expected_dependencies is None:
+        return ()
+    if isinstance(expected_dependencies, str):
+        values: Sequence[str] = (expected_dependencies,)
+    else:
+        values = tuple(expected_dependencies)
+    contracts = []
+    for value in values:
+        _, optional, has_marker = _parsed_requirement(value, "expected optional")
+        if not optional or not has_marker:
+            raise ArtifactVerificationError(
+                "expected optional dependency must require a selected extra"
+            )
+        contracts.append(re.sub(r"\s+", "", value))
+    if len(contracts) != len(set(contracts)):
+        raise ArtifactVerificationError(
+            "expected optional dependency set is ambiguous"
+        )
+    return tuple(contracts)
+
+
 def _validate_metadata(
     payload: bytes,
     label: str,
@@ -280,7 +307,8 @@ def _validate_metadata(
     expected_name: str,
     expected_version: str,
     expected_dependency: ExpectedDependencies,
-    forbidden_dependency: str,
+    forbidden_dependencies: Sequence[str],
+    expected_optional_dependency: ExpectedDependencies,
 ) -> Tuple[str, str]:
     metadata = _metadata(payload, label)
     identity = _identity(metadata)
@@ -290,12 +318,13 @@ def _validate_metadata(
         raise ArtifactVerificationError(label + " version does not match")
     expected = _expected_requirement_contracts(expected_dependency)
     expected_names = {contract[0] for contract in expected}
+    forbidden = {_normalized(value) for value in forbidden_dependencies}
     runtime: List[RequirementContract] = []
+    optional_requirements: List[str] = []
     for raw_requirement in metadata.get_all("Requires-Dist", []):
-        contract, optional, has_marker = _parsed_requirement(
-            str(raw_requirement), label
-        )
-        if contract[0] == forbidden_dependency and (
+        raw_text = str(raw_requirement)
+        contract, optional, has_marker = _parsed_requirement(raw_text, label)
+        if contract[0] in forbidden and (
             contract[0] not in expected_names or optional
         ):
             raise ArtifactVerificationError(
@@ -306,6 +335,7 @@ def _validate_metadata(
                 raise ArtifactVerificationError(
                     label + " expected runtime dependency cannot be optional"
                 )
+            optional_requirements.append(re.sub(r"\s+", "", raw_text))
             continue
         if has_marker:
             raise ArtifactVerificationError(
@@ -316,7 +346,137 @@ def _validate_metadata(
         raise ArtifactVerificationError(
             label + " default runtime dependency set does not match"
         )
+    if expected_optional_dependency is not None:
+        expected_optional = _expected_optional_requirement_contracts(
+            expected_optional_dependency
+        )
+        if (
+            len(optional_requirements) != len(expected_optional)
+            or set(optional_requirements) != set(expected_optional)
+        ):
+            raise ArtifactVerificationError(
+                label + " optional dependency set does not match"
+            )
     return identity
+
+
+def _package_sources(
+    configured: Optional[Sequence[PackageSource]],
+    legacy_package_root: Optional[str],
+) -> Tuple[PackageSource, ...]:
+    if configured is None:
+        if legacy_package_root is None:
+            raise ArtifactVerificationError("at least one package source is required")
+        values: Sequence[PackageSource] = (
+            (legacy_package_root, "src/" + legacy_package_root),
+        )
+    else:
+        values = tuple(configured)
+        if legacy_package_root is not None:
+            raise ArtifactVerificationError(
+                "legacy package root and package sources cannot be combined"
+            )
+    normalized: List[PackageSource] = []
+    seen_roots = set()
+    seen_sources = set()
+    for package_root, source_path in values:
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", package_root) is None:
+            raise ArtifactVerificationError("package root is invalid")
+        safe_source = _safe_member_name(source_path, "package source")
+        if safe_source != source_path.rstrip("/") or safe_source.split("/")[-1] != package_root:
+            raise ArtifactVerificationError("package source must end in its package root")
+        if package_root in seen_roots or safe_source in seen_sources:
+            raise ArtifactVerificationError("package source mapping is ambiguous")
+        seen_roots.add(package_root)
+        seen_sources.add(safe_source)
+        normalized.append((package_root, safe_source))
+    if not normalized:
+        raise ArtifactVerificationError("at least one package source is required")
+    return tuple(normalized)
+
+
+def _required_package_files(
+    configured: Sequence[RequiredPackageFile],
+    package_roots: Sequence[str],
+) -> Tuple[RequiredPackageFile, ...]:
+    roots = set(package_roots)
+    normalized: List[RequiredPackageFile] = []
+    seen = set()
+    for package_root, relative_path in configured:
+        if package_root not in roots:
+            raise ArtifactVerificationError(
+                "required package file references an unknown package root"
+            )
+        safe_relative = _safe_member_name(relative_path, "required package file")
+        key = (package_root, safe_relative)
+        if safe_relative != relative_path.rstrip("/") or key in seen:
+            raise ArtifactVerificationError("required package file is ambiguous")
+        seen.add(key)
+        normalized.append((package_root, safe_relative))
+    return tuple(normalized)
+
+
+def _parse_entry_points(payload: bytes, label: str) -> Dict[str, Dict[str, str]]:
+    if not payload or len(payload) > _MAX_METADATA_BYTES:
+        raise ArtifactVerificationError(label + " entry-point metadata is invalid")
+    try:
+        lines = payload.decode("utf-8", "strict").splitlines()
+    except UnicodeError as exc:
+        raise ArtifactVerificationError(
+            label + " entry-point metadata is not UTF-8"
+        ) from exc
+    result: Dict[str, Dict[str, str]] = {}
+    current: Optional[str] = None
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line:
+            continue
+        section_match = re.fullmatch(r"\[([A-Za-z0-9_.-]+)\]", line)
+        if section_match is not None:
+            current = section_match.group(1)
+            if current in result:
+                raise ArtifactVerificationError(
+                    label + " entry-point section is duplicated"
+                )
+            result[current] = {}
+            continue
+        if current is None or line.startswith(("#", ";")):
+            raise ArtifactVerificationError(
+                label + " entry-point metadata is malformed"
+            )
+        match = re.fullmatch(
+            r"([A-Za-z0-9][A-Za-z0-9_.-]*)\s*=\s*"
+            r"([A-Za-z_][A-Za-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*)",
+            line,
+        )
+        if match is None:
+            raise ArtifactVerificationError(
+                label + " entry-point metadata is malformed"
+            )
+        name, target = match.groups()
+        if name in result[current]:
+            raise ArtifactVerificationError(
+                label + " entry-point name is duplicated"
+            )
+        result[current][name] = target
+    if not result:
+        raise ArtifactVerificationError(label + " entry-point metadata is empty")
+    return result
+
+
+def _validate_entry_points(
+    payload: bytes,
+    label: str,
+    expected_entry_points: ExpectedEntryPoints,
+) -> None:
+    if expected_entry_points is None:
+        return
+    expected = {
+        str(group): {str(name): str(target) for name, target in entries.items()}
+        for group, entries in expected_entry_points.items()
+    }
+    if _parse_entry_points(payload, label) != expected:
+        raise ArtifactVerificationError(label + " entry-point set does not match")
 
 
 def _bounded_zip_payloads(
@@ -415,9 +575,12 @@ def _wheel_identity(
     *,
     expected_name: str,
     expected_version: str,
-    package_root: str,
-    forbidden_package_root: str,
+    package_sources: Sequence[PackageSource],
+    required_package_files: Sequence[RequiredPackageFile],
     expected_dependency: ExpectedDependencies,
+    expected_optional_dependency: ExpectedDependencies,
+    forbidden_dependencies: Sequence[str],
+    expected_entry_points: ExpectedEntryPoints,
 ) -> Tuple[str, str]:
     distribution = _distribution_component(expected_name)
     version = _version_component(expected_version)
@@ -426,7 +589,8 @@ def _wheel_identity(
         raise ArtifactVerificationError("wheel filename does not match the release identity")
     names, payloads = _bounded_zip_payloads(path)
     expected_dist_info = distribution + "-" + version + ".dist-info"
-    allowed_roots = {package_root, expected_dist_info}
+    package_roots = tuple(package_root for package_root, _ in package_sources)
+    allowed_roots = set(package_roots) | {expected_dist_info}
     if any(name.split("/", 1)[0] not in allowed_roots for name in names):
         raise ArtifactVerificationError("wheel contains an unexpected distribution root")
     for name in names:
@@ -436,18 +600,27 @@ def _wheel_identity(
                 index == 0 and part == expected_dist_info
             ):
                 raise ArtifactVerificationError("wheel contains an unexpected dist-info root")
-    if package_root + "/__init__.py" not in payloads:
-        raise ArtifactVerificationError("wheel is missing its expected package root")
-    if any(name.split("/", 1)[0] == forbidden_package_root for name in names):
-        raise ArtifactVerificationError("wheel mixes Core and Ext package roots")
+    for package_root in package_roots:
+        if package_root + "/__init__.py" not in payloads:
+            raise ArtifactVerificationError("wheel is missing an expected package root")
+    for package_root, relative_path in required_package_files:
+        if package_root + "/" + relative_path not in payloads:
+            raise ArtifactVerificationError("wheel is missing a required package file")
     metadata_path = expected_dist_info + "/METADATA"
     wheel_path = expected_dist_info + "/WHEEL"
+    entry_points_path = expected_dist_info + "/entry_points.txt"
     record_path = expected_dist_info + "/RECORD"
     for required in (metadata_path, wheel_path, record_path):
         if required not in payloads:
             raise ArtifactVerificationError("wheel is missing required dist-info metadata")
     if not payloads[wheel_path] or len(payloads[wheel_path]) > _MAX_METADATA_BYTES:
         raise ArtifactVerificationError("wheel WHEEL metadata is invalid")
+    if expected_entry_points is not None:
+        if entry_points_path not in payloads:
+            raise ArtifactVerificationError("wheel is missing entry-point metadata")
+        _validate_entry_points(
+            payloads[entry_points_path], "wheel", expected_entry_points
+        )
     _validate_record(payloads, record_path)
     return _validate_metadata(
         payloads[metadata_path],
@@ -455,7 +628,8 @@ def _wheel_identity(
         expected_name=expected_name,
         expected_version=expected_version,
         expected_dependency=expected_dependency,
-        forbidden_dependency=_normalized(forbidden_package_root),
+        forbidden_dependencies=forbidden_dependencies,
+        expected_optional_dependency=expected_optional_dependency,
     )
 
 
@@ -510,9 +684,12 @@ def _sdist_identity(
     *,
     expected_name: str,
     expected_version: str,
-    package_root: str,
-    forbidden_package_root: str,
+    package_sources: Sequence[PackageSource],
+    required_package_files: Sequence[RequiredPackageFile],
     expected_dependency: ExpectedDependencies,
+    expected_optional_dependency: ExpectedDependencies,
+    forbidden_dependencies: Sequence[str],
+    expected_entry_points: ExpectedEntryPoints,
 ) -> Tuple[str, str]:
     distribution = _distribution_component(expected_name)
     version = _version_component(expected_version)
@@ -526,29 +703,63 @@ def _sdist_identity(
     if any(name.split("/", 1)[0] != expected_root for name in names):
         raise ArtifactVerificationError("sdist contains an unexpected archive root")
     expected_egg_info = distribution + ".egg-info"
-    source_prefix = expected_root + "/src"
+    egg_metadata_candidates = (
+        expected_root + "/" + expected_egg_info + "/PKG-INFO",
+        expected_root + "/src/" + expected_egg_info + "/PKG-INFO",
+    )
+    present_egg_metadata = tuple(
+        candidate for candidate in egg_metadata_candidates if candidate in payloads
+    )
+    if len(present_egg_metadata) != 1:
+        raise ArtifactVerificationError(
+            "sdist must contain exactly one expected egg-info identity"
+        )
+    egg_metadata = present_egg_metadata[0]
+    allowed_egg_prefix = egg_metadata.rsplit("/", 1)[0]
+    source_children: Dict[str, set] = {}
+    for package_root, source_path in package_sources:
+        parent, _, child = source_path.rpartition("/")
+        if child != package_root:
+            raise ArtifactVerificationError("package source mapping is inconsistent")
+        source_children.setdefault(parent, set()).add(package_root)
+        expected_init = expected_root + "/" + source_path + "/__init__.py"
+        if expected_init not in payloads:
+            raise ArtifactVerificationError("sdist is missing an expected package root")
+    for package_root, relative_path in required_package_files:
+        source_path = dict(package_sources)[package_root]
+        if expected_root + "/" + source_path + "/" + relative_path not in payloads:
+            raise ArtifactVerificationError("sdist is missing a required package file")
     for name in names:
-        if name == source_prefix:
-            continue
-        if name.startswith(source_prefix + "/"):
-            relative = name[len(source_prefix) + 1 :]
-            source_root = relative.split("/", 1)[0]
-            if source_root not in {package_root, expected_egg_info}:
-                raise ArtifactVerificationError("sdist contains an unexpected source root")
         if ".dist-info" in name.split("/"):
             raise ArtifactVerificationError("sdist contains a wheel dist-info root")
-    expected_init = source_prefix + "/" + package_root + "/__init__.py"
-    if expected_init not in payloads:
-        raise ArtifactVerificationError("sdist is missing its expected package root")
-    forbidden_fragment = source_prefix + "/" + forbidden_package_root + "/"
-    if any(name.startswith(forbidden_fragment) for name in names):
-        raise ArtifactVerificationError("sdist mixes Core and Ext package roots")
+        parts = name.split("/")
+        for index, part in enumerate(parts):
+            if part.endswith(".egg-info"):
+                prefix = "/".join(parts[: index + 1])
+                if prefix != allowed_egg_prefix:
+                    raise ArtifactVerificationError(
+                        "sdist contains an unexpected source root (egg-info)"
+                    )
+        for parent, allowed_children in source_children.items():
+            container = expected_root + "/" + parent
+            if name == container:
+                continue
+            if name.startswith(container + "/"):
+                relative = name[len(container) + 1 :]
+                source_root = relative.split("/", 1)[0]
+                allowed = set(allowed_children)
+                if allowed_egg_prefix == container + "/" + expected_egg_info:
+                    allowed.add(expected_egg_info)
+                if source_root not in allowed:
+                    raise ArtifactVerificationError(
+                        "sdist contains an unexpected source root"
+                    )
     root_metadata = expected_root + "/PKG-INFO"
     if root_metadata not in payloads:
         raise ArtifactVerificationError("sdist is missing its root PKG-INFO")
     allowed_metadata = {
         root_metadata,
-        source_prefix + "/" + expected_egg_info + "/PKG-INFO",
+        egg_metadata,
     }
     if any(name.endswith("/PKG-INFO") and name not in allowed_metadata for name in payloads):
         raise ArtifactVerificationError("sdist contains an unexpected PKG-INFO")
@@ -558,19 +769,26 @@ def _sdist_identity(
         expected_name=expected_name,
         expected_version=expected_version,
         expected_dependency=expected_dependency,
-        forbidden_dependency=_normalized(forbidden_package_root),
+        forbidden_dependencies=forbidden_dependencies,
+        expected_optional_dependency=expected_optional_dependency,
     )
-    egg_metadata = source_prefix + "/" + expected_egg_info + "/PKG-INFO"
-    if egg_metadata in payloads:
-        if _validate_metadata(
-            payloads[egg_metadata],
-            "sdist egg-info",
-            expected_name=expected_name,
-            expected_version=expected_version,
-            expected_dependency=expected_dependency,
-            forbidden_dependency=_normalized(forbidden_package_root),
-        ) != identity:
-            raise ArtifactVerificationError("sdist metadata identities differ")
+    if _validate_metadata(
+        payloads[egg_metadata],
+        "sdist egg-info",
+        expected_name=expected_name,
+        expected_version=expected_version,
+        expected_dependency=expected_dependency,
+        forbidden_dependencies=forbidden_dependencies,
+        expected_optional_dependency=expected_optional_dependency,
+    ) != identity:
+        raise ArtifactVerificationError("sdist metadata identities differ")
+    if expected_entry_points is not None:
+        entry_points_path = allowed_egg_prefix + "/entry_points.txt"
+        if entry_points_path not in payloads:
+            raise ArtifactVerificationError("sdist is missing entry-point metadata")
+        _validate_entry_points(
+            payloads[entry_points_path], "sdist", expected_entry_points
+        )
     return identity
 
 
@@ -579,10 +797,23 @@ def verify_release_directory(
     *,
     expected_name: str,
     expected_version: str,
-    package_root: str,
-    forbidden_package_root: str,
+    package_root: Optional[str] = None,
+    forbidden_package_root: Optional[str] = None,
     expected_dependency: ExpectedDependencies = None,
+    package_sources: Optional[Sequence[PackageSource]] = None,
+    required_package_files: Sequence[RequiredPackageFile] = (),
+    expected_optional_dependency: ExpectedDependencies = None,
+    forbidden_dependencies: Sequence[str] = (),
+    expected_entry_points: ExpectedEntryPoints = None,
 ) -> Tuple[Path, Path]:
+    resolved_sources = _package_sources(package_sources, package_root)
+    resolved_required_files = _required_package_files(
+        required_package_files,
+        tuple(package for package, _ in resolved_sources),
+    )
+    resolved_forbidden_dependencies = tuple(forbidden_dependencies)
+    if forbidden_package_root is not None:
+        resolved_forbidden_dependencies += (_normalized(forbidden_package_root),)
     if directory.is_symlink() or not directory.is_dir():
         raise ArtifactVerificationError("release artifact directory does not exist")
     try:
@@ -614,17 +845,23 @@ def verify_release_directory(
             wheel,
             expected_name=expected_name,
             expected_version=expected_version,
-            package_root=package_root,
-            forbidden_package_root=forbidden_package_root,
+            package_sources=resolved_sources,
+            required_package_files=resolved_required_files,
             expected_dependency=expected_dependency,
+            expected_optional_dependency=expected_optional_dependency,
+            forbidden_dependencies=resolved_forbidden_dependencies,
+            expected_entry_points=expected_entry_points,
         ),
         _sdist_identity(
             sdist,
             expected_name=expected_name,
             expected_version=expected_version,
-            package_root=package_root,
-            forbidden_package_root=forbidden_package_root,
+            package_sources=resolved_sources,
+            required_package_files=resolved_required_files,
             expected_dependency=expected_dependency,
+            expected_optional_dependency=expected_optional_dependency,
+            forbidden_dependencies=resolved_forbidden_dependencies,
+            expected_entry_points=expected_entry_points,
         ),
     )
     if identities[0] != identities[1]:
@@ -637,8 +874,24 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("directory", type=Path)
     parser.add_argument("--name", required=True)
     parser.add_argument("--version", required=True)
-    parser.add_argument("--package-root", required=True)
-    parser.add_argument("--forbid-package-root", required=True)
+    package = parser.add_mutually_exclusive_group(required=True)
+    package.add_argument("--package-root")
+    package.add_argument(
+        "--package-source",
+        action="append",
+        help="Require a wheel root and sdist source mapping as ROOT=PATH; repeat",
+    )
+    parser.add_argument("--forbid-package-root")
+    parser.add_argument(
+        "--require-package-file",
+        action="append",
+        help="Require a file inside one package root as ROOT=RELATIVE_PATH; repeat",
+    )
+    parser.add_argument(
+        "--forbid-requires-dist",
+        action="append",
+        help="Reject this distribution name from every Requires-Dist field; repeat",
+    )
     parser.add_argument(
         "--requires-dist",
         action="append",
@@ -647,12 +900,66 @@ def _parser() -> argparse.ArgumentParser:
             "specifiers; repeat for the complete default-install dependency set"
         ),
     )
+    parser.add_argument(
+        "--optional-requires-dist",
+        action="append",
+        help=(
+            "Require this exact optional dependency including an extra marker; "
+            "repeat for the complete optional dependency set"
+        ),
+    )
+    parser.add_argument(
+        "--console-script",
+        action="append",
+        help="Require an exact console script as NAME=MODULE:ATTRIBUTE; repeat",
+    )
+    parser.add_argument(
+        "--provider-entry-point",
+        action="append",
+        help="Require an exact provider entry point as NAME=MODULE:ATTRIBUTE; repeat",
+    )
     return parser
+
+
+def _assignment(value: str, label: str) -> Tuple[str, str]:
+    key, separator, target = value.partition("=")
+    if separator != "=" or not key or not target:
+        raise ArtifactVerificationError(label + " must use NAME=VALUE")
+    if key != key.strip() or target != target.strip():
+        raise ArtifactVerificationError(label + " contains surrounding whitespace")
+    return key, target
+
+
+def _assignments(values: Optional[Sequence[str]], label: str) -> Tuple[Tuple[str, str], ...]:
+    if values is None:
+        return ()
+    result = tuple(_assignment(value, label) for value in values)
+    if len(result) != len({key for key, _ in result}):
+        raise ArtifactVerificationError(label + " names are duplicated")
+    return result
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        package_sources = (
+            _assignments(args.package_source, "package source")
+            if args.package_source is not None
+            else None
+        )
+        required_package_files = _assignments(
+            args.require_package_file, "required package file"
+        )
+        console_scripts = dict(_assignments(args.console_script, "console script"))
+        provider_entry_points = dict(
+            _assignments(args.provider_entry_point, "provider entry point")
+        )
+        expected_entry_points: ExpectedEntryPoints = None
+        if console_scripts or provider_entry_points:
+            expected_entry_points = {
+                "console_scripts": console_scripts,
+                "unified_cli.providers.v1": provider_entry_points,
+            }
         wheel, sdist = verify_release_directory(
             args.directory,
             expected_name=args.name,
@@ -660,6 +967,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             package_root=args.package_root,
             forbidden_package_root=args.forbid_package_root,
             expected_dependency=args.requires_dist,
+            package_sources=package_sources,
+            required_package_files=required_package_files,
+            expected_optional_dependency=args.optional_requires_dist,
+            forbidden_dependencies=args.forbid_requires_dist or (),
+            expected_entry_points=expected_entry_points,
         )
     except (ArtifactVerificationError, OSError) as exc:
         print("release artifact verification failed: " + str(exc), file=sys.stderr)

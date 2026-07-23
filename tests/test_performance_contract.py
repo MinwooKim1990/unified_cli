@@ -37,11 +37,29 @@ def _short(metric: dict, *, samples: int = 3) -> dict:
     return result
 
 
-def _reference_copy(
+def _set_declared_version(path: Path, version: str) -> None:
+    source = path.read_text(encoding="utf-8")
+    lines = source.splitlines()
+    declarations = [
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("__version__ = ")
+    ]
+    assert len(declarations) == 1
+    lines[declarations[0]] = '__version__ = "{}"'.format(version)
+    path.write_text(
+        "\n".join(lines) + ("\n" if source.endswith("\n") else ""),
+        encoding="utf-8",
+    )
+
+
+def _source_copy(
     tmp_path: Path,
     *,
+    core_version: str,
+    ext_version: str,
     sha: str = check_performance.REFERENCE_SHA,
-    name: str = "reference",
+    name: str,
 ) -> Path:
     root = tmp_path / name
     for relative in check_performance.SOURCE_TREES:
@@ -55,7 +73,59 @@ def _reference_copy(
         )
     (root / ".git").mkdir()
     (root / ".git" / "HEAD").write_text(sha + "\n", encoding="ascii")
+    _set_declared_version(
+        root / "src" / "unified_cli" / "__init__.py", core_version,
+    )
+    _set_declared_version(
+        root
+        / "packages"
+        / "unified-cli-ext"
+        / "src"
+        / "unified_cli_ext"
+        / "__init__.py",
+        ext_version,
+    )
     return root
+
+
+def _reference_copy(
+    tmp_path: Path,
+    *,
+    sha: str = check_performance.REFERENCE_SHA,
+    name: str = "reference",
+) -> Path:
+    return _source_copy(
+        tmp_path,
+        core_version=check_performance.REFERENCE_CORE_VERSION,
+        ext_version=check_performance.REFERENCE_EXT_VERSION,
+        sha=sha,
+        name=name,
+    )
+
+
+def _candidate_copy(tmp_path: Path, *, name: str = "candidate") -> Path:
+    return _source_copy(
+        tmp_path,
+        core_version=check_performance.CANDIDATE_CORE_VERSION,
+        ext_version=check_performance.CANDIDATE_EXT_VERSION,
+        name=name,
+    )
+
+
+def _reference_digest(root: Path) -> str:
+    return check_performance.source_tree_digest(
+        root,
+        expected_core_version=check_performance.REFERENCE_CORE_VERSION,
+        expected_ext_version=check_performance.REFERENCE_EXT_VERSION,
+    )
+
+
+def _candidate_digest(root: Path) -> str:
+    return check_performance.source_tree_digest(
+        root,
+        expected_core_version=check_performance.CANDIDATE_CORE_VERSION,
+        expected_ext_version=check_performance.CANDIDATE_EXT_VERSION,
+    )
 
 
 def _reference_manifest(tmp_path: Path, *, name: str):
@@ -63,7 +133,7 @@ def _reference_manifest(tmp_path: Path, *, name: str):
     return check_performance._validate_reference_manifest(
         reference,
         expected_sha=check_performance.REFERENCE_SHA,
-        expected_digest=check_performance.source_tree_digest(reference),
+        expected_digest=_reference_digest(reference),
     )
 
 
@@ -85,6 +155,14 @@ def _append_ext_candidate(candidate: Path, payload: str) -> None:
 def test_baseline_pins_reference_digest_anchors_and_exact_policies():
     config = check_performance.load_config(check_performance.DEFAULT_BASELINE)
     metrics = config["metrics"]
+    assert (
+        check_performance.CANDIDATE_CORE_VERSION,
+        check_performance.CANDIDATE_EXT_VERSION,
+    ) == ("0.5.1", "0.5.1")
+    assert (
+        check_performance.REFERENCE_CORE_VERSION,
+        check_performance.REFERENCE_EXT_VERSION,
+    ) == ("0.5.0", "0.1.0")
     assert config["schema_version"] == 1
     assert config["reference"] == {
         "digest_algorithm": "sha256-path-content-v1",
@@ -604,7 +682,7 @@ def test_exact_reference_candidate_reference_order_and_failure_is_closed():
 
 def test_reference_digest_sha_and_version_are_all_proven(tmp_path):
     reference = _reference_copy(tmp_path)
-    expected_digest = check_performance.source_tree_digest(reference)
+    expected_digest = _reference_digest(reference)
     manifest = check_performance._validate_reference_manifest(
         reference,
         expected_sha=check_performance.REFERENCE_SHA,
@@ -621,6 +699,79 @@ def test_reference_digest_sha_and_version_are_all_proven(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    ("package", "relative", "wrong_version"),
+    (
+        ("core", "src/unified_cli/__init__.py", "0.5.0"),
+        (
+            "ext",
+            "packages/unified-cli-ext/src/unified_cli_ext/__init__.py",
+            "0.1.0",
+        ),
+    ),
+)
+def test_candidate_core_and_ext_version_mismatches_fail_independently(
+    tmp_path, package, relative, wrong_version,
+):
+    candidate = _candidate_copy(tmp_path, name="candidate-" + package)
+    _set_declared_version(candidate / relative, wrong_version)
+    with pytest.raises(check_performance.MeasurementError, match="version proof"):
+        check_performance._read_source_manifest(
+            candidate,
+            expected_core_version=check_performance.CANDIDATE_CORE_VERSION,
+            expected_ext_version=check_performance.CANDIDATE_EXT_VERSION,
+        )
+
+
+@pytest.mark.parametrize(
+    ("package", "relative", "wrong_version"),
+    (
+        ("core", "src/unified_cli/__init__.py", "0.5.1"),
+        (
+            "ext",
+            "packages/unified-cli-ext/src/unified_cli_ext/__init__.py",
+            "0.5.1",
+        ),
+    ),
+)
+def test_reference_core_and_ext_version_mismatches_fail_independently(
+    tmp_path, package, relative, wrong_version,
+):
+    reference = _reference_copy(tmp_path, name="reference-" + package)
+    expected_digest = _reference_digest(reference)
+    _set_declared_version(reference / relative, wrong_version)
+    with pytest.raises(check_performance.MeasurementError, match="version proof"):
+        check_performance._validate_reference_manifest(
+            reference,
+            expected_sha=check_performance.REFERENCE_SHA,
+            expected_digest=expected_digest,
+        )
+
+
+@pytest.mark.parametrize(
+    ("expected_core_version", "expected_ext_version"),
+    (
+        ("from-environment", "0.5.1"),
+        ("0.5.1", "from-environment"),
+        ("0.5.1", "0.1.0"),
+        (["0.5.1"], "0.5.1"),
+    ),
+)
+def test_manifest_version_expectations_reject_untrusted_or_mixed_pairs(
+    tmp_path, expected_core_version, expected_ext_version,
+):
+    candidate = _candidate_copy(tmp_path)
+    with pytest.raises(
+        check_performance.MeasurementError,
+        match="version expectation is invalid",
+    ):
+        check_performance._read_source_manifest(
+            candidate,
+            expected_core_version=expected_core_version,
+            expected_ext_version=expected_ext_version,
+        )
+
+
 def test_verified_reference_bytes_survive_canonical_mutation_and_use_random_snapshots(
     tmp_path,
 ):
@@ -628,7 +779,7 @@ def test_verified_reference_bytes_survive_canonical_mutation_and_use_random_snap
     manifest = check_performance._validate_reference_manifest(
         reference,
         expected_sha=check_performance.REFERENCE_SHA,
-        expected_digest=check_performance.source_tree_digest(reference),
+        expected_digest=_reference_digest(reference),
     )
     original = next(
         entry.payload
@@ -658,7 +809,7 @@ def test_candidate_never_observes_before_or_future_reference_snapshot(tmp_path):
     manifest = check_performance._validate_reference_manifest(
         reference,
         expected_sha=check_performance.REFERENCE_SHA,
-        expected_digest=check_performance.source_tree_digest(reference),
+        expected_digest=_reference_digest(reference),
     )
     metric = _short(check_performance.load_config(
         check_performance.DEFAULT_BASELINE
@@ -688,8 +839,8 @@ def test_candidate_never_observes_before_or_future_reference_snapshot(tmp_path):
 
 def test_future_candidate_source_changes_do_not_invalidate_reference_fixture(tmp_path):
     reference = _reference_copy(tmp_path, name="reference")
-    candidate = _reference_copy(tmp_path, name="candidate")
-    expected_digest = check_performance.source_tree_digest(reference)
+    candidate = _candidate_copy(tmp_path, name="candidate")
+    expected_digest = _reference_digest(reference)
     candidate_init = candidate / "src" / "unified_cli" / "__init__.py"
     candidate_init.write_text(
         candidate_init.read_text(encoding="utf-8") + "\n# future candidate change\n",
@@ -701,7 +852,7 @@ def test_future_candidate_source_changes_do_not_invalidate_reference_fixture(tmp
         expected_digest=expected_digest,
     )
     assert manifest.digest == expected_digest
-    assert check_performance.source_tree_digest(candidate) != expected_digest
+    assert _candidate_digest(candidate) != expected_digest
     (reference / ".git" / "HEAD").write_text(
         check_performance.REFERENCE_SHA + "\n", encoding="ascii",
     )
@@ -717,14 +868,14 @@ def test_future_candidate_source_changes_do_not_invalidate_reference_fixture(tmp
 
 def test_digest_excludes_only_declared_cache_and_packaging_metadata(tmp_path):
     reference = _reference_copy(tmp_path)
-    original = check_performance.source_tree_digest(reference)
+    original = _reference_digest(reference)
     cache = reference / "src" / "unified_cli" / "__pycache__"
     cache.mkdir()
     (cache / "ignored.pyc").write_bytes(b"ambient")
     egg = reference / "src" / "unified_cli" / "ignored.egg-info"
     egg.mkdir()
     (egg / "PKG-INFO").write_text("ambient", encoding="utf-8")
-    assert check_performance.source_tree_digest(reference) == original
+    assert _reference_digest(reference) == original
 
     init = reference / "src" / "unified_cli" / "__init__.py"
     init.write_text(
@@ -732,7 +883,7 @@ def test_digest_excludes_only_declared_cache_and_packaging_metadata(tmp_path):
         encoding="utf-8",
     )
     with pytest.raises(check_performance.MeasurementError, match="version proof"):
-        check_performance.source_tree_digest(reference)
+        _reference_digest(reference)
 
 
 def test_digest_explicitly_sorts_each_declared_tree_without_cross_tree_reordering():
@@ -788,14 +939,22 @@ def test_manifest_rejects_symlinks_in_excluded_trees_and_special_files(tmp_path)
     except OSError:
         pytest.skip("symlinks unavailable")
     with pytest.raises(check_performance.MeasurementError, match="symlink"):
-        check_performance._read_source_manifest(reference)
+        check_performance._read_source_manifest(
+            reference,
+            expected_core_version=check_performance.REFERENCE_CORE_VERSION,
+            expected_ext_version=check_performance.REFERENCE_EXT_VERSION,
+        )
 
     if not hasattr(os, "mkfifo"):
         return
     special = _reference_copy(tmp_path, name="special-reference")
     os.mkfifo(special / "src" / "unified_cli" / "special.pipe")
     with pytest.raises(check_performance.MeasurementError, match="special file"):
-        check_performance._read_source_manifest(special)
+        check_performance._read_source_manifest(
+            special,
+            expected_core_version=check_performance.REFERENCE_CORE_VERSION,
+            expected_ext_version=check_performance.REFERENCE_EXT_VERSION,
+        )
 
 
 def test_core_candidate_and_reference_origins_are_separately_proven(tmp_path):
@@ -803,7 +962,7 @@ def test_core_candidate_and_reference_origins_are_separately_proven(tmp_path):
     manifest = check_performance._validate_reference_manifest(
         reference,
         expected_sha=check_performance.REFERENCE_SHA,
-        expected_digest=check_performance.source_tree_digest(reference),
+        expected_digest=_reference_digest(reference),
     )
     metric = _short(check_performance.load_config(
         check_performance.DEFAULT_BASELINE
@@ -822,7 +981,7 @@ def test_core_version_uses_fresh_verified_reference_snapshots(tmp_path):
     manifest = check_performance._validate_reference_manifest(
         reference,
         expected_sha=check_performance.REFERENCE_SHA,
-        expected_digest=check_performance.source_tree_digest(reference),
+        expected_digest=_reference_digest(reference),
     )
     metric = _short(check_performance.load_config(
         check_performance.DEFAULT_BASELINE
@@ -836,14 +995,116 @@ def test_core_version_uses_fresh_verified_reference_snapshots(tmp_path):
     assert not marker.exists()
 
 
+def test_measured_children_embed_trusted_candidate_and_reference_versions(
+    monkeypatch,
+):
+    config = check_performance.load_config(check_performance.DEFAULT_BASELINE)
+    calls = []
+    hostile = "0.5.1'; raise RuntimeError('environment injection')"
+
+    def fake_run(argv, env, **_kwargs):
+        code = argv[-1]
+        calls.append((env["kind"], code))
+        if "unified_cli.cli.main" in code:
+            version = (
+                check_performance.CANDIDATE_CORE_VERSION
+                if env["kind"] == "candidate"
+                else check_performance.REFERENCE_CORE_VERSION
+            )
+            return 0.0, (version + "\n").encode("ascii")
+        return 0.0, b"1.0\n"
+
+    def fake_fresh(_manifest, env, callback, *, registry=False):
+        assert type(registry) is bool
+        return callback(dict(env, kind="reference"))
+
+    monkeypatch.setattr(check_performance, "_run", fake_run)
+    monkeypatch.setattr(
+        check_performance, "_fresh_reference_once", fake_fresh,
+    )
+    monkeypatch.setattr(
+        check_performance, "_assert_guard_marker_clear", lambda _marker: None,
+    )
+    candidate_env = {
+        "kind": "candidate",
+        "UNIFIED_PERF_EXPECTED_CORE_VERSION": hostile,
+        "UNIFIED_PERF_EXPECTED_EXT_VERSION": hostile,
+    }
+    base_env = {
+        "kind": "base",
+        "UNIFIED_PERF_EXPECTED_CORE_VERSION": hostile,
+        "UNIFIED_PERF_EXPECTED_EXT_VERSION": hostile,
+    }
+    marker = Path("unused-marker")
+    runners = (
+        (
+            check_performance._measure_core_import,
+            "core_import",
+            (
+                "assert unified_cli.__version__ == '0.5.1'",
+            ),
+            (
+                "assert unified_cli.__version__ == '0.5.0'",
+            ),
+        ),
+        (
+            check_performance._measure_core_version,
+            "core_version",
+            (
+                "output.getvalue().strip() == '0.5.1'",
+            ),
+            (
+                "output.getvalue().strip() == '0.5.0'",
+            ),
+        ),
+        (
+            check_performance._measure_ext_import,
+            "ext_import",
+            (
+                "assert unified_cli_ext.__version__ == '0.5.1'",
+            ),
+            (
+                "assert unified_cli_ext.__version__ == '0.1.0'",
+            ),
+        ),
+        (
+            check_performance._measure_ext_registry,
+            "ext_passive_registry",
+            (
+                "assert unified_cli.__version__ == '0.5.1'",
+                "assert unified_cli_ext.__version__ == '0.5.1'",
+            ),
+            (
+                "assert unified_cli.__version__ == '0.5.0'",
+                "assert unified_cli_ext.__version__ == '0.1.0'",
+            ),
+        ),
+    )
+    for runner, metric_name, candidate_proofs, reference_proofs in runners:
+        calls.clear()
+        metric = _short(config["metrics"][metric_name], samples=1)
+        runner(metric, candidate_env, object(), base_env, marker)
+        assert [kind for kind, _code in calls] == [
+            "reference", "candidate", "reference",
+        ]
+        assert all(
+            proof in calls[1][1] for proof in candidate_proofs
+        )
+        assert all(
+            proof in calls[0][1] and proof in calls[2][1]
+            for proof in reference_proofs
+        )
+        assert all(hostile not in code for _kind, code in calls)
+
+
 def test_all_python_children_use_B_and_do_not_create_bytecode(tmp_path):
     assert check_performance._python_argv("pass")[1:5] == ("-I", "-S", "-B", "-c")
-    candidate = _reference_copy(tmp_path, name="candidate")
+    candidate = _candidate_copy(tmp_path, name="candidate")
     reference = _reference_copy(tmp_path, name="reference")
     manifest = check_performance._validate_reference_manifest(
         reference,
         expected_sha=check_performance.REFERENCE_SHA,
-        expected_digest=check_performance.source_tree_digest(reference),
+        expected_digest=_reference_digest(reference),
     )
     with check_performance.isolated_environment(ROOT) as (env, marker, _fixture):
         candidate_env = check_performance._source_environment(env, candidate)
@@ -866,7 +1127,7 @@ def test_all_python_children_use_B_and_do_not_create_bytecode(tmp_path):
 
 
 def test_candidate_metrics_use_captured_sources_not_live_or_sibling_shadows(tmp_path):
-    candidate = _reference_copy(tmp_path, name="candidate")
+    candidate = _candidate_copy(tmp_path, name="candidate")
     sentinel = tmp_path / "candidate-shadow-executed"
     shadow = candidate / "src" / "rich"
     shadow.mkdir()
@@ -876,7 +1137,11 @@ def test_candidate_metrics_use_captured_sources_not_live_or_sibling_shadows(tmp_
         "Path(os.environ['SHADOW_SENTINEL']).write_text('executed')\n",
         encoding="utf-8",
     )
-    manifest = check_performance._read_source_manifest(candidate)
+    manifest = check_performance._read_source_manifest(
+        candidate,
+        expected_core_version=check_performance.CANDIDATE_CORE_VERSION,
+        expected_ext_version=check_performance.CANDIDATE_EXT_VERSION,
+    )
     live_init = candidate / "src" / "unified_cli" / "__init__.py"
     live_init.write_text("raise RuntimeError('live checkout was reused')\n")
 
@@ -904,7 +1169,10 @@ def test_candidate_metrics_use_captured_sources_not_live_or_sibling_shadows(tmp_
             ),
             candidate_env,
         )
-        assert payload.decode("ascii").strip() == check_performance.CORE_VERSION
+        assert (
+            payload.decode("ascii").strip()
+            == check_performance.CANDIDATE_CORE_VERSION
+        )
         assert not sentinel.exists()
         assert not marker.exists()
 
@@ -912,7 +1180,7 @@ def test_candidate_metrics_use_captured_sources_not_live_or_sibling_shadows(tmp_
 def test_general_bootstrap_uses_empty_cwd_and_defeats_candidate_shadow_modules(
     tmp_path,
 ):
-    candidate = _reference_copy(tmp_path, name="candidate")
+    candidate = _candidate_copy(tmp_path, name="candidate")
     sentinel = tmp_path / "shadow-executed"
     shadow = (
         "from pathlib import Path\n"
@@ -955,7 +1223,7 @@ def test_registry_uses_only_equivalent_sanitized_sources_and_fixed_inventory(tmp
     manifest = check_performance._validate_reference_manifest(
         reference,
         expected_sha=check_performance.REFERENCE_SHA,
-        expected_digest=check_performance.source_tree_digest(reference),
+        expected_digest=_reference_digest(reference),
     )
     metric = _short(check_performance.load_config(
         check_performance.DEFAULT_BASELINE
@@ -1233,7 +1501,7 @@ def test_native_environment_scope_removal_is_blocked_without_banning_ctypes():
 def test_ext_import_cannot_replace_shared_guard_even_after_env_tampering(
     tmp_path, operation,
 ):
-    candidate = _reference_copy(tmp_path, name="candidate-" + operation)
+    candidate = _candidate_copy(tmp_path, name="candidate-" + operation)
     if operation == "write":
         attack = (
             "target = os.path.join(os.environ['UNIFIED_PERF_GUARD_ROOT'], "
@@ -1282,7 +1550,7 @@ def test_ext_import_cannot_replace_shared_guard_even_after_env_tampering(
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork is unavailable")
 def test_ext_import_cannot_fork_even_after_env_tampering(tmp_path):
-    candidate = _reference_copy(tmp_path, name="candidate-fork")
+    candidate = _candidate_copy(tmp_path, name="candidate-fork")
     _append_ext_candidate(
         candidate,
         "import os\n"
@@ -1307,7 +1575,7 @@ def test_ext_import_cannot_fork_even_after_env_tampering(tmp_path):
 
 
 def test_ext_import_cannot_leave_an_af_unix_endpoint(tmp_path):
-    candidate = _reference_copy(tmp_path, name="candidate-unix-socket")
+    candidate = _candidate_copy(tmp_path, name="candidate-unix-socket")
     _append_ext_candidate(
         candidate,
         "import os\n"
@@ -1342,7 +1610,7 @@ def test_guard_integrity_preflight_blocks_the_next_reference_child(tmp_path):
     manifest = check_performance._validate_reference_manifest(
         reference,
         expected_sha=check_performance.REFERENCE_SHA,
-        expected_digest=check_performance.source_tree_digest(reference),
+        expected_digest=_reference_digest(reference),
     )
     sentinel = tmp_path / "compromised-guard-executed"
     with check_performance.isolated_environment(ROOT) as (env, _marker, _fixture):
@@ -1583,11 +1851,11 @@ def test_candidate_after_cannot_mutate_verified_reference_or_trigger_future_snap
     tmp_path, monkeypatch,
 ):
     reference = _reference_copy(tmp_path, name="reference")
-    candidate = _reference_copy(tmp_path, name="candidate")
+    candidate = _candidate_copy(tmp_path, name="candidate")
     manifest = check_performance._validate_reference_manifest(
         reference,
         expected_sha=check_performance.REFERENCE_SHA,
-        expected_digest=check_performance.source_tree_digest(reference),
+        expected_digest=_reference_digest(reference),
     )
     target = reference / "src" / "unified_cli" / "__init__.py"
     original = target.read_bytes()
@@ -1629,11 +1897,11 @@ def test_candidate_cannot_fork_watcher_for_future_reference_snapshot(
     tmp_path, monkeypatch,
 ):
     reference = _reference_copy(tmp_path, name="reference")
-    candidate = _reference_copy(tmp_path, name="candidate")
+    candidate = _candidate_copy(tmp_path, name="candidate")
     manifest = check_performance._validate_reference_manifest(
         reference,
         expected_sha=check_performance.REFERENCE_SHA,
-        expected_digest=check_performance.source_tree_digest(reference),
+        expected_digest=_reference_digest(reference),
     )
     candidate_init = candidate / "src" / "unified_cli" / "__init__.py"
     candidate_init.write_text(
@@ -1879,7 +2147,11 @@ def test_run_forwards_explicit_input_bytes():
 
 
 def test_pty_checks_protected_candidate_before_launch():
-    manifest = check_performance._read_source_manifest(ROOT)
+    manifest = check_performance._read_source_manifest(
+        ROOT,
+        expected_core_version=check_performance.CANDIDATE_CORE_VERSION,
+        expected_ext_version=check_performance.CANDIDATE_EXT_VERSION,
+    )
     with check_performance.isolated_environment(ROOT) as (env, marker, _fixture):
         candidate, _ = check_performance._materialize_candidate_environments(
             manifest, env, Path(env["HOME"]).parent,
@@ -1916,7 +2188,7 @@ def test_normal_repl_and_stream_relay_measurements_are_preserved():
 def test_run_checks_wires_every_candidate_metric_to_captured_sources(
     tmp_path, monkeypatch,
 ):
-    candidate = _reference_copy(tmp_path, name="candidate-run")
+    candidate = _candidate_copy(tmp_path, name="candidate-run")
     fixture_source = ROOT / "tests" / "fixtures" / "core_provider_cli.py"
     fixture_target = candidate / "tests" / "fixtures" / fixture_source.name
     fixture_target.parent.mkdir(parents=True)
@@ -1929,7 +2201,7 @@ def test_run_checks_wires_every_candidate_metric_to_captured_sources(
     # baseline.  Bind its synthetic reference copy to its own prevalidated
     # manifest so ordinary source edits cannot make the wiring test stale.
     config["reference"]["source_tree_digest"] = (
-        check_performance.source_tree_digest(reference)
+        _reference_digest(reference)
     )
     for metric in config["metrics"].values():
         metric["samples"] = 1
@@ -1938,9 +2210,9 @@ def test_run_checks_wires_every_candidate_metric_to_captured_sources(
     real_reader = check_performance._read_source_manifest
     changed = False
 
-    def capture_then_change_live_source(root):
+    def capture_then_change_live_source(root, **expected_versions):
         nonlocal changed
-        manifest = real_reader(root)
+        manifest = real_reader(root, **expected_versions)
         if Path(root).resolve() == candidate.resolve() and not changed:
             changed = True
             live_init = candidate / "src" / "unified_cli" / "__init__.py"

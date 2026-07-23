@@ -76,14 +76,14 @@ def require_acp_sdk() -> ModuleType:
 
     if sys.version_info < (3, 10) or sys.version_info >= (3, 15):
         raise OptionalDependencyError(
-            "ACP support requires Python >=3.10,<3.15 and unified-cli-ext[acp]"
+            "ACP support requires Python >=3.10,<3.15 and unified-cli[acp]"
         )
     try:
         return importlib.import_module("acp")
     except ModuleNotFoundError as exc:
         if exc.name == "acp":
             raise OptionalDependencyError(
-                "ACP support requires the optional 'unified-cli-ext[acp]' extra"
+                "ACP support requires the optional 'unified-cli[acp]' extra"
             ) from exc
         raise TransportError("ACP SDK import failed") from None
     except Exception:

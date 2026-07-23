@@ -1,8 +1,21 @@
-# Changelog
+# Extensions changelog
 
-All notable changes to `unified-cli-ext` are documented in this file.
+This file records changes for the extension source tree bundled in `unified-cli`.
+It is not the changelog of an independently published package.
 
 ## [Unreleased]
+
+### Planned for unified-cli 0.5.1
+
+- Consolidates the extension source into the single `unified-cli` distribution;
+  the wheel will expose both `unified_cli` and `unified_cli_ext` namespaces.
+  Core defaults remain Claude, Codex, and Gemini only, while extensions remain
+  explicit and lazy. Grok stays Preview; Qoder, Kilo, and Poolside are runnable
+  Experimental integrations; and the other 14 providers stay Held. All Ext
+  server policies stay disabled.
+- Moves optional protocol installs to `unified-cli[acp]` and
+  `unified-cli[mcp]`. No extension-specific PyPI project or GitHub Release is
+  planned.
 
 ## [0.1.0] - 2026-07-23
 
@@ -34,25 +47,21 @@ Initial extension-foundation release for `unified-cli` 0.5.x.
 - Adds immutable local installation receipts for direct executables and scoped
   npm launchers. Receipts bind inspected local files; they do not establish
   publisher identity.
-- Adds inert Held catalog metadata for Kimi, Copilot, Cursor, CodeBuddy, Qoder,
-  Mistral Vibe, Qwen, Cline, OpenCode, Kilo Code, Factory Droid, Pi, Oh My Pi,
-  Hermes Agent, Poolside Agent CLI, Amp, and GitLab Duo CLI. These 17 entries
-  remain unavailable until provider-specific compatibility evidence is
-  completed and reviewed. Grok is the sole runnable Preview, only through the
-  explicit exact setup documented above; it remains server-disabled and is not
-  Stable.
+- Adds Held catalog metadata for Kimi, Copilot, Cursor, CodeBuddy, Mistral
+  Vibe, Qwen, Cline, OpenCode, Factory Droid, Pi, Oh My Pi, Hermes Agent, Amp,
+  and GitLab Duo CLI. These 14 entries remain unavailable until
+  provider-specific compatibility evidence is completed and reviewed. Grok is
+  a runnable Preview only through the explicit exact setup documented above;
+  Qoder, Kilo Code, and Poolside Agent CLI are runnable Experimental
+  integrations. All remain server-disabled, and none is Stable.
 - Separates registry lifecycle from integration support status and generates
   the public support table from plugin metadata with a CI consistency check.
 - Keeps extension identifiers explicit and lazy. Installing Ext does not change
   Core defaults or the Core server allowlist, handle provider credentials, or
   call a provider service.
-- Ships independently from the exact same source commit as Core 0.5.0, after
-  Core is available from PyPI. The Ext release verifies both published Core and
-  Ext versions, the exact default-runtime dependency set, and archive integrity.
-  Before Ext testing begins it also downloads the final Core GitHub Release,
-  verifies the exact asset set, sizes, SHA-256 digests, and artifact bytes, then
-  revalidates both Core archives. Its mandatory `ext-v0.1.0` GitHub Release is
-  created with the verified Ext wheel and sdist attached.
+- The `ext-v0.1.0` tag was an aborted publishing attempt. It did not publish an
+  extension package to public PyPI and did not create a GitHub Release. The
+  planned 0.5.1 unified distribution supersedes that split-release plan.
 
-[Unreleased]: https://github.com/MinwooKim1990/unified_cli/compare/ext-v0.1.0...HEAD
-[0.1.0]: https://github.com/MinwooKim1990/unified_cli/releases/tag/ext-v0.1.0
+[Unreleased]: https://github.com/MinwooKim1990/unified_cli/compare/v0.5.0...HEAD
+[0.1.0]: https://github.com/MinwooKim1990/unified_cli/tree/ext-v0.1.0

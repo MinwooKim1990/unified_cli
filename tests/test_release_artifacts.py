@@ -231,6 +231,90 @@ def _verify_ext(tmp_path):
     )
 
 
+_UNIFIED_ENTRY_POINTS = {
+    "console_scripts": {
+        "unified-cli": "unified_cli.cli:main",
+    },
+    "unified_cli.providers.v1": {
+        "grok": "unified_cli_ext.providers.grok:PLUGIN",
+        "kimi": "unified_cli_ext.providers.kimi:PLUGIN",
+    },
+}
+
+
+def _entry_points_payload(entries=_UNIFIED_ENTRY_POINTS):
+    lines = []
+    for group, values in entries.items():
+        lines.append("[" + group + "]")
+        lines.extend(
+            name + " = " + target for name, target in sorted(values.items())
+        )
+        lines.append("")
+    return "\n".join(lines).encode("utf-8")
+
+
+def _unified_artifacts(tmp_path, *, dependencies=None, entry_points=None):
+    version = "0.5.1"
+    root = "unified_cli-" + version
+    wheel_entry_points = "unified_cli-0.5.1.dist-info/entry_points.txt"
+    sdist_entry_points = root + "/src/unified_cli.egg-info/entry_points.txt"
+    payload = _entry_points_payload(
+        _UNIFIED_ENTRY_POINTS if entry_points is None else entry_points
+    )
+    return _artifacts(
+        tmp_path,
+        version=version,
+        dependency=dependencies,
+        wheel_options={
+            "extra": (
+                ("unified_cli/py.typed", b""),
+                ("unified_cli_ext/__init__.py", b""),
+                ("unified_cli_ext/py.typed", b""),
+                (wheel_entry_points, payload),
+            ),
+        },
+        sdist_options={
+            "extra_members": (
+                (root + "/src/unified_cli/py.typed", b""),
+                (
+                    root
+                    + "/packages/unified-cli-ext/src/unified_cli_ext/__init__.py",
+                    b"",
+                ),
+                (
+                    root
+                    + "/packages/unified-cli-ext/src/unified_cli_ext/py.typed",
+                    b"",
+                ),
+                (sdist_entry_points, payload),
+            ),
+        },
+    )
+
+
+def _verify_unified(tmp_path, *, expected_optional_dependency=None):
+    return verify_release_artifacts.verify_release_directory(
+        tmp_path,
+        expected_name="unified-cli",
+        expected_version="0.5.1",
+        package_sources=(
+            ("unified_cli", "src/unified_cli"),
+            (
+                "unified_cli_ext",
+                "packages/unified-cli-ext/src/unified_cli_ext",
+            ),
+        ),
+        required_package_files=(
+            ("unified_cli", "py.typed"),
+            ("unified_cli_ext", "py.typed"),
+        ),
+        expected_dependency=("rich>=13", "prompt-toolkit>=3.0.43"),
+        expected_optional_dependency=expected_optional_dependency,
+        forbidden_dependencies=("unified-cli", "unified-cli-ext"),
+        expected_entry_points=_UNIFIED_ENTRY_POINTS,
+    )
+
+
 def _metadata_target_options(target, dependencies):
     if target == "wheel":
         return {"wheel_options": {"metadata_dependencies": dependencies}}
@@ -245,6 +329,82 @@ def test_exact_wheel_sdist_record_and_identity_pass(tmp_path):
     wheel, sdist = _artifacts(tmp_path)
 
     assert _verify_core(tmp_path) == (wheel, sdist)
+
+
+def test_unified_distribution_requires_both_namespaces_and_exact_entry_points(
+    tmp_path,
+):
+    wheel, sdist = _unified_artifacts(
+        tmp_path,
+        dependencies=("prompt-toolkit>=3.0.43", "rich>=13"),
+    )
+
+    assert _verify_unified(tmp_path) == (wheel, sdist)
+
+
+def test_unified_distribution_rejects_legacy_ext_dependency(tmp_path):
+    _unified_artifacts(
+        tmp_path,
+        dependencies=(
+            "rich>=13",
+            "prompt-toolkit>=3.0.43",
+            'unified-cli-ext>=0.1; extra == "extensions"',
+        ),
+    )
+
+    with pytest.raises(
+        verify_release_artifacts.ArtifactVerificationError,
+        match="forbidden distribution dependency boundary",
+    ):
+        _verify_unified(tmp_path)
+
+
+def test_unified_distribution_rejects_entry_point_drift(tmp_path):
+    broken = {
+        group: dict(entries) for group, entries in _UNIFIED_ENTRY_POINTS.items()
+    }
+    broken["unified_cli.providers.v1"]["grok"] = (
+        "unified_cli_ext.providers.kimi:PLUGIN"
+    )
+    _unified_artifacts(
+        tmp_path,
+        dependencies=("rich>=13", "prompt-toolkit>=3.0.43"),
+        entry_points=broken,
+    )
+
+    with pytest.raises(
+        verify_release_artifacts.ArtifactVerificationError,
+        match="entry-point set does not match",
+    ):
+        _verify_unified(tmp_path)
+
+
+def test_unified_distribution_optional_dependency_set_is_exact(tmp_path):
+    expected_optional = (
+        'mcp>=1.27,<2; python_version >= "3.10" and extra == "mcp"',
+    )
+    wheel, sdist = _unified_artifacts(
+        tmp_path,
+        dependencies=(
+            "rich>=13",
+            "prompt-toolkit>=3.0.43",
+            expected_optional[0],
+        ),
+    )
+    assert _verify_unified(
+        tmp_path, expected_optional_dependency=expected_optional
+    ) == (wheel, sdist)
+
+    with pytest.raises(
+        verify_release_artifacts.ArtifactVerificationError,
+        match="optional dependency set does not match",
+    ):
+        _verify_unified(
+            tmp_path,
+            expected_optional_dependency=(
+                'mcp>=1.28,<2; python_version >= "3.10" and extra == "mcp"',
+            ),
+        )
 
 
 def test_ext_dependency_contract_is_order_insensitive_but_exact(tmp_path):

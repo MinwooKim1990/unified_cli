@@ -1,9 +1,12 @@
-# unified-cli-ext
+# Extensions source tree
 
-`unified-cli-ext` is the extension foundation for
-[`unified-cli`](https://github.com/MinwooKim1990/unified_cli). Version 0.1.0
-ships transport and runtime contracts, one bounded Grok Build Preview adapter,
-and 17 inert Held catalog entries.
+This directory organizes the extension source included in
+[`unified-cli`](https://github.com/MinwooKim1990/unified_cli). For the planned
+0.5.1 release it is not independently buildable or installable: one
+`unified-cli` wheel provides both `unified_cli` and `unified_cli_ext`. The
+extension feature set ships transport and runtime contracts, one bounded Grok
+Build Preview adapter, three runnable Experimental adapters (Qoder, Kilo, and
+Poolside), and 14 inert Held catalog entries.
 
 ## What this release does—and does not do
 
@@ -17,9 +20,10 @@ The installed catalog has entry-point metadata for Grok, Kimi, Copilot,
 Cursor, CodeBuddy, Qoder, Mistral Vibe, Qwen, Cline, OpenCode, Kilo Code,
 Factory Droid, Pi, Oh My Pi, Hermes Agent, Poolside Agent CLI, Amp, and GitLab
 Duo CLI. Grok is a read-tool-limited **Preview** with `chat`, `stream`, and
-`sessions` capabilities. The other 17 entries are **Held**: their Core plugins
+`sessions` capabilities. Qoder, Kilo, and Poolside are runnable **Experimental**
+`chat` integrations. The other 14 entries are **Held**: their Core plugins
 advertise no executable capability and cannot construct a provider or execute a
-command.
+command. All extension server policies are disabled.
 
 For Grok Build, Kimi Code CLI, GitHub Copilot CLI, and Cursor Agent CLI, the
 catalog now binds official source links, frozen future-lab targets, documented
@@ -34,7 +38,8 @@ native Grok `0.2.111` passed on macOS arm64 on 2026-07-23. It remains Preview
 and server-disabled because that is one version/platform/auth sample. Kimi `-p` auto-approves normal tools;
 Copilot still lacks the required local provenance capture; and Cursor still
 needs its positional prompt and configuration boundaries verified. Those three
-and every remaining catalog entry stay Held.
+and every remaining catalog entry stay Held; Qoder, Kilo, and Poolside are the
+separate runnable Experimental integrations.
 
 There are no bundled credentials, login flows, or paid-service calls in this
 release. Installation does not install vendor CLIs, log in, call a service, or
@@ -52,12 +57,17 @@ distribution channel and should verify the receipt immediately before launch.
 
 ## Requirements and installation
 
-This distribution targets `unified-cli` 0.5.x.  Install it alongside a
-compatible Core release:
+Install the planned unified release; Core and extensions are a feature boundary,
+not two distributions:
 
 ```bash
-python -m pip install "unified-cli~=0.5.0" unified-cli-ext
+python -m pip install "unified-cli==0.5.1"
 ```
+
+If a developer or tester installed a legacy local or failed split wheel, first
+run `python -m pip uninstall -y unified-cli-ext`, then run
+`python -m pip install --force-reinstall "unified-cli==0.5.1"`. No separate
+project was published to public PyPI.
 
 The import package is `unified_cli_ext`. Before selecting Grok, complete the
 official-native-binary snapshot, isolated login, and
@@ -94,13 +104,15 @@ for the full catalog and official vendor documentation.
 
 ## Optional protocol dependencies
 
-Protocol SDKs remain optional; they are not required to install the foundation
-and do not enable additional provider calls in 0.1.0. The available extras are
-`acp`, `mcp`, `all` (both protocol SDKs), and `dev` (test dependencies).
+Protocol SDKs remain optional; they are not required for Core or Grok in
+`unified-cli` 0.5.1. The `acp` extra is required when explicitly using the
+Qoder, Kilo, or Poolside Experimental integrations, but installing it does not
+select or run a provider by itself. The available extras are `acp`, `mcp`,
+`all` (both protocol SDKs), and `dev` (test dependencies).
 
 ```bash
-python -m pip install "unified-cli-ext[acp]"
-python -m pip install "unified-cli-ext[mcp]"
+python -m pip install "unified-cli[acp]"
+python -m pip install "unified-cli[mcp]"
 ```
 
 - ACP support uses the official
@@ -146,7 +158,8 @@ records, and none of this imports a plugin or probes a provider at startup.
 
 ## Status
 
-This is a foundation release with one offline-fixture-verified Grok Preview and
-17 Held entries. A representative authenticated native smoke has passed, but it
+This is a foundation release with one offline-fixture-verified Grok Preview,
+three runnable Experimental integrations (Qoder, Kilo, and Poolside), and 14
+Held entries. A representative authenticated native smoke has passed, but it
 does not establish broad provider compatibility; Grok is not Stable. No Ext
 provider is exposed through Core's local server.

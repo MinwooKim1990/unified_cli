@@ -1,4 +1,4 @@
-name: Publish Core to PyPI and GitHub
+name: Publish unified-cli to PyPI and GitHub
 
 # Trusted Publisher identity: MinwooKim1990/unified_cli, publish.yml,
 # environment pypi. No token-based or local production upload is supported.
@@ -11,15 +11,15 @@ permissions:
   contents: read
 
 concurrency:
-  group: publish-core-${{ github.ref }}
+  group: publish-unified-${{ github.ref }}
   cancel-in-progress: false
 
 env:
-  CORE_VERSION: "0.5.0"
+  RELEASE_VERSION: "0.5.1"
 
 jobs:
   verify-release:
-    name: Verify exact Core release provenance
+    name: Verify exact unified release provenance
     runs-on: ubuntu-latest
     steps:
       - name: Checkout the release tag with complete history
@@ -48,37 +48,55 @@ jobs:
           test "$tag_commit" = "$checkout_commit"
           test "$tag_commit" = "$event_commit"
           test "$tag_commit" = "$main_commit" || {
-            echo "refusing Core publish: release tag is not the exact origin/main commit" >&2
+            echo "refusing publish: release tag is not the exact origin/main commit" >&2
             exit 1
           }
           test -z "$(git status --porcelain=v1 --untracked-files=all)" || {
-            echo "refusing Core publish: release checkout is not clean" >&2
+            echo "refusing publish: release checkout is not clean" >&2
             exit 1
           }
 
           python - <<'PY'
           import ast
           import os
+          import tomllib
           from pathlib import Path
 
-          module = ast.parse(Path("src/unified_cli/__init__.py").read_text(encoding="utf-8"))
-          versions = [
-              node.value.value
-              for node in module.body
-              if isinstance(node, ast.Assign)
-              and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets)
-              and isinstance(node.value, ast.Constant)
-              and isinstance(node.value.value, str)
-          ]
-          expected = os.environ["CORE_VERSION"]
-          if versions != [expected]:
-              raise SystemExit("refusing Core publish: package version source is ambiguous or wrong")
+          expected = os.environ["RELEASE_VERSION"]
+          version_sources = (
+              Path("src/unified_cli/__init__.py"),
+              Path("packages/unified-cli-ext/src/unified_cli_ext/__init__.py"),
+          )
+          for source in version_sources:
+              module = ast.parse(source.read_text(encoding="utf-8"))
+              versions = [
+                  node.value.value
+                  for node in module.body
+                  if isinstance(node, ast.Assign)
+                  and any(
+                      isinstance(target, ast.Name) and target.id == "__version__"
+                      for target in node.targets
+                  )
+                  and isinstance(node.value, ast.Constant)
+                  and isinstance(node.value.value, str)
+              ]
+              if versions != [expected]:
+                  raise SystemExit(
+                      "refusing publish: namespace version source is ambiguous or wrong"
+                  )
+          project = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+          if project.get("project", {}).get("name") != "unified-cli":
+              raise SystemExit("refusing publish: root project identity is wrong")
+          if Path("packages/unified-cli-ext/pyproject.toml").exists():
+              raise SystemExit("refusing publish: legacy Ext project still exists")
+          if Path(".github/workflows/publish-ext.yml").exists():
+              raise SystemExit("refusing publish: legacy Ext publisher still exists")
           if os.environ["RELEASE_TAG"] != "v" + expected:
-              raise SystemExit("refusing Core publish: tag does not exactly match the package version")
+              raise SystemExit("refusing publish: tag does not match package version")
           PY
 
   test:
-    name: Test Core release tag offline
+    name: Test unified release tag offline
     needs: verify-release
     runs-on: ubuntu-latest
     steps:
@@ -97,15 +115,18 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev,server]"
 
-      - name: Run the complete offline Core suite
-        run: python -m pytest -q
+      - name: Run all offline release suites
+        run: |
+          python -m pytest -q
+          python -m pytest -q packages/unified-cli-ext/tests
+          python scripts/check_ext_provider_support.py --check
 
   performance:
-    name: Pinned-reference Core release performance gate
+    name: Pinned-reference unified release performance gate
     needs: verify-release
     runs-on: ubuntu-24.04
     steps:
-      - name: Checkout the exact Core release tag
+      - name: Checkout the exact release tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -132,7 +153,7 @@ jobs:
           --reference-root performance-reference
 
   build:
-    name: Build and verify Core wheel and sdist
+    name: Build and verify the one wheel and sdist
     needs: [verify-release, test, performance]
     runs-on: ubuntu-latest
     steps:
@@ -149,62 +170,68 @@ jobs:
       - name: Install build tooling
         run: python -m pip install --upgrade pip build twine
 
-      - name: Build exactly one Core wheel and one Core sdist
-        run: python -m build --outdir dist/core .
+      - name: Build exactly one wheel and one sdist
+        run: python -m build --outdir dist/unified .
 
-      - name: Verify Core artifact metadata and package separation
+      - name: Verify exact artifact contents and metadata
         run: |
-          python -m twine check dist/core/*
-          python scripts/verify_release_artifacts.py dist/core \
-            --name unified-cli --version "${CORE_VERSION}" \
-            --package-root unified_cli --forbid-package-root unified_cli_ext \
-            --requires-dist "rich>=13" \
-            --requires-dist "prompt-toolkit>=3.0.43"
+          python -m twine check dist/unified/*
+          python scripts/verify_unified_release_artifacts.py \
+            dist/unified --version "${RELEASE_VERSION}"
 
-      - name: Smoke test the Core wheel in a clean environment
+      - name: Rebuild and verify a wheel from the produced sdist
         run: |
-          python -m venv /tmp/unified-core-release-smoke
-          /tmp/unified-core-release-smoke/bin/python -m pip install --upgrade pip
-          /tmp/unified-core-release-smoke/bin/python -m pip install dist/core/*.whl
-          test "$(/tmp/unified-core-release-smoke/bin/unified-cli --version)" = "${CORE_VERSION}"
-          /tmp/unified-core-release-smoke/bin/python - <<'PY'
-          import importlib.util
-          import os
-          import unified_cli
+          python -m pip wheel --no-deps --wheel-dir dist/rebuilt \
+            "dist/unified/unified_cli-${RELEASE_VERSION}.tar.gz"
+          mkdir dist/rebuilt-pair
+          cp "dist/rebuilt/unified_cli-${RELEASE_VERSION}-py3-none-any.whl" \
+            dist/rebuilt-pair/
+          cp "dist/unified/unified_cli-${RELEASE_VERSION}.tar.gz" \
+            dist/rebuilt-pair/
+          python scripts/verify_unified_release_artifacts.py \
+            dist/rebuilt-pair --version "${RELEASE_VERSION}"
 
-          assert unified_cli.__version__ == os.environ["CORE_VERSION"]
-          assert importlib.util.find_spec("unified_cli_ext") is None
-          PY
-          /tmp/unified-core-release-smoke/bin/python -m pip check
+      - name: Smoke test the wheel in a clean environment
+        run: |
+          python -m venv /tmp/unified-release-smoke
+          /tmp/unified-release-smoke/bin/python -m pip install --upgrade pip
+          /tmp/unified-release-smoke/bin/python -m pip install \
+            "dist/unified/unified_cli-${RELEASE_VERSION}-py3-none-any.whl"
+          test "$(/tmp/unified-release-smoke/bin/unified-cli --version)" = \
+            "${RELEASE_VERSION}"
+          /tmp/unified-release-smoke/bin/unified-cli --help >/dev/null
+          /tmp/unified-release-smoke/bin/python \
+            scripts/verify_single_distribution.py --version "${RELEASE_VERSION}"
+          /tmp/unified-release-smoke/bin/python -m pip check
 
-      - name: Upload Core distributions only
+      - name: Upload the unified distributions only
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: core-dist-${{ github.sha }}
-          path: dist/core/
+          name: unified-dist-${{ github.sha }}
+          path: dist/unified/
           if-no-files-found: error
 
   publish:
-    name: Publish Core to PyPI
+    name: Publish unified-cli to PyPI
     needs: build
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
     steps:
-      - name: Download verified Core distributions
+      - name: Download verified unified distributions
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: core-dist-${{ github.sha }}
-          path: dist/core/
+          name: unified-dist-${{ github.sha }}
+          path: dist/unified/
 
-      - name: Publish Core with PyPI Trusted Publishing
+      - name: Publish with PyPI Trusted Publishing
         uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
         with:
-          packages-dir: dist/core/
+          packages-dir: dist/unified/
 
   pypi-smoke:
-    name: Smoke test released Core from PyPI
+    name: Smoke test released unified-cli from PyPI
     needs: publish
     runs-on: ubuntu-latest
     env:
@@ -215,60 +242,69 @@ jobs:
       PIP_NO_INDEX: "false"
       PIP_REQUIRE_VIRTUALENV: "false"
     steps:
+      - name: Checkout release verification scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
 
-      - name: Wait for PyPI and verify the released Core
+      - name: Wait for PyPI and verify the released wheel
         run: |
           set -euo pipefail
-          python -m venv /tmp/unified-core-pypi-smoke
+          python -m venv /tmp/unified-pypi-smoke
           for attempt in $(seq 1 12); do
-            if /tmp/unified-core-pypi-smoke/bin/python -m pip install \
+            if /tmp/unified-pypi-smoke/bin/python -m pip install \
               --disable-pip-version-check --no-cache-dir \
               --index-url "${PIP_INDEX_URL}" \
-              "unified-cli==${CORE_VERSION}"; then
+              "unified-cli==${RELEASE_VERSION}"; then
               break
             fi
             if test "$attempt" = 12; then
-              echo "released Core did not become installable from PyPI" >&2
+              echo "released unified-cli did not become installable from PyPI" >&2
               exit 1
             fi
             sleep 10
           done
-          test "$(/tmp/unified-core-pypi-smoke/bin/unified-cli --version)" = "${CORE_VERSION}"
-          /tmp/unified-core-pypi-smoke/bin/python - <<'PY'
-          import os
-          import unified_cli
-          assert unified_cli.__version__ == os.environ["CORE_VERSION"]
-          PY
-          /tmp/unified-core-pypi-smoke/bin/python -m pip check
+          test "$(/tmp/unified-pypi-smoke/bin/unified-cli --version)" = \
+            "${RELEASE_VERSION}"
+          /tmp/unified-pypi-smoke/bin/unified-cli --help >/dev/null
+          /tmp/unified-pypi-smoke/bin/python \
+            scripts/verify_single_distribution.py --version "${RELEASE_VERSION}"
+          /tmp/unified-pypi-smoke/bin/python -m pip check
 
   github-release:
-    name: Create mandatory Core GitHub Release
+    name: Create mandatory unified GitHub Release
     needs: pypi-smoke
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Download the verified Core wheel and sdist
+      - name: Checkout release verification scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the verified wheel and sdist
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: core-dist-${{ github.sha }}
-          path: dist/core/
+          name: unified-dist-${{ github.sha }}
+          path: dist/unified/
 
-      - name: Create or verify the immutable Core GitHub Release and assets
+      - name: Create or verify the immutable GitHub Release and assets
         env:
-          EXPECTED_SDIST: dist/core/unified_cli-${{ env.CORE_VERSION }}.tar.gz
-          EXPECTED_WHEEL: dist/core/unified_cli-${{ env.CORE_VERSION }}-py3-none-any.whl
+          EXPECTED_SDIST: dist/unified/unified_cli-${{ env.RELEASE_VERSION }}.tar.gz
+          EXPECTED_WHEEL: dist/unified/unified_cli-${{ env.RELEASE_VERSION }}-py3-none-any.whl
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           test -f "$EXPECTED_WHEEL"
           test -f "$EXPECTED_SDIST"
-          test "$(find dist/core -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" = 2
+          test "$(find dist/unified -mindepth 1 -maxdepth 1 -type f | wc -l | tr -d ' ')" = 2
 
           if ! gh release view "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
@@ -276,46 +312,31 @@ jobs:
               "$EXPECTED_WHEEL" "$EXPECTED_SDIST" \
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
-              --title "unified-cli ${CORE_VERSION}" \
+              --title "unified-cli ${RELEASE_VERSION}" \
               --generate-notes
           fi
 
-          release_json="${RUNNER_TEMP}/core-release.json"
-          assets_dir="${RUNNER_TEMP}/core-release-assets"
-          export release_json assets_dir
+          release_json="${RUNNER_TEMP}/unified-release.json"
+          assets_dir="${RUNNER_TEMP}/unified-release-assets"
           gh release view "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --json tagName,isDraft,isPrerelease,assets > "$release_json"
-          python - <<'PY'
-          import hashlib
-          import json
-          import os
-          from pathlib import Path
+          python scripts/verify_github_release_assets.py "$release_json" \
+            --manifest-only \
+            --tag "$RELEASE_TAG" \
+            --wheel-name "$(basename "$EXPECTED_WHEEL")" \
+            --sdist-name "$(basename "$EXPECTED_SDIST")"
 
-          payload = json.loads(Path(os.environ["release_json"]).read_text(encoding="utf-8"))
-          expected = {
-              Path(os.environ["EXPECTED_WHEEL"]).name: Path(os.environ["EXPECTED_WHEEL"]),
-              Path(os.environ["EXPECTED_SDIST"]).name: Path(os.environ["EXPECTED_SDIST"]),
-          }
-          if payload.get("tagName") != os.environ["RELEASE_TAG"]:
-              raise SystemExit("Core GitHub Release tag does not match")
-          if payload.get("isDraft") is not False or payload.get("isPrerelease") is not False:
-              raise SystemExit("Core GitHub Release must be final")
-          assets = payload.get("assets")
-          if not isinstance(assets, list) or {item.get("name") for item in assets} != set(expected):
-              raise SystemExit("Core GitHub Release assets do not match")
-          for item in assets:
-              local = expected[item["name"]]
-              if item.get("size") != local.stat().st_size:
-                  raise SystemExit("Core GitHub Release asset size does not match")
-              digest = item.get("digest")
-              if digest:
-                  local_digest = "sha256:" + hashlib.sha256(local.read_bytes()).hexdigest()
-                  if digest != local_digest:
-                      raise SystemExit("Core GitHub Release asset digest does not match")
-          PY
+          test ! -e "$assets_dir"
           mkdir "$assets_dir"
           gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" --dir "$assets_dir"
+          python scripts/verify_github_release_assets.py \
+            "$release_json" "$assets_dir" \
+            --tag "$RELEASE_TAG" \
+            --wheel-name "$(basename "$EXPECTED_WHEEL")" \
+            --sdist-name "$(basename "$EXPECTED_SDIST")"
+          python scripts/verify_unified_release_artifacts.py \
+            "$assets_dir" --version "${RELEASE_VERSION}"
           cmp "$EXPECTED_WHEEL" "$assets_dir/$(basename "$EXPECTED_WHEEL")"
           cmp "$EXPECTED_SDIST" "$assets_dir/$(basename "$EXPECTED_SDIST")"

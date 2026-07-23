@@ -155,7 +155,12 @@ def _plugin_error(provider_id: ProviderId, code: str) -> UnifiedError:
     hints = {
         "disabled": f"Unset {DISABLE_PLUGINS_ENV} to enable provider extensions.",
         "unknown": "Install a matching provider extension or use claude / codex / gemini.",
-        "duplicate": "Remove the duplicate provider distribution and retry.",
+        "duplicate": (
+            "Remove duplicate provider distributions and retry. If a legacy "
+            "local unified-cli-ext wheel was installed, run "
+            "'python -m pip uninstall -y unified-cli-ext' and then "
+            "'python -m pip install --force-reinstall unified-cli'."
+        ),
         "reserved": "Use the built-in public provider id; agy is only an executable alias.",
         "held": "Compatibility is not yet verified; use a supported provider.",
     }
