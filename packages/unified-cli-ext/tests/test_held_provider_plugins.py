@@ -806,26 +806,56 @@ else:
 
 def test_grok_requires_xai_identity_and_rejects_third_party_name_collision():
     module = _module("grok")
+    fixed_environment = {
+        "GROK_DISABLE_AUTOUPDATER": "1",
+        "GROK_WRITE_FILE": "0",
+        "GROK_TOOL_SEARCH": "0",
+        "GROK_LSP_TOOLS": "0",
+        "GROK_MEMORY": "0",
+        "GROK_SUBAGENTS": "0",
+        "GROK_WEB_FETCH": "0",
+        "GROK_RESPECT_GITIGNORE": "1",
+        "GROK_CURSOR_SKILLS_ENABLED": "false",
+        "GROK_CURSOR_RULES_ENABLED": "false",
+        "GROK_CURSOR_AGENTS_ENABLED": "false",
+        "GROK_CURSOR_MCPS_ENABLED": "false",
+        "GROK_CURSOR_HOOKS_ENABLED": "false",
+        "GROK_CURSOR_SESSIONS_ENABLED": "false",
+        "GROK_CLAUDE_SKILLS_ENABLED": "false",
+        "GROK_CLAUDE_RULES_ENABLED": "false",
+        "GROK_CLAUDE_AGENTS_ENABLED": "false",
+        "GROK_CLAUDE_MCPS_ENABLED": "false",
+        "GROK_CLAUDE_HOOKS_ENABLED": "false",
+        "GROK_CLAUDE_SESSIONS_ENABLED": "false",
+        "GROK_CODEX_SKILLS_ENABLED": "false",
+        "GROK_CODEX_RULES_ENABLED": "false",
+        "GROK_CODEX_AGENTS_ENABLED": "false",
+        "GROK_CODEX_MCPS_ENABLED": "false",
+        "GROK_CODEX_HOOKS_ENABLED": "false",
+        "GROK_CODEX_SESSIONS_ENABLED": "false",
+        "GROK_OFFICIAL_MARKETPLACE_AUTO_REGISTER": "0",
+        "GROK_MARKETPLACE_REQUIRE_SHA": "1",
+        "GROK_MANAGED_MCPS_ENABLED": "false",
+        "GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED": "false",
+    }
     assert module.GROK_OFFICIAL_PACKAGE == "@xai-official/grok"
+    assert module.GROK_DEFAULT_MODEL == "grok-4.5"
     assert module.GROK_REJECTED_PACKAGE_IDENTITIES == ("@vibe-kit/grok-cli",)
-    assert module.GROK_STAGE_6_TARGET_VERSION == "0.2.110"
-    assert module.GROK_REAL_AUTHENTICATED_SMOKE_CAPTURED is False
+    assert module.GROK_STAGE_6_TARGET_VERSION == "0.2.111"
+    assert module.GROK_REAL_AUTHENTICATED_SMOKE_CAPTURED is True
+    assert module.GROK_REAL_SMOKE_VERSION == "0.2.111"
+    assert module.GROK_REAL_SMOKE_PLATFORM == "macos-aarch64"
+    assert module.GROK_REAL_SMOKE_DATE == "2026-07-23"
     assert module.ADAPTER_SPEC.binary.executable == "grok"
     assert module.ADAPTER_SPEC.status is AdapterStatus.PREVIEW
     assert module.PLUGIN.support_status == "preview"
     assert module.PLUGIN.capabilities == frozenset(("chat", "sessions", "stream"))
     assert module.PLUGIN.server_policy.enabled is False
     assert module.ADAPTER_SPEC.environment.allowed_keys == frozenset(
-        (
-            "XAI_API_KEY",
-            "GROK_MANAGED_MCPS_ENABLED",
-            "GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED",
-        )
+        ("XAI_API_KEY", *fixed_environment)
     )
-    assert dict(module.ADAPTER_SPEC.environment.fixed_values) == {
-        "GROK_MANAGED_MCPS_ENABLED": "false",
-        "GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED": "false",
-    }
+    assert dict(module.ADAPTER_SPEC.environment.fixed_values) == fixed_environment
+    assert dict(module.GROK_FIXED_ENVIRONMENT) == fixed_environment
 
 
 def test_kimi_documents_auto_approval_without_claiming_safe_execution():

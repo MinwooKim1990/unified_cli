@@ -22,13 +22,42 @@ def sidecar(suffix, default):
 
 
 args = sys.argv[1:]
-if (
-    os.environ.get("GROK_MANAGED_MCPS_ENABLED") != "false"
-    or os.environ.get("GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED") != "false"
-):
+fixed_environment = {
+    "GROK_DISABLE_AUTOUPDATER": "1",
+    "GROK_WRITE_FILE": "0",
+    "GROK_TOOL_SEARCH": "0",
+    "GROK_LSP_TOOLS": "0",
+    "GROK_MEMORY": "0",
+    "GROK_SUBAGENTS": "0",
+    "GROK_WEB_FETCH": "0",
+    "GROK_RESPECT_GITIGNORE": "1",
+    "GROK_CURSOR_SKILLS_ENABLED": "false",
+    "GROK_CURSOR_RULES_ENABLED": "false",
+    "GROK_CURSOR_AGENTS_ENABLED": "false",
+    "GROK_CURSOR_MCPS_ENABLED": "false",
+    "GROK_CURSOR_HOOKS_ENABLED": "false",
+    "GROK_CURSOR_SESSIONS_ENABLED": "false",
+    "GROK_CLAUDE_SKILLS_ENABLED": "false",
+    "GROK_CLAUDE_RULES_ENABLED": "false",
+    "GROK_CLAUDE_AGENTS_ENABLED": "false",
+    "GROK_CLAUDE_MCPS_ENABLED": "false",
+    "GROK_CLAUDE_HOOKS_ENABLED": "false",
+    "GROK_CLAUDE_SESSIONS_ENABLED": "false",
+    "GROK_CODEX_SKILLS_ENABLED": "false",
+    "GROK_CODEX_RULES_ENABLED": "false",
+    "GROK_CODEX_AGENTS_ENABLED": "false",
+    "GROK_CODEX_MCPS_ENABLED": "false",
+    "GROK_CODEX_HOOKS_ENABLED": "false",
+    "GROK_CODEX_SESSIONS_ENABLED": "false",
+    "GROK_OFFICIAL_MARKETPLACE_AUTO_REGISTER": "0",
+    "GROK_MARKETPLACE_REQUIRE_SHA": "1",
+    "GROK_MANAGED_MCPS_ENABLED": "false",
+    "GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED": "false",
+}
+if any(os.environ.get(name) != value for name, value in fixed_environment.items()):
     raise SystemExit(95)
 if args == ["--version"]:
-    print(sidecar(".version", "grok 0.2.110 (official-test-commit)"))
+    print(sidecar(".version", "grok 0.2.111 (94172f2aa4e5) [stable]"))
     raise SystemExit(0)
 
 if args == ["--help"]:
@@ -144,6 +173,8 @@ end = {
         "input_tokens": 3,
         "cache_read_input_tokens": 1,
         "output_tokens": 2,
+        "reasoning_tokens": 1,
+        "total_tokens": 5,
     },
 }
 if prompt == "malformed-usage":
