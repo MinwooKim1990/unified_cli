@@ -213,6 +213,18 @@ Grok uses the guide's verified isolated login setup.
 > [GitHub issue](https://github.com/MinwooKim1990/unified_cli/issues/new).
 > Reports intentionally omit prompts, environment values, auth data, and tokens.
 
+> **OpenCode Go live result (2026-07-24):** OpenCode `1.18.0` and the user's
+> authenticated Go subscription passed live refresh of all 16 current Go
+> models, chat, local file tools, Exa web search, and a synthetic-image check
+> with `opencode-go/grok-4.5`. The current unified-cli adapter did **not** pass:
+> its provenance binding rejects the official Homebrew Cellar directory chain,
+> Python calls and REPL chat fail, the REPL exposes only `default`, Browser
+> Verify/Models return HTTP 502, and Browser Chat disables OpenCode. OpenCode
+> therefore remains **Preview**. See the
+> [complete test matrix](docs/development/opencode-go-live-smoke-2026-07-24.md).
+> This does not validate the separate Grok Build CLI adapter, so `grok` also
+> remains Preview.
+
 Python uses the same installed package and registry. `create()` is the public
 embedded API; importing `unified_cli_ext` directly is optional:
 

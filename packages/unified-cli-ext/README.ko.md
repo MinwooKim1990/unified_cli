@@ -147,6 +147,12 @@ Hermes, Mistral Vibe, Qoder는 제한된 호환성 오류를 반환했고, Pools
 동의가 필요해 설치하지 않았습니다. Grok은 별도의 대표 인증 native smoke도
 통과했습니다. 루트의
 [랩 근거](../../docs/development/ext-accountless-live-lab-2026-07-23.md)를 참고하세요.
+2026-07-24 인증된 OpenCode Go smoke에서는 vendor CLI의 모델·채팅·파일 도구·웹
+검색·이미지 가능 모델 하나가 통과했지만, unified-cli adapter는 공식 Homebrew
+설치본의 provenance binding에서 막혀 Python·REPL·Browser 호출이 실패했습니다.
+따라서 OpenCode는 Preview를 유지합니다.
+[실사용 테스트 표](../../docs/development/opencode-go-live-smoke-2026-07-24.md)를
+참고하세요.
 Ext provider는 Core의 public-compatible 서버 route에 노출되지 않습니다. Preview
 실행 실패 시 `~/.unified-cli/preview-diagnostics/`에 prompt 없는 보고서가 생성되며
 GitHub Issue에 첨부해 호환성 개선을 도울 수 있습니다.
