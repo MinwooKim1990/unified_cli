@@ -163,6 +163,12 @@ Poolside was not installed because accepting its EULA was outside the test
 authorization. Grok also has a representative authenticated native smoke.
 See the root
 [lab evidence](../../docs/development/ext-accountless-live-lab-2026-07-23.md).
+An authenticated OpenCode Go smoke on 2026-07-24 confirmed the vendor CLI's
+models, chat, file tools, web search, and one image-capable model, but the
+unified-cli adapter failed provenance binding for the official Homebrew
+installation on Python, REPL, and Browser surfaces. OpenCode therefore remains
+Preview; see the
+[live matrix](../../docs/development/opencode-go-live-smoke-2026-07-24.md).
 No Ext provider is exposed through Core's public-compatible server routes.
 Failed Preview runs write prompt-free reports under
 `~/.unified-cli/preview-diagnostics/`; attach one to a GitHub issue to help
